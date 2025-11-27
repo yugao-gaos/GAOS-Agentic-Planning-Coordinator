@@ -58,9 +58,63 @@ export interface PlanningSession {
     recommendedEngineers?: EngineerRecommendation;
     createdAt: string;
     updatedAt: string;
+    
+    // === Execution State (embedded coordinator) ===
+    execution?: ExecutionState;
 }
 
-export type PlanningStatus = 'debating' | 'reviewing' | 'approved' | 'revising' | 'cancelled';
+/**
+ * Planning status now includes execution phases
+ * - debating: AI analysts creating plan
+ * - reviewing: User reviewing plan
+ * - revising: Agents revising based on feedback
+ * - approved: Plan approved, ready to execute
+ * - executing: Plan being executed by engineers
+ * - paused: Execution paused (can resume)
+ * - stopped: Stopped by user (can resume)
+ * - completed: All tasks done
+ * - cancelled: Cancelled, cannot resume
+ */
+export type PlanningStatus = 
+    | 'debating' 
+    | 'reviewing' 
+    | 'approved' 
+    | 'revising' 
+    | 'cancelled' 
+    | 'stopped'
+    | 'executing'
+    | 'paused'
+    | 'completed';
+
+/**
+ * Execution state embedded in PlanningSession for UI display
+ * The actual execution is managed by CoordinatorService
+ */
+export interface ExecutionState {
+    /** Links to the CoordinatorService's coordinator */
+    coordinatorId: string;
+    mode: 'auto' | 'interactive';
+    startedAt: string;
+    /** Snapshot of engineer states for UI display (synced from coordinator) */
+    engineers: Record<string, EngineerExecutionState>;
+    progress: TaskProgress;
+    currentWave: number;
+    lastActivityAt: string;
+}
+
+/**
+ * Per-engineer execution state (synced from CoordinatorService)
+ */
+export interface EngineerExecutionState {
+    name: string;
+    status: 'idle' | 'starting' | 'working' | 'paused' | 'completed' | 'error';
+    sessionId: string;
+    currentTask?: string;
+    logFile: string;
+    processId?: number;
+    startTime: string;
+    lastActivity?: string;
+}
 
 export interface PlanVersion {
     version: number;
@@ -201,4 +255,13 @@ export interface EngineerTerminal {
     terminal: import('vscode').Terminal;
     logFile: string;
 }
+
+
+
+
+
+
+
+
+
 

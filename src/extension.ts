@@ -4,10 +4,13 @@ import { EngineerPoolService } from './services/EngineerPoolService';
 import { TerminalManager } from './services/TerminalManager';
 import { CoordinatorService } from './services/CoordinatorService';
 import { PlanningService } from './services/PlanningService';
+import { DependencyService } from './services/DependencyService';
+import { CliIpcService } from './services/CliIpcService';
 import { CliHandler } from './cli/CliHandler';
-import { PlanningSessionsProvider } from './ui/PlanningSessionsProvider';
+import { PlanningSessionsProvider, PlanningSessionItem } from './ui/PlanningSessionsProvider';
 import { CoordinatorsProvider } from './ui/CoordinatorsProvider';
 import { EngineerPoolProvider } from './ui/EngineerPoolProvider';
+import { DependencyStatusProvider } from './ui/DependencyStatusProvider';
 
 let stateManager: StateManager;
 let engineerPoolService: EngineerPoolService;
@@ -15,6 +18,7 @@ let terminalManager: TerminalManager;
 let coordinatorService: CoordinatorService;
 let planningService: PlanningService;
 let cliHandler: CliHandler;
+let cliIpcService: CliIpcService;
 
 export async function activate(context: vscode.ExtensionContext) {
     console.log('Agentic Planning Coordinator is activating...');
@@ -34,18 +38,53 @@ export async function activate(context: vscode.ExtensionContext) {
     terminalManager = new TerminalManager();
     coordinatorService = new CoordinatorService(stateManager, engineerPoolService, terminalManager);
     planningService = new PlanningService(stateManager);
+    
+    // Wire up CoordinatorService to PlanningService (for execution facade)
+    planningService.setCoordinatorService(coordinatorService);
+    
     cliHandler = new CliHandler(stateManager, engineerPoolService, coordinatorService, planningService, terminalManager);
 
-    // Register TreeView providers
+    // Initialize and start CLI IPC service (for apc command communication)
+    cliIpcService = new CliIpcService(stateManager, cliHandler);
+    cliIpcService.start();
+
+    // Initialize dependency service and check dependencies
+    const dependencyService = DependencyService.getInstance();
+    
+    // Register TreeView providers (no more separate Coordinators view - embedded in Sessions)
+    const dependencyStatusProvider = new DependencyStatusProvider();
     const planningSessionsProvider = new PlanningSessionsProvider(stateManager);
-    const coordinatorsProvider = new CoordinatorsProvider(stateManager);
     const engineerPoolProvider = new EngineerPoolProvider(engineerPoolService);
 
     context.subscriptions.push(
+        vscode.window.registerTreeDataProvider('agenticPlanning.dependencyStatusView', dependencyStatusProvider),
         vscode.window.registerTreeDataProvider('agenticPlanning.planningSessionsView', planningSessionsProvider),
-        vscode.window.registerTreeDataProvider('agenticPlanning.coordinatorsView', coordinatorsProvider),
         vscode.window.registerTreeDataProvider('agenticPlanning.engineerPoolView', engineerPoolProvider)
     );
+
+    // Connect planning service events to UI refresh
+    planningService.onSessionsChanged(() => {
+        planningSessionsProvider.refresh();
+    });
+
+    // Check dependencies on startup
+    dependencyService.checkAllDependencies().then(statuses => {
+        const platform = process.platform;
+        const relevantStatuses = statuses.filter(s => s.required && (s.platform === platform || s.platform === 'all'));
+        const missingDeps = relevantStatuses.filter(s => !s.installed);
+        
+        if (missingDeps.length > 0) {
+            const names = missingDeps.map(d => d.name).join(', ');
+            vscode.window.showWarningMessage(
+                `Agentic Planning: Missing dependencies: ${names}. Check System Status panel.`,
+                'Show System Status'
+            ).then(selection => {
+                if (selection === 'Show System Status') {
+                    vscode.commands.executeCommand('agenticPlanning.dependencyStatusView.focus');
+                }
+            });
+        }
+    });
 
     // Register commands
     context.subscriptions.push(
@@ -54,54 +93,175 @@ export async function activate(context: vscode.ExtensionContext) {
         }),
 
         vscode.commands.registerCommand('agenticPlanning.startPlanning', async () => {
-            const prompt = await vscode.window.showInputBox({
-                prompt: 'Enter your requirement or feature description',
-                placeHolder: 'e.g., Implement a combo system for match-3 game'
-            });
-            if (prompt) {
-                const result = await planningService.startPlanning(prompt);
-                vscode.window.showInformationMessage(`Planning session ${result.sessionId} started`);
-                planningSessionsProvider.refresh();
+            // Pre-filled prompt for the AI agent (no unicode/emojis for clipboard compatibility)
+            const planningPrompt = `Help me gather requirements for a new feature. Please ask me questions to understand:
+- What I want to build (feature/system requirements)
+- Technical constraints and preferences
+- Integration points with existing code
+- Testing and quality requirements
+
+IMPORTANT: Our conversation is REQUIREMENTS GATHERING, not planning.
+- If I provide docs (GDD, TDD, specs), copy them to _AiDevLog/Docs/
+- Once requirements are clear, call: apc plan new "<summary>" --docs <paths>
+- The APC extension creates the execution plan using multi-model analysts
+- You do NOT create the plan - the extension does
+
+Workflow:
+1. Gather requirements (this conversation)
+2. Save any docs to _AiDevLog/Docs/
+3. Run: apc plan new "..." to trigger plan creation
+4. Review with user: apc plan status <id>
+5. Approve: apc plan approve <id> (auto-starts execution)
+
+Let's get started!`;
+
+            // Copy prompt to clipboard
+            await vscode.env.clipboard.writeText(planningPrompt);
+            
+            const { exec } = require('child_process');
+            
+            if (process.platform === 'darwin') {
+                // macOS: Use AppleScript
+                const script = `
+                    tell application "Cursor" to activate
+                    delay 0.2
+                    tell application "System Events" to key code 53
+                    delay 0.3
+                    tell application "System Events" to keystroke "l" using {command down, shift down}
+                    delay 0.5
+                    tell application "System Events" to keystroke "v" using command down
+                `;
+                exec(`osascript -e '${script}'`, (error: Error | null) => {
+                    if (error) {
+                        vscode.window.showWarningMessage(
+                            'Could not open chat automatically. Press Cmd+Shift+L and paste (Cmd+V).'
+                        );
+                    }
+                });
+            } else if (process.platform === 'win32') {
+                // Windows: Use PowerShell with SendKeys
+                const psScript = `
+                    Add-Type -AssemblyName System.Windows.Forms
+                    Start-Sleep -Milliseconds 200
+                    [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
+                    Start-Sleep -Milliseconds 300
+                    [System.Windows.Forms.SendKeys]::SendWait('^+l')
+                    Start-Sleep -Milliseconds 500
+                    [System.Windows.Forms.SendKeys]::SendWait('^v')
+                `;
+                exec(`powershell -Command "${psScript.replace(/\n/g, ' ')}"`, (error: Error | null) => {
+                    if (error) {
+                        vscode.window.showWarningMessage(
+                            'Could not open chat automatically. Press Ctrl+Shift+L and paste (Ctrl+V).'
+                        );
+                    }
+                });
+            } else {
+                // Linux: Use xdotool if available
+                exec('which xdotool', (err: Error | null) => {
+                    if (!err) {
+                        exec('sleep 0.2 && xdotool key Escape && sleep 0.3 && xdotool key ctrl+shift+l && sleep 0.5 && xdotool key ctrl+v');
+                    } else {
+                        vscode.window.showInformationMessage(
+                            'Planning prompt copied! Press Ctrl+Shift+L to open chat, then Ctrl+V to paste.'
+                        );
+                    }
+                });
             }
         }),
 
-        vscode.commands.registerCommand('agenticPlanning.startCoordinator', async () => {
-            const plans = await stateManager.getApprovedPlans();
-            if (plans.length === 0) {
-                vscode.window.showWarningMessage('No approved plans available. Create and approve a plan first.');
-                return;
-            }
-            const selected = await vscode.window.showQuickPick(
-                plans.map(p => ({ label: p.title, description: p.path, plan: p })),
-                { placeHolder: 'Select a plan to execute' }
-            );
-            if (selected) {
-                const result = await coordinatorService.startCoordinator(selected.plan.path);
-                vscode.window.showInformationMessage(`Coordinator ${result.coordinatorId} started with ${result.engineersAllocated.length} engineers`);
-                coordinatorsProvider.refresh();
-                engineerPoolProvider.refresh();
-            }
-        }),
-
-        vscode.commands.registerCommand('agenticPlanning.stopCoordinator', async (coordinatorId?: string) => {
-            if (!coordinatorId) {
-                const coordinators = await stateManager.getActiveCoordinators();
-                if (coordinators.length === 0) {
-                    vscode.window.showWarningMessage('No active coordinators');
+        // Execution commands (facade to CoordinatorService via PlanningService)
+        vscode.commands.registerCommand('agenticPlanning.startExecution', async (item?: PlanningSessionItem) => {
+            const sessionId = item?.session?.id;
+            if (!sessionId) {
+                // No item selected - show picker
+                const sessions = planningService.listPlanningSessions()
+                    .filter(s => s.status === 'approved');
+                if (sessions.length === 0) {
+                    vscode.window.showWarningMessage('No approved plans available to execute.');
                     return;
                 }
                 const selected = await vscode.window.showQuickPick(
-                    coordinators.map(c => ({ label: c.id, description: c.status, coordinator: c })),
-                    { placeHolder: 'Select coordinator to stop' }
+                    sessions.map(s => ({ 
+                        label: s.id, 
+                        description: s.requirement.substring(0, 50) + '...',
+                        session: s 
+                    })),
+                    { placeHolder: 'Select a plan to execute' }
                 );
-                if (selected) {
-                    coordinatorId = selected.coordinator.id;
+                if (!selected) {return;}
+                
+                const result = await planningService.startExecution(selected.session.id);
+                if (result.success) {
+                    vscode.window.showInformationMessage(`Execution started with ${result.engineerCount} engineers!`);
+                } else {
+                    vscode.window.showErrorMessage(`Failed to start: ${result.error}`);
+                }
+            } else {
+                const result = await planningService.startExecution(sessionId);
+                if (result.success) {
+                    vscode.window.showInformationMessage(`Execution started with ${result.engineerCount} engineers!`);
+                } else {
+                    vscode.window.showErrorMessage(`Failed to start: ${result.error}`);
                 }
             }
-            if (coordinatorId) {
-                await coordinatorService.stopCoordinator(coordinatorId);
-                vscode.window.showInformationMessage(`Coordinator ${coordinatorId} stopped`);
-                coordinatorsProvider.refresh();
+            planningSessionsProvider.refresh();
+            engineerPoolProvider.refresh();
+        }),
+
+        vscode.commands.registerCommand('agenticPlanning.pauseExecution', async (item?: PlanningSessionItem) => {
+            const sessionId = item?.session?.id;
+            if (!sessionId) {
+                vscode.window.showWarningMessage('No session selected');
+                return;
+            }
+            const result = await planningService.pauseExecution(sessionId);
+            if (result.success) {
+                vscode.window.showInformationMessage(`Execution paused for ${sessionId}`);
+            } else {
+                vscode.window.showErrorMessage(result.error || 'Failed to pause');
+            }
+            planningSessionsProvider.refresh();
+            engineerPoolProvider.refresh();
+        }),
+
+        vscode.commands.registerCommand('agenticPlanning.resumeExecution', async (item?: PlanningSessionItem) => {
+            const sessionId = item?.session?.id;
+            if (!sessionId) {
+                vscode.window.showWarningMessage('No session selected');
+                return;
+            }
+            const result = await planningService.resumeExecution(sessionId);
+            if (result.success) {
+                vscode.window.showInformationMessage(`Execution resumed for ${sessionId}`);
+            } else {
+                vscode.window.showErrorMessage(result.error || 'Failed to resume');
+            }
+            planningSessionsProvider.refresh();
+            engineerPoolProvider.refresh();
+        }),
+
+        vscode.commands.registerCommand('agenticPlanning.stopExecution', async (item?: PlanningSessionItem) => {
+            const sessionId = item?.session?.id;
+            if (!sessionId) {
+                vscode.window.showWarningMessage('No session selected');
+                return;
+            }
+            
+            const confirm = await vscode.window.showWarningMessage(
+                `Stop execution for ${sessionId}? Engineers will be released.`,
+                { modal: true },
+                'Stop Execution'
+            );
+            
+            if (confirm === 'Stop Execution') {
+                const result = await planningService.stopExecution(sessionId);
+                if (result.success) {
+                    vscode.window.showInformationMessage(`Execution stopped for ${sessionId}`);
+                } else {
+                    vscode.window.showErrorMessage(result.error || 'Failed to stop');
+                }
+                planningSessionsProvider.refresh();
                 engineerPoolProvider.refresh();
             }
         }),
@@ -134,14 +294,160 @@ export async function activate(context: vscode.ExtensionContext) {
         }),
 
         // Refresh commands for tree views
-        vscode.commands.registerCommand('agenticPlanning.refreshPlanningsessions', () => {
+        vscode.commands.registerCommand('agenticPlanning.refreshPlanningSessions', () => {
             planningSessionsProvider.refresh();
         }),
-        vscode.commands.registerCommand('agenticPlanning.refreshCoordinators', () => {
-            coordinatorsProvider.refresh();
+
+        // Planning session management commands
+        vscode.commands.registerCommand('agenticPlanning.stopPlanningSession', async (item?: { session?: { id: string } }) => {
+            const sessionId = item?.session?.id;
+            if (!sessionId) {
+                vscode.window.showWarningMessage('No session selected');
+                return;
+            }
+            
+            const confirm = await vscode.window.showWarningMessage(
+                `Stop planning session ${sessionId}?`,
+                { modal: true },
+                'Stop'
+            );
+            
+            if (confirm === 'Stop') {
+                const result = await planningService.stopSession(sessionId);
+                if (result.success) {
+                    vscode.window.showInformationMessage(`Session ${sessionId} stopped`);
+                    planningSessionsProvider.refresh();
+                } else {
+                    vscode.window.showErrorMessage(result.error || 'Failed to stop session');
+                }
+            }
+        }),
+        
+        vscode.commands.registerCommand('agenticPlanning.removePlanningSession', async (item?: { session?: { id: string } }) => {
+            const sessionId = item?.session?.id;
+            if (!sessionId) {
+                vscode.window.showWarningMessage('No session selected');
+                return;
+            }
+            
+            const confirm = await vscode.window.showWarningMessage(
+                `Remove planning session ${sessionId}? This will delete the session data.`,
+                { modal: true },
+                'Remove'
+            );
+            
+            if (confirm === 'Remove') {
+                const result = await planningService.removeSession(sessionId);
+                if (result.success) {
+                    vscode.window.showInformationMessage(`Session ${sessionId} removed`);
+                    planningSessionsProvider.refresh();
+                } else {
+                    vscode.window.showErrorMessage(result.error || 'Failed to remove session');
+                }
+            }
+        }),
+        
+        vscode.commands.registerCommand('agenticPlanning.resumePlanningSession', async (item?: { session?: { id: string } }) => {
+            const sessionId = item?.session?.id;
+            if (!sessionId) {
+                vscode.window.showWarningMessage('No session selected');
+                return;
+            }
+            
+            const confirm = await vscode.window.showWarningMessage(
+                `Resume planning session ${sessionId}? This will restart the planning process.`,
+                { modal: true },
+                'Resume'
+            );
+            
+            if (confirm === 'Resume') {
+                const result = await planningService.resumeSession(sessionId);
+                if (result.success) {
+                    vscode.window.showInformationMessage(`Session ${sessionId} resuming...`);
+                    planningSessionsProvider.refresh();
+                } else {
+                    vscode.window.showErrorMessage(result.error || 'Failed to resume session');
+                }
+            }
         }),
         vscode.commands.registerCommand('agenticPlanning.refreshEngineerPool', () => {
+            // Also sync with settings when manually refreshed
+            const configSize = vscode.workspace.getConfiguration('agenticPlanning').get<number>('engineerPoolSize', 5);
+            const currentSize = engineerPoolService.getPoolStatus().total;
+            if (configSize !== currentSize) {
+                const result = engineerPoolService.resizePool(configSize);
+                if (result.added.length > 0) {
+                    vscode.window.showInformationMessage(`Added engineers: ${result.added.join(', ')}`);
+                }
+                if (result.removed.length > 0) {
+                    vscode.window.showInformationMessage(`Removed engineers: ${result.removed.join(', ')}`);
+                }
+            }
             engineerPoolProvider.refresh();
+        }),
+
+        // Dependency commands
+        vscode.commands.registerCommand('agenticPlanning.refreshDependencies', async () => {
+            vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: 'Checking dependencies...',
+                cancellable: false
+            }, async () => {
+                await dependencyService.checkAllDependencies();
+                dependencyStatusProvider.refresh();
+            });
+        }),
+        vscode.commands.registerCommand('agenticPlanning.openDependencyInstall', async (dep?: { installUrl?: string; name: string }) => {
+            if (dep?.installUrl) {
+                await dependencyService.openInstallUrl(dep as any);
+            } else if (dep) {
+                vscode.window.showInformationMessage(`No install URL available for ${dep.name}`);
+            }
+        }),
+        vscode.commands.registerCommand('agenticPlanning.copyDependencyCommand', async (dep?: { installCommand?: string; name: string }) => {
+            if (dep?.installCommand) {
+                await dependencyService.copyInstallCommand(dep as any);
+            } else if (dep) {
+                vscode.window.showInformationMessage(`No install command available for ${dep.name}`);
+            }
+        }),
+
+        // CLI installation commands
+        vscode.commands.registerCommand('agenticPlanning.installCli', async () => {
+            const result = await dependencyService.installApcCli(context.extensionPath);
+            
+            // Always refresh status after install attempt
+            await dependencyService.checkAllDependencies();
+            dependencyStatusProvider.refresh();
+            
+            if (result.success) {
+                // Check if PATH setup is needed
+                if (result.message.includes('Add to PATH')) {
+                    const action = await vscode.window.showInformationMessage(
+                        'APC CLI installed! Add ~/.local/bin to PATH to use it.',
+                        'Copy PATH Command'
+                    );
+                    if (action === 'Copy PATH Command') {
+                        const shellConfig = process.platform === 'darwin' ? '~/.zshrc' : '~/.bashrc';
+                        await vscode.env.clipboard.writeText(`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ${shellConfig} && source ${shellConfig}`);
+                        vscode.window.showInformationMessage('Copied! Paste in terminal, then restart terminal.');
+                    }
+                } else {
+                    vscode.window.showInformationMessage('APC CLI installed successfully! Try: apc help');
+                }
+            } else {
+                vscode.window.showErrorMessage(result.message);
+            }
+        }),
+        vscode.commands.registerCommand('agenticPlanning.uninstallCli', async () => {
+            const result = await dependencyService.uninstallApcCli();
+            if (result.success) {
+                vscode.window.showInformationMessage(result.message);
+                await dependencyService.checkAllDependencies();
+                dependencyStatusProvider.refresh();
+            } else {
+                vscode.window.showErrorMessage(result.message);
+            }
         })
     );
 
@@ -167,6 +473,23 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push({
         dispose: () => clearInterval(intervalId)
     });
+
+    // Listen for configuration changes
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration(e => {
+            if (e.affectsConfiguration('agenticPlanning.engineerPoolSize')) {
+                const newSize = vscode.workspace.getConfiguration('agenticPlanning').get<number>('engineerPoolSize', 5);
+                const result = engineerPoolService.resizePool(newSize);
+                if (result.added.length > 0) {
+                    vscode.window.showInformationMessage(`Added engineers: ${result.added.join(', ')}`);
+                }
+                if (result.removed.length > 0) {
+                    vscode.window.showInformationMessage(`Removed engineers: ${result.removed.join(', ')}`);
+                }
+                engineerPoolProvider.refresh();
+            }
+        })
+    );
 
     console.log('Agentic Planning Coordinator activated successfully');
     vscode.window.showInformationMessage('Agentic Planning Coordinator ready!');

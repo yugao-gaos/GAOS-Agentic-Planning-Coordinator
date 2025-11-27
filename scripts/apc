@@ -1,0 +1,448 @@
+#!/bin/bash
+# APC - Agentic Planning Coordinator CLI
+#
+# This script communicates with the VS Code extension via file-based IPC.
+# It writes commands to a request file and waits for responses.
+
+set -e
+
+# Colors
+CYAN='\033[0;36m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+GRAY='\033[0;90m'
+RESET='\033[0m'
+
+# Find workspace root (look for _AiDevLog or .git)
+find_workspace_root() {
+    local dir="$PWD"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -d "$dir/_AiDevLog" ]] || [[ -d "$dir/.git" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    echo "$PWD"
+}
+
+WORKSPACE_ROOT=$(find_workspace_root)
+WORKING_DIR="$WORKSPACE_ROOT/_AiDevLog"
+
+# Use /tmp for IPC files to keep project clean, with workspace hash to avoid conflicts
+# Note: Use printf without newline to match Node.js crypto hash calculation
+WORKSPACE_HASH=$(printf "%s" "$WORKSPACE_ROOT" | md5 | cut -c1-8)
+IPC_DIR="/tmp/apc_ipc_${WORKSPACE_HASH}"
+REQUEST_FILE="$IPC_DIR/request.json"
+RESPONSE_FILE="$IPC_DIR/response.json"
+LOCK_FILE="$IPC_DIR/lock"
+
+# Ensure directories exist
+mkdir -p "$WORKING_DIR"
+mkdir -p "$IPC_DIR"
+
+# Generate unique request ID
+REQUEST_ID="req_$(date +%s)_$$"
+
+# Cleanup on exit
+cleanup() {
+    rm -f "$LOCK_FILE" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# Write request and wait for response
+send_request() {
+    local command="$1"
+    local args="$2"
+    local show_progress="${3:-false}"
+    local progress_session="${4:-}"
+    
+    # Create request
+    cat > "$REQUEST_FILE" << EOF
+{
+    "id": "$REQUEST_ID",
+    "command": "$command",
+    "args": $args,
+    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+EOF
+    
+    # Remove old response file
+    rm -f "$RESPONSE_FILE" 2>/dev/null || true
+    
+    # Wait for response (timeout after 30 minutes for long planning operations)
+    # Planning sessions with AI agents can take 15+ minutes
+    local timeout=1800
+    local elapsed=0
+    local last_progress_line=0
+    local progress_file=""
+    local check_interval=1  # Check every 1 second (use integers for POSIX compatibility)
+    local last_heartbeat=0
+    local spinner_chars=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+    local spinner_idx=0
+    local iteration=0
+    
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${RESET}"
+    echo -e "${CYAN}║  Processing (timeout: ${timeout}s / 30min)                         ║${RESET}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${RESET}"
+    echo ""
+    
+    # Ensure planning_sessions directory exists
+    mkdir -p "$WORKING_DIR/planning_sessions" 2>/dev/null
+    
+    while [[ ! -f "$RESPONSE_FILE" ]] && [[ $elapsed -lt $timeout ]]; do
+        # If we should show progress, actively look for and tail progress files
+        if [[ "$show_progress" == "true" ]]; then
+            # Look for newest progress file every iteration (handles late creation)
+            local newest_file=$(find "$WORKING_DIR/planning_sessions" -name "*_progress.log" -mmin -5 -type f 2>/dev/null | head -1)
+            
+            if [[ -n "$newest_file" && -f "$newest_file" ]]; then
+                # Found a progress file
+                if [[ "$newest_file" != "$progress_file" ]]; then
+                    # New progress file found
+                    progress_file="$newest_file"
+                    echo -e "${GREEN}📂 Found progress: $(basename "$progress_file")${RESET}"
+                    last_progress_line=0
+                fi
+                
+                # Read and display new lines from progress file
+                local current_lines=$(wc -l < "$progress_file" 2>/dev/null | tr -d ' ' || echo "0")
+                
+                if [[ "$current_lines" -gt "$last_progress_line" ]]; then
+                    # Print new lines with color coding
+                    tail -n +$((last_progress_line + 1)) "$progress_file" 2>/dev/null | while IFS= read -r line; do
+                        # Color code based on content
+                        if [[ "$line" == *"PHASE"* ]] || [[ "$line" == *"═══"* ]]; then
+                            echo -e "${CYAN}$line${RESET}"
+                        elif [[ "$line" == *"✅"* ]] || [[ "$line" == *"Complete"* ]]; then
+                            echo -e "${GREEN}$line${RESET}"
+                        elif [[ "$line" == *"⚠️"* ]] || [[ "$line" == *"CONCERN"* ]]; then
+                            echo -e "${YELLOW}$line${RESET}"
+                        elif [[ "$line" == *"❌"* ]] || [[ "$line" == *"Error"* ]]; then
+                            echo -e "${RED}$line${RESET}"
+                        elif [[ "$line" == *"💭"* ]] || [[ "$line" == *"💓"* ]]; then
+                            # Thinking/heartbeat - dim gray
+                            echo -e "${GRAY}$line${RESET}"
+                        elif [[ "$line" == *"🔧"* ]] || [[ "$line" == *"Tool"* ]]; then
+                            echo -e "${YELLOW}$line${RESET}"
+                        else
+                        echo -e "${GRAY}$line${RESET}"
+                        fi
+                    done
+                    last_progress_line=$current_lines
+                fi
+            else
+                # No progress file yet - show spinner with status
+                local now=$(date +%s)
+                if [[ $((now - last_heartbeat)) -ge 3 ]]; then
+                    spinner_idx=$(( (spinner_idx + 1) % 10 ))
+                    echo -ne "\r${CYAN}${spinner_chars[$spinner_idx]} Waiting for planning session to start... (${elapsed}s)${RESET}   "
+                    last_heartbeat=$now
+                fi
+            fi
+        fi
+        
+        sleep $check_interval
+        elapsed=$((elapsed + check_interval))
+        iteration=$((iteration + 1))
+        
+        # Check if response appeared
+        if [[ -f "$RESPONSE_FILE" ]]; then
+            # Verify it's for our request
+            local resp_id=$(cat "$RESPONSE_FILE" 2>/dev/null | grep -o '"requestId"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+            if [[ "$resp_id" == "$REQUEST_ID" ]]; then
+                echo ""  # Clear any spinner output
+                # Show any remaining progress
+                if [[ "$show_progress" == "true" && -n "$progress_file" && -f "$progress_file" ]]; then
+                    local current_lines=$(wc -l < "$progress_file" 2>/dev/null | tr -d ' ' || echo "0")
+                    if [[ "$current_lines" -gt "$last_progress_line" ]]; then
+                        echo -e "${GREEN}📋 Final progress output:${RESET}"
+                        tail -n +$((last_progress_line + 1)) "$progress_file" | while IFS= read -r line; do
+                            echo -e "${GRAY}$line${RESET}"
+                        done
+                    fi
+                fi
+                break
+            fi
+        fi
+    done
+    
+    echo ""
+    
+    if [[ ! -f "$RESPONSE_FILE" ]]; then
+        echo -e "${RED}Error: Extension did not respond (timeout after ${timeout}s).${RESET}"
+        echo -e "${YELLOW}Make sure Cursor is running with the Agentic Planning extension active.${RESET}"
+        return 1
+    fi
+    
+    # Read and display response
+    local response=$(cat "$RESPONSE_FILE")
+    local success=$(echo "$response" | grep -o '"success"[[:space:]]*:[[:space:]]*[^,}]*' | grep -o 'true\|false')
+    
+    # Clean up response file after reading
+    rm -f "$RESPONSE_FILE" 2>/dev/null || true
+    
+    if [[ "$success" == "true" ]]; then
+        # Extract and display message/data
+        local message=$(echo "$response" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+        if [[ -n "$message" ]]; then
+            echo -e "${GREEN}$message${RESET}"
+        fi
+        
+        # Pretty print data if jq is available
+        if command -v jq &> /dev/null; then
+            local data=$(echo "$response" | jq -r '.data // empty' 2>/dev/null)
+            if [[ -n "$data" && "$data" != "null" ]]; then
+                echo "$data" | jq '.'
+            fi
+        else
+            # Fallback: just show the response
+            echo "$response"
+        fi
+    else
+        local error=$(echo "$response" | grep -o '"error"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+        echo -e "${RED}Error: $error${RESET}"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Parse command
+COMMAND="${1:-help}"
+shift 2>/dev/null || true
+
+case "$COMMAND" in
+    status|s)
+        send_request "status" "[]"
+        ;;
+    
+    plan|p)
+        SUB="${1:-list}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            list|ls)
+                send_request "plan.list" "[]"
+                ;;
+            new|n)
+                # Collect all remaining args as the prompt
+                PROMPT="$*"
+                # Parse --docs flag if present
+                DOCS="[]"
+                if [[ "$PROMPT" == *"--docs"* ]]; then
+                    # Extract docs paths
+                    DOCS_STR=$(echo "$PROMPT" | sed 's/.*--docs //' | tr ' ' '\n' | grep -v '^--' | head -5 | tr '\n' ',' | sed 's/,$//')
+                    DOCS="[$(echo "$DOCS_STR" | sed 's/\([^,]*\)/"\1"/g')]"
+                    PROMPT=$(echo "$PROMPT" | sed 's/--docs.*//')
+                fi
+                if [[ -z "$PROMPT" ]]; then
+                    echo -e "${RED}Usage: apc plan new \"<requirement>\" [--docs <path1> <path2>]${RESET}"
+                    exit 1
+                fi
+                # Escape quotes in prompt
+                PROMPT=$(echo "$PROMPT" | sed 's/"/\\"/g')
+                # Show progress for plan creation (pass true for show_progress)
+                send_request "plan.new" "{\"prompt\": \"$PROMPT\", \"docs\": $DOCS}" "true"
+                ;;
+            status|st)
+                ID="${1:-}"
+                if [[ -z "$ID" ]]; then
+                    echo -e "${RED}Usage: apc plan status <session_id>${RESET}"
+                    exit 1
+                fi
+                send_request "plan.status" "{\"id\": \"$ID\"}"
+                ;;
+            revise|r)
+                ID="${1:-}"
+                shift 2>/dev/null || true
+                FEEDBACK="$*"
+                if [[ -z "$ID" ]] || [[ -z "$FEEDBACK" ]]; then
+                    echo -e "${RED}Usage: apc plan revise <session_id> \"<feedback>\"${RESET}"
+                    exit 1
+                fi
+                FEEDBACK=$(echo "$FEEDBACK" | sed 's/"/\\"/g')
+                # Show progress for plan revision
+                send_request "plan.revise" "{\"id\": \"$ID\", \"feedback\": \"$FEEDBACK\"}" "true"
+                ;;
+            approve|a)
+                ID="${1:-}"
+                if [[ -z "$ID" ]]; then
+                    echo -e "${RED}Usage: apc plan approve <session_id>${RESET}"
+                    exit 1
+                fi
+                send_request "plan.approve" "{\"id\": \"$ID\"}"
+                ;;
+            cancel|c)
+                ID="${1:-}"
+                if [[ -z "$ID" ]]; then
+                    echo -e "${RED}Usage: apc plan cancel <session_id>${RESET}"
+                    exit 1
+                fi
+                send_request "plan.cancel" "{\"id\": \"$ID\"}"
+                ;;
+            *)
+                echo -e "${YELLOW}Usage: apc plan [list|new|status|revise|approve|cancel]${RESET}"
+                ;;
+        esac
+        ;;
+    
+    exec|e|run)
+        SUB="${1:-list}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            list|ls)
+                send_request "coordinator.list" "[]"
+                ;;
+            start|s)
+                PLAN="${1:-}"
+                if [[ -z "$PLAN" ]]; then
+                    echo -e "${RED}Usage: apc exec start <plan_path_or_session_id>${RESET}"
+                    exit 1
+                fi
+                send_request "coordinator.start" "{\"plan\": \"$PLAN\"}"
+                ;;
+            status|st)
+                ID="${1:-}"
+                if [[ -z "$ID" ]]; then
+                    echo -e "${RED}Usage: apc exec status <coordinator_id>${RESET}"
+                    exit 1
+                fi
+                send_request "coordinator.status" "{\"id\": \"$ID\"}"
+                ;;
+            pause|p)
+                ID="${1:-}"
+                send_request "coordinator.pause" "{\"id\": \"$ID\"}"
+                ;;
+            resume|r)
+                ID="${1:-}"
+                send_request "coordinator.resume" "{\"id\": \"$ID\"}"
+                ;;
+            stop|x)
+                ID="${1:-}"
+                send_request "coordinator.stop" "{\"id\": \"$ID\"}"
+                ;;
+            *)
+                echo -e "${YELLOW}Usage: apc exec [list|start|status|pause|resume|stop]${RESET}"
+                ;;
+        esac
+        ;;
+    
+    pool)
+        SUB="${1:-status}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            status|st)
+                send_request "pool.status" "[]"
+                ;;
+            resize|r)
+                SIZE="${1:-}"
+                if [[ -z "$SIZE" ]]; then
+                    echo -e "${RED}Usage: apc pool resize <size>${RESET}"
+                    exit 1
+                fi
+                send_request "pool.resize" "{\"size\": $SIZE}"
+                ;;
+            *)
+                echo -e "${YELLOW}Usage: apc pool [status|resize]${RESET}"
+                ;;
+        esac
+        ;;
+    
+    eng|engineer)
+        SUB="${1:-list}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            list|ls)
+                send_request "engineer.list" "[]"
+                ;;
+            status|st)
+                NAME="${1:-}"
+                send_request "engineer.status" "{\"name\": \"$NAME\"}"
+                ;;
+            log|l)
+                NAME="${1:-}"
+                LINES="${2:-50}"
+                send_request "engineer.log" "{\"name\": \"$NAME\", \"lines\": $LINES}"
+                ;;
+            term|t)
+                NAME="${1:-}"
+                send_request "engineer.terminal" "{\"name\": \"$NAME\"}"
+                ;;
+            stop|x)
+                NAME="${1:-}"
+                send_request "engineer.stop" "{\"name\": \"$NAME\"}"
+                ;;
+            *)
+                echo -e "${YELLOW}Usage: apc eng [list|status|log|term|stop]${RESET}"
+                ;;
+        esac
+        ;;
+    
+    unity|u)
+        SUB="${1:-compile}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            compile|c)
+                send_request "unity.compile" "[]"
+                ;;
+            test|t)
+                send_request "unity.test" "[]"
+                ;;
+            console|co)
+                send_request "unity.console" "[]"
+                ;;
+            *)
+                echo -e "${YELLOW}Usage: apc unity [compile|test|console]${RESET}"
+                ;;
+        esac
+        ;;
+    
+    help|--help|-h|h)
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${RESET}"
+        echo -e "${CYAN}║       APC - Agentic Planning Coordinator             ║${RESET}"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${RESET}"
+        echo ""
+        echo "Usage: apc <command> [subcommand] [options]"
+        echo ""
+        echo -e "${GREEN}Commands:${RESET}"
+        echo "  status, s                  Show overall status"
+        echo ""
+        echo -e "${YELLOW}Planning:${RESET}"
+        echo "  plan list                  List planning sessions"
+        echo "  plan new \"<prompt>\" [--docs <paths>]  Start new planning"
+        echo "  plan status <id>           Get plan status & debate results"
+        echo "  plan revise <id> \"<feedback>\"  Revise a plan"
+        echo "  plan approve <id>          Approve plan (auto-starts execution)"
+        echo ""
+        echo -e "${YELLOW}Execution:${RESET}"
+        echo "  exec list                  List coordinators"
+        echo "  exec start <plan/session>  Start executing a plan"
+        echo "  exec status <id>           Get coordinator status"
+        echo "  exec pause <id>            Pause execution"
+        echo "  exec resume <id>           Resume execution"
+        echo "  exec stop <id>             Stop execution"
+        echo ""
+        echo -e "${YELLOW}Engineer Pool:${RESET}"
+        echo "  pool status                Show pool status"
+        echo "  pool resize <n>            Resize pool"
+        echo ""
+        echo -e "${YELLOW}Engineers:${RESET}"
+        echo "  eng list                   List all engineers"
+        echo "  eng status <name>          Engineer status"
+        echo "  eng log <name> [lines]     View engineer log"
+        echo "  eng term <name>            Open engineer terminal"
+        echo ""
+        echo -e "${YELLOW}Unity:${RESET}"
+        echo "  unity compile              Check compilation"
+        echo "  unity test                 Run playmode test"
+        echo "  unity console              Read console"
+        echo ""
+        ;;
+    
+    *)
+        echo -e "${RED}Unknown command: $COMMAND${RESET}"
+        echo "Use 'apc help' for available commands."
+        exit 1
+        ;;
+esac

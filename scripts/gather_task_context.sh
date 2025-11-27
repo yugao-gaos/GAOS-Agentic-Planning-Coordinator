@@ -1,7 +1,8 @@
 #!/bin/bash
 
-# understand_unity_context.sh
+# gather_task_context.sh
 # Uses Cursor CLI with Gemini to analyze Unity files and generate context documentation
+# Supports: incremental updates, parallel file analysis, multiple concurrent instances
 
 set -e
 
@@ -18,7 +19,13 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONTEXT_DIR="$PROJECT_ROOT/_AiDevLog/Context"
 CONTEXT_INDEX="$CONTEXT_DIR/ContextIndex.md"
 DOCS_DIR="$PROJECT_ROOT/_AiDevLog/Docs"
+LOCK_DIR="$PROJECT_ROOT/_AiDevLog/.locks"
+TEMP_DIR="$PROJECT_ROOT/_AiDevLog/.temp"
 GAME_CONTEXT_DOCS=""  # Will be set from command line parameter
+MAX_PARALLEL_JOBS=5   # Max concurrent file analyses
+
+# Ensure lock and temp directories exist
+mkdir -p "$LOCK_DIR" "$TEMP_DIR"
 
 # Supported file types
 SUPPORTED_IMAGE_TYPES=("jpg" "jpeg" "png" "tga" "psd" "bmp" "gif")
@@ -42,6 +49,132 @@ print_error() {
 
 print_warning() {
     echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FILE LOCKING - Allows multiple script instances to run safely
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Acquire lock on a context file (allows multiple script instances)
+acquire_lock() {
+    local lock_name="$1"
+    local lock_file="$LOCK_DIR/${lock_name}.lock"
+    local max_wait=30
+    local waited=0
+    
+    while [ -f "$lock_file" ]; do
+        # Check if lock is stale (older than 5 minutes)
+        if [ -f "$lock_file" ]; then
+            local lock_age=$(( $(date +%s) - $(stat -f%m "$lock_file" 2>/dev/null || stat -c%Y "$lock_file" 2>/dev/null || echo 0) ))
+            if [ "$lock_age" -gt 300 ]; then
+                print_warning "Removing stale lock: $lock_name"
+                rm -f "$lock_file"
+                break
+            fi
+        fi
+        
+        sleep 0.5
+        waited=$((waited + 1))
+        if [ "$waited" -ge "$max_wait" ]; then
+            print_warning "Lock timeout for $lock_name, proceeding anyway"
+            rm -f "$lock_file"
+            break
+        fi
+    done
+    
+    echo "$$" > "$lock_file"
+}
+
+# Release lock
+release_lock() {
+    local lock_name="$1"
+    local lock_file="$LOCK_DIR/${lock_name}.lock"
+    rm -f "$lock_file"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PARALLEL PROCESSING - Analyze multiple files concurrently
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Track background jobs
+declare -a BACKGROUND_PIDS=()
+
+# Cleanup function for graceful exit
+cleanup_jobs() {
+    for pid in "${BACKGROUND_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    # Clean up temp files
+    rm -f "$TEMP_DIR"/*.tmp 2>/dev/null || true
+}
+trap cleanup_jobs EXIT
+
+# Wait for a slot to be available (limit concurrent jobs)
+wait_for_slot() {
+    while [ "$(jobs -r | wc -l)" -ge "$MAX_PARALLEL_JOBS" ]; do
+        sleep 0.2
+    done
+}
+
+# Analyze a single file in background and write to temp file
+analyze_file_async() {
+    local file_path="$1"
+    local file_name="$2"
+    local file_type="$3"
+    local folder_description="$4"
+    local temp_output="$5"
+    local counter="$6"
+    
+    local rel_file_path=$(get_relative_path "$file_path")
+    local description=""
+    local type_lower=$(echo "$file_type" | tr '[:upper:]' '[:lower:]')
+    
+    # Determine file category and analyze
+    local is_image=false is_font=false is_fx=false is_code=false
+    
+    for img_type in "${SUPPORTED_IMAGE_TYPES[@]}"; do
+        [ "$type_lower" == "$img_type" ] && is_image=true && break
+    done
+    for font_type in "${SUPPORTED_FONT_TYPES[@]}"; do
+        [ "$type_lower" == "$font_type" ] && is_font=true && break
+    done
+    for fx_type in "${SUPPORTED_FX_TYPES[@]}"; do
+        [ "$type_lower" == "$fx_type" ] && is_fx=true && break
+    done
+    for code_type in "${SUPPORTED_CODE_TYPES[@]}"; do
+        [ "$type_lower" == "$code_type" ] && is_code=true && break
+    done
+    
+    # Route to appropriate analyzer
+    if [ "$is_image" = true ]; then
+        description=$(analyze_image "$file_path" "$file_name" "$folder_description")
+    elif [ "$is_font" = true ]; then
+        description=$(analyze_font "$file_path" "$file_name" "$file_type" "$folder_description")
+    elif [ "$is_code" = true ]; then
+        description=$(analyze_code "$file_path" "$file_name" "$file_type" "$folder_description")
+    elif [ "$is_fx" = true ]; then
+        description=$(analyze_fx "$file_path" "$file_name" "$file_type" "$folder_description")
+    elif [[ "$type_lower" == "fbx" || "$type_lower" == "obj" || "$type_lower" == "blend" ]]; then
+        description=$(analyze_3d_model "$file_path" "$file_name" "$file_type" "$folder_description")
+    elif [[ "$type_lower" == "prefab" ]]; then
+        if grep -q "ParticleSystem" "$file_path" 2>/dev/null; then
+            description=$(analyze_fx "$file_path" "$file_name" "prefab" "$folder_description")
+        else
+            description=$(analyze_unity_text_file "$file_path" "$file_name" "$file_type" "$folder_description")
+        fi
+    else
+        description=$(analyze_unity_text_file "$file_path" "$file_name" "$file_type" "$folder_description")
+    fi
+    
+    # Write result to temp file (atomic)
+    cat > "$temp_output" << EOF
+#${counter}.
+Url: $rel_file_path
+Desc: $description
+
+EOF
+    
+    echo "DONE:$file_name" >&2
 }
 
 # Function to build game context from documentation files
@@ -152,10 +285,10 @@ analyze_image() {
     
     local game_aware_prompt="$context_hint
 
-GAME: This is for a Match-3 puzzle game (like Candy Crush/Bejeweled). 
+PROJECT CONTEXT:
 ${GAME_CONTEXT_DOCS}
 
-Analyze this Unity texture/sprite image. Describe what it looks like and suggest specific uses in our Match-3 game, OR note if it's not relevant. One concise sentence. Examples: 'Low-poly grass texture - could be used for game board background', 'Blue gradient sky - not relevant for Match-3 gameplay', 'Colorful gem texture - perfect for gem visuals'. ${sprite_info}"
+Analyze this Unity texture/sprite image. Describe what it looks like and suggest specific uses based on the project context, OR note if not relevant. One concise sentence. ${sprite_info}"
     
     # Use cursor agent with Gemini to analyze the image (with UnityMCP access)
     local description=$(cursor agent --print --output-format text --approve-mcps --model gemini-3-pro --workspace "$PROJECT_ROOT" "Analyze image at $file_path. $game_aware_prompt" 2>&1 | grep -v "^\[" | grep -v "^$" | grep -v "Warning:" | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -193,10 +326,10 @@ analyze_font() {
         
         local prompt="${context_hint}
 
-GAME: This is for a Match-3 puzzle game.
+PROJECT CONTEXT:
 ${GAME_CONTEXT_DOCS}
 
-Analyze this Unity font meta file. Determine the font family, style, and suggest uses in our Match-3 game OR note if not relevant. One sentence. Example: 'Sans-serif font - good for UI score display and menus'."
+Analyze this Unity font meta file. Determine the font family, style, and suggest uses based on project context. One sentence."
         
         font_info=$(cursor agent --print --output-format text --approve-mcps --model gemini-3-pro --workspace "$PROJECT_ROOT" "$prompt Meta file content: $meta_content" 2>&1 | grep -v "^\[" | grep -v "^$" | grep -v "Warning:" | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     fi
@@ -234,26 +367,26 @@ analyze_code() {
         "cs")
             prompt="${context_hint}
 
-GAME: This is for a Match-3 puzzle game.
+PROJECT CONTEXT:
 ${GAME_CONTEXT_DOCS}
 
-Analyze this C# Unity script. Describe its purpose and relevance to our Match-3 game in ONE sentence. Examples: 'BoardManager script - already implemented for our match-3 board', 'Enemy AI script - not relevant to puzzle game', 'Particle controller - could be used for gem pop effects'."
+Analyze this C# Unity script. Describe its purpose and relevance to the project. ONE sentence."
             ;;
         "shader"|"cginc"|"hlsl"|"glsl")
             prompt="${context_hint}
 
-GAME: Match-3 puzzle game.
+PROJECT CONTEXT:
 ${GAME_CONTEXT_DOCS}
 
-Analyze this shader. Describe visual effect and potential use in our game in ONE sentence. Examples: 'PBR metallic shader - good for gem rendering', 'Toon outline shader - not relevant to our art style'."
+Analyze this shader. Describe visual effect and potential uses. ONE sentence."
             ;;
         "compute")
             prompt="${context_hint}
 
-GAME: Match-3 puzzle game.
+PROJECT CONTEXT:
 ${GAME_CONTEXT_DOCS}
 
-Analyze this compute shader and suggest Match-3 game applications. ONE sentence. Example: 'Particle physics compute - could optimize gem cascade effects'."
+Analyze this compute shader and suggest applications. ONE sentence."
             ;;
     esac
     
@@ -296,10 +429,10 @@ analyze_fx() {
     
     local prompt="${context_hint}
 
-GAME: Match-3 puzzle game (like Candy Crush).
+PROJECT CONTEXT:
 ${GAME_CONTEXT_DOCS}
 
-Analyze this Unity particle/VFX file. Describe the visual effect and suggest specific uses in our Match-3 game OR note if not relevant. ONE sentence. Examples: 'Sparkle particles - perfect for gem collection feedback', 'Explosion effect - good for special gem activation', 'Weather particles - not relevant to puzzle gameplay'."
+Analyze this Unity particle/VFX file. Describe the visual effect and suggest uses based on project context. ONE sentence."
     
     # Use cursor agent with Gemini and UnityMCP to analyze VFX
     local description=$(cursor agent --print --output-format text --approve-mcps --model gemini-3-pro --workspace "$PROJECT_ROOT" "$prompt File content: $file_content" 2>&1 | grep -v "^\[" | grep -v "^$" | grep -v "Warning:" | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -338,34 +471,34 @@ analyze_unity_text_file() {
         "prefab")
             prompt="${context_hint}
 
-GAME: Match-3 puzzle game. We need: gems (6 colors), obstacles (boxes/ice/jelly), board tiles, UI elements, particle effects.
+PROJECT CONTEXT:
 ${GAME_CONTEXT_DOCS}
 
-Analyze this Unity prefab using UnityMCP if helpful. Describe the 3D model and rate its relevance to our Match-3 game (HIGH/MEDIUM/LOW/NONE). ONE sentence. Examples: 'Low-poly sphere - HIGH relevance, perfect base for gem prefabs', 'Building column - NONE, not relevant to puzzle game', 'Coin icon - MEDIUM, could be used for currency UI'."
+Analyze this Unity prefab. Describe what it is and rate relevance to the project (HIGH/MEDIUM/LOW/NONE). ONE sentence."
             ;;
         "scene")
             prompt="${context_hint}
 
-GAME: Match-3 puzzle game.
+PROJECT CONTEXT:
 ${GAME_CONTEXT_DOCS}
 
-Analyze this Unity scene. Describe structure and Match-3 relevance. ONE sentence. Example: 'Demo scene with environment - LOW relevance, we need board-focused gameplay scene'."
+Analyze this Unity scene. Describe structure and project relevance. ONE sentence."
             ;;
         "asset")
             prompt="${context_hint}
 
-GAME: Match-3 puzzle game.
+PROJECT CONTEXT:
 ${GAME_CONTEXT_DOCS}
 
-Analyze this ScriptableObject asset. Describe data purpose and Match-3 relevance. ONE sentence. Example: 'Level config asset - HIGH relevance if matches our LevelData structure'."
+Analyze this ScriptableObject asset. Describe data purpose and project relevance. ONE sentence."
             ;;
         "mat")
             prompt="${context_hint}
 
-GAME: Match-3 puzzle game needing colorful gem materials.
+PROJECT CONTEXT:
 ${GAME_CONTEXT_DOCS}
 
-Analyze this Unity material. Describe appearance and suggest Match-3 uses or note if not relevant. ONE sentence. Example: 'Metallic PBR material - MEDIUM, good base for gem variants'."
+Analyze this Unity material. Describe appearance and suggest uses. ONE sentence."
             ;;
     esac
     
@@ -410,10 +543,10 @@ analyze_3d_model() {
         # Extract material and texture info from meta
         local prompt="${context_hint}
 
-GAME: Match-3 puzzle game needing gems, obstacles, board tiles, UI.
+PROJECT CONTEXT:
 ${GAME_CONTEXT_DOCS}
 
-Analyze this 3D FBX model (filename: ${base_name}). Describe what it is and rate Match-3 relevance (HIGH/MEDIUM/LOW/NONE). ONE sentence. Examples: 'Sphere model - HIGH, perfect for gems', 'Tree model - NONE, not relevant', 'Cube model - MEDIUM, could be obstacle base'."
+Analyze this 3D FBX model (filename: ${base_name}). Describe what it is and rate project relevance (HIGH/MEDIUM/LOW/NONE). ONE sentence."
         
         description=$(cursor agent --print --output-format text --approve-mcps --model gemini-3-pro --workspace "$PROJECT_ROOT" "$prompt You can use UnityMCP's manage_asset tool to inspect this FBX at: $file_path. Meta content: $meta_content" 2>&1 | grep -v "^\[" | grep -v "^$" | grep -v "Warning:" | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         
@@ -457,7 +590,7 @@ update_context_index() {
     print_success "Added $context_file_name to context index"
 }
 
-# Function to create or update context file
+# Function to create or update context file (with locking and parallel processing)
 process_folder() {
     local folder_path="$1"
     local file_type="$2"
@@ -481,10 +614,12 @@ process_folder() {
         exit 1
     fi
     
-    # Generate context file name
+    # Generate context file name (unique per folder+type combo)
     local folder_name=$(basename "$folder_path")
-    local context_file_name="${folder_name}_${file_type}.md"
+    local folder_hash=$(echo "$folder_path" | md5sum | cut -c1-8 2>/dev/null || echo "$folder_path" | md5 -q | cut -c1-8)
+    local context_file_name="${folder_name}_${file_type}_${folder_hash}.md"
     local context_file="$CONTEXT_DIR/$context_file_name"
+    local lock_name="${folder_name}_${file_type}_${folder_hash}"
     
     # Get relative folder path
     local rel_folder=$(get_relative_path "$folder_path")
@@ -492,135 +627,119 @@ process_folder() {
     print_info "Processing folder: $rel_folder"
     print_info "Looking for .$file_type files"
     
-    # Find all files of specified type
+    # Find all files of specified type (recursively with depth limit)
     local files=()
     while IFS= read -r -d '' file; do
         files+=("$file")
-    done < <(find "$folder_path" -maxdepth 1 -type f -name "*.${file_type}" -print0 2>/dev/null)
+    done < <(find "$folder_path" -maxdepth 2 -type f -name "*.${file_type}" -print0 2>/dev/null)
     
     if [ ${#files[@]} -eq 0 ]; then
         print_warning "No .$file_type files found in $rel_folder"
         exit 0
     fi
     
-    print_info "Found ${#files[@]} files to analyze"
+    print_info "Found ${#files[@]} files to analyze (max $MAX_PARALLEL_JOBS parallel)"
     
-    # Create or update context file
+    # Acquire lock for this context file
+    acquire_lock "$lock_name"
+    
+    # Create or update context file (atomic)
     local file_exists=false
+    local existing_files=()
     if [ -f "$context_file" ]; then
         file_exists=true
         print_info "Updating existing context file: $context_file_name"
+        # Get list of already documented files
+        mapfile -t existing_files < <(grep "^Url:" "$context_file" | cut -d' ' -f2)
     else
         print_info "Creating new context file: $context_file_name"
-        # Write header
-        echo "Folder: $rel_folder" > "$context_file"
-        
-        # Add folder description if provided
+        # Write header atomically
+        {
+            echo "Folder: $rel_folder"
         if [ -n "$folder_description" ]; then
-            echo "Desc: $folder_description" >> "$context_file"
+                echo "Desc: $folder_description"
         fi
-        
-        echo "" >> "$context_file"
+            echo ""
+        } > "$context_file"
     fi
     
-    # Process each file
+    # Get starting counter
     local counter=1
     if [ "$file_exists" = true ]; then
-        # Get the last entry number
         counter=$(grep -c "^#" "$context_file" 2>/dev/null || echo 0)
         counter=$((counter + 1))
     fi
     
+    # Filter out already documented files
+    local files_to_process=()
     for file_path in "${files[@]}"; do
-        local file_name=$(basename "$file_path")
         local rel_file_path=$(get_relative_path "$file_path")
-        
-        # Skip if already in context file
-        if [ "$file_exists" = true ] && grep -q "$rel_file_path" "$context_file"; then
-            print_info "Skipping already documented file: $file_name"
-            continue
-        fi
-        
-        # Show progress
-        print_info "Analyzing ($counter/${#files[@]}): $file_name"
-        
-        # Analyze file based on type
-        local description=""
-        local type_lower=$(echo "$file_type" | tr '[:upper:]' '[:lower:]')
-        
-        # Check file type category
-        local is_image=false
-        local is_font=false
-        local is_fx=false
-        local is_code=false
-        
-        for img_type in "${SUPPORTED_IMAGE_TYPES[@]}"; do
-            if [ "$type_lower" == "$img_type" ]; then
-                is_image=true
+        local skip=false
+        for existing in "${existing_files[@]}"; do
+            if [ "$rel_file_path" == "$existing" ]; then
+                skip=true
                 break
             fi
         done
-        
-        for font_type in "${SUPPORTED_FONT_TYPES[@]}"; do
-            if [ "$type_lower" == "$font_type" ]; then
-                is_font=true
-                break
-            fi
-        done
-        
-        for fx_type in "${SUPPORTED_FX_TYPES[@]}"; do
-            if [ "$type_lower" == "$fx_type" ]; then
-                is_fx=true
-                break
-            fi
-        done
-        
-        for code_type in "${SUPPORTED_CODE_TYPES[@]}"; do
-            if [ "$type_lower" == "$code_type" ]; then
-                is_code=true
-                break
-            fi
-        done
-        
-        # Route to appropriate analyzer
-        if [ "$is_image" = true ]; then
-            description=$(analyze_image "$file_path" "$file_name" "$folder_description")
-        elif [ "$is_font" = true ]; then
-            description=$(analyze_font "$file_path" "$file_name" "$file_type" "$folder_description")
-        elif [ "$is_code" = true ]; then
-            description=$(analyze_code "$file_path" "$file_name" "$file_type" "$folder_description")
-        elif [ "$is_fx" = true ]; then
-            description=$(analyze_fx "$file_path" "$file_name" "$file_type" "$folder_description")
-        elif [[ "$type_lower" == "fbx" || "$type_lower" == "obj" || "$type_lower" == "blend" ]]; then
-            description=$(analyze_3d_model "$file_path" "$file_name" "$file_type" "$folder_description")
+        if [ "$skip" = false ]; then
+            files_to_process+=("$file_path")
         else
-            # Check if it's a particle system prefab by examining file content
-            if [[ "$type_lower" == "prefab" ]]; then
-                if grep -q "ParticleSystem" "$file_path" 2>/dev/null; then
-                    # It's a particle system prefab, treat as FX
-                    description=$(analyze_fx "$file_path" "$file_name" "prefab" "$folder_description")
-                else
-                    description=$(analyze_unity_text_file "$file_path" "$file_name" "$file_type" "$folder_description")
-                fi
-            else
-                description=$(analyze_unity_text_file "$file_path" "$file_name" "$file_type" "$folder_description")
+            print_info "Skipping already documented: $(basename "$file_path")"
             fi
-        fi
+        done
         
-        # Write entry to context file
-        echo "#$counter." >> "$context_file"
-        echo "Url: $rel_file_path" >> "$context_file"
-        echo "Desc: $description" >> "$context_file"
-        echo "" >> "$context_file"
+    local total_new=${#files_to_process[@]}
+    if [ "$total_new" -eq 0 ]; then
+        print_info "All files already documented"
+        release_lock "$lock_name"
+        return
+    fi
+    
+    print_info "Analyzing $total_new new files in parallel..."
+    
+    # Process files in parallel batches
+    local batch_temp_files=()
+    local idx=0
+    
+    for file_path in "${files_to_process[@]}"; do
+        local file_name=$(basename "$file_path")
+        local temp_file="$TEMP_DIR/ctx_${lock_name}_${counter}.tmp"
+        batch_temp_files+=("$temp_file")
         
-        print_success "Documented: $file_name"
+        # Wait for slot if at max parallel jobs
+        wait_for_slot
+        
+        print_info "[$((idx + 1))/$total_new] Analyzing: $file_name"
+        
+        # Run analysis in background
+        analyze_file_async "$file_path" "$file_name" "$file_type" "$folder_description" "$temp_file" "$counter" &
+        BACKGROUND_PIDS+=($!)
+        
         counter=$((counter + 1))
+        idx=$((idx + 1))
     done
+    
+    # Wait for all background jobs to complete
+    print_info "Waiting for parallel analyses to complete..."
+    wait
+    
+    # Collect results and append to context file (in order)
+    print_info "Merging results..."
+    for temp_file in "${batch_temp_files[@]}"; do
+        if [ -f "$temp_file" ]; then
+            cat "$temp_file" >> "$context_file"
+            rm -f "$temp_file"
+        fi
+    done
+    
+    # Release lock
+    release_lock "$lock_name"
     
     # Update context index
     update_context_index "$folder_path" "$context_file"
     
     print_success "Context documentation complete: $context_file_name"
+    print_success "Processed $total_new files"
 }
 
 # Main script

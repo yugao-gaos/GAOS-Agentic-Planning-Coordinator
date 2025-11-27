@@ -165,11 +165,21 @@ export class CliHandler {
             return { success: false, error: 'Missing --prompt parameter' };
         }
 
-        const result = await this.planningService.startPlanning(prompt);
+        // Parse docs parameter (comma-separated or space-separated paths)
+        const docsParam = params['docs'];
+        const docs = docsParam ? docsParam.split(/[,\s]+/).filter(d => d.length > 0) : [];
+
+        const result = await this.planningService.startPlanning(prompt, docs);
         return {
             success: true,
-            message: `Planning session ${result.sessionId} started`,
-            data: result
+            message: `Planning session ${result.sessionId} completed - ${result.status}`,
+            data: {
+                sessionId: result.sessionId,
+                status: result.status,
+                planPath: result.planPath,
+                recommendedEngineers: result.recommendedEngineers,
+                debateSummary: result.debateSummary
+            }
         };
     }
 
@@ -693,4 +703,12 @@ Commands:
         return params;
     }
 }
+
+
+
+
+
+
+
+
 
