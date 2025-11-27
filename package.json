@@ -1,0 +1,147 @@
+{
+  "name": "agentic-planning-coordinator",
+  "displayName": "Agentic Planning Coordinator",
+  "description": "Multi-agent AI planning and execution system for Unity game development",
+  "version": "0.1.0",
+  "publisher": "your-publisher-name",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "ai",
+    "agents",
+    "planning",
+    "unity",
+    "cursor",
+    "automation"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agenticPlanning.showDashboard",
+        "title": "Agentic: Show Dashboard"
+      },
+      {
+        "command": "agenticPlanning.startPlanning",
+        "title": "Agentic: Start Planning Session"
+      },
+      {
+        "command": "agenticPlanning.startCoordinator",
+        "title": "Agentic: Start Coordinator"
+      },
+      {
+        "command": "agenticPlanning.stopCoordinator",
+        "title": "Agentic: Stop Coordinator"
+      },
+      {
+        "command": "agenticPlanning.showEngineerTerminal",
+        "title": "Agentic: Show Engineer Terminal"
+      },
+      {
+        "command": "agenticPlanning.poolStatus",
+        "title": "Agentic: Show Engineer Pool Status"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentic-planning",
+          "title": "Agentic Planning",
+          "icon": "resources/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "agentic-planning": [
+        {
+          "id": "agenticPlanning.planningSessionsView",
+          "name": "Planning Sessions"
+        },
+        {
+          "id": "agenticPlanning.coordinatorsView",
+          "name": "Coordinators"
+        },
+        {
+          "id": "agenticPlanning.engineerPoolView",
+          "name": "Engineer Pool"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Agentic Planning Coordinator",
+      "properties": {
+        "agenticPlanning.engineerPoolSize": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 20,
+          "description": "Total number of engineers available in the pool"
+        },
+        "agenticPlanning.defaultBackend": {
+          "type": "string",
+          "default": "cursor",
+          "enum": ["cursor", "claude-code", "codex"],
+          "description": "Default AI backend for engineer sessions"
+        },
+        "agenticPlanning.workingDirectory": {
+          "type": "string",
+          "default": "_AiDevLog",
+          "description": "Working directory for plans, logs, and state files"
+        },
+        "agenticPlanning.autoOpenTerminals": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically open terminal for each engineer when started"
+        },
+        "agenticPlanning.stateUpdateInterval": {
+          "type": "number",
+          "default": 5000,
+          "description": "Interval in ms to update state files"
+        }
+      }
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "agenticPlanning.startPlanning",
+          "when": "view == agenticPlanning.planningSessionsView",
+          "group": "navigation"
+        },
+        {
+          "command": "agenticPlanning.startCoordinator",
+          "when": "view == agenticPlanning.coordinatorsView",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test": "node ./out/test/runTest.js",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.54.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.22.0"
+  },
+  "dependencies": {}
+}
+
