@@ -3,13 +3,28 @@
   "displayName": "Agentic Planning Coordinator",
   "description": "Multi-agent AI planning and execution system for Unity game development",
   "version": "0.1.0",
-  "publisher": "your-publisher-name",
+  "publisher": "GAOS",
+  "author": {
+    "name": "Yu Gao",
+    "url": "https://www.linkedin.com/in/yugao-luckyvr/"
+  },
+  "homepage": "https://github.com/yugao-gaos/agentic-planning-coordinator",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yugao-gaos/agentic-planning-coordinator"
+  },
+  "bugs": {
+    "url": "https://github.com/yugao-gaos/agentic-planning-coordinator/issues"
+  },
+  "license": "MIT",
+  "icon": "resources/icon-256.png",
   "engines": {
     "vscode": "^1.85.0"
   },
   "categories": [
     "Other",
-    "Machine Learning"
+    "Machine Learning",
+    "Programming Languages"
   ],
   "keywords": [
     "ai",
@@ -17,7 +32,9 @@
     "planning",
     "unity",
     "cursor",
-    "automation"
+    "automation",
+    "game-development",
+    "multi-agent"
   ],
   "activationEvents": [
     "onStartupFinished"
@@ -95,18 +112,33 @@
       },
       {
         "command": "agenticPlanning.stopPlanningSession",
-        "title": "Stop Session",
+        "title": "Stop Planning",
         "icon": "$(debug-stop)"
       },
       {
         "command": "agenticPlanning.resumePlanningSession",
-        "title": "Resume Session",
+        "title": "Resume Planning",
         "icon": "$(debug-start)"
       },
       {
         "command": "agenticPlanning.removePlanningSession",
         "title": "Remove Session",
         "icon": "$(trash)"
+      },
+      {
+        "command": "agenticPlanning.revisePlan",
+        "title": "Revise Plan",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "agenticPlanning.approvePlan",
+        "title": "Approve & Execute",
+        "icon": "$(check)"
+      },
+      {
+        "command": "agenticPlanning.releaseEngineer",
+        "title": "Release Engineer",
+        "icon": "$(debug-stop)"
       }
     ],
     "viewsContainers": {
@@ -114,7 +146,7 @@
         {
           "id": "agentic-planning",
           "title": "Agentic Planning",
-          "icon": "resources/icon.svg"
+          "icon": "resources/sidebar-icon.svg"
         }
       ]
     },
@@ -131,6 +163,10 @@
         {
           "id": "agenticPlanning.engineerPoolView",
           "name": "Engineer Pool"
+        },
+        {
+          "id": "agenticPlanning.unityControlView",
+          "name": "Unity Control Agent"
         }
       ]
     },
@@ -205,74 +241,84 @@
           "when": "view == agenticPlanning.dependencyStatusView && viewItem == missing"
         },
         {
+          "command": "agenticPlanning.removePlanningSession",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == planningSession",
+          "group": "inline@1"
+        },
+        {
           "command": "agenticPlanning.stopPlanningSession",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem =~ /^planningSession_(debating|reviewing|revising)$/",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_planning",
           "group": "inline@1"
         },
         {
           "command": "agenticPlanning.resumePlanningSession",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem =~ /^planningSession_(cancelled|stopped)$/",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_stopped",
           "group": "inline@1"
         },
         {
+          "command": "agenticPlanning.revisePlan",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_pending",
+          "group": "inline@1"
+        },
+        {
+          "command": "agenticPlanning.approvePlan",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_pending",
+          "group": "inline@2"
+        },
+        {
           "command": "agenticPlanning.startExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planningSession_approved",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_approved",
+          "group": "inline@1"
+        },
+        {
+          "command": "agenticPlanning.revisePlan",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_approved",
+          "group": "inline@2"
+        },
+        {
+          "command": "agenticPlanning.revisePlan",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_executing",
           "group": "inline@1"
         },
         {
           "command": "agenticPlanning.pauseExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planningSession_executing",
-          "group": "inline@1"
-        },
-        {
-          "command": "agenticPlanning.resumeExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planningSession_paused",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == executionItem_running",
           "group": "inline@1"
         },
         {
           "command": "agenticPlanning.stopExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem =~ /^planningSession_(executing|paused)$/",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == executionItem_running",
           "group": "inline@2"
         },
         {
-          "command": "agenticPlanning.removePlanningSession",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem =~ /^planningSession_/",
+          "command": "agenticPlanning.resumeExecution",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == executionItem_paused",
+          "group": "inline@1"
+        },
+        {
+          "command": "agenticPlanning.stopExecution",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == executionItem_paused",
           "group": "inline@2"
-        },
-        {
-          "command": "agenticPlanning.stopPlanningSession",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem =~ /^planningSession_(debating|reviewing|revising)$/",
-          "group": "1_actions@1"
-        },
-        {
-          "command": "agenticPlanning.resumePlanningSession",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem =~ /^planningSession_(cancelled|stopped)$/",
-          "group": "1_actions@1"
         },
         {
           "command": "agenticPlanning.startExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planningSession_approved",
-          "group": "1_actions@1"
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == executionItem_ready",
+          "group": "inline@1"
         },
         {
-          "command": "agenticPlanning.pauseExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planningSession_executing",
-          "group": "1_actions@1"
-        },
-        {
-          "command": "agenticPlanning.resumeExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planningSession_paused",
-          "group": "1_actions@1"
-        },
-        {
-          "command": "agenticPlanning.stopExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem =~ /^planningSession_(executing|paused)$/",
-          "group": "1_actions@2"
+          "command": "agenticPlanning.startExecution",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == executionItem_stopped",
+          "group": "inline@1"
         },
         {
           "command": "agenticPlanning.removePlanningSession",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem =~ /^planningSession_/",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == planningSession",
           "group": "2_delete@1"
+        },
+        {
+          "command": "agenticPlanning.releaseEngineer",
+          "when": "view == agenticPlanning.engineerPoolView && viewItem == busyEngineer",
+          "group": "inline@1"
         }
       ]
     }

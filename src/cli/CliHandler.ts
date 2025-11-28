@@ -55,17 +55,15 @@ export class CliHandler {
             case 'plan':
                 return this.handlePlan(subArgs);
             
+            case 'exec':
+            case 'execute':
+                return this.handleExecution(subArgs);
+            
             case 'coordinator':
                 return this.handleCoordinator(subArgs);
             
             case 'pool':
                 return this.handlePool(subArgs);
-            
-            case 'engineer':
-                return this.handleEngineer(subArgs);
-            
-            case 'unity':
-                return this.handleUnity(subArgs);
             
             case 'help':
                 return this.showHelp();
@@ -242,6 +240,137 @@ export class CliHandler {
         return {
             success: true,
             message: `Plan ${id} cancelled`
+        };
+    }
+
+    // ========================================================================
+    // Execution Commands (Higher-level than coordinator commands)
+    // ========================================================================
+
+    private async handleExecution(args: string[]): Promise<CliResponse> {
+        if (args.length === 0) {
+            return { success: false, error: 'Missing exec subcommand. Use: start, pause, resume, stop, status' };
+        }
+
+        const subCommand = args[0];
+        const params = this.parseArgs(args.slice(1));
+
+        switch (subCommand) {
+            case 'start':
+                return this.execStart(params);
+            
+            case 'pause':
+                return this.execPause(params);
+            
+            case 'resume':
+                return this.execResume(params);
+            
+            case 'stop':
+                return this.execStop(params);
+            
+            case 'status':
+                return this.execStatus(params);
+            
+            default:
+                return { success: false, error: `Unknown exec subcommand: ${subCommand}` };
+        }
+    }
+
+    private async execStart(params: Record<string, string>): Promise<CliResponse> {
+        const sessionId = params['session'] || params['id'];
+        if (!sessionId) {
+            return { success: false, error: 'Missing --session or --id parameter (e.g., ps_001)' };
+        }
+
+        const mode = params['mode'] as 'auto' | 'interactive' || 'auto';
+        const engineerCount = params['engineers'] ? parseInt(params['engineers']) : undefined;
+
+        const result = await this.planningService.startExecution(sessionId, {
+            mode,
+            engineerCount
+        });
+
+        if (!result.success) {
+            return { success: false, error: result.error };
+        }
+
+        return {
+            success: true,
+            message: `Execution started for ${sessionId} with ${result.engineerCount} engineers`,
+            data: result
+        };
+    }
+
+    private async execPause(params: Record<string, string>): Promise<CliResponse> {
+        const sessionId = params['session'] || params['id'];
+        if (!sessionId) {
+            return { success: false, error: 'Missing --session or --id parameter' };
+        }
+
+        const result = await this.planningService.pauseExecution(sessionId);
+        if (!result.success) {
+            return { success: false, error: result.error };
+        }
+
+        return {
+            success: true,
+            message: `Execution paused for ${sessionId}`
+        };
+    }
+
+    private async execResume(params: Record<string, string>): Promise<CliResponse> {
+        const sessionId = params['session'] || params['id'];
+        if (!sessionId) {
+            return { success: false, error: 'Missing --session or --id parameter' };
+        }
+
+        const result = await this.planningService.resumeExecution(sessionId);
+        if (!result.success) {
+            return { success: false, error: result.error };
+        }
+
+        return {
+            success: true,
+            message: `Execution resumed for ${sessionId}`
+        };
+    }
+
+    private async execStop(params: Record<string, string>): Promise<CliResponse> {
+        const sessionId = params['session'] || params['id'];
+        if (!sessionId) {
+            return { success: false, error: 'Missing --session or --id parameter' };
+        }
+
+        const result = await this.planningService.stopExecution(sessionId);
+        if (!result.success) {
+            return { success: false, error: result.error };
+        }
+
+        return {
+            success: true,
+            message: `Execution stopped for ${sessionId}`
+        };
+    }
+
+    private async execStatus(params: Record<string, string>): Promise<CliResponse> {
+        const sessionId = params['session'] || params['id'];
+        if (!sessionId) {
+            return { success: false, error: 'Missing --session or --id parameter' };
+        }
+
+        const session = this.planningService.getPlanningStatus(sessionId);
+        if (!session) {
+            return { success: false, error: `Planning session ${sessionId} not found` };
+        }
+
+        return {
+            success: true,
+            data: {
+                sessionId: session.id,
+                status: session.status,
+                execution: session.execution,
+                progress: session.execution?.progress
+            }
         };
     }
 
@@ -438,202 +567,6 @@ export class CliHandler {
     }
 
     // ========================================================================
-    // Engineer Commands
-    // ========================================================================
-
-    private async handleEngineer(args: string[]): Promise<CliResponse> {
-        if (args.length === 0) {
-            return { success: false, error: 'Missing engineer subcommand. Use: list, status, log, terminal, stop, pause, resume' };
-        }
-
-        const subCommand = args[0];
-        const params = this.parseArgs(args.slice(1));
-
-        switch (subCommand) {
-            case 'list':
-                return this.engineerList();
-            
-            case 'status':
-                return this.engineerStatus(params);
-            
-            case 'log':
-                return this.engineerLog(params);
-            
-            case 'terminal':
-                return this.engineerTerminal(params);
-            
-            case 'stop':
-                return this.engineerStop(params);
-            
-            case 'pause':
-                return this.engineerPause(params);
-            
-            case 'resume':
-                return this.engineerResume(params);
-            
-            default:
-                return { success: false, error: `Unknown engineer subcommand: ${subCommand}` };
-        }
-    }
-
-    private async engineerList(): Promise<CliResponse> {
-        const poolStatus = this.engineerPoolService.getPoolStatus();
-        const busyEngineers = this.engineerPoolService.getBusyEngineers();
-
-        return {
-            success: true,
-            data: {
-                available: poolStatus.available,
-                busy: busyEngineers
-            }
-        };
-    }
-
-    private async engineerStatus(params: Record<string, string>): Promise<CliResponse> {
-        const name = params['name'];
-        if (!name) {
-            return { success: false, error: 'Missing --name parameter' };
-        }
-
-        const status = this.engineerPoolService.getEngineerStatus(name);
-        if (!status) {
-            return { success: false, error: `Engineer ${name} not found` };
-        }
-
-        return {
-            success: true,
-            data: status
-        };
-    }
-
-    private async engineerLog(params: Record<string, string>): Promise<CliResponse> {
-        const name = params['name'];
-        const lines = params['lines'] ? parseInt(params['lines']) : 50;
-
-        if (!name) {
-            return { success: false, error: 'Missing --name parameter' };
-        }
-
-        const log = this.coordinatorService.readEngineerLog(name, lines);
-        return {
-            success: true,
-            data: { log }
-        };
-    }
-
-    private async engineerTerminal(params: Record<string, string>): Promise<CliResponse> {
-        const name = params['name'];
-        if (!name) {
-            return { success: false, error: 'Missing --name parameter' };
-        }
-
-        const success = this.terminalManager.showEngineerTerminal(name);
-        if (!success) {
-            return { success: false, error: `Could not open terminal for engineer ${name}` };
-        }
-
-        return {
-            success: true,
-            message: `Terminal opened for engineer ${name}`
-        };
-    }
-
-    private async engineerStop(params: Record<string, string>): Promise<CliResponse> {
-        const name = params['name'];
-        if (!name) {
-            return { success: false, error: 'Missing --name parameter' };
-        }
-
-        await this.coordinatorService.stopEngineer(name);
-        return {
-            success: true,
-            message: `Engineer ${name} stopped`
-        };
-    }
-
-    private async engineerPause(params: Record<string, string>): Promise<CliResponse> {
-        const name = params['name'];
-        if (!name) {
-            return { success: false, error: 'Missing --name parameter' };
-        }
-
-        await this.coordinatorService.pauseEngineer(name);
-        return {
-            success: true,
-            message: `Engineer ${name} paused`
-        };
-    }
-
-    private async engineerResume(params: Record<string, string>): Promise<CliResponse> {
-        const name = params['name'];
-        if (!name) {
-            return { success: false, error: 'Missing --name parameter' };
-        }
-
-        await this.coordinatorService.resumeEngineer(name);
-        return {
-            success: true,
-            message: `Engineer ${name} resumed`
-        };
-    }
-
-    // ========================================================================
-    // Unity Commands
-    // ========================================================================
-
-    private async handleUnity(args: string[]): Promise<CliResponse> {
-        if (args.length === 0) {
-            return { success: false, error: 'Missing unity subcommand. Use: compile, test, console' };
-        }
-
-        const subCommand = args[0];
-        const params = this.parseArgs(args.slice(1));
-
-        switch (subCommand) {
-            case 'compile':
-                return this.unityCompile();
-            
-            case 'test':
-                return this.unityTest(params);
-            
-            case 'console':
-                return this.unityConsole(params);
-            
-            default:
-                return { success: false, error: `Unknown unity subcommand: ${subCommand}` };
-        }
-    }
-
-    private async unityCompile(): Promise<CliResponse> {
-        // TODO: Implement Unity compilation check
-        // This would use the check_unity_compilation.sh script
-        return {
-            success: true,
-            message: 'Unity compilation check not yet implemented',
-            data: { status: 'not_implemented' }
-        };
-    }
-
-    private async unityTest(params: Record<string, string>): Promise<CliResponse> {
-        // TODO: Implement Unity playmode test
-        // This would use the run_playmode_test.py script
-        return {
-            success: true,
-            message: 'Unity test not yet implemented',
-            data: { status: 'not_implemented' }
-        };
-    }
-
-    private async unityConsole(params: Record<string, string>): Promise<CliResponse> {
-        // TODO: Read Unity console via MCP
-        return {
-            success: true,
-            message: 'Unity console read not yet implemented',
-            data: { status: 'not_implemented' }
-        };
-    }
-
-    // ========================================================================
     // Help
     // ========================================================================
 
@@ -641,41 +574,33 @@ export class CliHandler {
         const help = `
 Agentic Planning Coordinator CLI
 
-Usage: agentic <command> [subcommand] [options]
+Usage: apc <command> [subcommand] [options]
 
 Commands:
   status                          Show overall status
   
   plan list                       List all planning sessions
-  plan start --prompt "..."       Start new planning session
-  plan status --id <id>           Get planning session status
-  plan revise --id <id> --feedback "..."  Revise a plan
-  plan approve --id <id>          Approve a plan for execution
-  plan cancel --id <id>           Cancel a planning session
+  plan new "<prompt>" [--docs]    Start new planning session
+  plan status <id>                Get planning session status
+  plan revise <id> "<feedback>"   Revise a plan
+  plan approve <id>               Approve a plan for execution
+  plan cancel <id>                Cancel a planning session
   
-  coordinator list                List all coordinators
-  coordinator start --plan <path> [--mode auto|interactive] [--engineers <n>]
-  coordinator status --id <id>    Get coordinator status
-  coordinator pause --id <id>     Pause a coordinator
-  coordinator resume --id <id>    Resume a coordinator
-  coordinator stop --id <id>      Stop a coordinator
+  exec start <session_id>         Start execution for an approved plan
+  exec pause <session_id>         Pause execution
+  exec resume <session_id>        Resume execution
+  exec stop <session_id>          Stop execution
+  exec status <session_id>        Get execution status
   
   pool status                     Show engineer pool status
-  pool resize --size <n>          Resize engineer pool
-  
-  engineer list                   List all engineers
-  engineer status --name <name>   Get engineer status
-  engineer log --name <name> [--lines <n>]  Read engineer log
-  engineer terminal --name <name> Open engineer terminal
-  engineer stop --name <name>     Stop an engineer
-  engineer pause --name <name>    Pause an engineer
-  engineer resume --name <name>   Resume an engineer
-  
-  unity compile                   Check Unity compilation
-  unity test [--scene <path>]     Run Unity playmode test
-  unity console                   Read Unity console
+  pool resize <n>                 Resize engineer pool
   
   help                            Show this help message
+
+Notes:
+  - Session IDs start with 'ps_' (e.g., ps_000001)
+  - Use the extension UI for individual engineer management
+  - Unity operations are handled automatically by Unity Control Agent
 `;
 
         return {

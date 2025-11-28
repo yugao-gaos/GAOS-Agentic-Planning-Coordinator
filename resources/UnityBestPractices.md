@@ -26,18 +26,26 @@ public class ScoreCalculator { }
 
 **NEVER create .meta files manually** - Let Unity handle it.
 
-After making changes to Unity assets:
-1. Use `check_unity_compilation.sh` to focus Unity and trigger reimport
-2. Wait and monitor Unity status using Unity MCP
-3. Loop until reimport finishes
-4. Check console for any errors
+After making changes to Unity assets, **delegate to UnityControlAgent**:
+1. Request compilation via `CoordinatorService.requestCompilation()`
+2. UnityControlAgent queues the request and manages Unity focus
+3. Wait for compilation completion callback
+4. Check errors via error registry
 
-```bash
-# Correct workflow after file changes
-./check_unity_compilation.sh
-# Then via MCP: mcp_unityMCP_manage_editor({ action: 'get_state' })
-# Wait for compilation to complete
-# Then: mcp_unityMCP_read_console({ types: ['error'] })
+**For engineers**: Call the coordinator's compilation request - don't interact with Unity directly.
+
+```typescript
+// Engineers request compilation through coordinator
+await coordinatorService.requestCompilation(coordinatorId, engineerName);
+// UnityControlAgent handles: focus Unity → wait for compile → collect errors
+```
+
+**Direct MCP usage** (for debugging only):
+```typescript
+// Check Unity state
+mcp_unityMCP_manage_editor({ action: 'get_state' })
+// Check for errors
+mcp_unityMCP_read_console({ types: ['error'] })
 ```
 
 ---
@@ -155,9 +163,46 @@ public class UILayoutBuilder : ScriptableObject
 
 ## 6. Testing with Unity Test Framework
 
-### Test Types
+### ⚠️ Important: Don't Over-Test
 
-**EditMode Tests** - Run without Play mode, fast, for pure logic:
+Unity tests can become a **maintenance burden** in game projects. Be strategic about what you test:
+
+- **Test critical logic**, not every method
+- **Focus on bug-prone areas**, not obvious code
+- **Keep tests fast** - slow test suites get ignored
+- **Delete tests that don't catch bugs** - they're just overhead
+
+### Test Types and When to Use Them
+
+| Test Type | Use For | Skip For |
+|-----------|---------|----------|
+| **test_framework_editmode** | Pure C# logic, data structures, algorithms, state machines | Simple getters/setters, trivial code |
+| **test_framework_playmode** | Scene setup, UI interactions, component lifecycle, animations | Pure logic (use EditMode instead) |
+| **test_player_playmode** | Gameplay feel, visual polish, UX flow, "does it feel right?" | Automated verification |
+
+### Per-Task Test Requirements
+
+**NOT every task needs all test types.** Match testing to task type:
+
+| Task Type | EditMode | PlayMode | Player Test |
+|-----------|----------|----------|-------------|
+| **Data/Logic** (algorithms, state, calculations) | ✅ Required | ❌ Skip | ❌ Skip |
+| **Components** (MonoBehaviours, services) | ✅ If has logic | ⚠️ Maybe | ❌ Skip |
+| **Scene/UI** (layouts, prefabs, canvas) | ❌ Skip | ✅ Required | ⚠️ Maybe |
+| **Gameplay** (mechanics, feel, balance) | ⚠️ Maybe | ✅ Required | ✅ Required |
+
+**Examples:**
+```
+✅ Cluster Detection (pure logic) → EditMode only
+✅ UI Manager (scene/UI) → PlayMode only  
+✅ Gem Physics (gameplay) → EditMode + PlayMode + Player test
+❌ GemData class (simple data) → No tests needed
+```
+
+### EditMode Tests - Fast Logic Tests
+
+Run without Play mode. Use for pure logic that doesn't need Unity lifecycle:
+
 ```csharp
 [TestFixture]
 public class ClusterDetectorTests
@@ -173,7 +218,10 @@ public class ClusterDetectorTests
 }
 ```
 
-**PlayMode Tests** - Run in Play mode, for MonoBehaviour/Scene tests:
+### PlayMode Tests - Scene/Component Tests
+
+Run in Play mode. Use for MonoBehaviour, UI, and scene-dependent code:
+
 ```csharp
 [UnityTest]
 public IEnumerator GameLoop_WinCondition_TriggersEvent()
@@ -186,9 +234,16 @@ public IEnumerator GameLoop_WinCondition_TriggersEvent()
 }
 ```
 
-### Running Tests via Unity MCP
+### Player PlayMode Tests - Manual Gameplay Tests
 
-**IMPORTANT**: Always run tests using Unity MCP to verify code works:
+For gameplay tasks, a human needs to play and verify "feel":
+- Does the animation feel responsive?
+- Is the difficulty right?
+- Do the controls feel good?
+
+These can't be automated - use `test_player_playmode` to have the player test.
+
+### Running Tests via Unity MCP
 
 ```bash
 # Run EditMode tests (fast, no Play mode)
@@ -198,22 +253,17 @@ mcp_unityMCP_run_tests({ mode: "EditMode" })
 mcp_unityMCP_run_tests({ mode: "PlayMode", timeout_seconds: 60 })
 ```
 
-### Per-Task Test Requirements
+### Test Naming Convention
 
-Every task should include:
-1. **Unit tests** for pure logic (EditMode)
-2. **Integration tests** if task involves scene/components (PlayMode)
-3. **Test naming convention**: `[Method]_[Scenario]_[ExpectedResult]`
+`[Method]_[Scenario]_[ExpectedResult]`
 
-Example test list per task:
+Example:
 ```
 Task: Cluster Detection
 ├── ClusterDetectorTests.cs (EditMode)
 │   ├── FindMatches_HorizontalThree_ReturnsMatch
-│   ├── FindMatches_VerticalThree_ReturnsMatch
 │   ├── FindMatches_LShape_ReturnsTwoMatches
-│   ├── FindMatches_NoMatch_ReturnsEmpty
-│   └── FindMatches_LargeBoard_CompletesUnder1ms
+│   └── FindMatches_NoMatch_ReturnsEmpty
 ```
 
 ### Assembly Definition Setup
@@ -315,6 +365,101 @@ Result:        Just swap the mesh and material later
 - Use **async/await** instead of coroutines for complex async operations
 
 **Note:** These optimizations apply to **production code**, not prototypes. See Section 7 for prototyping guidelines.
+
+---
+
+## 9. Project Structure and Asset Store Assets
+
+### Folder Structure
+
+Keep your game's assets in a dedicated subfolder under `Assets/`:
+
+```
+Assets/
+├── _Game/                    # Your game's assets (underscore keeps it at top)
+│   ├── Scenes/
+│   ├── Scripts/
+│   ├── Prefabs/
+│   ├── Materials/
+│   ├── Textures/
+│   ├── Models/
+│   ├── Audio/
+│   ├── Animations/
+│   ├── UI/
+│   └── ScriptableObjects/
+├── ThirdParty/               # Copied assets from Asset Store (optional organization)
+├── [Asset Store Package 1]/  # Original Asset Store packages (don't modify)
+├── [Asset Store Package 2]/
+└── ...
+```
+
+### Why Use `_Game/` Folder?
+
+Asset Store packages often contain many assets you don't need. Keeping your game isolated:
+- **Clarity**: Easy to see what's actually used in your game
+- **Clean exports**: Export only your game folder for backups or sharing
+- **Safe updates**: Update Asset Store packages without breaking your game
+- **Organized references**: All your game assets in one place
+
+### Using Asset Store Assets
+
+**NEVER use Asset Store assets directly in your game.** Always copy what you need:
+
+```
+✗ Wrong: Drag prefab directly from AssetStorePack/Prefabs/Enemy.prefab into scene
+✓ Right: Copy Enemy.prefab to _Game/Prefabs/Enemy.prefab, use the copy
+```
+
+### Copying Assets with Dependencies
+
+When copying an asset, you must also copy its dependencies and re-hook references:
+
+```
+Example: Copying a character prefab
+
+1. Copy the prefab
+   AssetStorePack/Prefabs/Knight.prefab → _Game/Prefabs/Characters/Knight.prefab
+
+2. Copy the model/mesh
+   AssetStorePack/Models/Knight.fbx → _Game/Models/Characters/Knight.fbx
+
+3. Copy materials
+   AssetStorePack/Materials/Knight_Mat.mat → _Game/Materials/Characters/Knight_Mat.mat
+
+4. Copy textures
+   AssetStorePack/Textures/Knight_Diffuse.png → _Game/Textures/Characters/Knight_Diffuse.png
+   AssetStorePack/Textures/Knight_Normal.png → _Game/Textures/Characters/Knight_Normal.png
+
+5. Re-hook references in your copies:
+   - Knight.prefab → references your copied Knight.fbx
+   - Knight_Mat.mat → references your copied textures
+```
+
+### Scripts from Asset Store
+
+**Be cautious with scripts from Asset Store packages:**
+
+| Script Type | Recommendation |
+|-------------|----------------|
+| Asset pack scripts (e.g., demo controllers, example code) | ❌ **Do NOT use** - Write your own |
+| Standalone tools/systems (e.g., DOTween, TextMeshPro, input systems) | ✅ **OK to use** - Keep the entire package |
+| Utility scripts bundled with art packs | ⚠️ **Avoid** - Often coupled to specific assets |
+
+**Reasoning:**
+- Asset pack scripts are often tightly coupled to their specific assets
+- They may conflict with your architecture or coding standards
+- Standalone tools are designed to be dependencies and stay as complete packages
+- Mixing partial script imports creates maintenance nightmares
+
+### Best Practices Summary
+
+1. **Create `Assets/_Game/` folder** at project start
+2. **Never modify** original Asset Store package folders
+3. **Copy assets** you need into `_Game/` folders
+4. **Copy all dependencies** (models, materials, textures, animations)
+5. **Re-hook all references** in your copied assets
+6. **Don't copy scripts** from asset packs - write your own
+7. **Keep standalone tools** as complete packages (DOTween, etc.)
 
 ---
 

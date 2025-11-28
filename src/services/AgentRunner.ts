@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { spawn, execSync, ChildProcess } from 'child_process';
+import { ProcessManager } from './ProcessManager';
 
 /**
  * Analyst agent configuration
@@ -112,6 +113,7 @@ export class AgentRunner {
     private contextDir: string;  // Temporary session context
     private persistentContextDir: string;  // Persistent indexed context
     private activeProcesses: Map<string, ChildProcess> = new Map();
+    private processManager: ProcessManager;
     private contextGatherer: ContextGathererState | null = null;
     private contextIndex: ContextIndex | null = null;
 
@@ -120,6 +122,10 @@ export class AgentRunner {
         this.debateDir = path.join(workspaceRoot, '_AiDevLog', '.debate');
         this.contextDir = path.join(workspaceRoot, '_AiDevLog', '.context_gatherer');
         this.persistentContextDir = path.join(workspaceRoot, '_AiDevLog', 'Context');
+        this.processManager = ProcessManager.getInstance();
+        
+        // Set state directory for process manager
+        this.processManager.setStateDir(path.join(workspaceRoot, '_AiDevLog'));
         
         // Ensure directories exist
         if (!fs.existsSync(this.debateDir)) {
@@ -954,10 +960,12 @@ Keep running until the debate completes.
         const proc = spawn('bash', ['-c', shellCmd], {
             cwd: this.workspaceRoot,
             stdio: ['pipe', 'pipe', 'pipe'],
-            env: { ...process.env }
+            env: { ...process.env },
+            detached: true  // Create process group for reliable cleanup
         });
 
         this.activeProcesses.set(processId, proc);
+        console.log(`[AgentRunner] Started Context Gatherer process PID: ${proc.pid}, tracked as: ${processId}`);
 
         let chunkCount = 0;
         let lastProgressTime = Date.now();
@@ -1214,10 +1222,12 @@ ${tasks.map((t, i) => `${i + 1}. ${t.name}\n   Files: ${t.files.join(', ')}`).jo
             const proc = spawn('bash', ['-c', shellCmd], {
                 cwd: this.workspaceRoot,
                 stdio: ['pipe', 'pipe', 'pipe'],
-                env: { ...process.env }
+                env: { ...process.env },
+                detached: true  // Create process group for reliable cleanup
             });
 
             this.activeProcesses.set(processId, proc);
+            console.log(`[AgentRunner] Started Task Review process PID: ${proc.pid}, tracked as: ${processId}`);
 
             let chunkCount = 0;
             let lastProgressTime = Date.now();
@@ -1321,15 +1331,24 @@ ${tasks.map((t, i) => `${i + 1}. ${t.name}\n   Files: ${t.files.join(', ')}`).jo
     }
 
     /**
-     * Stop Context Gatherer
+     * Stop Context Gatherer - uses proper process group killing
      */
-    stopContextGatherer(): void {
+    async stopContextGatherer(): Promise<void> {
         if (this.contextGatherer?.processId) {
+            console.log(`[AgentRunner] Stopping Context Gatherer: ${this.contextGatherer.processId}`);
+            
+            // Try ProcessManager first
+            await this.processManager.stopProcess(this.contextGatherer.processId, false);
+            
+            // Also check legacy tracking and use the killProcess method
             const proc = this.activeProcesses.get(this.contextGatherer.processId);
             if (proc) {
-                proc.kill();
+                await this.killProcess(this.contextGatherer.processId, proc);
                 this.activeProcesses.delete(this.contextGatherer.processId);
             }
+            
+            this.contextGatherer = null;
+            console.log(`[AgentRunner] Context Gatherer stopped`);
         }
     }
 
@@ -1990,11 +2009,15 @@ ${consensus.agreedRecommendations.length > 0
             const proc = spawn('bash', ['-c', shellCmd], {
                 cwd: this.workspaceRoot,
                 stdio: ['pipe', 'pipe', 'pipe'],
-                env: { ...process.env }
+                env: { ...process.env },
+                detached: true  // Create process group for reliable cleanup
             });
 
             const processId = `${analyst.id}_${Date.now()}`;
             this.activeProcesses.set(processId, proc);
+            
+            // Log PID for debugging
+            console.log(`[AgentRunner] Started ${analyst.name} process PID: ${proc.pid}, tracked as: ${processId}`);
 
             let collectedText = '';
             let lastProgressTime = Date.now();
@@ -2256,13 +2279,96 @@ ${consensus.agreedRecommendations.length > 0
     }
 
     /**
-     * Stop all active agent processes
+     * Stop all active agent processes - kills process groups for reliable cleanup
      */
-    stopAll(): void {
+    async stopAll(): Promise<void> {
+        console.log(`[AgentRunner] Stopping all processes. Active count: ${this.activeProcesses.size}`);
+        
+        // Stop processes tracked by ProcessManager
+        await this.processManager.stopAll(false);  // Graceful stop
+        
+        // Kill all processes tracked in activeProcesses
+        const killPromises: Promise<void>[] = [];
+        
         for (const [id, proc] of this.activeProcesses) {
-            proc.kill();
-            this.activeProcesses.delete(id);
+            killPromises.push(this.killProcess(id, proc));
         }
+        
+        // Wait for all kills to complete (with timeout)
+        await Promise.all(killPromises);
+        
+        // Clear the map
+        this.activeProcesses.clear();
+        
+        console.log(`[AgentRunner] All processes stopped`);
+    }
+    
+    /**
+     * Kill a single process and its children (process group)
+     */
+    private async killProcess(id: string, proc: ChildProcess): Promise<void> {
+        if (!proc.pid) {
+            console.log(`[AgentRunner] Process ${id} has no PID, skipping`);
+            return;
+        }
+        
+        if (proc.killed) {
+            console.log(`[AgentRunner] Process ${id} (PID: ${proc.pid}) already killed`);
+            return;
+        }
+        
+        console.log(`[AgentRunner] Killing process ${id} (PID: ${proc.pid})`);
+        
+        try {
+            if (process.platform !== 'win32') {
+                // On Unix, kill the process group (negative PID) for clean termination
+                // This kills bash + cursor agent + any children
+                try {
+                    process.kill(-proc.pid, 'SIGTERM');
+                    console.log(`[AgentRunner] Sent SIGTERM to process group -${proc.pid}`);
+                } catch (e) {
+                    // If process group kill fails, try direct kill
+                    proc.kill('SIGTERM');
+                }
+                
+                // Wait up to 3 seconds for graceful shutdown
+                await new Promise<void>((resolve) => {
+                    const timeout = setTimeout(() => {
+                        if (!proc.killed) {
+                            console.log(`[AgentRunner] Process ${id} didn't exit, sending SIGKILL`);
+                            try {
+                                process.kill(-proc.pid!, 'SIGKILL');
+                            } catch (e) {
+                                try { proc.kill('SIGKILL'); } catch (e2) { /* ignore */ }
+                            }
+                        }
+                        resolve();
+                    }, 3000);
+                    
+                    proc.on('exit', () => {
+                        clearTimeout(timeout);
+                        console.log(`[AgentRunner] Process ${id} exited`);
+                        resolve();
+                    });
+                });
+            } else {
+                // On Windows, use taskkill to kill process tree
+                const { spawn: spawnWin } = require('child_process');
+                spawnWin('taskkill', ['/pid', String(proc.pid), '/f', '/t'], { stdio: 'ignore' });
+                
+                // Wait a bit for Windows to clean up
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        } catch (e) {
+            console.error(`[AgentRunner] Error killing process ${id}:`, e);
+        }
+    }
+    
+    /**
+     * Check if any processes are still running
+     */
+    hasActiveProcesses(): boolean {
+        return this.activeProcesses.size > 0 || this.processManager.getRunningProcessIds().length > 0;
     }
 }
 

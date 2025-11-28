@@ -6,6 +6,7 @@ import { StateManager } from './StateManager';
 import { PlanningSession, PlanningStatus, PlanVersion, RevisionEntry, ExecutionState, EngineerExecutionState } from '../types';
 import { AgentRunner, AgentAnalysis } from './AgentRunner';
 import { CoordinatorService } from './CoordinatorService';
+import { OutputChannelManager } from './OutputChannelManager';
 
 interface UnityContext {
     editorState?: string;
@@ -28,7 +29,7 @@ export class PlanningService {
     readonly onSessionsChanged = this._onSessionsChanged.event;
     private bestPractices: string = '';
     private agentRunner: AgentRunner;
-    private outputChannel: vscode.OutputChannel;
+    private outputManager: OutputChannelManager;
     
     // CoordinatorService for execution (set via setCoordinatorService to avoid circular deps)
     private coordinatorService?: CoordinatorService;
@@ -41,8 +42,8 @@ export class PlanningService {
         this.agentRunner = new AgentRunner(stateManager.getWorkspaceRoot());
         this.loadBestPractices();
         
-        // Create output channel for real-time streaming in VS Code
-        this.outputChannel = vscode.window.createOutputChannel('APC Planning');
+        // Use unified output channel
+        this.outputManager = OutputChannelManager.getInstance();
     }
     
     /**
@@ -56,7 +57,7 @@ export class PlanningService {
      * Show the output channel in VS Code
      */
     showOutput(): void {
-        this.outputChannel.show(true);
+        this.outputManager.show();
     }
 
     /**
@@ -97,29 +98,43 @@ export class PlanningService {
     /**
      * Get relevant best practices for a task type
      */
+    /**
+     * Get relevant best practices from loaded UnityBestPractices.md based on task type
+     * References sections from the document instead of hardcoding
+     */
     private getRelevantBestPractices(taskType: string): string[] {
         const practices: string[] = [];
         
+        // Reference sections from UnityBestPractices.md
         if (taskType.includes('UI') || taskType.includes('Canvas') || taskType.includes('Widget')) {
-            practices.push('⚠️ UI Best Practice: Build Canvas in prefabs. Use Editor SO code to generate UI, not direct AI generation.');
-            practices.push('⚠️ Ask for mockups and sizing before building UI elements.');
+            practices.push('⚠️ See UnityBestPractices.md Section 3: Scene and UI Building');
+            practices.push('⚠️ See UnityBestPractices.md Section 5: ScriptableObject Builder Pattern');
         }
         
         if (taskType.includes('Scene') || taskType.includes('Prefab')) {
-            practices.push('⚠️ Scene Best Practice: Use ScriptableObject Builder pattern. Reference sprites, models, materials from config.');
+            practices.push('⚠️ See UnityBestPractices.md Section 5: ScriptableObject Builder Pattern');
+            practices.push('⚠️ See UnityBestPractices.md Section 7: Prototyping Guidelines');
         }
         
         if (taskType.includes('Data') || taskType.includes('Config') || taskType.includes('Level')) {
-            practices.push('⚠️ Data Best Practice: Use ScriptableObject with JSON serialization. Create custom editor panel.');
+            practices.push('⚠️ See UnityBestPractices.md Section 4: Data Objects and ScriptableObjects');
         }
         
         if (taskType.includes('Script') || taskType.includes('Component')) {
-            practices.push('⚠️ Script Best Practice: MonoBehaviour for GO attachment, plain C# for pure logic.');
-            practices.push('⚠️ After creating scripts: Use check_unity_compilation.sh, wait for Unity, check console.');
+            practices.push('⚠️ See UnityBestPractices.md Section 1: MonoBehaviour vs Pure C#');
+            practices.push('⚠️ After creating scripts: Delegate compilation to UnityControlAgent, check error registry.');
         }
         
         if (taskType.includes('Pool') || taskType.includes('Spawn')) {
-            practices.push('⚠️ Performance Best Practice: Pre-allocate pools, avoid allocations in Update.');
+            practices.push('⚠️ See UnityBestPractices.md Section 8: Performance Guidelines');
+        }
+        
+        if (taskType.includes('Test') || taskType.includes('Testing')) {
+            practices.push('⚠️ See UnityBestPractices.md Section 6: Testing with Unity Test Framework');
+        }
+        
+        if (taskType.includes('Asset') || taskType.includes('Import') || taskType.includes('ThirdParty')) {
+            practices.push('⚠️ See UnityBestPractices.md Section 9: Project Structure and Asset Store Assets');
         }
         
         return practices;
@@ -195,7 +210,7 @@ export class PlanningService {
         const line = `[${timestamp}] [${phase}] ${message}`;
         
         // Write to VS Code output channel (shows in GUI)
-        this.outputChannel.appendLine(line);
+        this.outputManager.appendLine(line);
         
         // Ensure directory exists
         const dir = path.dirname(progressPath);
@@ -656,20 +671,20 @@ export class PlanningService {
         const recommendations: string[] = [];
         
         // Show output channel in VS Code so user can see progress
-        this.outputChannel.clear();
-        this.outputChannel.show(true);
-        this.outputChannel.appendLine(`════════════════════════════════════════════════════════════`);
-        this.outputChannel.appendLine(`  APC PLANNING SESSION: ${session.id}`);
-        this.outputChannel.appendLine(`════════════════════════════════════════════════════════════`);
-        this.outputChannel.appendLine(``);
-        this.outputChannel.appendLine(`📋 Requirement: ${session.requirement.substring(0, 100)}...`);
+        this.outputManager.clear();
+        this.outputManager.show();
+        this.outputManager.appendLine(`════════════════════════════════════════════════════════════`);
+        this.outputManager.appendLine(`  APC PLANNING SESSION: ${session.id}`);
+        this.outputManager.appendLine(`════════════════════════════════════════════════════════════`);
+        this.outputManager.appendLine(``);
+        this.outputManager.appendLine(`📋 Requirement: ${session.requirement.substring(0, 100)}...`);
         if (docs.length > 0) {
-            this.outputChannel.appendLine(`📄 Documents: ${docs.join(', ')}`);
+            this.outputManager.appendLine(`📄 Documents: ${docs.join(', ')}`);
         }
-        this.outputChannel.appendLine(``);
-        this.outputChannel.appendLine(`💡 TIP: Watch this panel for live updates from AI agents!`);
-        this.outputChannel.appendLine(`────────────────────────────────────────────────────────────`);
-        this.outputChannel.appendLine(``);
+        this.outputManager.appendLine(``);
+        this.outputManager.appendLine(`💡 TIP: Watch this panel for live updates from AI agents!`);
+        this.outputManager.appendLine(`────────────────────────────────────────────────────────────`);
+        this.outputManager.appendLine(``);
         
         // Clear any existing progress file and write header
         fs.writeFileSync(progressPath, `════════════════════════════════════════════════════════════\n`);
@@ -1814,18 +1829,18 @@ This is an auto-generated plan template. Review and modify as needed.
         const progressPath = this.getProgressFilePath(session.id);
         
         // Show output channel
-        this.outputChannel.clear();
-        this.outputChannel.show(true);
-        this.outputChannel.appendLine(`════════════════════════════════════════════════════════════`);
-        this.outputChannel.appendLine(`  APC PLAN REVISION: ${session.id} → v${newVersion}`);
-        this.outputChannel.appendLine(`════════════════════════════════════════════════════════════`);
-        this.outputChannel.appendLine(``);
-        this.outputChannel.appendLine(`📋 Original Requirement: ${session.requirement.substring(0, 80)}...`);
-        this.outputChannel.appendLine(`📝 Revision Feedback: ${feedback.substring(0, 80)}...`);
-        this.outputChannel.appendLine(``);
-        this.outputChannel.appendLine(`💡 TIP: Watch this panel for live updates from AI agents!`);
-        this.outputChannel.appendLine(`────────────────────────────────────────────────────────────`);
-        this.outputChannel.appendLine(``);
+        this.outputManager.clear();
+        this.outputManager.show();
+        this.outputManager.appendLine(`════════════════════════════════════════════════════════════`);
+        this.outputManager.appendLine(`  APC PLAN REVISION: ${session.id} → v${newVersion}`);
+        this.outputManager.appendLine(`════════════════════════════════════════════════════════════`);
+        this.outputManager.appendLine(``);
+        this.outputManager.appendLine(`📋 Original Requirement: ${session.requirement.substring(0, 80)}...`);
+        this.outputManager.appendLine(`📝 Revision Feedback: ${feedback.substring(0, 80)}...`);
+        this.outputManager.appendLine(``);
+        this.outputManager.appendLine(`💡 TIP: Watch this panel for live updates from AI agents!`);
+        this.outputManager.appendLine(`────────────────────────────────────────────────────────────`);
+        this.outputManager.appendLine(``);
 
         // Write revision header to progress log
         fs.writeFileSync(progressPath, `════════════════════════════════════════════════════════════\n`);
@@ -2168,8 +2183,8 @@ _Reviewing feedback impact on testing..._
                 return { success: false, error: `Session ${sessionId} not found` };
             }
             
-            if (session.status !== 'approved' && session.status !== 'paused') {
-                return { success: false, error: `Session must be 'approved' or 'paused' to start execution (current: ${session.status})` };
+            if (session.status !== 'approved' && session.status !== 'paused' && session.status !== 'stopped') {
+                return { success: false, error: `Session must be 'approved', 'paused', or 'stopped' to start execution (current: ${session.status})` };
             }
             
             if (!session.currentPlanPath) {
@@ -2184,11 +2199,16 @@ _Reviewing feedback impact on testing..._
             const engineerCount = options?.engineerCount || session.recommendedEngineers?.count || 3;
             const mode = options?.mode || 'auto';
             
-            // Start the coordinator
+            // IMPORTANT: Reuse existing coordinator ID if session was paused/stopped
+            // This ensures consistent coordinator ID across pause/resume/stop/restart cycles
+            const existingCoordinatorId = session.execution?.coordinatorId;
+            
+            // Start the coordinator (reusing existing ID if available)
             const result = await this.coordinatorService.startCoordinator(session.currentPlanPath, {
                 mode,
                 engineerCount,
-                planSessionId: sessionId
+                planSessionId: sessionId,
+                reuseCoordinatorId: existingCoordinatorId  // Pass existing ID to reuse
             });
             
             // Create execution state on the session
@@ -2402,23 +2422,32 @@ _Reviewing feedback impact on testing..._
             return;
         }
         
-        // Update engineer states
-        for (const [name, engineerSession] of Object.entries(coordStatus.engineerSessions)) {
-            if (session.execution.engineers[name]) {
-                session.execution.engineers[name] = {
-                    ...session.execution.engineers[name],
-                    status: engineerSession.status === 'working' ? 'working' 
-                          : engineerSession.status === 'completed' ? 'completed'
-                          : engineerSession.status === 'error' ? 'error'
-                          : engineerSession.status === 'paused' ? 'paused'
-                          : 'starting',
-                    sessionId: engineerSession.sessionId,
-                    currentTask: engineerSession.task,
-                    logFile: engineerSession.logFile,
-                    processId: engineerSession.processId,
-                    lastActivity: engineerSession.lastActivity
-                };
+        // Remove engineers that are no longer in coordinator (released)
+        const currentEngineers = Object.keys(session.execution.engineers);
+        const activeEngineers = Object.keys(coordStatus.engineerSessions);
+        for (const name of currentEngineers) {
+            if (!activeEngineers.includes(name)) {
+                // Engineer was released - remove from session
+                delete session.execution.engineers[name];
             }
+        }
+        
+        // Update/add engineer states from coordinator
+        for (const [name, engineerSession] of Object.entries(coordStatus.engineerSessions)) {
+            session.execution.engineers[name] = {
+                ...(session.execution.engineers[name] || {}),
+                status: engineerSession.status === 'working' ? 'working' 
+                      : engineerSession.status === 'completed' ? 'completed'
+                      : engineerSession.status === 'error' ? 'error'
+                      : engineerSession.status === 'paused' ? 'paused'
+                      : engineerSession.status === 'idle' ? 'idle'
+                      : 'starting',
+                sessionId: engineerSession.sessionId,
+                currentTask: engineerSession.task,
+                logFile: engineerSession.logFile,
+                processId: engineerSession.processId,
+                lastActivity: engineerSession.lastActivity
+            };
         }
         
         // Update progress
@@ -2474,6 +2503,7 @@ _Reviewing feedback impact on testing..._
     /**
      * Stop a running planning session
      * Stops any active agent processes and marks session as stopped
+     * Uses ProcessManager for reliable process termination
      */
     async stopSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
         try {
@@ -2482,9 +2512,13 @@ _Reviewing feedback impact on testing..._
                 return { success: false, error: `Session ${sessionId} not found` };
             }
 
-            // Stop any running agents
-            this.agentRunner.stopContextGatherer();
-            this.agentRunner.stopAll();
+            this.writeProgress(sessionId, 'STOP', '='.repeat(60));
+            this.writeProgress(sessionId, 'STOP', `⏹️ STOPPING SESSION: ${sessionId}`);
+            this.writeProgress(sessionId, 'STOP', '='.repeat(60));
+
+            // Stop any running agents - await for proper cleanup
+            await this.agentRunner.stopContextGatherer();
+            await this.agentRunner.stopAll();
 
             // Update session status to 'stopped' (can be resumed)
             session.status = 'stopped';
@@ -2492,9 +2526,64 @@ _Reviewing feedback impact on testing..._
             this.stateManager.savePlanningSession(session);
             this.notifyChange();
 
+            this.writeProgress(sessionId, 'STOP', `✅ Session stopped successfully`);
+
             return { success: true };
         } catch (error) {
-            return { success: false, error: `Failed to stop session: ${error}` };
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            this.writeProgress(sessionId, 'ERROR', `❌ Failed to stop: ${errorMessage}`);
+            return { success: false, error: `Failed to stop session: ${errorMessage}` };
+        }
+    }
+
+    /**
+     * Pause a running planning session
+     * Saves the current state so it can be resumed later
+     */
+    async pauseSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            const session = this.stateManager.getPlanningSession(sessionId);
+            if (!session) {
+                return { success: false, error: `Session ${sessionId} not found` };
+            }
+
+            if (session.status !== 'debating' && session.status !== 'reviewing' && session.status !== 'revising') {
+                return { success: false, error: `Session ${sessionId} is not in a pausable state (current: ${session.status})` };
+            }
+
+            this.writeProgress(sessionId, 'PAUSE', '='.repeat(60));
+            this.writeProgress(sessionId, 'PAUSE', `⏸️ PAUSING SESSION: ${sessionId}`);
+            this.writeProgress(sessionId, 'PAUSE', `   Current status: ${session.status}`);
+            this.writeProgress(sessionId, 'PAUSE', '='.repeat(60));
+
+            // Stop agent processes (ProcessManager saves state automatically)
+            await this.agentRunner.stopContextGatherer();
+            await this.agentRunner.stopAll();
+
+            // Save the previous status so we can resume correctly
+            const previousStatus = session.status;
+            
+            // Update session status to 'paused'
+            session.status = 'stopped';  // Use 'stopped' as it's an existing valid status
+            session.updatedAt = new Date().toISOString();
+            
+            // Store pause metadata for smart resume
+            if (!session.metadata) {
+                session.metadata = {};
+            }
+            session.metadata.pausedAt = new Date().toISOString();
+            session.metadata.pausedStatus = previousStatus;
+            
+            this.stateManager.savePlanningSession(session);
+            this.notifyChange();
+
+            this.writeProgress(sessionId, 'PAUSE', `✅ Session paused successfully (was: ${previousStatus})`);
+
+            return { success: true };
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            this.writeProgress(sessionId, 'ERROR', `❌ Failed to pause: ${errorMessage}`);
+            return { success: false, error: `Failed to pause session: ${errorMessage}` };
         }
     }
 
@@ -2513,15 +2602,25 @@ _Reviewing feedback impact on testing..._
                 return { success: false, error: `Session ${sessionId} is not in a resumable state (current: ${session.status})` };
             }
 
+            // Determine what state to resume to
+            const previousStatus = session.metadata?.pausedStatus || 'debating';
+            
             // Log the resume action
             this.writeProgress(sessionId, 'RESUME', '='.repeat(60));
-            this.writeProgress(sessionId, 'RESUME', `📍 RESUMING SESSION: ${sessionId}`);
+            this.writeProgress(sessionId, 'RESUME', `▶️ RESUMING SESSION: ${sessionId}`);
             this.writeProgress(sessionId, 'RESUME', `   Previous status: ${session.status}`);
+            this.writeProgress(sessionId, 'RESUME', `   Resuming to: ${previousStatus}`);
             this.writeProgress(sessionId, 'RESUME', `   Requirement: ${session.requirement.substring(0, 60)}...`);
             this.writeProgress(sessionId, 'RESUME', '='.repeat(60));
 
-            // Update session status to 'debating' to restart the process
-            session.status = 'debating';
+            // Clear pause metadata
+            if (session.metadata) {
+                delete session.metadata.pausedAt;
+                delete session.metadata.pausedStatus;
+            }
+
+            // Update session status to resume from the right point
+            session.status = previousStatus as PlanningStatus;
             session.updatedAt = new Date().toISOString();
             this.stateManager.savePlanningSession(session);
             this.notifyChange();
@@ -2555,10 +2654,10 @@ _Reviewing feedback impact on testing..._
                 return { success: false, error: `Session ${sessionId} not found` };
             }
 
-            // Stop if still running
+            // Stop if still running - await for proper cleanup
             if (session.status === 'debating' || session.status === 'reviewing' || session.status === 'revising') {
-                this.agentRunner.stopContextGatherer();
-                this.agentRunner.stopAll();
+                await this.agentRunner.stopContextGatherer();
+                await this.agentRunner.stopAll();
             }
 
             const workingDir = this.stateManager.getWorkingDir();

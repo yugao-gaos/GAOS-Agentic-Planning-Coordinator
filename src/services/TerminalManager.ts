@@ -2,8 +2,15 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { EngineerTerminal } from '../types';
 
+interface CoordinatorTerminal {
+    coordinatorId: string;
+    terminal: vscode.Terminal;
+    logFile: string;
+}
+
 export class TerminalManager {
     private engineerTerminals: Map<string, EngineerTerminal> = new Map();
+    private coordinatorTerminals: Map<string, CoordinatorTerminal> = new Map();
     private disposables: vscode.Disposable[] = [];
 
     constructor() {
@@ -41,12 +48,12 @@ export class TerminalManager {
             return existing.terminal;
         }
 
-        // Create new terminal with custom name
+        // Create new terminal with session ID as name
         const terminal = vscode.window.createTerminal({
-            name: terminalName,
+            name: sessionId,
             cwd: workspaceRoot,
             iconPath: new vscode.ThemeIcon('person'),
-            message: `Engineer ${engineerName} - Session ${sessionId}`
+            message: `Engineer ${engineerName}`
         });
 
         // Store terminal reference
@@ -81,8 +88,26 @@ export class TerminalManager {
             return;
         }
 
-        // Start tailing the log file
-        engineerTerminal.terminal.sendText(`tail -f "${engineerTerminal.logFile}"`);
+        // Ensure log file exists, show current content, then start tailing
+        engineerTerminal.terminal.sendText(`touch "${engineerTerminal.logFile}" && cat "${engineerTerminal.logFile}" 2>/dev/null; echo "--- Live stream started ---"; tail -f "${engineerTerminal.logFile}"`);
+    }
+    
+    /**
+     * Run cursor agent directly in the terminal with streaming output
+     * @param promptFile Path to a file containing the prompt (avoids shell escaping issues)
+     */
+    runCursorAgent(engineerName: string, promptFile: string, logFile: string): boolean {
+        const engineerTerminal = this.engineerTerminals.get(engineerName);
+        if (!engineerTerminal || !this.isTerminalAlive(engineerTerminal.terminal)) {
+            return false;
+        }
+
+        // Run cursor agent with streaming JSON output, parsed and written to log
+        // This mimics what run_engineer.sh does for consistent output format
+        const command = `cursor agent --model sonnet-4.5 -p --force --approve-mcps --output-format stream-json --stream-partial-output "$(cat '${promptFile}')" 2>&1 | while IFS= read -r line; do content=$(echo "$line" | jq -r '.message.content[0].text // empty' 2>/dev/null); [ -n "$content" ] && [ "$content" != "null" ] && printf "%s" "$content"; done | tee -a "${logFile}"`;
+        
+        engineerTerminal.terminal.sendText(command);
+        return true;
     }
 
     /**
@@ -112,7 +137,7 @@ export class TerminalManager {
         // Terminal was closed but we have the info - recreate it
         if (engineerTerminal) {
             const terminal = vscode.window.createTerminal({
-                name: `${engineerName}_${engineerTerminal.sessionId.substring(0, 8)}`,
+                name: engineerTerminal.sessionId,
                 iconPath: new vscode.ThemeIcon('person'),
                 message: `Engineer ${engineerName} - Reconnected`
             });
@@ -184,15 +209,79 @@ export class TerminalManager {
     /**
      * Create a coordinator terminal for monitoring
      */
-    createCoordinatorTerminal(coordinatorId: string, workspaceRoot: string): vscode.Terminal {
+    createCoordinatorTerminal(
+        coordinatorId: string, 
+        logFile: string,
+        workspaceRoot: string
+    ): vscode.Terminal {
+        // Check if terminal already exists
+        const existing = this.coordinatorTerminals.get(coordinatorId);
+        if (existing && this.isTerminalAlive(existing.terminal)) {
+            existing.terminal.show();
+            return existing.terminal;
+        }
+
         const terminal = vscode.window.createTerminal({
-            name: `Coordinator_${coordinatorId}`,
+            name: coordinatorId,
             cwd: workspaceRoot,
             iconPath: new vscode.ThemeIcon('organization'),
-            message: `Coordinator ${coordinatorId} - Monitoring`
+            message: `Coordinator - Real-time logs`
         });
 
+        // Store terminal reference
+        this.coordinatorTerminals.set(coordinatorId, {
+            coordinatorId,
+            terminal,
+            logFile
+        });
+
+        // Show the terminal
+        terminal.show(false);
+
         return terminal;
+    }
+
+    /**
+     * Start tailing the coordinator's log file in their terminal
+     */
+    startCoordinatorLogTail(coordinatorId: string): void {
+        const coordTerminal = this.coordinatorTerminals.get(coordinatorId);
+        if (!coordTerminal) {
+            console.warn(`No terminal found for coordinator: ${coordinatorId}`);
+            return;
+        }
+
+        if (!this.isTerminalAlive(coordTerminal.terminal)) {
+            console.warn(`Terminal for ${coordinatorId} is not alive`);
+            return;
+        }
+
+        // Ensure log file exists, show existing content, then tail
+        // Use touch to create if missing, cat to show existing, then tail -f
+        coordTerminal.terminal.sendText(`touch "${coordTerminal.logFile}" && cat "${coordTerminal.logFile}" 2>/dev/null; echo "--- Live stream started ---"; tail -f "${coordTerminal.logFile}"`);
+    }
+
+    /**
+     * Close a coordinator's terminal
+     */
+    closeCoordinatorTerminal(coordinatorId: string): void {
+        const coordTerminal = this.coordinatorTerminals.get(coordinatorId);
+        if (coordTerminal && this.isTerminalAlive(coordTerminal.terminal)) {
+            coordTerminal.terminal.dispose();
+        }
+        this.coordinatorTerminals.delete(coordinatorId);
+    }
+
+    /**
+     * Show a coordinator's terminal
+     */
+    showCoordinatorTerminal(coordinatorId: string): boolean {
+        const coordTerminal = this.coordinatorTerminals.get(coordinatorId);
+        if (coordTerminal && this.isTerminalAlive(coordTerminal.terminal)) {
+            coordTerminal.terminal.show();
+            return true;
+        }
+        return false;
     }
 
     dispose(): void {
@@ -200,6 +289,14 @@ export class TerminalManager {
             disposable.dispose();
         }
         this.closeAllTerminals();
+        
+        // Close coordinator terminals
+        for (const [id, coordTerminal] of this.coordinatorTerminals) {
+            if (this.isTerminalAlive(coordTerminal.terminal)) {
+                coordTerminal.terminal.dispose();
+            }
+        }
+        this.coordinatorTerminals.clear();
     }
 }
 

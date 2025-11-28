@@ -292,38 +292,55 @@ case "$COMMAND" in
         shift 2>/dev/null || true
         case "$SUB" in
             list|ls)
-                send_request "coordinator.list" "[]"
+                send_request "exec.list" "[]"
                 ;;
             start|s)
-                PLAN="${1:-}"
-                if [[ -z "$PLAN" ]]; then
-                    echo -e "${RED}Usage: apc exec start <plan_path_or_session_id>${RESET}"
+                SESSION="${1:-}"
+                if [[ -z "$SESSION" ]]; then
+                    echo -e "${RED}Usage: apc exec start <session_id>${RESET}"
+                    echo -e "${YELLOW}Example: apc exec start ps_001${RESET}"
                     exit 1
                 fi
-                send_request "coordinator.start" "{\"plan\": \"$PLAN\"}"
+                send_request "exec.start" "{\"session\": \"$SESSION\"}"
                 ;;
             status|st)
-                ID="${1:-}"
-                if [[ -z "$ID" ]]; then
-                    echo -e "${RED}Usage: apc exec status <coordinator_id>${RESET}"
+                SESSION="${1:-}"
+                if [[ -z "$SESSION" ]]; then
+                    echo -e "${RED}Usage: apc exec status <session_id>${RESET}"
                     exit 1
                 fi
-                send_request "coordinator.status" "{\"id\": \"$ID\"}"
+                send_request "exec.status" "{\"session\": \"$SESSION\"}"
                 ;;
             pause|p)
-                ID="${1:-}"
-                send_request "coordinator.pause" "{\"id\": \"$ID\"}"
+                SESSION="${1:-}"
+                if [[ -z "$SESSION" ]]; then
+                    echo -e "${RED}Usage: apc exec pause <session_id>${RESET}"
+                    exit 1
+                fi
+                send_request "exec.pause" "{\"session\": \"$SESSION\"}"
                 ;;
             resume|r)
-                ID="${1:-}"
-                send_request "coordinator.resume" "{\"id\": \"$ID\"}"
+                SESSION="${1:-}"
+                if [[ -z "$SESSION" ]]; then
+                    echo -e "${RED}Usage: apc exec resume <session_id>${RESET}"
+                    exit 1
+                fi
+                send_request "exec.resume" "{\"session\": \"$SESSION\"}"
                 ;;
             stop|x)
-                ID="${1:-}"
-                send_request "coordinator.stop" "{\"id\": \"$ID\"}"
+                SESSION="${1:-}"
+                if [[ -z "$SESSION" ]]; then
+                    echo -e "${RED}Usage: apc exec stop <session_id>${RESET}"
+                    exit 1
+                fi
+                send_request "exec.stop" "{\"session\": \"$SESSION\"}"
                 ;;
             *)
-                echo -e "${YELLOW}Usage: apc exec [list|start|status|pause|resume|stop]${RESET}"
+                echo -e "${YELLOW}Usage: apc exec [start|status|pause|resume|stop]${RESET}"
+                echo -e "${YELLOW}Examples:${RESET}"
+                echo -e "${YELLOW}  apc exec start ps_001  - Start execution for approved plan${RESET}"
+                echo -e "${YELLOW}  apc exec pause ps_001  - Pause execution${RESET}"
+                echo -e "${YELLOW}  apc exec resume ps_001 - Resume execution${RESET}"
                 ;;
         esac
         ;;
@@ -345,55 +362,6 @@ case "$COMMAND" in
                 ;;
             *)
                 echo -e "${YELLOW}Usage: apc pool [status|resize]${RESET}"
-                ;;
-        esac
-        ;;
-    
-    eng|engineer)
-        SUB="${1:-list}"
-        shift 2>/dev/null || true
-        case "$SUB" in
-            list|ls)
-                send_request "engineer.list" "[]"
-                ;;
-            status|st)
-                NAME="${1:-}"
-                send_request "engineer.status" "{\"name\": \"$NAME\"}"
-                ;;
-            log|l)
-                NAME="${1:-}"
-                LINES="${2:-50}"
-                send_request "engineer.log" "{\"name\": \"$NAME\", \"lines\": $LINES}"
-                ;;
-            term|t)
-                NAME="${1:-}"
-                send_request "engineer.terminal" "{\"name\": \"$NAME\"}"
-                ;;
-            stop|x)
-                NAME="${1:-}"
-                send_request "engineer.stop" "{\"name\": \"$NAME\"}"
-                ;;
-            *)
-                echo -e "${YELLOW}Usage: apc eng [list|status|log|term|stop]${RESET}"
-                ;;
-        esac
-        ;;
-    
-    unity|u)
-        SUB="${1:-compile}"
-        shift 2>/dev/null || true
-        case "$SUB" in
-            compile|c)
-                send_request "unity.compile" "[]"
-                ;;
-            test|t)
-                send_request "unity.test" "[]"
-                ;;
-            console|co)
-                send_request "unity.console" "[]"
-                ;;
-            *)
-                echo -e "${YELLOW}Usage: apc unity [compile|test|console]${RESET}"
                 ;;
         esac
         ;;
@@ -426,17 +394,6 @@ case "$COMMAND" in
         echo -e "${YELLOW}Engineer Pool:${RESET}"
         echo "  pool status                Show pool status"
         echo "  pool resize <n>            Resize pool"
-        echo ""
-        echo -e "${YELLOW}Engineers:${RESET}"
-        echo "  eng list                   List all engineers"
-        echo "  eng status <name>          Engineer status"
-        echo "  eng log <name> [lines]     View engineer log"
-        echo "  eng term <name>            Open engineer terminal"
-        echo ""
-        echo -e "${YELLOW}Unity:${RESET}"
-        echo "  unity compile              Check compilation"
-        echo "  unity test                 Run playmode test"
-        echo "  unity console              Read console"
         echo ""
         ;;
     

@@ -58,33 +58,47 @@ export interface PlanningSession {
     recommendedEngineers?: EngineerRecommendation;
     createdAt: string;
     updatedAt: string;
+    metadata?: Record<string, any>;  // Optional metadata for pause/resume state
     
     // === Execution State (embedded coordinator) ===
     execution?: ExecutionState;
 }
 
 /**
- * Planning status now includes execution phases
+ * Planning-only statuses (for the plan creation phase)
  * - debating: AI analysts creating plan
- * - reviewing: User reviewing plan
+ * - reviewing: Plan complete, user reviewing for approval
  * - revising: Agents revising based on feedback
  * - approved: Plan approved, ready to execute
- * - executing: Plan being executed by engineers
- * - paused: Execution paused (can resume)
- * - stopped: Stopped by user (can resume)
- * - completed: All tasks done
- * - cancelled: Cancelled, cannot resume
+ * - stopped: Planning stopped by user (can resume)
+ * - cancelled: Planning cancelled, cannot resume
  */
-export type PlanningStatus = 
+export type PlanningOnlyStatus = 
     | 'debating' 
     | 'reviewing' 
     | 'approved' 
     | 'revising' 
-    | 'cancelled' 
     | 'stopped'
+    | 'cancelled';
+
+/**
+ * Execution-only statuses (for the execution phase)
+ * - executing: Engineers actively working
+ * - paused: Execution paused (can resume)
+ * - completed: All tasks done
+ * - failed: Execution failed
+ */
+export type ExecutionOnlyStatus =
     | 'executing'
     | 'paused'
-    | 'completed';
+    | 'completed'
+    | 'failed';
+
+/**
+ * Combined status for PlanningSession
+ * The session tracks both planning phase and execution phase
+ */
+export type PlanningStatus = PlanningOnlyStatus | ExecutionOnlyStatus;
 
 /**
  * Execution state embedded in PlanningSession for UI display
@@ -146,15 +160,17 @@ export interface CoordinatorState {
     engineerSessions: Record<string, EngineerSessionInfo>;
     planVersion: number;
     progress: TaskProgress;
+    logFile: string;  // Coordinator log file for terminal streaming
+    executionSummaryPath?: string;  // Path to execution summary/review file
     createdAt: string;
     updatedAt: string;
 }
 
-export type CoordinatorStatus = 'initializing' | 'running' | 'paused' | 'stopped' | 'completed' | 'error';
+export type CoordinatorStatus = 'initializing' | 'running' | 'paused' | 'stopped' | 'reviewing' | 'completed' | 'error';
 
 export interface EngineerSessionInfo {
     sessionId: string;
-    status: 'starting' | 'working' | 'paused' | 'completed' | 'error' | 'stopped';
+    status: 'starting' | 'working' | 'paused' | 'completed' | 'error' | 'stopped' | 'idle';
     task?: string;
     logFile: string;
     processId?: number;

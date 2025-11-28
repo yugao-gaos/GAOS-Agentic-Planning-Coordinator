@@ -154,6 +154,10 @@ export class CliIpcService {
                 case 'plan':
                     result = await this.handlePlan(action, request.args);
                     break;
+                case 'exec':
+                case 'execute':
+                    result = await this.handleExec(action, request.args);
+                    break;
                 case 'coordinator':
                     result = await this.handleCoordinator(action, request.args);
                     break;
@@ -220,6 +224,33 @@ export class CliIpcService {
                 return this.cliHandler.handleCommand(['plan', 'cancel', '--id', args.id || '']);
             default:
                 return { success: false, error: `Unknown plan action: ${action}` };
+        }
+    }
+
+    private async handleExec(action: string, args: any): Promise<any> {
+        switch (action) {
+            case 'start':
+                const startArgs = ['exec', 'start'];
+                if (args.session || args.id) {
+                    startArgs.push('--session', args.session || args.id);
+                }
+                if (args.mode) {
+                    startArgs.push('--mode', args.mode);
+                }
+                if (args.engineers) {
+                    startArgs.push('--engineers', String(args.engineers));
+                }
+                return this.cliHandler.handleCommand(startArgs);
+            case 'pause':
+                return this.cliHandler.handleCommand(['exec', 'pause', '--session', args.session || args.id || '']);
+            case 'resume':
+                return this.cliHandler.handleCommand(['exec', 'resume', '--session', args.session || args.id || '']);
+            case 'stop':
+                return this.cliHandler.handleCommand(['exec', 'stop', '--session', args.session || args.id || '']);
+            case 'status':
+                return this.cliHandler.handleCommand(['exec', 'status', '--session', args.session || args.id || '']);
+            default:
+                return { success: false, error: `Unknown exec action: ${action}` };
         }
     }
 

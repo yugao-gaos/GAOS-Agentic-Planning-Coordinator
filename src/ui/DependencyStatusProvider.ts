@@ -6,6 +6,7 @@ export class DependencyStatusProvider implements vscode.TreeDataProvider<Depende
     readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
     private dependencyService: DependencyService;
+    private hasMissingDependencies: boolean = false;
 
     constructor() {
         this.dependencyService = DependencyService.getInstance();
@@ -21,10 +22,6 @@ export class DependencyStatusProvider implements vscode.TreeDataProvider<Depende
     }
 
     async getChildren(element?: DependencyItem): Promise<DependencyItem[]> {
-        if (element) {
-            return [];
-        }
-
         const statuses = this.dependencyService.getCachedStatus();
         const platform = process.platform;
 
@@ -33,6 +30,12 @@ export class DependencyStatusProvider implements vscode.TreeDataProvider<Depende
             s => s.platform === platform || s.platform === 'all'
         );
 
+        // If this is a child request - no children needed
+        if (element) {
+            return [];
+        }
+
+        // Root level
         if (relevantStatuses.length === 0) {
             // Show "checking..." item
             return [new DependencyItem(
@@ -43,36 +46,59 @@ export class DependencyStatusProvider implements vscode.TreeDataProvider<Depende
             )];
         }
 
-        const allMet = relevantStatuses.filter(s => s.required).every(s => s.installed);
+        const requiredStatuses = relevantStatuses.filter(s => s.required);
+        const optionalStatuses = relevantStatuses.filter(s => !s.required);
+        const allRequiredMet = requiredStatuses.every(s => s.installed);
+        this.hasMissingDependencies = !allRequiredMet;
 
         const items: DependencyItem[] = [];
 
-        // Add summary item
-        items.push(new DependencyItem(
-            allMet ? '✓ All dependencies met' : '⚠ Missing dependencies',
-            '',
-            vscode.TreeItemCollapsibleState.None,
-            allMet ? 'check' : 'warning',
-            undefined,
-            allMet ? 'ready' : 'missing'
-        ));
-
-        // Add individual dependency items
-        for (const status of relevantStatuses) {
-            const item = new DependencyItem(
-                status.name,
-                status.installed 
-                    ? (status.version ? `v${status.version}` : 'Installed')
-                    : 'Not installed',
+        if (allRequiredMet) {
+            // ✅ All required deps met - just show green checkmark with "Ready"
+            items.push(new DependencyItem(
+                '✓ Ready',
+                '',
                 vscode.TreeItemCollapsibleState.None,
-                status.installed ? 'check' : 'close',
-                status,
-                status.installed ? 'installed' : 'missing'
-            );
-            items.push(item);
+                'circle-filled',  // Solid circle icon
+                undefined,
+                'ready'
+            ));
+            // No sub-items when ready!
+        } else {
+            // ⚠️ Missing dependencies - show each missing one as a flat list (clickable to install)
+            const missingDeps = requiredStatuses.filter(s => !s.installed);
+            
+            // Header showing count
+            items.push(new DependencyItem(
+                `⚠ ${missingDeps.length} Missing`,
+                'Click items below to install',
+                vscode.TreeItemCollapsibleState.None,
+                'warning',
+                undefined,
+                'missing-header'
+            ));
+            
+            // Show each missing dependency (clickable)
+            for (const status of missingDeps) {
+                items.push(new DependencyItem(
+                    `  ✗ ${status.name}`,
+                    'Click to install',
+                    vscode.TreeItemCollapsibleState.None,
+                    'close',
+                    status,
+                    'missing'
+                ));
+            }
         }
 
         return items;
+    }
+
+    /**
+     * Check if there are missing dependencies (for auto-expand)
+     */
+    hasMissing(): boolean {
+        return this.hasMissingDependencies;
     }
 }
 
@@ -83,14 +109,25 @@ class DependencyItem extends vscode.TreeItem {
         public readonly collapsibleState: vscode.TreeItemCollapsibleState,
         iconId?: string,
         public readonly dependency?: DependencyStatus,
-        contextValue?: string
+        contextValue?: string,
+        isChild: boolean = false
     ) {
         super(label, collapsibleState);
         this.description = description;
         this.contextValue = contextValue;
         
         if (iconId) {
-            this.iconPath = new vscode.ThemeIcon(iconId);
+            // Use colored icons based on status
+            if (contextValue === 'missing' || contextValue === 'missing-parent' || contextValue === 'missing-header') {
+                this.iconPath = new vscode.ThemeIcon(iconId, new vscode.ThemeColor('errorForeground'));
+            } else if (contextValue === 'ready' || contextValue === 'installed') {
+                // Use bright green for ready status
+                this.iconPath = new vscode.ThemeIcon(iconId, new vscode.ThemeColor('testing.iconPassed'));
+            } else if (contextValue === 'info') {
+                this.iconPath = new vscode.ThemeIcon(iconId, new vscode.ThemeColor('charts.blue'));
+            } else {
+                this.iconPath = new vscode.ThemeIcon(iconId);
+            }
         }
 
         if (dependency) {
@@ -98,7 +135,7 @@ class DependencyItem extends vscode.TreeItem {
             
             // If not installed, make it clickable
             if (!dependency.installed) {
-                if (dependency.name === 'APC CLI') {
+                if (dependency.name.includes('APC CLI')) {
                     // Special case: APC CLI uses our install command
                     this.command = {
                         command: 'agenticPlanning.installCli',
@@ -112,6 +149,11 @@ class DependencyItem extends vscode.TreeItem {
                     };
                 }
             }
+        }
+
+        // For missing parent, clicking should just expand (default behavior)
+        if (contextValue === 'missing-parent') {
+            this.tooltip = 'Click to see missing dependencies and install them';
         }
     }
 
@@ -133,4 +175,3 @@ class DependencyItem extends vscode.TreeItem {
         return tooltip;
     }
 }
-

@@ -132,6 +132,15 @@ export class StateManager {
         }
     }
 
+    /**
+     * Public method to reload state from files (used by file watcher)
+     * This is called when external processes (CLI, bash scripts) modify state files
+     */
+    reloadFromFiles(): void {
+        this.loadStateFromFiles();
+        console.log('StateManager: Reloaded state from files');
+    }
+
     async updateStateFiles(): Promise<void> {
         // Update extension state
         const extensionStatePath = path.join(this.workingDir, '.extension_state.json');
@@ -255,18 +264,50 @@ export class StateManager {
 
     generatePlanningSessionId(): string {
         const count = this.planningSessions.size + 1;
-        return `ps_${count.toString().padStart(3, '0')}`;
+        return `ps_${count.toString().padStart(6, '0')}`;
     }
 
-    generateCoordinatorId(): string {
-        const count = this.coordinators.size + 1;
-        return `coord_${count.toString().padStart(3, '0')}`;
+    /**
+     * Generate coordinator ID with hash-style format
+     * Format: coord_XXXXXXXX (8 random alphanumeric characters)
+     * Each new coordinator gets a unique hash ID
+     */
+    generateCoordinatorId(_planSessionId?: string): string {
+        // Generate random 8-character alphanumeric hash
+        const chars = '0123456789abcdefghijklmnopqrstuvwxyz';
+        let hash = '';
+        for (let i = 0; i < 8; i++) {
+            hash += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        return `coord_${hash}`;
     }
 
+    /**
+     * Generate incremental session ID for an engineer
+     * Format: engineername_000001, engineername_000002, etc.
+     */
     generateSessionId(engineerName: string): string {
-        const timestamp = Date.now().toString(36);
-        const random = Math.random().toString(36).substring(2, 6);
-        return `${engineerName.toLowerCase()}_${timestamp}_${random}`;
+        // Count existing sessions for this engineer from log files
+        const logsDir = path.join(this.workingDir, 'Logs', 'engineers');
+        let count = 1;
+        
+        if (fs.existsSync(logsDir)) {
+            const pattern = new RegExp(`^${engineerName.toLowerCase()}_\\d{6}\\.log$`, 'i');
+            const existingLogs = fs.readdirSync(logsDir).filter(f => pattern.test(f));
+            
+            // Find the highest number
+            for (const log of existingLogs) {
+                const match = log.match(/_(\d{6})\.log$/);
+                if (match) {
+                    const num = parseInt(match[1], 10);
+                    if (num >= count) {
+                        count = num + 1;
+                    }
+                }
+            }
+        }
+        
+        return `${engineerName.toLowerCase()}_${count.toString().padStart(6, '0')}`;
     }
 }
 

@@ -11,6 +11,8 @@ import { PlanningSessionsProvider, PlanningSessionItem } from './ui/PlanningSess
 import { CoordinatorsProvider } from './ui/CoordinatorsProvider';
 import { EngineerPoolProvider } from './ui/EngineerPoolProvider';
 import { DependencyStatusProvider } from './ui/DependencyStatusProvider';
+import { UnityControlStatusProvider } from './ui/UnityControlStatusProvider';
+import { UnityControlAgent } from './services/UnityControlAgent';
 
 let stateManager: StateManager;
 let engineerPoolService: EngineerPoolService;
@@ -55,12 +57,78 @@ export async function activate(context: vscode.ExtensionContext) {
     const dependencyStatusProvider = new DependencyStatusProvider();
     const planningSessionsProvider = new PlanningSessionsProvider(stateManager);
     const engineerPoolProvider = new EngineerPoolProvider(engineerPoolService);
+    const unityControlStatusProvider = new UnityControlStatusProvider();
+    
+    // Initialize Unity Control Agent and connect to UI
+    const unityControlAgent = UnityControlAgent.getInstance();
+    if (workspaceRoot) {
+        unityControlAgent.initialize(workspaceRoot);
+    }
+    
+    // Connect Unity Control Agent events to UI
+    unityControlAgent.onStatusChanged((state) => {
+        unityControlStatusProvider.updateStatus({
+            isRunning: state.status !== 'idle' || unityControlAgent.getQueue().length > 0,
+            currentTask: state.currentTask ? {
+                id: state.currentTask.id,
+                type: state.currentTask.type as 'prep_editor' | 'test_framework_editmode' | 'test_framework_playmode' | 'test_player_playmode',
+                requestedBy: state.currentTask.requestedBy.map(r => r.engineerName),
+                status: state.currentTask.status as 'queued' | 'executing' | 'completed' | 'failed',
+                queuedAt: state.currentTask.createdAt,
+                phase: state.currentTask.phase
+            } : null,
+            queueLength: state.queueLength,
+            queue: unityControlAgent.getQueue().map(t => ({
+                id: t.id,
+                type: t.type as 'prep_editor' | 'test_framework_editmode' | 'test_framework_playmode' | 'test_player_playmode',
+                requestedBy: t.requestedBy.map(r => r.engineerName),
+                status: t.status as 'queued' | 'executing' | 'completed' | 'failed',
+                queuedAt: t.createdAt
+            })),
+            estimatedWaitTime: Math.floor(unityControlAgent.getEstimatedWaitTime('prep_editor') / 1000),
+            lastActivity: state.lastActivity
+        });
+    });
 
     context.subscriptions.push(
         vscode.window.registerTreeDataProvider('agenticPlanning.dependencyStatusView', dependencyStatusProvider),
         vscode.window.registerTreeDataProvider('agenticPlanning.planningSessionsView', planningSessionsProvider),
-        vscode.window.registerTreeDataProvider('agenticPlanning.engineerPoolView', engineerPoolProvider)
+        vscode.window.registerTreeDataProvider('agenticPlanning.engineerPoolView', engineerPoolProvider),
+        vscode.window.registerTreeDataProvider('agenticPlanning.unityControlView', unityControlStatusProvider)
     );
+
+    // Watch for state file changes to auto-refresh UI (CLI updates files directly)
+    const config = vscode.workspace.getConfiguration('agenticPlanning');
+    const workingDirectory = config.get<string>('workingDirectory', '_AiDevLog');
+    const stateFilesPattern = new vscode.RelativePattern(
+        vscode.Uri.file(workspaceRoot), 
+        `${workingDirectory}/{.engineer_pool.json,planning_sessions/*.json,coordinators/*.json}`
+    );
+    
+    const stateFileWatcher = vscode.workspace.createFileSystemWatcher(stateFilesPattern);
+    
+    // Debounce refresh to avoid rapid-fire updates
+    let refreshTimeout: NodeJS.Timeout | undefined;
+    const debouncedRefresh = () => {
+        if (refreshTimeout) {
+            clearTimeout(refreshTimeout);
+        }
+        refreshTimeout = setTimeout(() => {
+            // Reload state from files
+            stateManager.reloadFromFiles();
+            // Refresh all UI providers
+            engineerPoolProvider.refresh();
+            planningSessionsProvider.refresh();
+        }, 500); // 500ms debounce
+    };
+    
+    stateFileWatcher.onDidChange(debouncedRefresh);
+    stateFileWatcher.onDidCreate(debouncedRefresh);
+    stateFileWatcher.onDidDelete(debouncedRefresh);
+    
+    context.subscriptions.push(stateFileWatcher);
+    
+    console.log('State file watcher initialized for auto-refresh');
 
     // Connect planning service events to UI refresh
     planningService.onSessionsChanged(() => {
@@ -370,6 +438,85 @@ Let's get started!`;
                 }
             }
         }),
+        
+        // Revise plan - opens AI chat for revision
+        vscode.commands.registerCommand('agenticPlanning.revisePlan', async (item?: { session?: { id: string } }) => {
+            const sessionId = item?.session?.id;
+            if (!sessionId) {
+                vscode.window.showWarningMessage('No session selected');
+                return;
+            }
+            
+            const session = planningService.getPlanningStatus(sessionId);
+            if (!session) {
+                vscode.window.showErrorMessage(`Session ${sessionId} not found`);
+                return;
+            }
+            
+            // Pre-filled prompt for revision
+            const revisionPrompt = `I want to revise the plan for session ${sessionId}.
+
+Current plan: ${session.currentPlanPath}
+Requirement: ${session.requirement.substring(0, 200)}...
+
+Please help me revise the plan. What changes would you like to make?
+
+IMPORTANT: After discussing changes, run:
+  apc plan revise ${sessionId} "<feedback summary>"
+
+This will trigger the multi-agent debate to revise the plan.`;
+
+            // Copy to clipboard and open chat
+            await vscode.env.clipboard.writeText(revisionPrompt);
+            
+            const { exec } = require('child_process');
+            if (process.platform === 'darwin') {
+                const script = `
+                    tell application "Cursor" to activate
+                    delay 0.2
+                    tell application "System Events" to key code 53
+                    delay 0.3
+                    tell application "System Events" to keystroke "l" using {command down, shift down}
+                    delay 0.5
+                    tell application "System Events" to keystroke "v" using command down
+                `;
+                exec(`osascript -e '${script}'`, (error: Error | null) => {
+                    if (error) {
+                        vscode.window.showInformationMessage(
+                            'Revision prompt copied! Press Cmd+Shift+L to open chat, then Cmd+V to paste.'
+                        );
+                    }
+                });
+            } else {
+                vscode.window.showInformationMessage(
+                    'Revision prompt copied! Press Ctrl+Shift+L to open chat, then Ctrl+V to paste.'
+                );
+            }
+        }),
+        
+        // Approve plan and auto-start execution
+        vscode.commands.registerCommand('agenticPlanning.approvePlan', async (item?: { session?: { id: string } }) => {
+            const sessionId = item?.session?.id;
+            if (!sessionId) {
+                vscode.window.showWarningMessage('No session selected');
+                return;
+            }
+            
+            const confirm = await vscode.window.showInformationMessage(
+                `Approve plan for ${sessionId} and start execution?`,
+                { modal: true },
+                'Approve & Execute'
+            );
+            
+            if (confirm === 'Approve & Execute') {
+                // Approve plan with autoStart=true (handles execution internally)
+                await planningService.approvePlan(sessionId, true);
+                // Note: approvePlan with autoStart=true already starts execution and shows messages
+                planningSessionsProvider.refresh();
+                engineerPoolProvider.refresh();
+            }
+        }),
+        
         vscode.commands.registerCommand('agenticPlanning.refreshEngineerPool', () => {
             // Also sync with settings when manually refreshed
             const configSize = vscode.workspace.getConfiguration('agenticPlanning').get<number>('engineerPoolSize', 5);
@@ -384,6 +531,30 @@ Let's get started!`;
                 }
             }
             engineerPoolProvider.refresh();
+        }),
+
+        // Release/stop a busy engineer manually
+        vscode.commands.registerCommand('agenticPlanning.releaseEngineer', async (item?: { label?: string; engineerStatus?: { name?: string } }) => {
+            // Get engineer name from the tree item
+            const engineerName = typeof item?.label === 'string' ? item.label : item?.engineerStatus?.name;
+            
+            if (!engineerName) {
+                vscode.window.showErrorMessage('No engineer selected');
+                return;
+            }
+            
+            const confirm = await vscode.window.showWarningMessage(
+                `Release ${engineerName} from their current coordinator?`,
+                { modal: true },
+                'Release'
+            );
+            
+            if (confirm === 'Release') {
+                engineerPoolService.releaseEngineers([engineerName]);
+                engineerPoolProvider.refresh();
+                planningSessionsProvider.refresh();
+                vscode.window.showInformationMessage(`${engineerName} released back to pool`);
+            }
         }),
 
         // Dependency commands
