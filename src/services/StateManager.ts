@@ -40,6 +40,13 @@ export class StateManager {
         this.engineerPoolState = this.createDefaultEngineerPool(this.extensionState.globalSettings.engineerPoolSize);
     }
 
+    /**
+     * Get the current engineer pool size from settings
+     */
+    getPoolSize(): number {
+        return this.extensionState.globalSettings.engineerPoolSize;
+    }
+
     // ========================================================================
     // Path Helpers - All paths relative to plan folder structure
     // ========================================================================

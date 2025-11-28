@@ -805,13 +805,15 @@ export class PlanningService {
 
         // Run multi-agent debate - agents write directly to plan file
         // Context Gatherer continues running in background during this
+        const poolSize = this.stateManager.getPoolSize();
         const analyses = await this.agentRunner.runMultiAgentDebate(
             session.id,
             session.requirement,
             docs,
             planFilePath,
             contextString,
-            (msg) => this.writeProgress(session.id, 'DEBATE', `${msg}`)
+            (msg) => this.writeProgress(session.id, 'DEBATE', `${msg}`),
+            poolSize
         );
 
         // Store analyses on session
@@ -1955,13 +1957,15 @@ _Reviewing feedback impact on testing..._
         
         // Run multi-agent debate with revision context
         // Agents write directly to the plan file
+        const poolSize = this.stateManager.getPoolSize();
         const analyses = await this.agentRunner.runMultiAgentDebate(
             session.id,
             revisionRequirement,
             [],  // No additional docs for revision
             planPath,
             existingPlanContent,  // Pass existing plan as context
-            (msg) => this.writeProgress(session.id, 'DEBATE', `${msg}`)
+            (msg) => this.writeProgress(session.id, 'DEBATE', `${msg}`),
+            poolSize
         );
 
         // Store analyses on session

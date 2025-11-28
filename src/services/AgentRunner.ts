@@ -305,7 +305,8 @@ export class AgentRunner {
         sessionId: string,
         requirement: string,
         docs: string[],
-        planPath: string
+        planPath: string,
+        poolSize: number = 5  // Dynamic pool size from settings
     ): void {
         const timestamp = new Date().toISOString();
         const analysts = ANALYST_CONFIGS.map(a => `- ${a.name} (${a.role})`).join('\n');
@@ -411,11 +412,13 @@ _Will be generated from task dependencies_
 
 ## 8. Engineer Allocation
 
-**Recommended:** TBD (Maximize based on task parallelism)
+**Pool Size:** ${poolSize} engineers available
+**Recommended:** TBD (Maximize based on task parallelism, up to ${poolSize})
 **Rationale:** TBD
 
 _Each analyst will vote on engineer count based on maximum parallel tasks possible.
-AI engineers have NO communication overhead - more = faster if tasks allow._
+AI engineers have NO communication overhead - more = faster if tasks allow.
+Pool has ${poolSize} engineers available - use them all if tasks parallelize!_
 
 ---
 
@@ -1372,7 +1375,8 @@ ${tasks.map((t, i) => `${i + 1}. ${t.name}\n   Files: ${t.files.join(', ')}`).jo
         requirement: string,
         docs: string[],
         planFile: string,  // Changed from debateFile to planFile
-        contextSummary: string
+        contextSummary: string,
+        poolSize: number = 5  // Dynamic pool size from settings
     ): string {
         const docsParam = docs.map(d => d.replace('_AiDevLog/Docs/', '')).join(',');
         
@@ -1491,15 +1495,15 @@ cat > /tmp/${analyst.id}_analysis.md << 'ANALYSIS_EOF'
 - Best Practice: ...
 
 #### Engineer Vote
-- Count: [number] (Aim for MAXIMUM parallelization - see guidance below)
+- Count: [number] (Pool has ${poolSize} engineers - use them if tasks parallelize!)
 - Rationale: [Explain based on task dependency graph]
 
 **IMPORTANT: AI Engineer Guidelines:**
 - Engineers are AI agents with NO communication overhead
 - More engineers = faster execution IF tasks can parallelize
+- Pool has ${poolSize} engineers available - recommend up to that many
 - Count the MAXIMUM number of tasks that can run simultaneously at any wave
-- Don't artificially limit to 3 - analyze actual task dependencies
-- Example: 5 independent tasks = recommend 5 engineers
+- Example: 5 independent tasks in a wave = recommend 5 engineers
 
 #### Response to Other Analysts
 - [If you read other analysts' findings, respond here]
@@ -1643,17 +1647,18 @@ BEGIN YOUR ANALYSIS NOW. Start by calling Unity MCP and gather_task_context.sh.
         docs: string[],
         planFile: string,
         contextSummary: string,
-        onProgress?: (message: string) => void
+        onProgress?: (message: string) => void,
+        poolSize: number = 5  // Dynamic pool size from settings
     ): Promise<AgentAnalysis[]> {
         if (!this.isCursorAvailable()) {
             onProgress?.('⚠️ Cursor CLI not available. Using fallback analysis.');
-            return [this.getMockAnalysis(requirement)];
+            return [this.getMockAnalysis(requirement, poolSize)];
         }
 
         // Create plan skeleton if it doesn't exist
         if (!fs.existsSync(planFile)) {
             onProgress?.(`📄 Creating plan skeleton: ${planFile}`);
-            this.createPlanSkeleton(sessionId, requirement, docs, planFile);
+            this.createPlanSkeleton(sessionId, requirement, docs, planFile, poolSize);
         }
 
         onProgress?.(`🎯 Starting multi-agent debate`);
@@ -1666,7 +1671,7 @@ BEGIN YOUR ANALYSIS NOW. Start by calling Unity MCP and gather_task_context.sh.
         onProgress?.(`═══════════════════════════════════════════`);
 
         const analystPromises = ANALYST_CONFIGS.map(analyst => 
-            this.runAnalystSession(analyst, requirement, docs, planFile, contextSummary, onProgress)
+            this.runAnalystSession(analyst, requirement, docs, planFile, contextSummary, onProgress, poolSize)
         );
 
         // Wait for all analysts to complete
@@ -1690,7 +1695,7 @@ BEGIN YOUR ANALYSIS NOW. Start by calling Unity MCP and gather_task_context.sh.
         onProgress?.(`  PHASE 3: BUILDING CONSENSUS`);
         onProgress?.(`═══════════════════════════════════════════`);
 
-        const consensus = this.buildConsensus(analyses, onProgress);
+        const consensus = this.buildConsensus(analyses, onProgress, poolSize);
 
         // Update the plan file with consensus
         this.updatePlanWithConsensus(planFile, analyses, consensus, onProgress);
@@ -1898,7 +1903,8 @@ ${consensus.agreedRecommendations.length > 0
      */
     private buildConsensus(
         analyses: AgentAnalysis[],
-        onProgress?: (message: string) => void
+        onProgress?: (message: string) => void,
+        poolSize: number = 5
     ): {
         agreedConcerns: string[];
         agreedRecommendations: string[];
@@ -1964,8 +1970,8 @@ ${consensus.agreedRecommendations.length > 0
         const counts = analyses.map(a => a.engineerCount).filter(c => c > 0);
         const engineerCount = counts.length > 0 
             ? Math.max(...counts)  // Take max, not average - maximize parallelism
-            : 5;  // Default to 5 if no votes (pool default size)
-        onProgress?.(`  ✓ Engineer count: ${engineerCount} (max vote from analysts)`);
+            : poolSize;  // Default to pool size if no votes
+        onProgress?.(`  ✓ Engineer count: ${engineerCount} (max vote from analysts, pool has ${poolSize})`);
 
         // Build summary
         const summary = `Consensus from ${analyses.length} analysts:\n` +
@@ -1988,9 +1994,10 @@ ${consensus.agreedRecommendations.length > 0
         docs: string[],
         debateFile: string,
         contextSummary: string,
-        onProgress?: (message: string) => void
+        onProgress?: (message: string) => void,
+        poolSize: number = 5
     ): Promise<void> {
-        const prompt = this.buildAnalystPrompt(analyst, requirement, docs, debateFile, contextSummary);
+        const prompt = this.buildAnalystPrompt(analyst, requirement, docs, debateFile, contextSummary, poolSize);
         
         onProgress?.(`\n═══════════════════════════════════════════`);
         onProgress?.(`  [${analyst.name}] STARTING SESSION`);
@@ -2229,7 +2236,7 @@ ${consensus.agreedRecommendations.length > 0
     /**
      * Fallback mock analysis when Cursor CLI is not available
      */
-    private getMockAnalysis(requirement: string): AgentAnalysis {
+    private getMockAnalysis(requirement: string, poolSize: number = 5): AgentAnalysis {
         const keywords = requirement.toLowerCase();
         
         const concerns: string[] = [
@@ -2283,7 +2290,7 @@ ${consensus.agreedRecommendations.length > 0
             concerns,
             recommendations,
             taskBreakdown: tasks,
-            engineerCount: 5,  // Default to pool size for max parallelism
+            engineerCount: poolSize,  // Use actual pool size for max parallelism
             rationale: 'Install Cursor CLI for real multi-agent debate',
             rawOutput: 'Mock analysis - install cursor CLI'
         };
