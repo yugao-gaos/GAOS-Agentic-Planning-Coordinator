@@ -1,6 +1,7 @@
 import { spawn, ChildProcess, SpawnOptions } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { OutputChannelManager } from './OutputChannelManager';
 
 /**
@@ -88,7 +89,8 @@ export class ProcessManager {
      */
     setStateDir(dir: string): void {
         this.stateDir = dir;
-        const pauseDir = path.join(dir, '.paused_processes');
+        // Use OS temp dir for paused process states (not workspace)
+        const pauseDir = path.join(os.tmpdir(), 'apc_paused_processes');
         if (!fs.existsSync(pauseDir)) {
             fs.mkdirSync(pauseDir, { recursive: true });
         }
@@ -527,7 +529,7 @@ export class ProcessManager {
     private savePausedState(state: ProcessState): void {
         if (!this.stateDir) return;
         
-        const pauseDir = path.join(this.stateDir, '.paused_processes');
+        const pauseDir = path.join(os.tmpdir(), 'apc_paused_processes');
         const filePath = path.join(pauseDir, `${state.id}.json`);
         
         try {
@@ -543,7 +545,7 @@ export class ProcessManager {
     private loadPausedState(id: string): ProcessState | null {
         if (!this.stateDir) return null;
         
-        const filePath = path.join(this.stateDir, '.paused_processes', `${id}.json`);
+        const filePath = path.join(os.tmpdir(), 'apc_paused_processes', `${id}.json`);
         
         try {
             if (fs.existsSync(filePath)) {
@@ -562,7 +564,7 @@ export class ProcessManager {
     private loadAllPausedStateIds(): string[] {
         if (!this.stateDir) return [];
         
-        const pauseDir = path.join(this.stateDir, '.paused_processes');
+        const pauseDir = path.join(os.tmpdir(), 'apc_paused_processes');
         
         try {
             if (fs.existsSync(pauseDir)) {
@@ -582,7 +584,7 @@ export class ProcessManager {
     private cleanupPausedState(id: string): void {
         if (!this.stateDir) return;
         
-        const filePath = path.join(this.stateDir, '.paused_processes', `${id}.json`);
+        const filePath = path.join(os.tmpdir(), 'apc_paused_processes', `${id}.json`);
         
         try {
             if (fs.existsSync(filePath)) {
@@ -599,7 +601,7 @@ export class ProcessManager {
     private cleanupAllPausedStates(): void {
         if (!this.stateDir) return;
         
-        const pauseDir = path.join(this.stateDir, '.paused_processes');
+        const pauseDir = path.join(os.tmpdir(), 'apc_paused_processes');
         
         try {
             if (fs.existsSync(pauseDir)) {

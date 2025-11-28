@@ -798,7 +798,7 @@ export class PlanningService {
         if (!fs.existsSync(plansDir)) {
             fs.mkdirSync(plansDir, { recursive: true });
         }
-        const planFileName = `Plan_${session.id}_v1.md`;
+        const planFileName = `Plan_${session.id}.md`;
         const planFilePath = path.join(plansDir, planFileName);
         
         // Store plan path on session early
@@ -1207,7 +1207,7 @@ were aggregated into the concerns and recommendations listed above.`;
         engineerCount: number
     ): Promise<string> {
         const plansDir = path.join(this.stateManager.getWorkingDir(), 'Plans');
-        const planFileName = `Plan_${session.id}_v1.md`;
+        const planFileName = `Plan_${session.id}.md`;
         const planPath = path.join(plansDir, planFileName);
 
         // Read existing plan file (agents wrote their contributions here)
@@ -1706,7 +1706,7 @@ ${concerns.map((c, i) => `${i + 1}. **${c}**
      */
     private async generatePlan(session: PlanningSession): Promise<string> {
         const plansDir = path.join(this.stateManager.getWorkingDir(), 'Plans');
-        const planFileName = `Plan_${session.id}_v1.md`;
+        const planFileName = `Plan_${session.id}.md`;
         const planPath = path.join(plansDir, planFileName);
 
         // Generate a template plan
@@ -2077,9 +2077,9 @@ _Reviewing feedback impact on testing..._
         this.writeProgress(session.id, 'REVISE', '📝 Generating revised plan...');
         await this.delay(400);
 
-        // Generate revised plan
+        // Generate revised plan - overwrite the same file
         const newVersion = session.planHistory.length + 1;
-        const planFileName = `Plan_${session.id}_v${newVersion}.md`;
+        const planFileName = `Plan_${session.id}.md`;
         const planPath = path.join(this.stateManager.getWorkingDir(), 'Plans', planFileName);
 
         // Read existing plan and append revision notes

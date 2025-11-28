@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 import { ChildProcess } from 'child_process';
 import { StateManager } from './StateManager';
 import { EngineerPoolService } from './EngineerPoolService';
@@ -1589,8 +1590,8 @@ Stage: ${task.stage}
     private async cleanupCoordinatorFiles(coordinatorId: string): Promise<void> {
         const workingDir = this.stateManager.getWorkingDir();
         
-        // Clean up paused process states
-        const pauseDir = path.join(workingDir, '.paused_processes');
+        // Clean up paused process states (in OS temp dir)
+        const pauseDir = path.join(os.tmpdir(), 'apc_paused_processes');
         if (fs.existsSync(pauseDir)) {
             try {
                 const files = fs.readdirSync(pauseDir);

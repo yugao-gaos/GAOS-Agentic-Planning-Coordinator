@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { spawn, ChildProcess } from 'child_process';
 import { ProcessManager, ProcessState } from './ProcessManager';
 
@@ -86,8 +87,8 @@ export class CursorAgentRunner {
         let exitCode: number | null = null;
         let error: string | undefined;
 
-        // Write prompt to temp file to avoid shell escaping issues
-        const tempDir = path.join(cwd, '_AiDevLog', 'Logs', 'temp');
+        // Write prompt to OS temp file to avoid shell escaping issues
+        const tempDir = path.join(os.tmpdir(), 'apc_prompts');
         if (!fs.existsSync(tempDir)) {
             fs.mkdirSync(tempDir, { recursive: true });
         }

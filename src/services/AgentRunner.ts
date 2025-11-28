@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as os from 'os';
 import { spawn, execSync, ChildProcess } from 'child_process';
 import { ProcessManager } from './ProcessManager';
 
@@ -119,8 +120,9 @@ export class AgentRunner {
 
     constructor(workspaceRoot: string) {
         this.workspaceRoot = workspaceRoot;
-        this.debateDir = path.join(workspaceRoot, '_AiDevLog', '.debate');
-        this.contextDir = path.join(workspaceRoot, '_AiDevLog', '.context_gatherer');
+        // Use OS temp dir for temporary files (not workspace)
+        this.debateDir = path.join(os.tmpdir(), 'apc_debate');
+        this.contextDir = path.join(os.tmpdir(), 'apc_context_gatherer');
         this.persistentContextDir = path.join(workspaceRoot, '_AiDevLog', 'Context');
         this.processManager = ProcessManager.getInstance();
         
