@@ -557,6 +557,78 @@ This will trigger the multi-agent debate to revise the plan.`;
             }
         }),
 
+        // Kill stuck processes command
+        vscode.commands.registerCommand('agenticPlanning.killStuckProcesses', async () => {
+            const { ProcessManager } = await import('./services/ProcessManager');
+            const processManager = ProcessManager.getInstance();
+            
+            vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: 'Killing stuck processes...',
+                cancellable: false
+            }, async (progress) => {
+                // Kill tracked stuck processes
+                progress.report({ message: 'Checking tracked processes...' });
+                const killedTracked = await processManager.killStuckProcesses();
+                
+                // Kill orphan cursor-agent processes
+                progress.report({ message: 'Checking orphan processes...' });
+                const killedOrphans = await processManager.killOrphanCursorAgents();
+                
+                const total = killedTracked.length + killedOrphans;
+                if (total > 0) {
+                    vscode.window.showInformationMessage(
+                        `Killed ${total} stuck/orphan processes (${killedTracked.length} tracked, ${killedOrphans} orphans)`
+                    );
+                } else {
+                    vscode.window.showInformationMessage('No stuck processes found');
+                }
+                
+                engineerPoolProvider.refresh();
+                planningSessionsProvider.refresh();
+            });
+        }),
+
+        // Show running processes command
+        vscode.commands.registerCommand('agenticPlanning.showRunningProcesses', async () => {
+            const { ProcessManager } = await import('./services/ProcessManager');
+            const processManager = ProcessManager.getInstance();
+            
+            const processes = processManager.getRunningProcessInfo();
+            
+            if (processes.length === 0) {
+                vscode.window.showInformationMessage('No running processes tracked by ProcessManager');
+                return;
+            }
+            
+            const items = processes.map(p => ({
+                label: `${p.isStuck ? '⚠️ ' : '✅ '}${p.id}`,
+                description: `Runtime: ${Math.round(p.runtimeMs / 1000)}s, Last activity: ${Math.round(p.timeSinceActivityMs / 1000)}s ago`,
+                detail: p.command,
+                process: p
+            }));
+            
+            const selected = await vscode.window.showQuickPick(items, {
+                placeHolder: 'Select a process to kill (or press Escape to cancel)',
+                title: `Running Processes (${processes.length})`
+            });
+            
+            if (selected) {
+                const confirm = await vscode.window.showWarningMessage(
+                    `Kill process ${selected.process.id}?`,
+                    { modal: true },
+                    'Kill'
+                );
+                
+                if (confirm === 'Kill') {
+                    await processManager.stopProcess(selected.process.id, true);
+                    vscode.window.showInformationMessage(`Process ${selected.process.id} killed`);
+                    engineerPoolProvider.refresh();
+                    planningSessionsProvider.refresh();
+                }
+            }
+        }),
+
         // Dependency commands
         vscode.commands.registerCommand('agenticPlanning.refreshDependencies', async () => {
             vscode.window.withProgress({

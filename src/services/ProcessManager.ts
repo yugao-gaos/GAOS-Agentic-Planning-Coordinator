@@ -26,6 +26,9 @@ interface ManagedProcess {
     state: ProcessState;
     outputBuffer: string[];
     onExit?: (code: number | null) => void;
+    timeoutId?: NodeJS.Timeout;
+    healthCheckId?: NodeJS.Timeout;
+    lastActivityTime: number;
 }
 
 /**
@@ -47,9 +50,30 @@ export class ProcessManager {
 
     private readonly GRACEFUL_TIMEOUT_MS = 5000;  // 5 seconds to gracefully stop
     private readonly FORCE_KILL_TIMEOUT_MS = 2000;  // 2 more seconds before SIGKILL
+    private readonly DEFAULT_MAX_RUNTIME_MS = 60 * 60 * 1000;  // 1 hour default max runtime
+    private readonly HEALTH_CHECK_INTERVAL_MS = 30 * 1000;  // Check health every 30 seconds
+    private readonly STUCK_THRESHOLD_MS = 5 * 60 * 1000;  // Consider stuck if no output for 5 minutes
+    
+    // Event emitters for monitoring
+    private onStuckCallbacks: Array<(id: string, state: ProcessState) => void> = [];
+    private onTimeoutCallbacks: Array<(id: string, state: ProcessState) => void> = [];
 
     private constructor() {
         this.outputManager = OutputChannelManager.getInstance();
+    }
+
+    /**
+     * Register callback for when a process appears stuck (no output for STUCK_THRESHOLD_MS)
+     */
+    onProcessStuck(callback: (id: string, state: ProcessState) => void): void {
+        this.onStuckCallbacks.push(callback);
+    }
+
+    /**
+     * Register callback for when a process times out
+     */
+    onProcessTimeout(callback: (id: string, state: ProcessState) => void): void {
+        this.onTimeoutCallbacks.push(callback);
     }
 
     static getInstance(): ProcessManager {
@@ -71,7 +95,7 @@ export class ProcessManager {
     }
 
     /**
-     * Spawn a managed process
+     * Spawn a managed process with optional timeout and health monitoring
      */
     spawn(
         id: string,
@@ -83,6 +107,8 @@ export class ProcessManager {
             onOutput?: (data: string) => void;
             onExit?: (code: number | null) => void;
             metadata?: Record<string, any>;
+            maxRuntimeMs?: number;  // Max runtime before auto-kill (default: 1 hour)
+            enableHealthCheck?: boolean;  // Enable stuck detection (default: true)
         }
     ): ChildProcess {
         // Kill existing process with same ID if any
@@ -116,13 +142,15 @@ export class ProcessManager {
             proc,
             state,
             outputBuffer: [],
-            onExit: options.onExit
+            onExit: options.onExit,
+            lastActivityTime: Date.now()
         };
 
         // Capture stdout
         proc.stdout?.on('data', (data: Buffer) => {
             const text = data.toString();
             managed.outputBuffer.push(text);
+            managed.lastActivityTime = Date.now();  // Update activity time
             // Keep last 100 lines
             if (managed.outputBuffer.length > 100) {
                 managed.outputBuffer.shift();
@@ -135,6 +163,7 @@ export class ProcessManager {
         proc.stderr?.on('data', (data: Buffer) => {
             const text = data.toString();
             managed.outputBuffer.push(`[stderr] ${text}`);
+            managed.lastActivityTime = Date.now();  // Update activity time
             if (managed.outputBuffer.length > 100) {
                 managed.outputBuffer.shift();
             }
@@ -146,6 +175,10 @@ export class ProcessManager {
             if (state.status === 'running') {
                 state.status = code === 0 ? 'completed' : 'error';
             }
+            // Clear timers
+            if (managed.timeoutId) clearTimeout(managed.timeoutId);
+            if (managed.healthCheckId) clearInterval(managed.healthCheckId);
+            
             this.processes.delete(id);
             managed.onExit?.(code);
             this.log(`Process ${id} exited with code ${code}`);
@@ -157,7 +190,30 @@ export class ProcessManager {
         });
 
         this.processes.set(id, managed);
-        this.log(`Started process ${id}: ${command} ${args.join(' ')}`);
+        
+        // Set up timeout if specified
+        const maxRuntime = options.maxRuntimeMs ?? this.DEFAULT_MAX_RUNTIME_MS;
+        if (maxRuntime > 0) {
+            managed.timeoutId = setTimeout(() => {
+                this.log(`⏰ Process ${id} exceeded max runtime (${maxRuntime}ms), killing...`);
+                this.onTimeoutCallbacks.forEach(cb => cb(id, state));
+                this.stopProcess(id, true);
+            }, maxRuntime);
+        }
+
+        // Set up health check if enabled (default: true)
+        const enableHealthCheck = options.enableHealthCheck !== false;
+        if (enableHealthCheck) {
+            managed.healthCheckId = setInterval(() => {
+                const timeSinceActivity = Date.now() - managed.lastActivityTime;
+                if (timeSinceActivity > this.STUCK_THRESHOLD_MS && state.status === 'running') {
+                    this.log(`⚠️ Process ${id} appears stuck (no output for ${Math.round(timeSinceActivity / 1000)}s)`);
+                    this.onStuckCallbacks.forEach(cb => cb(id, state));
+                }
+            }, this.HEALTH_CHECK_INTERVAL_MS);
+        }
+
+        this.log(`Started process ${id}: ${command} ${args.slice(0, 3).join(' ')}...`);
 
         return proc;
     }
@@ -318,6 +374,99 @@ export class ProcessManager {
         const inMemory = Array.from(this.pausedStates.keys());
         const onDisk = this.loadAllPausedStateIds();
         return [...new Set([...inMemory, ...onDisk])];
+    }
+
+    /**
+     * Get detailed info about all running processes (for UI visibility)
+     */
+    getRunningProcessInfo(): Array<{
+        id: string;
+        command: string;
+        startTime: string;
+        runtimeMs: number;
+        timeSinceActivityMs: number;
+        status: string;
+        metadata?: Record<string, any>;
+        isStuck: boolean;
+    }> {
+        const now = Date.now();
+        return Array.from(this.processes.entries()).map(([id, managed]) => ({
+            id,
+            command: `${managed.state.command} ${managed.state.args.slice(0, 2).join(' ')}...`,
+            startTime: managed.state.startTime,
+            runtimeMs: now - new Date(managed.state.startTime).getTime(),
+            timeSinceActivityMs: now - managed.lastActivityTime,
+            status: managed.state.status,
+            metadata: managed.state.metadata,
+            isStuck: (now - managed.lastActivityTime) > this.STUCK_THRESHOLD_MS
+        }));
+    }
+
+    /**
+     * Kill all stuck processes (no output for STUCK_THRESHOLD_MS)
+     */
+    async killStuckProcesses(): Promise<string[]> {
+        const now = Date.now();
+        const killedIds: string[] = [];
+        
+        for (const [id, managed] of this.processes.entries()) {
+            const timeSinceActivity = now - managed.lastActivityTime;
+            if (timeSinceActivity > this.STUCK_THRESHOLD_MS && managed.state.status === 'running') {
+                this.log(`🗑️ Killing stuck process ${id} (no output for ${Math.round(timeSinceActivity / 1000)}s)`);
+                await this.stopProcess(id, true);
+                killedIds.push(id);
+            }
+        }
+        
+        return killedIds;
+    }
+
+    /**
+     * Find and kill orphan cursor-agent processes not tracked by ProcessManager
+     * This catches processes that survived extension restarts
+     */
+    async killOrphanCursorAgents(): Promise<number> {
+        if (process.platform === 'win32') {
+            // TODO: Windows implementation
+            return 0;
+        }
+
+        const { execSync } = require('child_process');
+        let killedCount = 0;
+        
+        try {
+            // Find cursor-agent processes
+            const result = execSync(
+                'ps aux | grep -E "cursor-agent.*(agent|status)" | grep -v grep | awk \'{print $2}\'',
+                { encoding: 'utf-8', timeout: 5000 }
+            ).trim();
+            
+            if (!result) return 0;
+            
+            const pids = result.split('\n').filter((p: string) => p.trim());
+            const trackedPids = new Set(
+                Array.from(this.processes.values())
+                    .map(m => m.proc.pid)
+                    .filter(pid => pid !== undefined)
+            );
+            
+            for (const pid of pids) {
+                const pidNum = parseInt(pid, 10);
+                if (!isNaN(pidNum) && !trackedPids.has(pidNum)) {
+                    try {
+                        process.kill(pidNum, 'SIGKILL');
+                        this.log(`🗑️ Killed orphan cursor-agent process ${pidNum}`);
+                        killedCount++;
+                    } catch (e) {
+                        // Process might already be dead
+                    }
+                }
+            }
+        } catch (e) {
+            this.log(`Error finding orphan processes: ${e}`);
+        }
+        
+        return killedCount;
     }
 
     /**

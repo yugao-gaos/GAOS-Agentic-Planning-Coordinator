@@ -139,6 +139,14 @@
         "command": "agenticPlanning.releaseEngineer",
         "title": "Release Engineer",
         "icon": "$(debug-stop)"
+      },
+      {
+        "command": "agenticPlanning.killStuckProcesses",
+        "title": "Agentic: Kill Stuck Processes"
+      },
+      {
+        "command": "agenticPlanning.showRunningProcesses",
+        "title": "Agentic: Show Running Processes"
       }
     ],
     "viewsContainers": {

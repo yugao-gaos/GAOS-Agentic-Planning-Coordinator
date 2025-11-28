@@ -359,8 +359,9 @@ Coordinator: ${coordinatorId}
             workspaceRoot
         );
         
-        // Start tailing the log file to show real-time progress
-        this.terminalManager.startLogTail(engineer.engineerName);
+        // Start streaming log file in terminal (tail -f)
+        // This must be done BEFORE starting the process so we catch the header
+        this.terminalManager.startStreamingLog(engineer.engineerName, engineer.logFile);
 
         // Start engineer process
         await this.startEngineerProcess(
@@ -378,8 +379,8 @@ Coordinator: ${coordinatorId}
     }
 
     /**
-     * Start engineer process using run_engineer.sh or cursor agent
-     * Uses ProcessManager for reliable process control
+     * Start engineer process using CursorAgentRunner (TypeScript-based)
+     * This is more reliable than shell scripts and provides better tracking
      */
     private async startEngineerProcess(
         engineerName: string,
@@ -389,95 +390,112 @@ Coordinator: ${coordinatorId}
         workspaceRoot: string,
         coordinatorId: string
     ): Promise<void> {
-        const scriptPath = path.join(workspaceRoot, '_AiDevLog/Scripts/run_engineer.sh');
-        const useScript = fs.existsSync(scriptPath);
+        // Import CursorAgentRunner
+        const { CursorAgentRunner } = await import('./CursorAgentRunner');
+        const agentRunner = CursorAgentRunner.getInstance();
 
-        // Build task instruction
-        const instruction = `Task ${task.id}: ${task.description}
+        // Build the prompt for the engineer
+        const prompt = `You are ${engineerName}, a software engineer working on a Unity game project.
 
-WORKFLOW:
-0. FIRST: Read previous session logs from _AiDevLog/Logs/engineers/, read context and existing docs for your task
-1. Implement your assigned task
-2. When you need Unity to compile, call: requestCompilation()
-3. Check _AiDevLog/Errors/error_registry.md before fixing ANY error
-4. UPDATE DOCS: Prefer updating existing docs. For new systems add new doc. Write summary of changes in your log.
-5. Mark your checkbox [x] in the plan when task is complete
-6. If blocked, write "BLOCKED: reason" in your log
-(Context is updated automatically by coordinator after task completion)`;
+========================================
+🎯 CURRENT TASK: ${task.id}
+${task.description}
+========================================
+
+📋 REFERENCE: Read the full plan at ${planPath} for complete context.
+
+🔧 AVAILABLE TOOLS:
+- unityMCP for Unity operations (read/write scripts, manage GameObjects, run tests)
+- File operations for reading/writing code
+- Terminal commands for git, compilation, etc.
+
+📜 WORKFLOW:
+1. FIRST: Read previous session logs from _AiDevLog/Logs/engineers/ to understand context
+2. Read relevant existing docs in _AiDevLog/Docs/ for your task
+3. Implement the task following the plan's specifications
+4. Check _AiDevLog/Errors/error_registry.md before fixing ANY error (avoid duplicate fixes)
+5. UPDATE DOCS: Prefer updating existing docs. For new systems, add new doc.
+6. Mark your checkbox [x] in the plan when task is complete
+7. Write completion summary at the end, or "BLOCKED: reason" if stuck
+
+⚠️ IMPORTANT:
+- Follow existing code patterns in the codebase
+- Write clean, well-documented code
+- If you encounter an error that's already in error_registry.md, check the fix there first
+- Context will be updated automatically by coordinator after task completion`;
 
         // Create unique process ID
-        const processId = `engineer_${coordinatorId}_${engineerName}`;
-        
-        let command: string;
-        let args: string[];
+        const processId = `engineer_${coordinatorId}_${engineerName}_${Date.now()}`;
 
-        if (useScript) {
-            command = 'bash';
-            args = [
-                scriptPath,
-                '--headless',
-                '--log-file', logFile,  // Pass log file path to script
-                engineerName,
-                planPath,
-                instruction,
-                String(this.DEFAULT_TIMEOUT)
-            ];
-            // Spawn script using ProcessManager
-            // Note: Script will stream cursor agent output directly to the log file
-            this.processManager.spawn(processId, command, args, {
-                cwd: workspaceRoot,
-                metadata: { engineerName, coordinatorId, taskId: task.id, planPath, logFile },
-                onOutput: (data) => {
-                    // Log script's control messages (not cursor agent output)
-                    this.logCoord(coordinatorId, `[${engineerName}] ${data.trim()}`);
-                },
-                onExit: (code) => {
-                    fs.appendFileSync(logFile, `\n--- Process exited with code ${code} ---\n`);
-                    const taskManager = this.taskManagers.get(coordinatorId);
-                    if (taskManager) {
-                        if (code === 0) taskManager.markTaskCompleted(task.id);
-                        else if (code !== null) taskManager.markTaskFailed(task.id, `Exit code ${code}`);
-                    }
-                    const coordinator = this.stateManager.getCoordinator(coordinatorId);
-                    if (coordinator?.engineerSessions[engineerName]) {
-                        coordinator.engineerSessions[engineerName].status = code === 0 ? 'completed' : 'error';
-                        this.stateManager.saveCoordinator(coordinator);
-                    }
-                }
-            });
-            
-            // Start tailing log in terminal (script writes to this file)
-            this.terminalManager.startLogTail(engineerName);
-        } else {
-            // No script - run cursor agent directly in terminal with streaming output
-            const prompt = `You are ${engineerName}. 
+        // Write header to log file
+        const header = `
+========================================
+Engineer: ${engineerName}
+Task ID: ${task.id}
+Task: ${task.description}
+Started: ${new Date().toISOString()}
+Plan: ${planPath}
+Coordinator: ${coordinatorId}
+========================================
 
-🎯 TASK: ${task.description}
+`;
+        fs.appendFileSync(logFile, header);
 
-Reference the plan at ${planPath} for full context.
-You have unityMCP available for Unity operations.
+        this.logCoord(coordinatorId, `🚀 Starting ${engineerName} on task ${task.id}`);
 
-WORKFLOW:
-0. FIRST: Read previous session logs from _AiDevLog/Logs/engineers/, read context and existing docs for your task
-1. Implement the task
-2. When ready to test, your coordinator will handle Unity compilation
-3. Check _AiDevLog/Errors/error_registry.md before fixing any errors
-4. UPDATE DOCS: Prefer updating existing docs. For new systems add new doc. Write summary of changes in your log.
-5. Mark your checkbox [x] in the plan when done
-6. Write completion summary or "BLOCKED: reason" if stuck
-(Context is updated automatically by coordinator after task completion)`;
-
-            // Write prompt to temp file to avoid shell escaping issues with long prompts
-            const promptFile = logFile.replace('.log', '_prompt.txt');
-            fs.writeFileSync(promptFile, prompt);
-
-            // Run cursor agent directly in terminal (cursor needs a real terminal for streaming)
-            const success = this.terminalManager.runCursorAgent(engineerName, promptFile, logFile);
-            if (!success) {
-                this.logCoord(coordinatorId, `⚠️ Failed to start cursor agent for ${engineerName}`);
+        // Run the agent asynchronously
+        agentRunner.run({
+            id: processId,
+            prompt,
+            cwd: workspaceRoot,
+            model: 'sonnet-4.5',
+            logFile,
+            timeoutMs: this.DEFAULT_TIMEOUT * 1000,  // Convert to ms
+            metadata: { engineerName, coordinatorId, taskId: task.id, planPath },
+            onOutput: (text, type) => {
+                // Stream output to terminal
+                this.terminalManager.appendToTerminal(engineerName, text, type);
+            },
+            onProgress: (message) => {
+                this.logCoord(coordinatorId, `[${engineerName}] ${message}`);
+            },
+            onStart: (pid) => {
+                this.logCoord(coordinatorId, `[${engineerName}] Process started (PID: ${pid})`);
             }
-        }
-        
+        }).then((result) => {
+            // Handle completion
+            fs.appendFileSync(logFile, `\n\n--- Process exited with code ${result.exitCode} ---\n`);
+            
+            const taskManager = this.taskManagers.get(coordinatorId);
+            if (taskManager) {
+                if (result.success) {
+                    taskManager.markTaskCompleted(task.id);
+                } else if (result.error) {
+                    taskManager.markTaskFailed(task.id, result.error);
+                } else {
+                    taskManager.markTaskFailed(task.id, `Exit code ${result.exitCode}`);
+                }
+            }
+            
+            const coordinator = this.stateManager.getCoordinator(coordinatorId);
+            if (coordinator?.engineerSessions[engineerName]) {
+                coordinator.engineerSessions[engineerName].status = result.success ? 'completed' : 'error';
+                this.stateManager.saveCoordinator(coordinator);
+            }
+
+            // Show completion in output channel
+            this.terminalManager.showTaskCompletion(
+                engineerName, 
+                result.success, 
+                `Task: ${task.id}\nDuration: ${Math.round(result.durationMs / 1000)}s\nExit code: ${result.exitCode}`
+            );
+
+            this.logCoord(coordinatorId, `[${engineerName}] ${result.success ? '✅' : '❌'} Task ${task.id} finished (${Math.round(result.durationMs / 1000)}s)`);
+        }).catch((err) => {
+            this.logCoord(coordinatorId, `[${engineerName}] ❌ Error: ${err.message}`);
+            this.terminalManager.showTaskCompletion(engineerName, false, `Error: ${err.message}`);
+        });
+
         this.logCoord(coordinatorId, `Started ${engineerName} on task ${task.id}`);
     }
 

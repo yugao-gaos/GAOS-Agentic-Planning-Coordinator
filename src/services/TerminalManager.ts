@@ -11,6 +11,7 @@ interface CoordinatorTerminal {
 export class TerminalManager {
     private engineerTerminals: Map<string, EngineerTerminal> = new Map();
     private coordinatorTerminals: Map<string, CoordinatorTerminal> = new Map();
+    private engineerOutputChannels: Map<string, vscode.OutputChannel> = new Map();
     private disposables: vscode.Disposable[] = [];
 
     constructor() {
@@ -93,21 +94,47 @@ export class TerminalManager {
     }
     
     /**
-     * Run cursor agent directly in the terminal with streaming output
-     * @param promptFile Path to a file containing the prompt (avoids shell escaping issues)
+     * Append text to an engineer's terminal is now a no-op since we use tail -f on log file.
+     * The CursorAgentRunner writes directly to the log file which the terminal tails.
      */
-    runCursorAgent(engineerName: string, promptFile: string, logFile: string): boolean {
+    appendToTerminal(engineerName: string, text: string, type: 'text' | 'thinking' | 'tool' | 'tool_result' | 'error' | 'info'): void {
+        // No-op: output goes to log file which terminal tails via startStreamingLog()
+    }
+
+    /**
+     * Start streaming the log file in terminal with tail -f
+     * This shows live output as CursorAgentRunner writes to the log
+     */
+    startStreamingLog(engineerName: string, logFile: string): void {
         const engineerTerminal = this.engineerTerminals.get(engineerName);
         if (!engineerTerminal || !this.isTerminalAlive(engineerTerminal.terminal)) {
-            return false;
+            console.warn(`No terminal found for engineer: ${engineerName}`);
+            return;
         }
 
-        // Run cursor agent with streaming JSON output, parsed and written to log
-        // This mimics what run_engineer.sh does for consistent output format
-        const command = `cursor agent --model sonnet-4.5 -p --force --approve-mcps --output-format stream-json --stream-partial-output "$(cat '${promptFile}')" 2>&1 | while IFS= read -r line; do content=$(echo "$line" | jq -r '.message.content[0].text // empty' 2>/dev/null); [ -n "$content" ] && [ "$content" != "null" ] && printf "%s" "$content"; done | tee -a "${logFile}"`;
-        
-        engineerTerminal.terminal.sendText(command);
-        return true;
+        // Clear terminal and start tailing the log file
+        engineerTerminal.terminal.sendText('clear');
+        engineerTerminal.terminal.sendText(`echo "🔴 Live streaming output from: ${logFile}"`);
+        engineerTerminal.terminal.sendText(`echo ""`);
+        // Touch to create file if it doesn't exist, then tail with -f for continuous streaming
+        engineerTerminal.terminal.sendText(`touch "${logFile}" && tail -f "${logFile}"`);
+        engineerTerminal.terminal.show();
+    }
+
+    /**
+     * Show header in terminal for the engineer's task (writes to log file so it appears in tail)
+     */
+    showTaskHeader(engineerName: string, taskId: string, taskDescription: string): void {
+        // This is now handled by CursorAgentRunner writing header to log file
+        // The terminal will see it via tail -f
+    }
+
+    /**
+     * Show completion message (writes to log file so it appears in tail)
+     */
+    showTaskCompletion(engineerName: string, success: boolean, message?: string): void {
+        // This is now handled by CursorAgentRunner writing to log file
+        // The terminal will see it via tail -f
     }
 
     /**

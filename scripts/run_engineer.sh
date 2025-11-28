@@ -335,24 +335,28 @@ fi
     --stream-partial-output \
     "$PROMPT" 2>&1 | \
     while IFS= read -r line; do
-      # Extract content type and text
-      content_type=$(echo "$line" | jq -r '.message.content[0].type // empty' 2>/dev/null)
-      content_text=$(echo "$line" | jq -r '.message.content[0].text // empty' 2>/dev/null)
-      tool_name=$(echo "$line" | jq -r '.message.content[0].name // empty' 2>/dev/null)
+      # Get the message type and extract text
+      msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
       
-      # Handle different content types with colors
-      if [ "$content_type" = "thinking" ] && [ -n "$content_text" ] && [ "$content_text" != "null" ] && [ "$content_text" != "empty" ]; then
-        # Thinking text in cyan
-        printf "${COLOR_THINKING}%s${COLOR_RESET}" "$content_text" | sed 's/\. /.\n/g'
-      elif [ "$content_type" = "text" ] && [ -n "$content_text" ] && [ "$content_text" != "null" ] && [ "$content_text" != "empty" ]; then
-        # Response text in green
-        printf "${COLOR_RESPONSE}%s${COLOR_RESET}" "$content_text" | sed 's/\. /.\n/g'
-      elif [ -n "$tool_name" ] && [ "$tool_name" != "null" ] && [ "$tool_name" != "empty" ]; then
-        # Tool call in yellow
-        printf "\n${COLOR_TOOL}🔧 Tool: %s${COLOR_RESET}\n" "$tool_name"
-      elif [ -n "$content_text" ] && [ "$content_text" != "null" ] && [ "$content_text" != "empty" ]; then
-        # Fallback for other text
-        printf "%s" "$content_text" | sed 's/\. /.\n/g'
+      if [ "$msg_type" = "assistant" ]; then
+        # Extract text content from assistant message
+        content_type=$(echo "$line" | jq -r '.message.content[0].type // empty' 2>/dev/null)
+        content_text=$(echo "$line" | jq -r '.message.content[0].text // empty' 2>/dev/null)
+        tool_name=$(echo "$line" | jq -r '.message.content[0].name // empty' 2>/dev/null)
+        
+        if [ "$content_type" = "thinking" ] && [ -n "$content_text" ] && [ "$content_text" != "null" ]; then
+          # Thinking text in cyan (streaming)
+          printf "${COLOR_THINKING}%s${COLOR_RESET}" "$content_text"
+        elif [ "$content_type" = "text" ] && [ -n "$content_text" ] && [ "$content_text" != "null" ]; then
+          # Response text in green (streaming)
+          printf "${COLOR_RESPONSE}%s${COLOR_RESET}" "$content_text"
+        elif [ "$content_type" = "tool_use" ] && [ -n "$tool_name" ] && [ "$tool_name" != "null" ]; then
+          # Tool call in yellow
+          printf "\n${COLOR_TOOL}🔧 Tool: %s${COLOR_RESET}\n" "$tool_name"
+        fi
+      elif [ "$msg_type" = "result" ]; then
+        # Final result - add newline
+        printf "\n"
       fi
     done | tee -a "$LOG_FILE"
   
