@@ -236,10 +236,16 @@ export class StateManager {
 
     savePlanningSession(session: PlanningSession): void {
         this.planningSessions.set(session.id, session);
+        // Also persist to disk so file watchers trigger
+        const sessionPath = path.join(this.workingDir, 'planning_sessions', `${session.id}.json`);
+        fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2));
     }
 
     saveCoordinator(coordinator: CoordinatorState): void {
         this.coordinators.set(coordinator.id, coordinator);
+        // Also persist to disk so file watchers trigger
+        const coordPath = path.join(this.workingDir, 'coordinators', `${coordinator.id}.json`);
+        fs.writeFileSync(coordPath, JSON.stringify(coordinator, null, 2));
     }
 
     deletePlanningSession(id: string): void {
