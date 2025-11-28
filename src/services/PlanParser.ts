@@ -105,7 +105,7 @@ export class PlanParser {
 
         // Try to find engineer count from "Use N engineers" pattern
         const engineerCountMatch = content.match(/use\s+(\d+)\s+engineers/i);
-        const engineerCount = engineerCountMatch ? parseInt(engineerCountMatch[1], 10) : 3;
+        const engineerCount = engineerCountMatch ? parseInt(engineerCountMatch[1], 10) : 5;  // Default to pool size
 
         // Try legacy format first: ## Engineer's Checklist
         const legacyTasks = this.parseLegacyFormat(content);

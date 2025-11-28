@@ -411,10 +411,11 @@ _Will be generated from task dependencies_
 
 ## 8. Engineer Allocation
 
-**Recommended:** TBD
+**Recommended:** TBD (Maximize based on task parallelism)
 **Rationale:** TBD
 
-_Each analyst will vote on engineer count_
+_Each analyst will vote on engineer count based on maximum parallel tasks possible.
+AI engineers have NO communication overhead - more = faster if tasks allow._
 
 ---
 
@@ -1490,8 +1491,15 @@ cat > /tmp/${analyst.id}_analysis.md << 'ANALYSIS_EOF'
 - Best Practice: ...
 
 #### Engineer Vote
-- Count: [number]
-- Rationale: [Why this number based on task parallelism]
+- Count: [number] (Aim for MAXIMUM parallelization - see guidance below)
+- Rationale: [Explain based on task dependency graph]
+
+**IMPORTANT: AI Engineer Guidelines:**
+- Engineers are AI agents with NO communication overhead
+- More engineers = faster execution IF tasks can parallelize
+- Count the MAXIMUM number of tasks that can run simultaneously at any wave
+- Don't artificially limit to 3 - analyze actual task dependencies
+- Example: 5 independent tasks = recommend 5 engineers
 
 #### Response to Other Analysts
 - [If you read other analysts' findings, respond here]
@@ -1826,7 +1834,7 @@ BEGIN YOUR ANALYSIS NOW. Start by calling Unity MCP and gather_task_context.sh.
      */
     private extractEngineerCount(content: string): number {
         const countMatch = content.match(/Count:\s*(\d+)/i);
-        return countMatch ? parseInt(countMatch[1], 10) : 3;
+        return countMatch ? parseInt(countMatch[1], 10) : 5;  // Default to pool size
     }
 
     /**
@@ -1951,12 +1959,13 @@ ${consensus.agreedRecommendations.length > 0
         const mergedTasks = Array.from(taskMap.values());
         onProgress?.(`  ✓ ${mergedTasks.length} unique tasks identified`);
 
-        // Average engineer count
+        // Use MAXIMUM engineer count from analysts (they analyze parallelism)
+        // AI engineers have no overhead, so more = faster if tasks allow
         const counts = analyses.map(a => a.engineerCount).filter(c => c > 0);
         const engineerCount = counts.length > 0 
-            ? Math.round(counts.reduce((a, b) => a + b, 0) / counts.length)
-            : 3;
-        onProgress?.(`  ✓ Engineer count consensus: ${engineerCount}`);
+            ? Math.max(...counts)  // Take max, not average - maximize parallelism
+            : 5;  // Default to 5 if no votes (pool default size)
+        onProgress?.(`  ✓ Engineer count: ${engineerCount} (max vote from analysts)`);
 
         // Build summary
         const summary = `Consensus from ${analyses.length} analysts:\n` +
@@ -2274,7 +2283,7 @@ ${consensus.agreedRecommendations.length > 0
             concerns,
             recommendations,
             taskBreakdown: tasks,
-            engineerCount: 3,
+            engineerCount: 5,  // Default to pool size for max parallelism
             rationale: 'Install Cursor CLI for real multi-agent debate',
             rawOutput: 'Mock analysis - install cursor CLI'
         };
