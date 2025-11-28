@@ -664,12 +664,33 @@ IMPORTANT:
      * Start the review process after all tasks complete
      */
     private async startReviewProcess(coordinatorId: string): Promise<void> {
+        const coordinator = this.stateManager.getCoordinator(coordinatorId);
+        
         // Stop monitoring loop
         this.stopMonitoringLoop(coordinatorId);
         
-        // Release all engineers
+        this.logCoord(coordinatorId, `📋 Starting review process...`);
+        this.logCoord(coordinatorId, `   Stopping engineer processes and releasing to pool...`);
+        
+        // Release all engineers (stops processes, closes terminals, releases to pool)
         await this.releaseAllEngineersAsync(coordinatorId);
-        this.logCoord(coordinatorId, `   ✓ Released all engineers`);
+        this.logCoord(coordinatorId, `   ✓ All engineer processes stopped`);
+        
+        // Clean up engineer terminals
+        if (coordinator) {
+            const engineerNames = Object.keys(coordinator.engineerSessions);
+            for (const name of engineerNames) {
+                this.terminalManager.closeEngineerTerminal(name);
+            }
+            this.logCoord(coordinatorId, `   ✓ Closed ${engineerNames.length} engineer terminals`);
+        }
+        
+        // Release engineers back to pool
+        if (coordinator) {
+            const engineerNames = Object.keys(coordinator.engineerSessions);
+            this.engineerPoolService.releaseEngineers(engineerNames);
+            this.logCoord(coordinatorId, `   ✓ Released engineers to pool`);
+        }
         
         // Check if we can proceed immediately (no pending context agents)
         this.checkReviewReady(coordinatorId);
@@ -784,14 +805,15 @@ Keep it concise but comprehensive. Use markdown formatting.`;
      * Full cleanup when execution completes
      */
     private async cleanupOnCompletion(coordinatorId: string): Promise<void> {
+        const coordinator = this.stateManager.getCoordinator(coordinatorId);
         this.logCoord(coordinatorId, `🧹 Cleaning up after completion...`);
         
         // Stop monitoring loop
         this.stopMonitoringLoop(coordinatorId);
         
-        // Release all engineers
+        // Release all engineers (stops processes, closes terminals, releases to pool)
         await this.releaseAllEngineersAsync(coordinatorId);
-        this.logCoord(coordinatorId, `   ✓ Released all engineers`);
+        this.logCoord(coordinatorId, `   ✓ Released all engineers and stopped processes`);
         
         // Clean up task manager
         this.taskManagers.delete(coordinatorId);
@@ -803,12 +825,17 @@ Keep it concise but comprehensive. Use markdown formatting.`;
         await this.cleanupCoordinatorFiles(coordinatorId);
         this.logCoord(coordinatorId, `   ✓ Cleaned up temp files`);
         
-        // Close coordinator terminal after a short delay (so user can see the completion message)
-        setTimeout(() => {
-            this.terminalManager.closeCoordinatorTerminal(coordinatorId);
-        }, 5000); // 5 second delay before closing terminal
+        // Clean up all engineer terminals for this coordinator
+        if (coordinator) {
+            const engineerNames = Object.keys(coordinator.engineerSessions);
+            this.terminalManager.clearCoordinatorTerminals(coordinatorId, engineerNames);
+        }
         
-        this.logCoord(coordinatorId, `🎉 Cleanup complete. Terminal will close in 5 seconds.`);
+        // Clean up stale terminal references
+        this.terminalManager.cleanupStaleTerminals();
+        this.logCoord(coordinatorId, `   ✓ Cleaned up terminals`);
+        
+        this.logCoord(coordinatorId, `🎉 Cleanup complete!`);
     }
 
     /**

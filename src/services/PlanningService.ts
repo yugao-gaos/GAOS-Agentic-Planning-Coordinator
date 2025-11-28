@@ -2446,7 +2446,14 @@ _Reviewing feedback impact on testing..._
         session.execution.progress = coordStatus.progress;
         session.execution.lastActivityAt = new Date().toISOString();
         
-        // Check for completion
+        // Check for reviewing state (all tasks done, generating summary)
+        if (coordStatus.status === 'reviewing' && session.status === 'executing') {
+            // Don't change session status yet - coordinator is releasing engineers and generating summary
+            // Just log that we're in review phase
+            this.writeProgress(sessionId, 'EXECUTION', '📋 All tasks complete. Reviewing and generating summary...');
+        }
+        
+        // Check for completion (only after summary is generated)
         if (coordStatus.status === 'completed') {
             session.status = 'completed';
             this.stopExecutionSync();
