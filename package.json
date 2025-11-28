@@ -264,6 +264,11 @@
           "group": "inline@1"
         },
         {
+          "command": "agenticPlanning.resumePlanningSession",
+          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_cancelled",
+          "group": "inline@1"
+        },
+        {
           "command": "agenticPlanning.revisePlan",
           "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_pending",
           "group": "inline@1"

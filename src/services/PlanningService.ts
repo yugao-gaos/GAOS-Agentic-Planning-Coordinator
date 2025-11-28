@@ -2505,7 +2505,9 @@ _Reviewing feedback impact on testing..._
 
     /**
      * Stop a running planning session
-     * Stops any active agent processes and marks session as stopped
+     * Stops any active agent processes and marks session appropriately:
+     * - If stopped during planning (debating/revising/reviewing) → 'cancelled'
+     * - If stopped during execution → 'stopped'
      * Uses ProcessManager for reliable process termination
      */
     async stopSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
@@ -2515,21 +2517,34 @@ _Reviewing feedback impact on testing..._
                 return { success: false, error: `Session ${sessionId} not found` };
             }
 
+            const previousStatus = session.status;
+            const wasDuringPlanning = ['debating', 'revising', 'reviewing'].includes(previousStatus);
+            
             this.writeProgress(sessionId, 'STOP', '='.repeat(60));
             this.writeProgress(sessionId, 'STOP', `⏹️ STOPPING SESSION: ${sessionId}`);
+            this.writeProgress(sessionId, 'STOP', `   Previous status: ${previousStatus}`);
             this.writeProgress(sessionId, 'STOP', '='.repeat(60));
 
             // Stop any running agents - await for proper cleanup
+            this.writeProgress(sessionId, 'STOP', `   Stopping context gatherer...`);
             await this.agentRunner.stopContextGatherer();
+            this.writeProgress(sessionId, 'STOP', `   Stopping all agents...`);
             await this.agentRunner.stopAll();
 
-            // Update session status to 'stopped' (can be resumed)
-            session.status = 'stopped';
+            // Determine final status based on when we stopped
+            // If stopped during planning phase → cancelled (plan incomplete)
+            // If stopped during execution phase → stopped (can resume)
+            if (wasDuringPlanning) {
+                session.status = 'cancelled';
+                this.writeProgress(sessionId, 'STOP', `✅ Session cancelled (stopped during planning)`);
+            } else {
+                session.status = 'stopped';
+                this.writeProgress(sessionId, 'STOP', `✅ Session stopped (can resume execution)`);
+            }
+            
             session.updatedAt = new Date().toISOString();
             this.stateManager.savePlanningSession(session);
             this.notifyChange();
-
-            this.writeProgress(sessionId, 'STOP', `✅ Session stopped successfully`);
 
             return { success: true };
         } catch (error) {

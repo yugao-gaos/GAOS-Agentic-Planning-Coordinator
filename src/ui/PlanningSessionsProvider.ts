@@ -268,19 +268,29 @@ export class PlanningSessionItem extends vscode.TreeItem {
                 case 'plan':
                     // Plan item shows approval status + context-aware buttons
                     const approved = planItemState?.isApproved ?? false;
-                    const planningDone = !planItemState?.isPlanningOngoing;
+                    const isPlanningOngoing = planItemState?.isPlanningOngoing ?? false;
+                    const isCancelled = session.status === 'cancelled';
+                    const isStopped = session.status === 'stopped' && !session.execution;
                     
                     if (approved) {
                         this.iconPath = new vscode.ThemeIcon('pass', new vscode.ThemeColor('charts.green'));
                         this.description = '✓ approved';
-                    } else if (planningDone) {
-                        // Planning complete, awaiting approval
-                        this.iconPath = new vscode.ThemeIcon('checklist', new vscode.ThemeColor('charts.blue'));
-                        this.description = '📋 ready for approval';
-                    } else {
+                    } else if (isCancelled) {
+                        // Cancelled during planning - incomplete plan
+                        this.iconPath = new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('charts.red'));
+                        this.description = '⛔ cancelled (incomplete)';
+                    } else if (isStopped) {
+                        // Stopped but has plan file - may need review
+                        this.iconPath = new vscode.ThemeIcon('debug-pause', new vscode.ThemeColor('charts.orange'));
+                        this.description = '⏸️ stopped';
+                    } else if (isPlanningOngoing) {
                         // Planning still in progress
                         this.iconPath = new vscode.ThemeIcon('loading~spin', new vscode.ThemeColor('charts.yellow'));
                         this.description = '⏳ planning...';
+                    } else {
+                        // Planning complete, awaiting approval
+                        this.iconPath = new vscode.ThemeIcon('checklist', new vscode.ThemeColor('charts.blue'));
+                        this.description = '📋 ready for approval';
                     }
                     
                     if (session.currentPlanPath) {
@@ -389,9 +399,10 @@ export class PlanningSessionItem extends vscode.TreeItem {
                 const isPlanningOngoing = planItemState?.isPlanningOngoing ?? ['debating', 'revising'].includes(status);
                 const isApproved = planItemState?.isApproved ?? (status === 'approved');
                 const hasPlanFile = planItemState?.hasPlanFile ?? !!session.currentPlanPath;
-                const isPlanningStoppedOrCancelled = planItemState?.isPlanningStoppedOrCancelled ?? ['stopped', 'cancelled'].includes(status);
                 const isInExecutionPhase = planItemState?.isInExecutionPhase ?? ['executing', 'paused', 'completed'].includes(status);
                 const isReviewing = status === 'reviewing';
+                const isCancelled = status === 'cancelled';
+                const isStopped = status === 'stopped' && !session.execution;
                 
                 if (isPlanningOngoing) {
                     // Planning actively in progress (debating/revising) - only stop button
@@ -399,11 +410,14 @@ export class PlanningSessionItem extends vscode.TreeItem {
                 } else if (isInExecutionPhase) {
                     // In execution phase - plan is locked, only allow revision
                     return 'planItem_executing';
-                } else if (isPlanningStoppedOrCancelled && hasPlanFile) {
-                    // Planning was stopped but we have a plan file - show Revise + Approve
+                } else if (isCancelled) {
+                    // Cancelled during planning - plan is incomplete, show Resume/Delete only
+                    return 'planItem_cancelled';
+                } else if (isStopped && hasPlanFile) {
+                    // Stopped with plan file - show Revise + Approve
                     return 'planItem_pending';
-                } else if (isPlanningStoppedOrCancelled && !hasPlanFile) {
-                    // Planning was stopped before plan was created - show Resume
+                } else if (isStopped && !hasPlanFile) {
+                    // Stopped before plan was created - show Resume
                     return 'planItem_stopped';
                 } else if (isReviewing) {
                     // Plan complete, ready for approval - show Revise + Approve
