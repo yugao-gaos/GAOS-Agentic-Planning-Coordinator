@@ -40,21 +40,29 @@ export class TerminalManager {
         logFile: string,
         workspaceRoot: string
     ): vscode.Terminal {
-        const terminalName = `${engineerName}_${sessionId.substring(0, 8)}`;
+        const terminalName = `🔧 ${engineerName}`;
         
         // Check if terminal already exists and is still valid
         const existing = this.engineerTerminals.get(engineerName);
         if (existing && this.isTerminalAlive(existing.terminal)) {
+            // Update the stored info in case sessionId/logFile changed
+            existing.sessionId = sessionId;
+            existing.logFile = logFile;
             existing.terminal.show();
             return existing.terminal;
         }
+        
+        // If existing terminal is dead, dispose it first
+        if (existing) {
+            this.engineerTerminals.delete(engineerName);
+        }
 
-        // Create new terminal with session ID as name
+        // Create new terminal with proper engineer name
         const terminal = vscode.window.createTerminal({
-            name: sessionId,
+            name: terminalName,
             cwd: workspaceRoot,
             iconPath: new vscode.ThemeIcon('person'),
-            message: `Engineer ${engineerName}`
+            message: `Engineer ${engineerName} | Session: ${sessionId}`
         });
 
         // Store terminal reference
@@ -163,10 +171,11 @@ export class TerminalManager {
 
         // Terminal was closed but we have the info - recreate it
         if (engineerTerminal) {
+            const terminalName = `🔧 ${engineerName}`;
             const terminal = vscode.window.createTerminal({
-                name: engineerTerminal.sessionId,
+                name: terminalName,
                 iconPath: new vscode.ThemeIcon('person'),
-                message: `Engineer ${engineerName} - Reconnected`
+                message: `Engineer ${engineerName} - Reconnected | Session: ${engineerTerminal.sessionId}`
             });
 
             this.engineerTerminals.set(engineerName, {
@@ -175,7 +184,11 @@ export class TerminalManager {
             });
 
             terminal.show();
-            terminal.sendText(`tail -f "${engineerTerminal.logFile}"`);
+            // Only tail if log file path exists
+            if (engineerTerminal.logFile) {
+                terminal.sendText(`echo "📄 Reconnecting to log file..."`);
+                terminal.sendText(`tail -f "${engineerTerminal.logFile}"`);
+            }
             return true;
         }
 
@@ -244,15 +257,22 @@ export class TerminalManager {
         // Check if terminal already exists
         const existing = this.coordinatorTerminals.get(coordinatorId);
         if (existing && this.isTerminalAlive(existing.terminal)) {
+            existing.logFile = logFile; // Update in case it changed
             existing.terminal.show();
             return existing.terminal;
         }
+        
+        // Clean up dead terminal reference
+        if (existing) {
+            this.coordinatorTerminals.delete(coordinatorId);
+        }
 
+        const shortId = coordinatorId.replace('coord_', '').substring(0, 8);
         const terminal = vscode.window.createTerminal({
-            name: coordinatorId,
+            name: `📋 Coordinator ${shortId}`,
             cwd: workspaceRoot,
             iconPath: new vscode.ThemeIcon('organization'),
-            message: `Coordinator - Real-time logs`
+            message: `Coordinator ${coordinatorId} - Real-time logs`
         });
 
         // Store terminal reference
@@ -300,7 +320,7 @@ export class TerminalManager {
     }
 
     /**
-     * Show a coordinator's terminal
+     * Show a coordinator's terminal (recreate if needed)
      */
     showCoordinatorTerminal(coordinatorId: string): boolean {
         const coordTerminal = this.coordinatorTerminals.get(coordinatorId);
@@ -308,7 +328,65 @@ export class TerminalManager {
             coordTerminal.terminal.show();
             return true;
         }
+        
+        // Terminal was closed but we have the info - recreate it
+        if (coordTerminal) {
+            const shortId = coordinatorId.replace('coord_', '').substring(0, 8);
+            const terminal = vscode.window.createTerminal({
+                name: `📋 Coordinator ${shortId}`,
+                iconPath: new vscode.ThemeIcon('organization'),
+                message: `Coordinator ${coordinatorId} - Reconnected`
+            });
+
+            this.coordinatorTerminals.set(coordinatorId, {
+                ...coordTerminal,
+                terminal
+            });
+
+            terminal.show();
+            if (coordTerminal.logFile) {
+                terminal.sendText(`echo "📄 Reconnecting to coordinator log..."`);
+                terminal.sendText(`tail -f "${coordTerminal.logFile}"`);
+            }
+            return true;
+        }
+        
         return false;
+    }
+    
+    /**
+     * Clear all terminal references for a coordinator and its engineers
+     * Call this when stopping/resetting a coordinator
+     */
+    clearCoordinatorTerminals(coordinatorId: string, engineerNames: string[]): void {
+        // Close coordinator terminal
+        this.closeCoordinatorTerminal(coordinatorId);
+        
+        // Close engineer terminals
+        for (const name of engineerNames) {
+            this.closeEngineerTerminal(name);
+        }
+    }
+    
+    /**
+     * Remove stale (dead) terminal references without closing active ones
+     */
+    cleanupStaleTerminals(): void {
+        // Clean up stale engineer terminals
+        for (const [name, engineerTerminal] of this.engineerTerminals) {
+            if (!this.isTerminalAlive(engineerTerminal.terminal)) {
+                console.log(`Cleaning up stale terminal reference for engineer: ${name}`);
+                this.engineerTerminals.delete(name);
+            }
+        }
+        
+        // Clean up stale coordinator terminals
+        for (const [id, coordTerminal] of this.coordinatorTerminals) {
+            if (!this.isTerminalAlive(coordTerminal.terminal)) {
+                console.log(`Cleaning up stale terminal reference for coordinator: ${id}`);
+                this.coordinatorTerminals.delete(id);
+            }
+        }
     }
 
     dispose(): void {

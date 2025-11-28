@@ -1548,8 +1548,12 @@ Stage: ${task.stage}
         // Clean up temporary files
         await this.cleanupCoordinatorFiles(coordinatorId);
         
-        // Close coordinator terminal
-        this.terminalManager.closeCoordinatorTerminal(coordinatorId);
+        // Close coordinator terminal and clean up all engineer terminals
+        const engineerNames = Object.keys(coordinator.engineerSessions);
+        this.terminalManager.clearCoordinatorTerminals(coordinatorId, engineerNames);
+        
+        // Also clean up any stale terminal references
+        this.terminalManager.cleanupStaleTerminals();
 
         // Update status
         coordinator.status = 'stopped';
@@ -1606,6 +1610,9 @@ Stage: ${task.stage}
         }
 
         this.logCoord(coordinatorId, `▶️ RESUMING coordinator...`);
+        
+        // Clean up any stale terminal references first
+        this.terminalManager.cleanupStaleTerminals();
 
         const taskManager = this.taskManagers.get(coordinatorId);
         
