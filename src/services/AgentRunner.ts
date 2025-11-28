@@ -952,7 +952,7 @@ Keep running until the debate completes.
         const promptFile = `/tmp/apc_context_gatherer_${Date.now()}.txt`;
         fs.writeFileSync(promptFile, prompt);
         
-        // Run via shell, piping prompt from file (same pattern as run_engineer.sh)
+        // Run via shell, piping prompt from file
         const shellCmd = `cat "${promptFile}" | cursor agent --model "gemini-3-pro" -p --force --approve-mcps --output-format stream-json --stream-partial-output; rm -f "${promptFile}"`;
         
         onProgress?.(`[Context Gatherer] 📄 Prompt saved (${prompt.length} chars), starting agent...`);
@@ -1998,7 +1998,7 @@ ${consensus.agreedRecommendations.length > 0
             fs.writeFileSync(debugLogFile, `=== Agent ${analyst.name} Debug Log ===\nStarted: ${new Date().toISOString()}\n\n`);
             
             // Run cursor agent via shell, piping the prompt from file
-            // This matches how run_engineer.sh works and avoids shell escaping issues
+            // Pipe prompt from file to avoid shell escaping issues
             const shellCmd = `cat "${promptFile}" | cursor agent --model "${analyst.model}" -p --force --approve-mcps --output-format stream-json --stream-partial-output 2>&1; rm -f "${promptFile}"`;
             
             onProgress?.(`[${analyst.name}] 📄 Prompt saved (${prompt.length} chars)`);
