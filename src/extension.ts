@@ -189,16 +189,18 @@ export async function activate(context: vscode.ExtensionContext) {
 - Integration points with existing code
 - Testing and quality requirements
 
-IMPORTANT: Our conversation is REQUIREMENTS GATHERING, not planning.
+IMPORTANT: This is REQUIREMENTS GATHERING, not planning.
 - If I provide docs (GDD, TDD, specs), copy them to _AiDevLog/Docs/
-- Once requirements are clear, call: apc plan new "<summary>" --docs <paths>
 - The APC extension creates the execution plan using multi-model analysts
 - You do NOT create the plan - the extension does
+
+When requirements are clear, SUMMARIZE this conversation and run:
+  apc plan new "<requirement summary from conversation>" --docs <paths>
 
 Workflow:
 1. Gather requirements (this conversation)
 2. Save any docs to _AiDevLog/Docs/
-3. Run: apc plan new "..." to trigger plan creation
+3. Summarize requirements and run: apc plan new "<summary>"
 4. Review with user: apc plan status <id>
 5. Approve: apc plan approve <id> (auto-starts execution)
 
@@ -482,12 +484,16 @@ Let's get started!`;
             const revisionPrompt = `I want to revise the plan for session ${sessionId}.
 
 Current plan: ${session.currentPlanPath}
-Requirement: ${session.requirement.substring(0, 200)}...
+Original requirement: ${session.requirement.substring(0, 200)}...
 
-Please help me revise the plan. What changes would you like to make?
+Please help me discuss what changes I want to make to this plan.
 
-IMPORTANT: After discussing changes, run:
-  apc plan revise ${sessionId} "<feedback summary>"
+IMPORTANT: This is REVISION DISCUSSION, not direct editing.
+- The APC extension will revise the plan using multi-model analysts
+- You do NOT edit the plan directly - the extension does
+
+When revision requirements are clear, SUMMARIZE this conversation and run:
+  apc plan revise ${sessionId} "<revision summary from conversation>"
 
 This will trigger the multi-agent debate to revise the plan.`;
 
