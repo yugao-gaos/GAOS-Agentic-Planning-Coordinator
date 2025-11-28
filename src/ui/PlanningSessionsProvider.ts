@@ -78,12 +78,8 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
             ));
         }
 
-        // Progress log (shared between planning and execution)
-        const progressLogPath = path.join(
-            this.stateManager.getWorkingDir(),
-            'planning_sessions',
-            `${session.id}_progress.log`
-        );
+        // Progress log (in plan folder: _AiDevLog/Plans/{sessionId}/progress.log)
+        const progressLogPath = this.stateManager.getProgressLogPath(session.id);
         if (fs.existsSync(progressLogPath)) {
             details.push(new PlanningSessionItem(
                 session,
