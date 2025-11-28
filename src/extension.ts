@@ -42,36 +42,36 @@ export async function activate(context: vscode.ExtensionContext) {
     const unityControlStatusProvider = new UnityControlStatusProvider();
     
     try {
-        // Initialize services
-        stateManager = new StateManager(workspaceRoot, context);
-        await stateManager.initialize();
+    // Initialize services
+    stateManager = new StateManager(workspaceRoot, context);
+    await stateManager.initialize();
         
         // Debug: Log what we loaded
         const sessions = stateManager.getAllPlanningSessions();
         console.log(`Agentic Planning: Loaded ${sessions.length} planning sessions`);
         sessions.forEach(s => console.log(`  - Session: ${s.id}, status: ${s.status}`));
 
-        engineerPoolService = new EngineerPoolService(stateManager);
-        terminalManager = new TerminalManager();
-        coordinatorService = new CoordinatorService(stateManager, engineerPoolService, terminalManager);
-        planningService = new PlanningService(stateManager);
+    engineerPoolService = new EngineerPoolService(stateManager);
+    terminalManager = new TerminalManager();
+    coordinatorService = new CoordinatorService(stateManager, engineerPoolService, terminalManager);
+    planningService = new PlanningService(stateManager);
         
         // Create providers with initialized services
         planningSessionsProvider = new PlanningSessionsProvider(stateManager);
         engineerPoolProvider = new EngineerPoolProvider(engineerPoolService);
-        
-        // Wire up CoordinatorService to PlanningService (for execution facade)
-        planningService.setCoordinatorService(coordinatorService);
-        
-        cliHandler = new CliHandler(stateManager, engineerPoolService, coordinatorService, planningService, terminalManager);
+    
+    // Wire up CoordinatorService to PlanningService (for execution facade)
+    planningService.setCoordinatorService(coordinatorService);
+    
+    cliHandler = new CliHandler(stateManager, engineerPoolService, coordinatorService, planningService, terminalManager);
 
-        // Initialize and start CLI IPC service (for apc command communication)
-        cliIpcService = new CliIpcService(stateManager, cliHandler);
-        cliIpcService.start();
+    // Initialize and start CLI IPC service (for apc command communication)
+    cliIpcService = new CliIpcService(stateManager, cliHandler);
+    cliIpcService.start();
     } catch (error) {
         console.error('Agentic Planning: Failed to initialize services:', error);
         vscode.window.showErrorMessage(`Agentic Planning failed to initialize: ${error}`);
-        
+    
         // Create dummy state manager for error state providers
         stateManager = new StateManager(workspaceRoot, context);
         engineerPoolService = new EngineerPoolService(stateManager);

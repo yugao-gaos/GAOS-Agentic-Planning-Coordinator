@@ -252,22 +252,22 @@ export class StateManager {
                 // Load session state
                 const sessionFile = path.join(planFolder, 'session.json');
                 if (fs.existsSync(sessionFile)) {
-                    try {
+                try {
                         const data = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'));
-                        this.planningSessions.set(data.id, data);
+                    this.planningSessions.set(data.id, data);
                         console.log(`StateManager: Loaded session ${data.id}`);
-                    } catch (e) {
+                } catch (e) {
                         console.error(`Failed to load planning session ${sessionId}:`, e);
-                    }
-                }
+            }
+        }
 
                 // Load coordinator state (if exists)
                 const coordinatorFile = path.join(planFolder, 'coordinator.json');
                 if (fs.existsSync(coordinatorFile)) {
-                    try {
+                try {
                         const data = JSON.parse(fs.readFileSync(coordinatorFile, 'utf-8'));
-                        this.coordinators.set(data.id, data);
-                    } catch (e) {
+                    this.coordinators.set(data.id, data);
+                } catch (e) {
                         console.error(`Failed to load coordinator for ${sessionId}:`, e);
                     }
                 }
@@ -306,7 +306,7 @@ export class StateManager {
             if (coordinator.planSessionId) {
                 this.ensurePlanDirectories(coordinator.planSessionId);
                 const coordPath = this.getCoordinatorFilePath(coordinator.planSessionId);
-                fs.writeFileSync(coordPath, JSON.stringify(coordinator, null, 2));
+            fs.writeFileSync(coordPath, JSON.stringify(coordinator, null, 2));
             }
         }
     }
@@ -402,8 +402,8 @@ export class StateManager {
         // Coordinator file is in session folder - don't delete the whole folder
         if (coordinator?.planSessionId) {
             const coordPath = this.getCoordinatorFilePath(coordinator.planSessionId);
-            if (fs.existsSync(coordPath)) {
-                fs.unlinkSync(coordPath);
+        if (fs.existsSync(coordPath)) {
+            fs.unlinkSync(coordPath);
             }
         }
     }
@@ -425,7 +425,7 @@ export class StateManager {
             hash += chars.charAt(Math.floor(Math.random() * chars.length));
         }
         return `coord_${hash}`;
-    }
+            }
 
     /**
      * Generate incremental session ID for an engineer
@@ -446,16 +446,16 @@ export class StateManager {
             
             for (const sessionId of planFolders) {
                 const logsDir = this.getEngineerLogsFolder(sessionId);
-                if (fs.existsSync(logsDir)) {
-                    const existingLogs = fs.readdirSync(logsDir).filter(f => pattern.test(f));
-                    
-                    for (const log of existingLogs) {
+        if (fs.existsSync(logsDir)) {
+            const existingLogs = fs.readdirSync(logsDir).filter(f => pattern.test(f));
+            
+            for (const log of existingLogs) {
                         const match = log.match(/_(\d{6})\.log$/);
-                        if (match) {
-                            const num = parseInt(match[1], 10);
-                            if (num >= count) {
-                                count = num + 1;
-                            }
+                if (match) {
+                    const num = parseInt(match[1], 10);
+                    if (num >= count) {
+                        count = num + 1;
+                    }
                         }
                     }
                 }
