@@ -98,11 +98,12 @@ export async function activate(context: vscode.ExtensionContext) {
     );
 
     // Watch for state file changes to auto-refresh UI (CLI updates files directly)
+    // New structure: _AiDevLog/Plans/{sessionId}/session.json and coordinator.json
     const config = vscode.workspace.getConfiguration('agenticPlanning');
     const workingDirectory = config.get<string>('workingDirectory', '_AiDevLog');
     const stateFilesPattern = new vscode.RelativePattern(
         vscode.Uri.file(workspaceRoot), 
-        `${workingDirectory}/{.engineer_pool.json,planning_sessions/*.json,coordinators/*.json}`
+        `${workingDirectory}/{.engineer_pool.json,Plans/*/session.json,Plans/*/coordinator.json}`
     );
     
     const stateFileWatcher = vscode.workspace.createFileSystemWatcher(stateFilesPattern);

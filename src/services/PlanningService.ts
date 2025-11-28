@@ -195,9 +195,10 @@ export class PlanningService {
 
     /**
      * Get the progress file path for a session
+     * Structure: _AiDevLog/Plans/{sessionId}/progress.log
      */
     private getProgressFilePath(sessionId: string): string {
-        return path.join(this.stateManager.getWorkingDir(), 'planning_sessions', `${sessionId}_progress.log`);
+        return this.stateManager.getProgressLogPath(sessionId);
     }
 
     /**
@@ -794,12 +795,9 @@ export class PlanningService {
         }
 
         // Create plan file path - agents will write directly to it
-        const plansDir = path.join(this.stateManager.getWorkingDir(), 'Plans');
-        if (!fs.existsSync(plansDir)) {
-            fs.mkdirSync(plansDir, { recursive: true });
-        }
-        const planFileName = `Plan_${session.id}.md`;
-        const planFilePath = path.join(plansDir, planFileName);
+        // Use new structure: _AiDevLog/Plans/{sessionId}/plan.md
+        this.stateManager.ensurePlanDirectories(session.id);
+        const planFilePath = this.stateManager.getPlanFilePath(session.id);
         
         // Store plan path on session early
         session.currentPlanPath = planFilePath;
@@ -1206,9 +1204,8 @@ were aggregated into the concerns and recommendations listed above.`;
         recommendations: string[],
         engineerCount: number
     ): Promise<string> {
-        const plansDir = path.join(this.stateManager.getWorkingDir(), 'Plans');
-        const planFileName = `Plan_${session.id}.md`;
-        const planPath = path.join(plansDir, planFileName);
+        // Use new structure: _AiDevLog/Plans/{sessionId}/plan.md
+        const planPath = this.stateManager.getPlanFilePath(session.id);
 
         // Read existing plan file (agents wrote their contributions here)
         let existingPlanContent = '';
@@ -1705,9 +1702,9 @@ ${concerns.map((c, i) => `${i + 1}. **${c}**
      * Generate a plan file from the requirement
      */
     private async generatePlan(session: PlanningSession): Promise<string> {
-        const plansDir = path.join(this.stateManager.getWorkingDir(), 'Plans');
-        const planFileName = `Plan_${session.id}.md`;
-        const planPath = path.join(plansDir, planFileName);
+        // Use new structure: _AiDevLog/Plans/{sessionId}/plan.md
+        this.stateManager.ensurePlanDirectories(session.id);
+        const planPath = this.stateManager.getPlanFilePath(session.id);
 
         // Generate a template plan
         const planContent = `# Plan: ${session.requirement}
@@ -1914,15 +1911,10 @@ Update tasks, add new tasks, or modify existing ones based on the feedback.
 Preserve what works, change what the feedback requires.
 `;
 
-        // Prepare revised plan file for agents to write to
-        const planFileName = `Plan_${session.id}_v${newVersion}.md`;
-        const planPath = path.join(this.stateManager.getWorkingDir(), 'Plans', planFileName);
-        
-        // Ensure Plans directory exists
-        const plansDir = path.dirname(planPath);
-        if (!fs.existsSync(plansDir)) {
-            fs.mkdirSync(plansDir, { recursive: true });
-        }
+        // Prepare revised plan file - use same file (plan.md), version tracked internally
+        // Structure: _AiDevLog/Plans/{sessionId}/plan.md
+        this.stateManager.ensurePlanDirectories(session.id);
+        const planPath = this.stateManager.getPlanFilePath(session.id);
 
         // Copy existing plan as base for revision (NOT a fresh skeleton)
         const revisionHeader = `# Plan Revision v${newVersion}
@@ -2029,7 +2021,7 @@ _Reviewing feedback impact on testing..._
 
         // Final progress messages
         this.writeProgress(session.id, 'COMPLETE', `✅ Revision v${newVersion} complete!`);
-        this.writeProgress(session.id, 'COMPLETE', `   Plan: ${planFileName}`);
+        this.writeProgress(session.id, 'COMPLETE', `   Plan: ${path.basename(planPath)}`);
         this.writeProgress(session.id, 'COMPLETE', ``);
         this.writeProgress(session.id, 'COMPLETE', `🎯 Ready for review!`);
         this.writeProgress(session.id, 'COMPLETE', `   Use: apc plan status ${session.id}`);
@@ -2078,9 +2070,9 @@ _Reviewing feedback impact on testing..._
         await this.delay(400);
 
         // Generate revised plan - overwrite the same file
+        // Structure: _AiDevLog/Plans/{sessionId}/plan.md
         const newVersion = session.planHistory.length + 1;
-        const planFileName = `Plan_${session.id}.md`;
-        const planPath = path.join(this.stateManager.getWorkingDir(), 'Plans', planFileName);
+        const planPath = this.stateManager.getPlanFilePath(session.id);
 
         // Read existing plan and append revision notes
         let existingContent = '';
@@ -2101,7 +2093,7 @@ _Reviewing feedback impact on testing..._
 
         fs.writeFileSync(planPath, revisedContent);
 
-        this.writeProgress(session.id, 'COMPLETE', `✅ Revision ${newVersion} generated: ${planFileName}`);
+        this.writeProgress(session.id, 'COMPLETE', `✅ Revision ${newVersion} generated: ${path.basename(planPath)}`);
         this.writeProgress(session.id, 'COMPLETE', `\n🎯 Ready for review!`);
         this.writeProgress(session.id, 'COMPLETE', `   Use: apc plan status ${session.id}`);
         this.writeProgress(session.id, 'COMPLETE', `   Or:  apc plan approve ${session.id}`);

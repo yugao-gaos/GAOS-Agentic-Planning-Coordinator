@@ -40,6 +40,117 @@ export class StateManager {
         this.engineerPoolState = this.createDefaultEngineerPool(this.extensionState.globalSettings.engineerPoolSize);
     }
 
+    // ========================================================================
+    // Path Helpers - All paths relative to plan folder structure
+    // ========================================================================
+
+    /**
+     * Get the base folder for a planning session
+     * Structure: _AiDevLog/Plans/{sessionId}/
+     */
+    getPlanFolder(sessionId: string): string {
+        return path.join(this.workingDir, 'Plans', sessionId);
+    }
+
+    /**
+     * Get the plan file path for a session
+     * Structure: _AiDevLog/Plans/{sessionId}/plan.md
+     */
+    getPlanFilePath(sessionId: string): string {
+        return path.join(this.getPlanFolder(sessionId), 'plan.md');
+    }
+
+    /**
+     * Get the session state file path
+     * Structure: _AiDevLog/Plans/{sessionId}/session.json
+     */
+    getSessionFilePath(sessionId: string): string {
+        return path.join(this.getPlanFolder(sessionId), 'session.json');
+    }
+
+    /**
+     * Get the coordinator state file path for a session
+     * Structure: _AiDevLog/Plans/{sessionId}/coordinator.json
+     */
+    getCoordinatorFilePath(sessionId: string): string {
+        return path.join(this.getPlanFolder(sessionId), 'coordinator.json');
+    }
+
+    /**
+     * Get the progress log file path
+     * Structure: _AiDevLog/Plans/{sessionId}/progress.log
+     */
+    getProgressLogPath(sessionId: string): string {
+        return path.join(this.getPlanFolder(sessionId), 'progress.log');
+    }
+
+    /**
+     * Get the completions folder for a session
+     * Structure: _AiDevLog/Plans/{sessionId}/completions/
+     */
+    getCompletionsFolder(sessionId: string): string {
+        return path.join(this.getPlanFolder(sessionId), 'completions');
+    }
+
+    /**
+     * Get the logs folder for a session
+     * Structure: _AiDevLog/Plans/{sessionId}/logs/
+     */
+    getLogsFolder(sessionId: string): string {
+        return path.join(this.getPlanFolder(sessionId), 'logs');
+    }
+
+    /**
+     * Get the engineer logs folder for a session
+     * Structure: _AiDevLog/Plans/{sessionId}/logs/engineers/
+     */
+    getEngineerLogsFolder(sessionId: string): string {
+        return path.join(this.getLogsFolder(sessionId), 'engineers');
+    }
+
+    /**
+     * Get the coordinator log file path
+     * Structure: _AiDevLog/Plans/{sessionId}/logs/coordinator.log
+     */
+    getCoordinatorLogPath(sessionId: string): string {
+        return path.join(this.getLogsFolder(sessionId), 'coordinator.log');
+    }
+
+    /**
+     * Get the summaries folder for a session
+     * Structure: _AiDevLog/Plans/{sessionId}/summaries/
+     */
+    getSummariesFolder(sessionId: string): string {
+        return path.join(this.getPlanFolder(sessionId), 'summaries');
+    }
+
+    /**
+     * Get the execution summary path
+     * Structure: _AiDevLog/Plans/{sessionId}/summaries/execution_summary.md
+     */
+    getExecutionSummaryPath(sessionId: string): string {
+        return path.join(this.getSummariesFolder(sessionId), 'execution_summary.md');
+    }
+
+    /**
+     * Ensure all directories for a plan session exist
+     */
+    ensurePlanDirectories(sessionId: string): void {
+        const dirs = [
+            this.getPlanFolder(sessionId),
+            this.getCompletionsFolder(sessionId),
+            this.getLogsFolder(sessionId),
+            this.getEngineerLogsFolder(sessionId),
+            this.getSummariesFolder(sessionId)
+        ];
+
+        for (const dir of dirs) {
+            if (!fs.existsSync(dir)) {
+                fs.mkdirSync(dir, { recursive: true });
+            }
+        }
+    }
+
     async initialize(): Promise<void> {
         // Ensure directories exist
         await this.ensureDirectories();
@@ -51,13 +162,12 @@ export class StateManager {
     }
 
     private async ensureDirectories(): Promise<void> {
+        // Only create base directories - plan-specific dirs created when sessions are created
         const dirs = [
             this.workingDir,
             path.join(this.workingDir, 'Plans'),
-            path.join(this.workingDir, 'Logs'),
-            path.join(this.workingDir, 'Logs', 'engineers'),
-            path.join(this.workingDir, 'planning_sessions'),
-            path.join(this.workingDir, 'coordinators')
+            path.join(this.workingDir, 'Docs'),
+            path.join(this.workingDir, 'Context')
         ];
 
         for (const dir of dirs) {
@@ -103,30 +213,69 @@ export class StateManager {
             }
         }
 
-        // Load planning sessions
-        const sessionsDir = path.join(this.workingDir, 'planning_sessions');
-        if (fs.existsSync(sessionsDir)) {
-            const files = fs.readdirSync(sessionsDir).filter(f => f.endsWith('.json'));
-            for (const file of files) {
-                try {
-                    const data = JSON.parse(fs.readFileSync(path.join(sessionsDir, file), 'utf-8'));
-                    this.planningSessions.set(data.id, data);
-                } catch (e) {
-                    console.error(`Failed to load planning session ${file}:`, e);
+        // Load planning sessions and coordinators from new plan folder structure
+        // Structure: _AiDevLog/Plans/{sessionId}/session.json and coordinator.json
+        const plansDir = path.join(this.workingDir, 'Plans');
+        if (fs.existsSync(plansDir)) {
+            const planFolders = fs.readdirSync(plansDir, { withFileTypes: true })
+                .filter(d => d.isDirectory())
+                .map(d => d.name);
+
+            for (const sessionId of planFolders) {
+                const planFolder = path.join(plansDir, sessionId);
+                
+                // Load session state
+                const sessionFile = path.join(planFolder, 'session.json');
+                if (fs.existsSync(sessionFile)) {
+                    try {
+                        const data = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'));
+                        this.planningSessions.set(data.id, data);
+                    } catch (e) {
+                        console.error(`Failed to load planning session ${sessionId}:`, e);
+                    }
+                }
+
+                // Load coordinator state (if exists)
+                const coordinatorFile = path.join(planFolder, 'coordinator.json');
+                if (fs.existsSync(coordinatorFile)) {
+                    try {
+                        const data = JSON.parse(fs.readFileSync(coordinatorFile, 'utf-8'));
+                        this.coordinators.set(data.id, data);
+                    } catch (e) {
+                        console.error(`Failed to load coordinator for ${sessionId}:`, e);
+                    }
                 }
             }
         }
 
-        // Load coordinators
-        const coordinatorsDir = path.join(this.workingDir, 'coordinators');
-        if (fs.existsSync(coordinatorsDir)) {
-            const files = fs.readdirSync(coordinatorsDir).filter(f => f.endsWith('.json'));
+        // Backwards compatibility: Load from old structure if exists
+        // TODO: Remove this after migration is complete
+        const oldSessionsDir = path.join(this.workingDir, 'planning_sessions');
+        if (fs.existsSync(oldSessionsDir)) {
+            const files = fs.readdirSync(oldSessionsDir).filter(f => f.endsWith('.json'));
             for (const file of files) {
                 try {
-                    const data = JSON.parse(fs.readFileSync(path.join(coordinatorsDir, file), 'utf-8'));
-                    this.coordinators.set(data.id, data);
+                    const data = JSON.parse(fs.readFileSync(path.join(oldSessionsDir, file), 'utf-8'));
+                    if (!this.planningSessions.has(data.id)) {
+                        this.planningSessions.set(data.id, data);
+                    }
                 } catch (e) {
-                    console.error(`Failed to load coordinator ${file}:`, e);
+                    console.error(`Failed to load legacy planning session ${file}:`, e);
+                }
+            }
+        }
+
+        const oldCoordinatorsDir = path.join(this.workingDir, 'coordinators');
+        if (fs.existsSync(oldCoordinatorsDir)) {
+            const files = fs.readdirSync(oldCoordinatorsDir).filter(f => f.endsWith('.json'));
+            for (const file of files) {
+                try {
+                    const data = JSON.parse(fs.readFileSync(path.join(oldCoordinatorsDir, file), 'utf-8'));
+                    if (!this.coordinators.has(data.id)) {
+                        this.coordinators.set(data.id, data);
+                    }
+                } catch (e) {
+                    console.error(`Failed to load legacy coordinator ${file}:`, e);
                 }
             }
         }
@@ -160,16 +309,20 @@ export class StateManager {
         const poolStatePath = path.join(this.workingDir, '.engineer_pool.json');
         fs.writeFileSync(poolStatePath, JSON.stringify(this.engineerPoolState, null, 2));
 
-        // Update individual planning sessions
+        // Update individual planning sessions and coordinators (in plan folders)
         for (const [id, session] of this.planningSessions) {
-            const sessionPath = path.join(this.workingDir, 'planning_sessions', `${id}.json`);
+            this.ensurePlanDirectories(id);
+            const sessionPath = this.getSessionFilePath(id);
             fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2));
         }
 
-        // Update individual coordinators
         for (const [id, coordinator] of this.coordinators) {
-            const coordPath = path.join(this.workingDir, 'coordinators', `${id}.json`);
-            fs.writeFileSync(coordPath, JSON.stringify(coordinator, null, 2));
+            // Coordinators are stored in their session's folder
+            if (coordinator.planSessionId) {
+                this.ensurePlanDirectories(coordinator.planSessionId);
+                const coordPath = this.getCoordinatorFilePath(coordinator.planSessionId);
+                fs.writeFileSync(coordPath, JSON.stringify(coordinator, null, 2));
+            }
         }
     }
 
@@ -236,42 +389,43 @@ export class StateManager {
 
     savePlanningSession(session: PlanningSession): void {
         this.planningSessions.set(session.id, session);
-        // Also persist to disk so file watchers trigger
-        const sessionPath = path.join(this.workingDir, 'planning_sessions', `${session.id}.json`);
+        // Ensure plan directories exist and persist to disk
+        this.ensurePlanDirectories(session.id);
+        const sessionPath = this.getSessionFilePath(session.id);
         fs.writeFileSync(sessionPath, JSON.stringify(session, null, 2));
     }
 
     saveCoordinator(coordinator: CoordinatorState): void {
         this.coordinators.set(coordinator.id, coordinator);
-        // Also persist to disk so file watchers trigger
-        const coordPath = path.join(this.workingDir, 'coordinators', `${coordinator.id}.json`);
-        fs.writeFileSync(coordPath, JSON.stringify(coordinator, null, 2));
+        // Save coordinator in its session's folder
+        if (coordinator.planSessionId) {
+            this.ensurePlanDirectories(coordinator.planSessionId);
+            const coordPath = this.getCoordinatorFilePath(coordinator.planSessionId);
+            fs.writeFileSync(coordPath, JSON.stringify(coordinator, null, 2));
+        }
     }
 
     deletePlanningSession(id: string): void {
         this.planningSessions.delete(id);
-        const sessionPath = path.join(this.workingDir, 'planning_sessions', `${id}.json`);
-        if (fs.existsSync(sessionPath)) {
-            fs.unlinkSync(sessionPath);
-        }
+        // Note: We don't delete the plan folder - it contains logs and history
+        // Only mark as deleted in state
     }
 
     deleteCoordinator(id: string): void {
+        const coordinator = this.coordinators.get(id);
         this.coordinators.delete(id);
-        const coordPath = path.join(this.workingDir, 'coordinators', `${id}.json`);
-        if (fs.existsSync(coordPath)) {
-            fs.unlinkSync(coordPath);
+        // Coordinator file is in session folder - don't delete the whole folder
+        if (coordinator?.planSessionId) {
+            const coordPath = this.getCoordinatorFilePath(coordinator.planSessionId);
+            if (fs.existsSync(coordPath)) {
+                fs.unlinkSync(coordPath);
+            }
         }
     }
 
     // ========================================================================
     // ID Generation
     // ========================================================================
-
-    generatePlanningSessionId(): string {
-        const count = this.planningSessions.size + 1;
-        return `ps_${count.toString().padStart(6, '0')}`;
-    }
 
     /**
      * Generate coordinator ID with hash-style format
@@ -291,29 +445,67 @@ export class StateManager {
     /**
      * Generate incremental session ID for an engineer
      * Format: engineername_000001, engineername_000002, etc.
+     * Looks across all plan folders for existing sessions
      */
     generateSessionId(engineerName: string): string {
-        // Count existing sessions for this engineer from log files
-        const logsDir = path.join(this.workingDir, 'Logs', 'engineers');
         let count = 1;
         
-        if (fs.existsSync(logsDir)) {
-            const pattern = new RegExp(`^${engineerName.toLowerCase()}_\\d{6}\\.log$`, 'i');
-            const existingLogs = fs.readdirSync(logsDir).filter(f => pattern.test(f));
+        // Scan all plan folders for engineer logs
+        const plansDir = path.join(this.workingDir, 'Plans');
+        if (fs.existsSync(plansDir)) {
+            const pattern = new RegExp(`^${engineerName}_\\d{6}\\.log$`, 'i');
             
-            // Find the highest number
-            for (const log of existingLogs) {
-                const match = log.match(/_(\d{6})\.log$/);
-                if (match) {
-                    const num = parseInt(match[1], 10);
-                    if (num >= count) {
-                        count = num + 1;
+            const planFolders = fs.readdirSync(plansDir, { withFileTypes: true })
+                .filter(d => d.isDirectory())
+                .map(d => d.name);
+            
+            for (const sessionId of planFolders) {
+                const logsDir = this.getEngineerLogsFolder(sessionId);
+                if (fs.existsSync(logsDir)) {
+                    const existingLogs = fs.readdirSync(logsDir).filter(f => pattern.test(f));
+                    
+                    for (const log of existingLogs) {
+                        const match = log.match(/_(\d{6})\.log$/);
+                        if (match) {
+                            const num = parseInt(match[1], 10);
+                            if (num >= count) {
+                                count = num + 1;
+                            }
+                        }
                     }
                 }
             }
         }
         
         return `${engineerName.toLowerCase()}_${count.toString().padStart(6, '0')}`;
+    }
+
+    /**
+     * Generate planning session ID
+     * Format: ps_000001, ps_000002, etc.
+     */
+    generatePlanningSessionId(): string {
+        // Find the highest existing session number
+        let count = 0;
+        
+        const plansDir = path.join(this.workingDir, 'Plans');
+        if (fs.existsSync(plansDir)) {
+            const planFolders = fs.readdirSync(plansDir, { withFileTypes: true })
+                .filter(d => d.isDirectory())
+                .map(d => d.name);
+            
+            for (const folder of planFolders) {
+                const match = folder.match(/^ps_(\d{6})$/);
+                if (match) {
+                    const num = parseInt(match[1], 10);
+                    if (num > count) {
+                        count = num;
+                    }
+                }
+            }
+        }
+        
+        return `ps_${(count + 1).toString().padStart(6, '0')}`;
     }
 }
 

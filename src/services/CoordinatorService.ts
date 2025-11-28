@@ -185,12 +185,14 @@ export class CoordinatorService {
         this.log(`Allocated ${allocatedEngineers.length} engineers: ${allocatedEngineers.join(', ')}`);
 
         // Step 4: Create coordinator log file
+        // Structure: _AiDevLog/Plans/{sessionId}/logs/coordinator.log
         const workspaceRoot = this.stateManager.getWorkspaceRoot();
-        const logDir = path.join(this.stateManager.getWorkingDir(), 'Logs', 'coordinators');
-        if (!fs.existsSync(logDir)) {
-            fs.mkdirSync(logDir, { recursive: true });
+        if (options.planSessionId) {
+            this.stateManager.ensurePlanDirectories(options.planSessionId);
         }
-        const coordinatorLogFile = path.join(logDir, `${coordinatorId}.log`);
+        const coordinatorLogFile = options.planSessionId 
+            ? this.stateManager.getCoordinatorLogPath(options.planSessionId)
+            : path.join(this.stateManager.getWorkingDir(), 'Logs', 'coordinators', `${coordinatorId}.log`);
         
         // Write log header
         const logHeader = `
@@ -230,21 +232,19 @@ Progress: ${planData.metadata.completedTasks}/${planData.metadata.totalTasks} ($
         this.terminalManager.startCoordinatorLogTail(coordinatorId);
 
         // Step 5: Register engineers with TaskManager
+        // Structure: _AiDevLog/Plans/{sessionId}/logs/engineers/{EngineerName}_{sessionId}.log
         for (const engineerName of allocatedEngineers) {
-            const sessionId = this.stateManager.generateSessionId(engineerName);
-            const logFile = path.join(
-                this.stateManager.getWorkingDir(),
-                'Logs',
-                'engineers',
-                `${engineerName}_${sessionId}.log`
-            );
+            const engineerSessionId = this.stateManager.generateSessionId(engineerName);
+            const logFile = options.planSessionId
+                ? path.join(this.stateManager.getEngineerLogsFolder(options.planSessionId), `${engineerName}_${engineerSessionId}.log`)
+                : path.join(this.stateManager.getWorkingDir(), 'Logs', 'engineers', `${engineerName}_${engineerSessionId}.log`);
 
             // Register with TaskManager
-            taskManager.registerEngineer(engineerName, sessionId, logFile);
+            taskManager.registerEngineer(engineerName, engineerSessionId, logFile);
 
             // Add to coordinator state
             coordinator.engineerSessions[engineerName] = {
-                sessionId,
+                sessionId: engineerSessionId,
                 status: 'starting',
                 logFile,
                 startTime: new Date().toISOString()
@@ -252,7 +252,7 @@ Progress: ${planData.metadata.completedTasks}/${planData.metadata.totalTasks} ($
 
             // Update pool
             this.engineerPoolService.updateEngineerSession(engineerName, {
-                sessionId,
+                sessionId: engineerSessionId,
                 logFile
             });
         }
@@ -411,7 +411,7 @@ ${task.description}
 - Terminal commands for git, compilation, etc.
 
 📜 WORKFLOW:
-1. FIRST: Read previous session logs from _AiDevLog/Logs/engineers/ to understand context
+1. FIRST: Read previous session logs from _AiDevLog/Plans/ to understand context
 2. Read relevant existing docs in _AiDevLog/Docs/ for your task
 3. Implement the task following the plan's specifications
 4. Check _AiDevLog/Errors/error_registry.md before fixing ANY error (avoid duplicate fixes)
@@ -658,12 +658,17 @@ IMPORTANT:
         if (!coordinator) return;
         
         const workspaceRoot = this.stateManager.getWorkspaceRoot();
-        const summaryDir = path.join(this.stateManager.getWorkingDir(), 'Summaries');
+        
+        // Structure: _AiDevLog/Plans/{sessionId}/summaries/execution_summary.md
+        const summaryPath = coordinator.planSessionId
+            ? this.stateManager.getExecutionSummaryPath(coordinator.planSessionId)
+            : path.join(this.stateManager.getWorkingDir(), 'Summaries', `${coordinatorId}_summary.md`);
+        
+        // Ensure parent directory exists
+        const summaryDir = path.dirname(summaryPath);
         if (!fs.existsSync(summaryDir)) {
             fs.mkdirSync(summaryDir, { recursive: true });
         }
-        
-        const summaryPath = path.join(summaryDir, `${coordinatorId}_summary.md`);
         const planPath = coordinator.planPath;
         
         this.logCoord(coordinatorId, `   📝 Generating execution summary...`);
