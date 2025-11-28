@@ -386,6 +386,8 @@ _Analysis pending..._
 Tasks will be added by analysts during their analysis.
 Each task includes: name, files, dependencies, tests, best practices.
 
+**⚠️ DO NOT group tasks into "waves" - just specify dependencies. Coordinator dispatches dynamically.**
+
 | ID | Task | Dependencies | Files | Tests |
 |----|------|--------------|-------|-------|
 | _TBD_ | _Analysts identifying tasks..._ | _TBD_ | _TBD_ | _TBD_ |
@@ -424,7 +426,11 @@ Pool has ${poolSize} engineers available - use them all if tasks parallelize!_
 
 ## 9. Execution Strategy
 
-_Tasks will be dynamically dispatched based on dependencies (coordinator handles parallelization)_
+**Dynamic Dispatch:** Tasks are dispatched automatically as their dependencies complete.
+- Tasks with NO dependencies start immediately (in parallel)
+- Tasks with dependencies wait until those complete
+- Coordinator handles all parallelization - NO manual "wave" grouping needed
+- Just specify task dependencies in the Task Breakdown table above
 
 ---
 
