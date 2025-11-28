@@ -338,6 +338,23 @@ export class PlanningSessionItem extends vscode.TreeItem {
                         this.description = '(no log yet)';
                     }
                     break;
+                
+                case 'execution_summary':
+                    // Execution summary - clicking opens the summary file
+                    this.iconPath = new vscode.ThemeIcon('file-text', new vscode.ThemeColor('charts.green'));
+                    if (extraPath && fs.existsSync(extraPath)) {
+                        this.command = {
+                            command: 'vscode.open',
+                            title: 'Open Execution Summary',
+                            arguments: [vscode.Uri.file(extraPath)]
+                        };
+                        this.description = '(click to view)';
+                        this.tooltip = `Click to view execution summary`;
+                    } else if (extraPath) {
+                        this.tooltip = `Summary file not found: ${extraPath}`;
+                        this.description = '(file missing)';
+                    }
+                    break;
                     
                 default:
                     this.iconPath = new vscode.ThemeIcon('circle-small-filled');
