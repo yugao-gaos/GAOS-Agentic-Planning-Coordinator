@@ -412,24 +412,38 @@ ${task.description}
 📋 REFERENCE: Read the full plan at ${planPath} for complete context.
 
 🔧 AVAILABLE TOOLS:
-- unityMCP for Unity operations (read/write scripts, manage GameObjects, run tests)
+- unityMCP for Unity operations: scripts (create/read/edit), assets, GameObjects, scenes
 - File operations for reading/writing code
-- Terminal commands for git, compilation, etc.
+- Terminal commands for git, etc.
+
+🚫 DO NOT USE DIRECTLY (coordinator will handle these):
+- mcp_unityMCP_run_tests - DO NOT call this directly
+- mcp_unityMCP_manage_editor with action "play"/"stop" - DO NOT call this directly
+
+Instead, when you need Unity compilation or tests, write this marker in your output:
+  [UNITY_REQUEST:compile] - Request Unity to recompile scripts
+  [UNITY_REQUEST:test_editmode] - Request EditMode tests to run
+  [UNITY_REQUEST:test_playmode] - Request PlayMode tests to run
+  
+The coordinator will queue these operations and provide results. Continue with other work while waiting.
 
 📜 WORKFLOW:
 1. FIRST: Read previous session logs from the plan folder to understand context
 2. Read relevant existing docs in _AiDevLog/Docs/ for your task
 3. Implement the task following the plan's specifications
-4. Check _AiDevLog/Errors/error_registry.md before fixing ANY error (avoid duplicate fixes)
-5. UPDATE DOCS: Prefer updating existing docs. For new systems, add new doc.
-6. Mark your checkbox [x] in the plan when task is complete
-7. Write completion report to: ${completionReportPath}
+4. After writing/modifying C# files, output [UNITY_REQUEST:compile] to trigger recompilation
+5. When ready to verify, output [UNITY_REQUEST:test_editmode] to run tests
+6. Check _AiDevLog/Errors/error_registry.md before fixing ANY error (avoid duplicate fixes)
+7. UPDATE DOCS: Prefer updating existing docs. For new systems, add new doc.
+8. Mark your checkbox [x] in the plan when task is complete
+9. Write completion report to: ${completionReportPath}
    - Include: what was done, files created/modified, tests added
    - If blocked, write "BLOCKED: reason" in the report
 
 ⚠️ IMPORTANT:
 - Follow existing code patterns in the codebase
 - Write clean, well-documented code
+- DO NOT call mcp_unityMCP_run_tests directly - use [UNITY_REQUEST:test_*] markers
 - If you encounter an error that's already in error_registry.md, check the fix there first
 - Context will be updated automatically by coordinator after task completion`;
 
@@ -464,6 +478,9 @@ Coordinator: ${coordinatorId}
             onOutput: (text, type) => {
                 // Stream output to terminal
                 this.terminalManager.appendToTerminal(engineerName, text, type);
+                
+                // Detect Unity operation requests from engineer output
+                this.detectAndQueueUnityRequests(text, coordinatorId, engineerName, task.id);
             },
             onProgress: (message) => {
                 this.logCoord(coordinatorId, `[${engineerName}] ${message}`);
@@ -905,6 +922,53 @@ Keep it concise but comprehensive. Use markdown formatting.`;
 
         this.log(`Queued ${testType} test for ${engineerName} (Unity task: ${unityTaskId})`);
         return unityTaskId;
+    }
+
+    /**
+     * Detect [UNITY_REQUEST:*] markers in engineer output and queue appropriate Unity operations
+     */
+    private detectAndQueueUnityRequests(text: string, coordinatorId: string, engineerName: string, taskId: string): void {
+        // Pattern: [UNITY_REQUEST:compile], [UNITY_REQUEST:test_editmode], [UNITY_REQUEST:test_playmode]
+        const requestPattern = /\[UNITY_REQUEST:(compile|test_editmode|test_playmode)\]/gi;
+        const matches = text.matchAll(requestPattern);
+        
+        for (const match of matches) {
+            const requestType = match[1].toLowerCase() as 'compile' | 'test_editmode' | 'test_playmode';
+            this.logCoord(coordinatorId, `🎮 ${engineerName} requested Unity operation: ${requestType}`);
+            
+            // Map request type to Unity task type
+            const unityTaskTypeMap: Record<string, 'prep_editor' | 'test_framework_editmode' | 'test_framework_playmode'> = {
+                'compile': 'prep_editor',
+                'test_editmode': 'test_framework_editmode',
+                'test_playmode': 'test_framework_playmode'
+            };
+            
+            const unityTaskType = unityTaskTypeMap[requestType];
+            if (!unityTaskType) {
+                this.logCoord(coordinatorId, `⚠️ Unknown Unity request type: ${requestType}`);
+                continue;
+            }
+            
+            // Queue the Unity operation with proper TaskRequester format
+            const unityTaskId = this.unityAgent.queueTask(unityTaskType, {
+                coordinatorId,
+                engineerName
+            });
+            
+            this.logCoord(coordinatorId, `📋 Queued Unity task ${unityTaskId} (${unityTaskType}) for ${engineerName}`);
+            
+            // Track the pending request with proper PendingUnityRequest format
+            if (!this.pendingUnityRequests.has(coordinatorId)) {
+                this.pendingUnityRequests.set(coordinatorId, []);
+            }
+            this.pendingUnityRequests.get(coordinatorId)!.push({
+                unityTaskId,
+                engineerName,
+                taskId,
+                type: requestType,
+                requestedAt: new Date().toISOString()
+            });
+        }
     }
 
     /**
