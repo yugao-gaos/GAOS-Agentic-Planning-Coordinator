@@ -33,37 +33,51 @@ export async function activate(context: vscode.ExtensionContext) {
     }
     console.log(`Agentic Planning: Workspace root = ${workspaceRoot}`);
 
-    // Initialize services
-    stateManager = new StateManager(workspaceRoot, context);
-    await stateManager.initialize();
-    
-    // Debug: Log what we loaded
-    const sessions = stateManager.getAllPlanningSessions();
-    console.log(`Agentic Planning: Loaded ${sessions.length} planning sessions`);
-    sessions.forEach(s => console.log(`  - Session: ${s.id}, status: ${s.status}`));
-
-    engineerPoolService = new EngineerPoolService(stateManager);
-    terminalManager = new TerminalManager();
-    coordinatorService = new CoordinatorService(stateManager, engineerPoolService, terminalManager);
-    planningService = new PlanningService(stateManager);
-    
-    // Wire up CoordinatorService to PlanningService (for execution facade)
-    planningService.setCoordinatorService(coordinatorService);
-    
-    cliHandler = new CliHandler(stateManager, engineerPoolService, coordinatorService, planningService, terminalManager);
-
-    // Initialize and start CLI IPC service (for apc command communication)
-    cliIpcService = new CliIpcService(stateManager, cliHandler);
-    cliIpcService.start();
-
-    // Initialize dependency service and check dependencies
+    // Create placeholder providers first so TreeViews are always registered
+    // This prevents "no data provider" errors even if initialization fails
     const dependencyService = DependencyService.getInstance();
-    
-    // Register TreeView providers (no more separate Coordinators view - embedded in Sessions)
     const dependencyStatusProvider = new DependencyStatusProvider();
-    const planningSessionsProvider = new PlanningSessionsProvider(stateManager);
-    const engineerPoolProvider = new EngineerPoolProvider(engineerPoolService);
+    let planningSessionsProvider: PlanningSessionsProvider;
+    let engineerPoolProvider: EngineerPoolProvider;
     const unityControlStatusProvider = new UnityControlStatusProvider();
+    
+    try {
+        // Initialize services
+        stateManager = new StateManager(workspaceRoot, context);
+        await stateManager.initialize();
+        
+        // Debug: Log what we loaded
+        const sessions = stateManager.getAllPlanningSessions();
+        console.log(`Agentic Planning: Loaded ${sessions.length} planning sessions`);
+        sessions.forEach(s => console.log(`  - Session: ${s.id}, status: ${s.status}`));
+
+        engineerPoolService = new EngineerPoolService(stateManager);
+        terminalManager = new TerminalManager();
+        coordinatorService = new CoordinatorService(stateManager, engineerPoolService, terminalManager);
+        planningService = new PlanningService(stateManager);
+        
+        // Create providers with initialized services
+        planningSessionsProvider = new PlanningSessionsProvider(stateManager);
+        engineerPoolProvider = new EngineerPoolProvider(engineerPoolService);
+        
+        // Wire up CoordinatorService to PlanningService (for execution facade)
+        planningService.setCoordinatorService(coordinatorService);
+        
+        cliHandler = new CliHandler(stateManager, engineerPoolService, coordinatorService, planningService, terminalManager);
+
+        // Initialize and start CLI IPC service (for apc command communication)
+        cliIpcService = new CliIpcService(stateManager, cliHandler);
+        cliIpcService.start();
+    } catch (error) {
+        console.error('Agentic Planning: Failed to initialize services:', error);
+        vscode.window.showErrorMessage(`Agentic Planning failed to initialize: ${error}`);
+        
+        // Create dummy state manager for error state providers
+        stateManager = new StateManager(workspaceRoot, context);
+        engineerPoolService = new EngineerPoolService(stateManager);
+        planningSessionsProvider = new PlanningSessionsProvider(stateManager);
+        engineerPoolProvider = new EngineerPoolProvider(engineerPoolService);
+    }
     
     // Initialize Unity Control Agent and connect to UI
     const unityControlAgent = UnityControlAgent.getInstance();

@@ -51,7 +51,7 @@ export class TerminalManager {
             existing.terminal.show();
             return existing.terminal;
         }
-        
+
         // If existing terminal is dead, dispose it first
         if (existing) {
             this.engineerTerminals.delete(engineerName);
@@ -187,7 +187,7 @@ export class TerminalManager {
             // Only tail if log file path exists
             if (engineerTerminal.logFile) {
                 terminal.sendText(`echo "📄 Reconnecting to log file..."`);
-                terminal.sendText(`tail -f "${engineerTerminal.logFile}"`);
+            terminal.sendText(`tail -f "${engineerTerminal.logFile}"`);
             }
             return true;
         }
@@ -261,7 +261,7 @@ export class TerminalManager {
             existing.terminal.show();
             return existing.terminal;
         }
-        
+
         // Clean up dead terminal reference
         if (existing) {
             this.coordinatorTerminals.delete(coordinatorId);

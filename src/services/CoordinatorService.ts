@@ -470,7 +470,7 @@ Coordinator: ${coordinatorId}
         agentRunner.run({
             id: processId,
             prompt,
-            cwd: workspaceRoot,
+                cwd: workspaceRoot,
             model: 'sonnet-4.5',
             logFile,
             timeoutMs: this.DEFAULT_TIMEOUT * 1000,  // Convert to ms
@@ -484,7 +484,7 @@ Coordinator: ${coordinatorId}
             },
             onProgress: (message) => {
                 this.logCoord(coordinatorId, `[${engineerName}] ${message}`);
-            },
+                },
             onStart: (pid) => {
                 this.logCoord(coordinatorId, `[${engineerName}] Process started (PID: ${pid})`);
             }
@@ -492,23 +492,23 @@ Coordinator: ${coordinatorId}
             // Handle completion
             fs.appendFileSync(logFile, `\n\n--- Process exited with code ${result.exitCode} ---\n`);
             
-            const taskManager = this.taskManagers.get(coordinatorId);
-            if (taskManager) {
+                    const taskManager = this.taskManagers.get(coordinatorId);
+                    if (taskManager) {
                 if (result.success) {
                     taskManager.markTaskCompleted(task.id);
                 } else if (result.error) {
                     taskManager.markTaskFailed(task.id, result.error);
                 } else {
                     taskManager.markTaskFailed(task.id, `Exit code ${result.exitCode}`);
-                }
+                    }
             }
             
-            const coordinator = this.stateManager.getCoordinator(coordinatorId);
-            if (coordinator?.engineerSessions[engineerName]) {
+                    const coordinator = this.stateManager.getCoordinator(coordinatorId);
+                    if (coordinator?.engineerSessions[engineerName]) {
                 coordinator.engineerSessions[engineerName].status = result.success ? 'completed' : 'error';
-                this.stateManager.saveCoordinator(coordinator);
-            }
-
+                        this.stateManager.saveCoordinator(coordinator);
+                    }
+            
             // Show completion in output channel
             this.terminalManager.showTaskCompletion(
                 engineerName, 
@@ -521,7 +521,7 @@ Coordinator: ${coordinatorId}
             this.logCoord(coordinatorId, `[${engineerName}] ❌ Error: ${err.message}`);
             this.terminalManager.showTaskCompletion(engineerName, false, `Error: ${err.message}`);
         });
-
+        
         this.logCoord(coordinatorId, `Started ${engineerName} on task ${task.id}`);
     }
 
