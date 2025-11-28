@@ -945,9 +945,10 @@ export class PlanningService {
         phases.push('Engineer Optimization');
         await this.delay(300);
 
-        // Aggregate engineer count recommendations
-        const engineerVotes = analyses.map(a => a.engineerCount);
-        const avgEngineers = Math.round(engineerVotes.reduce((a, b) => a + b, 0) / engineerVotes.length);
+        // Use MAXIMUM engineer count recommendation (AI engineers have no overhead)
+        // Coordinator will dynamically dispatch work, so max parallelism is optimal
+        const engineerVotes = analyses.map(a => a.engineerCount).filter(c => c > 0);
+        const maxEngineers = engineerVotes.length > 0 ? Math.max(...engineerVotes) : this.stateManager.getPoolSize();
         
         for (const analysis of analyses) {
             this.writeProgress(session.id, 'ENGINEERS', `  ${analysis.agentName}: ${analysis.engineerCount} engineers`);
@@ -956,8 +957,8 @@ export class PlanningService {
             }
         }
         
-        this.writeProgress(session.id, 'ENGINEERS', `  ✅ Recommended: ${avgEngineers} engineers (avg of ${analyses.length} agents)`);
-        recommendations.push(`Use ${avgEngineers} engineers (consensus from multi-agent analysis)`)
+        this.writeProgress(session.id, 'ENGINEERS', `  ✅ Recommended: ${maxEngineers} engineers (max of ${analyses.length} agent votes)`);
+        recommendations.push(`Use ${maxEngineers} engineers (max parallelism from multi-agent analysis)`)
 
         // Phase 9: Build Dependency Graph from Tasks
         this.writeProgress(session.id, 'PHASE-9', '🔗 BUILDING DEPENDENCY GRAPH FROM TASKS...');
@@ -999,8 +1000,8 @@ export class PlanningService {
         this.writeProgress(session.id, 'PARALLEL', `  Critical path length: ${depGraph.criticalPathLength}`);
         await this.delay(200);
 
-        // Use engineer count from agent consensus
-        const engineerCount = avgEngineers;
+        // Use maximum engineer count from agent recommendations
+        const engineerCount = maxEngineers;
 
         // Phase 11: Generate detailed plan
         this.writeProgress(session.id, 'PHASE-11', '📝 GENERATING DETAILED EXECUTION PLAN...');
