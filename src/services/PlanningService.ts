@@ -37,9 +37,9 @@ export class PlanningService {
     // Sync interval for updating execution state
     private executionSyncInterval?: NodeJS.Timeout;
 
-    constructor(stateManager: StateManager) {
+    constructor(stateManager: StateManager, extensionPath?: string) {
         this.stateManager = stateManager;
-        this.agentRunner = new AgentRunner(stateManager.getWorkspaceRoot());
+        this.agentRunner = new AgentRunner(stateManager.getWorkspaceRoot(), extensionPath);
         this.loadBestPractices();
         
         // Use unified output channel

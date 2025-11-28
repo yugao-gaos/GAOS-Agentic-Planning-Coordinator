@@ -54,7 +54,7 @@ export async function activate(context: vscode.ExtensionContext) {
     engineerPoolService = new EngineerPoolService(stateManager);
     terminalManager = new TerminalManager();
     coordinatorService = new CoordinatorService(stateManager, engineerPoolService, terminalManager);
-    planningService = new PlanningService(stateManager);
+    planningService = new PlanningService(stateManager, context.extensionPath);
         
         // Create providers with initialized services
         planningSessionsProvider = new PlanningSessionsProvider(stateManager);

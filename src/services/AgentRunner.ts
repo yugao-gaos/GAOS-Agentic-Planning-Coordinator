@@ -110,6 +110,7 @@ interface ContextIndex {
 
 export class AgentRunner {
     private workspaceRoot: string;
+    private extensionPath: string;
     private debateDir: string;
     private contextDir: string;  // Temporary session context
     private persistentContextDir: string;  // Persistent indexed context
@@ -118,8 +119,9 @@ export class AgentRunner {
     private contextGatherer: ContextGathererState | null = null;
     private contextIndex: ContextIndex | null = null;
 
-    constructor(workspaceRoot: string) {
+    constructor(workspaceRoot: string, extensionPath?: string) {
         this.workspaceRoot = workspaceRoot;
+        this.extensionPath = extensionPath || '';
         // Use OS temp dir for temporary files (not workspace)
         this.debateDir = path.join(os.tmpdir(), 'apc_debate');
         this.contextDir = path.join(os.tmpdir(), 'apc_context_gatherer');
@@ -1524,94 +1526,15 @@ cat > /tmp/${analyst.id}_analysis.md << 'ANALYSIS_EOF'
 ANALYSIS_EOF
 \`\`\`
 
-Then, use file locking to safely update the plan file:
+Then, use the update script to safely write your analysis:
 \`\`\`bash
-(
-  flock -x 200
-  
-  # Read current plan
-  PLAN_CONTENT=$(cat "${planFile}")
-  
-  # Find and replace your section (between your header and the next ---)
-  # Your section is marked with "${sectionMarker}"
-  
-  # Read your analysis
-  MY_ANALYSIS=$(cat /tmp/${analyst.id}_analysis.md)
-  
-  # Use sed to replace your section
-  # The section starts after "### ${sectionMarker}" and ends before the next "---"
-  python3 << PYEOF
-import re
-
-plan_path = "${planFile}"
-with open(plan_path, 'r') as f:
-    content = f.read()
-
-# Pattern to find this analyst's section
-pattern = r'(### ${sectionMarker}.*?\\n\\*\\*Status:\\*\\* ⏳ Analyzing\\.\\.\\.\\n\\n)_Analysis pending\\.\\.\\._'
-
-# Read the analysis file
-with open('/tmp/${analyst.id}_analysis.md', 'r') as f:
-    analysis = f.read()
-
-# Replace the placeholder with actual analysis
-replacement = r'\\1' + analysis.replace('\\\\', '\\\\\\\\').replace('\\n', '\\\\n')
-new_content = re.sub(pattern, replacement, content, flags=re.DOTALL)
-
-if new_content == content:
-    # Fallback: append to the end of analyst section if pattern didn't match
-    section_pattern = r'(### ${sectionMarker}.*?)(\\n---\\n### |\\n<!-- ANALYST_SECTION_END -->)'
-    new_content = re.sub(section_pattern, r'\\1\\n' + analysis + r'\\2', content, flags=re.DOTALL)
-
-with open(plan_path, 'w') as f:
-    f.write(new_content)
-
-print("Plan updated successfully")
-PYEOF
-
-) 200>"${planFile}.lock"
+python3 "${this.extensionPath}/scripts/update_plan_section.py" "${planFile}" "${sectionMarker}" /tmp/${analyst.id}_analysis.md
 \`\`\`
 
-## Step 4: Add Tasks to Task Table
-Also add your identified tasks to the Task Breakdown table:
+## Step 4: Verify Your Update
+Read the plan file to confirm your analysis was added:
 \`\`\`bash
-(
-  flock -x 200
-  
-  python3 << 'PYEOF'
-import re
-
-plan_path = "${planFile}"
-with open(plan_path, 'r') as f:
-    content = f.read()
-
-# Your tasks to add (replace with actual tasks you identified)
-new_tasks = """| T1 | [Your Task 1 Name] | [Dependencies] | [Files] | [Tests] |
-| T2 | [Your Task 2 Name] | [Dependencies] | [Files] | [Tests] |"""
-
-# Find the task table and add rows
-# Pattern matches the TBD row
-pattern = r'(\\| _TBD_ \\| _Analysts identifying tasks\\.\\.\\._ \\| _TBD_ \\| _TBD_ \\| _TBD_ \\|)'
-
-# Add new tasks before or replace the TBD row
-if '| _TBD_ |' in content:
-    new_content = content.replace(
-        '| _TBD_ | _Analysts identifying tasks..._ | _TBD_ | _TBD_ | _TBD_ |',
-        new_tasks
-    )
-else:
-    # Append to existing tasks
-    table_end = content.find('\\n---\\n\\n## 6. Consensus')
-    if table_end > 0:
-        new_content = content[:table_end] + '\\n' + new_tasks + content[table_end:]
-    else:
-        new_content = content
-
-with open(plan_path, 'w') as f:
-    f.write(new_content)
-PYEOF
-
-) 200>"${planFile}.lock"
+cat "${planFile}" | grep -A 20 "${sectionMarker}"
 \`\`\`
 
 ## Step 5: Read Updated Plan & Respond
@@ -1627,7 +1550,7 @@ If you have responses to other analysts, append to your section using the same l
 # IMPORTANT GUIDELINES
 
 1. **Call real tools**: You MUST invoke Unity MCP and gather_task_context.sh - don't skip this
-2. **Use file locking**: ALWAYS use flock when writing to the plan file
+2. **Use the update script**: ALWAYS use update_plan_section.py when writing - it handles file locking
 3. **Focus on ${analyst.role}**: That's your specialty
 4. **Be specific**: Reference actual files, classes, methods you found
 5. **Unity best practices to consider**:
