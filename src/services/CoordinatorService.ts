@@ -394,6 +394,12 @@ Coordinator: ${coordinatorId}
         // Import CursorAgentRunner
         const { CursorAgentRunner } = await import('./CursorAgentRunner');
         const agentRunner = CursorAgentRunner.getInstance();
+        
+        // Get coordinator for completion report path
+        const coordinator = this.stateManager.getCoordinator(coordinatorId);
+        const completionReportPath = coordinator 
+            ? this.getCompletionReportPath(coordinator, task)
+            : `_AiDevLog/Completions/${task.id}_completion.md`;
 
         // Build the prompt for the engineer
         const prompt = `You are ${engineerName}, a software engineer working on a Unity game project.
@@ -411,13 +417,15 @@ ${task.description}
 - Terminal commands for git, compilation, etc.
 
 📜 WORKFLOW:
-1. FIRST: Read previous session logs from _AiDevLog/Plans/ to understand context
+1. FIRST: Read previous session logs from the plan folder to understand context
 2. Read relevant existing docs in _AiDevLog/Docs/ for your task
 3. Implement the task following the plan's specifications
 4. Check _AiDevLog/Errors/error_registry.md before fixing ANY error (avoid duplicate fixes)
 5. UPDATE DOCS: Prefer updating existing docs. For new systems, add new doc.
 6. Mark your checkbox [x] in the plan when task is complete
-7. Write completion summary at the end, or "BLOCKED: reason" if stuck
+7. Write completion report to: ${completionReportPath}
+   - Include: what was done, files created/modified, tests added
+   - If blocked, write "BLOCKED: reason" in the report
 
 ⚠️ IMPORTANT:
 - Follow existing code patterns in the codebase
@@ -1799,6 +1807,25 @@ Stage: ${task.stage}
         }
         
         this.log(`Resumed engineer ${engineerName}`);
+    }
+
+    /**
+     * Get the path for a task completion report
+     * Structure: _AiDevLog/Plans/{sessionId}/completions/{task_id}_completion.md
+     */
+    private getCompletionReportPath(coordinator: CoordinatorState, task: ManagedTask): string {
+        if (coordinator.planSessionId) {
+            const completionsDir = this.stateManager.getCompletionsFolder(coordinator.planSessionId);
+            // Ensure directory exists
+            if (!fs.existsSync(completionsDir)) {
+                fs.mkdirSync(completionsDir, { recursive: true });
+            }
+            // Clean task ID for filename (replace dots/spaces with underscores)
+            const cleanTaskId = task.id.replace(/[.\s]+/g, '_').toLowerCase();
+            return path.join(completionsDir, `${cleanTaskId}_completion.md`);
+        }
+        // Fallback for coordinators without session ID
+        return path.join(this.stateManager.getWorkingDir(), 'Completions', `${task.id}_completion.md`);
     }
 
     /**
