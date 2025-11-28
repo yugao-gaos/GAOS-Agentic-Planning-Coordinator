@@ -13,6 +13,7 @@ export interface ParsedPlan {
     version: number;
     description: string;
     engineersNeeded: string[];
+    recommendedEngineerCount: number;  // From plan's "Recommended: X engineers"
     engineerChecklists: Record<string, PlanTask[]>;
     tasks: PlanTask[];  // Flat list of all tasks
     metadata: PlanMetadata;
@@ -80,6 +81,7 @@ export class PlanParser {
             version: 1,
             description: '',
             engineersNeeded: [],
+            recommendedEngineerCount: 5,  // Default, will be overwritten if found
             engineerChecklists: {},
             tasks: [],
             metadata: {
@@ -103,9 +105,14 @@ export class PlanParser {
             plan.version = parseInt(versionMatch[1], 10);
         }
 
-        // Try to find engineer count from "Use N engineers" pattern
-        const engineerCountMatch = content.match(/use\s+(\d+)\s+engineers/i);
-        const engineerCount = engineerCountMatch ? parseInt(engineerCountMatch[1], 10) : 5;  // Default to pool size
+        // Try to find recommended engineer count from plan
+        // Matches: "**Recommended:** 5 engineers" or "Use 5 engineers"
+        const recommendedMatch = content.match(/\*\*Recommended:\*\*\s*(\d+)\s*engineers/i) ||
+                                 content.match(/use\s+(\d+)\s+engineers/i);
+        if (recommendedMatch) {
+            plan.recommendedEngineerCount = parseInt(recommendedMatch[1], 10);
+        }
+        const engineerCount = plan.recommendedEngineerCount;
 
         // Try legacy format first: ## Engineer's Checklist
         const legacyTasks = this.parseLegacyFormat(content);

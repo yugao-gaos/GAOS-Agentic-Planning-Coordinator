@@ -210,7 +210,7 @@ Let's get started!`;
             const { exec } = require('child_process');
             
             if (process.platform === 'darwin') {
-                // macOS: Use AppleScript
+                // macOS: Use AppleScript - open chat, paste, and press Enter
                 const script = `
                     tell application "Cursor" to activate
                     delay 0.2
@@ -219,6 +219,8 @@ Let's get started!`;
                     tell application "System Events" to keystroke "l" using {command down, shift down}
                     delay 0.5
                     tell application "System Events" to keystroke "v" using command down
+                    delay 0.3
+                    tell application "System Events" to key code 36
                 `;
                 exec(`osascript -e '${script}'`, (error: Error | null) => {
                     if (error) {
@@ -228,7 +230,7 @@ Let's get started!`;
                     }
                 });
             } else if (process.platform === 'win32') {
-                // Windows: Use PowerShell with SendKeys
+                // Windows: Use PowerShell with SendKeys - open chat, paste, and press Enter
                 const psScript = `
                     Add-Type -AssemblyName System.Windows.Forms
                     Start-Sleep -Milliseconds 200
@@ -237,6 +239,8 @@ Let's get started!`;
                     [System.Windows.Forms.SendKeys]::SendWait('^+l')
                     Start-Sleep -Milliseconds 500
                     [System.Windows.Forms.SendKeys]::SendWait('^v')
+                    Start-Sleep -Milliseconds 300
+                    [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
                 `;
                 exec(`powershell -Command "${psScript.replace(/\n/g, ' ')}"`, (error: Error | null) => {
                     if (error) {
@@ -246,10 +250,10 @@ Let's get started!`;
                     }
                 });
             } else {
-                // Linux: Use xdotool if available
+                // Linux: Use xdotool if available - open chat, paste, and press Enter
                 exec('which xdotool', (err: Error | null) => {
                     if (!err) {
-                        exec('sleep 0.2 && xdotool key Escape && sleep 0.3 && xdotool key ctrl+shift+l && sleep 0.5 && xdotool key ctrl+v');
+                        exec('sleep 0.2 && xdotool key Escape && sleep 0.3 && xdotool key ctrl+shift+l && sleep 0.5 && xdotool key ctrl+v && sleep 0.3 && xdotool key Return');
                     } else {
                         vscode.window.showInformationMessage(
                             'Planning prompt copied! Press Ctrl+Shift+L to open chat, then Ctrl+V to paste.'
@@ -492,6 +496,7 @@ This will trigger the multi-agent debate to revise the plan.`;
             
             const { exec } = require('child_process');
             if (process.platform === 'darwin') {
+                // macOS: Use AppleScript - open chat, paste, and press Enter
                 const script = `
                     tell application "Cursor" to activate
                     delay 0.2
@@ -500,6 +505,8 @@ This will trigger the multi-agent debate to revise the plan.`;
                     tell application "System Events" to keystroke "l" using {command down, shift down}
                     delay 0.5
                     tell application "System Events" to keystroke "v" using command down
+                    delay 0.3
+                    tell application "System Events" to key code 36
                 `;
                 exec(`osascript -e '${script}'`, (error: Error | null) => {
                     if (error) {

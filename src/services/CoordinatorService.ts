@@ -172,14 +172,24 @@ export class CoordinatorService {
         });
 
         // Step 3: Allocate engineers
-        const requestedCount = options.engineerCount || planData.engineersNeeded.length || 3;
+        // Priority: explicit option > plan recommendation > plan's engineer list > pool size
+        const poolSize = this.stateManager.getPoolSize();
+        const requestedCount = options.engineerCount || 
+                               planData.recommendedEngineerCount || 
+                               planData.engineersNeeded.length || 
+                               poolSize;
         const availableEngineers = this.engineerPoolService.getAvailableEngineers();
         
         if (availableEngineers.length === 0) {
             throw new Error('No engineers available in the pool');
         }
 
+        // Use min of requested and available, but log if constrained
         const engineerCount = Math.min(requestedCount, availableEngineers.length);
+        if (engineerCount < requestedCount) {
+            this.logCoord(coordinatorId, `⚠️ Requested ${requestedCount} engineers but only ${availableEngineers.length} available`);
+        }
+        this.logCoord(coordinatorId, `Engineer allocation: ${engineerCount} (plan recommends: ${planData.recommendedEngineerCount}, pool has: ${poolSize})`);
         const allocatedEngineers = this.engineerPoolService.allocateEngineers(coordinatorId, engineerCount);
 
         this.log(`Allocated ${allocatedEngineers.length} engineers: ${allocatedEngineers.join(', ')}`);
