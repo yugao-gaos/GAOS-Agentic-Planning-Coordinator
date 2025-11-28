@@ -392,8 +392,8 @@ export class StateManager {
 
     deletePlanningSession(id: string): void {
         this.planningSessions.delete(id);
-        // Note: We don't delete the plan folder - it contains logs and history
-        // Only mark as deleted in state
+        // Note: Plan folder deletion is handled by PlanningService.removeSession()
+        // This just removes from in-memory state
     }
 
     deleteCoordinator(id: string): void {

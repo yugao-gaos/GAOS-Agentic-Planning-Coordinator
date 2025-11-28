@@ -2372,7 +2372,7 @@ _Reviewing feedback impact on testing..._
 
     /**
      * Remove a planning session completely
-     * Deletes the session data and any associated files
+     * Deletes the session data and the entire Plan folder
      */
     async removeSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
         try {
@@ -2387,64 +2387,20 @@ _Reviewing feedback impact on testing..._
                 await this.agentRunner.stopAll();
             }
 
-            const workingDir = this.stateManager.getWorkingDir();
-            const sessionsDir = path.join(workingDir, 'planning_sessions');
-            const plansDir = path.join(workingDir, 'Plans');
-
-            // Delete associated plan files
-            if (session.currentPlanPath && fs.existsSync(session.currentPlanPath)) {
+            // Delete the entire plan folder for this session
+            // Structure: _AiDevLog/Plans/{sessionId}/
+            const planFolder = this.stateManager.getPlanFolder(sessionId);
+            if (fs.existsSync(planFolder)) {
                 try {
-                    fs.unlinkSync(session.currentPlanPath);
-                    // Also delete lock file
-                    const lockFile = `${session.currentPlanPath}.lock`;
-                    if (fs.existsSync(lockFile)) {
-                        fs.unlinkSync(lockFile);
-                    }
+                    // Recursively delete the folder and all contents
+                    fs.rmSync(planFolder, { recursive: true, force: true });
+                    console.log(`Deleted plan folder: ${planFolder}`);
                 } catch (e) {
-                    console.error(`Failed to delete plan file: ${e}`);
+                    console.error(`Failed to delete plan folder: ${e}`);
                 }
             }
 
-            // Delete all plan versions
-            for (const version of session.planHistory) {
-                if (version.path && fs.existsSync(version.path)) {
-                    try {
-                        fs.unlinkSync(version.path);
-                    } catch (e) {
-                        console.error(`Failed to delete version file: ${e}`);
-                    }
-                }
-            }
-
-            // Delete progress log file
-            const progressLogPath = path.join(sessionsDir, `${sessionId}_progress.log`);
-            if (fs.existsSync(progressLogPath)) {
-                try {
-                    fs.unlinkSync(progressLogPath);
-                } catch (e) {
-                    console.error(`Failed to delete progress log: ${e}`);
-                }
-            }
-
-            // Delete any debate summary files for this session
-            try {
-                const files = fs.readdirSync(sessionsDir);
-                for (const file of files) {
-                    if (file.startsWith('debate_summary_') && file.endsWith('.md')) {
-                        // Check if it's from this session's timeframe (rough match)
-                        const filePath = path.join(sessionsDir, file);
-                        try {
-                            fs.unlinkSync(filePath);
-                        } catch (e) {
-                            // Ignore - might be from another session
-                        }
-                    }
-                }
-            } catch (e) {
-                // Ignore directory read errors
-            }
-
-            // Remove from state manager (this also deletes the session JSON file)
+            // Remove from state manager (just removes from memory now)
             this.stateManager.deletePlanningSession(sessionId);
             this.notifyChange();
 
