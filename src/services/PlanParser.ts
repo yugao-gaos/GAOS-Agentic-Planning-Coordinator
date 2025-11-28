@@ -29,7 +29,6 @@ export interface PlanTask {
     completed: boolean;
     approved: boolean;  // For revision-based approval
     dependencies: string[];
-    wave?: number;
     section?: string;  // Which section the task belongs to
 }
 
@@ -66,7 +65,7 @@ export class PlanParser {
      * Parse a plan markdown file
      * Supports two formats:
      * 1. Legacy: ## Engineer's Checklist with - [ ] tasks
-     * 2. Modern: ### Wave N with #### Task X.Y and **Engineer**: Engineer-N
+     * 2. Modern: ### Section with #### Task X.Y and **Engineer**: Engineer-N
      */
     static parsePlanFile(planPath: string): ParsedPlan {
         if (!fs.existsSync(planPath)) {
@@ -117,7 +116,7 @@ export class PlanParser {
         // Try legacy format first: ## Engineer's Checklist
         const legacyTasks = this.parseLegacyFormat(content);
         
-        // Try modern format: ### Wave N with #### Task X.Y
+        // Try modern format: ### Section with #### Task X.Y
         const modernTasks = this.parseModernFormat(content);
 
         // Use whichever format found more tasks
@@ -190,7 +189,8 @@ export class PlanParser {
     }
 
     /**
-     * Parse modern format: ### Wave N with #### Task X.Y and **Engineer**: Engineer-N
+     * Parse modern format: #### Task X.Y and **Engineer**: Engineer-N
+     * Tasks are dispatched dynamically by coordinator based on dependencies (no waves)
      */
     private static parseModernFormat(content: string): PlanTask[] {
         const tasks: PlanTask[] = [];
@@ -214,9 +214,11 @@ export class PlanParser {
                                /✅/.test(taskContent) ||
                                /Status[:\s]*COMPLETED/i.test(taskContent);
             
-            // Extract wave number from context
-            const waveMatch = content.substring(0, match.index).match(/###\s*Wave\s+(\d+)/gi);
-            const wave = waveMatch ? parseInt(waveMatch[waveMatch.length - 1].match(/\d+/)![0], 10) : 1;
+            // Extract section header from context (e.g., ### Core Foundation, ### UI System)
+            const sectionMatch = content.substring(0, match.index).match(/###\s+([^\n]+)/gi);
+            const section = sectionMatch 
+                ? sectionMatch[sectionMatch.length - 1].replace(/^###\s*/, '').trim()
+                : 'Tasks';
             
             // Extract files to create for description
             const filesMatch = taskContent.match(/\*\*Files to create\*\*:\s*([\s\S]*?)(?=\*\*|$)/i);
@@ -235,8 +237,7 @@ export class PlanParser {
                 completed: isComplete,
                 approved: true,
                 dependencies: [],
-                wave: wave,
-                section: `Wave ${wave}`
+                section: section
             });
         }
         

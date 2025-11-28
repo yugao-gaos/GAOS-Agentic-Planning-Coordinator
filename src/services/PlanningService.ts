@@ -289,11 +289,11 @@ export class PlanningService {
     ): Array<{ id: string; name: string; context: string[] }> {
         const tasks: Array<{ id: string; name: string; context: string[] }> = [];
         let taskNum = 1;
-        let waveNum = 1;
+        let groupNum = 1;  // Just for task ID grouping (e.g., 1.1, 1.2, 2.1)
         
         for (const category of categories) {
             for (let i = 0; i < category.count; i++) {
-                const taskId = `${waveNum}.${taskNum % 3 + 1}`;
+                const taskId = `${groupNum}.${taskNum % 3 + 1}`;
                 tasks.push({
                     id: taskId,
                     name: `${category.name} - Task ${i + 1}`,
@@ -304,7 +304,7 @@ export class PlanningService {
                     ].filter(c => c !== 'N/A')
                 });
                 taskNum++;
-                if (taskNum % 3 === 0) waveNum++;
+                if (taskNum % 3 === 0) groupNum++;
             }
         }
         
@@ -374,60 +374,35 @@ export class PlanningService {
 
     /**
      * Build a dependency graph from extracted tasks
-     * Returns waves of tasks that can be executed in parallel
+     * Returns task dependency info for display (coordinator dispatches dynamically)
      */
     private buildDependencyGraph(tasks: Array<{ name: string; files: string[]; dependencies: string[]; tests: string[]; source: string }>): {
-        waves: string[][];
-        maxParallelWidth: number;
-        criticalPathLength: number;
+        taskCount: number;
+        dependencyCount: number;
+        independentTasks: string[];  // Tasks with no dependencies (can start immediately)
+        dependencyMap: Map<string, string[]>;
     } {
-        const waves: string[][] = [];
-        const completed = new Set<string>();
-        const remaining = new Set(tasks.map(t => t.name));
-        
         // Build dependency map
         const depMap = new Map<string, string[]>();
+        let dependencyCount = 0;
+        const independentTasks: string[] = [];
+        
         for (const task of tasks) {
-            depMap.set(task.name, task.dependencies.filter(d => d && d.trim() !== ''));
+            const deps = task.dependencies.filter(d => d && d.trim() !== '');
+            depMap.set(task.name, deps);
+            dependencyCount += deps.length;
+            
+            if (deps.length === 0) {
+                independentTasks.push(task.name);
+            }
         }
         
-        // Process waves until all tasks are scheduled
-        let waveNum = 0;
-        while (remaining.size > 0 && waveNum < 20) { // Max 20 waves to prevent infinite loop
-            const currentWave: string[] = [];
-            
-            for (const taskName of remaining) {
-                const deps = depMap.get(taskName) || [];
-                // Check if all dependencies are completed
-                const allDepsComplete = deps.every(d => completed.has(d) || !remaining.has(d));
-                
-                if (allDepsComplete) {
-                    currentWave.push(taskName);
-                }
-            }
-            
-            // If no tasks can be scheduled, break to avoid infinite loop
-            if (currentWave.length === 0) {
-                // Add remaining tasks to final wave (circular dependency fallback)
-                waves.push([...remaining]);
-                break;
-            }
-            
-            // Add wave and mark tasks as completed
-            waves.push(currentWave);
-            for (const task of currentWave) {
-                completed.add(task);
-                remaining.delete(task);
-            }
-            
-            waveNum++;
-        }
-        
-        // Calculate metrics
-        const maxParallelWidth = Math.max(...waves.map(w => w.length), 0);
-        const criticalPathLength = waves.length;
-        
-        return { waves, maxParallelWidth, criticalPathLength };
+        return { 
+            taskCount: tasks.length,
+            dependencyCount,
+            independentTasks,
+            dependencyMap: depMap
+        };
     }
 
     /**
@@ -961,7 +936,7 @@ export class PlanningService {
         recommendations.push(`Use ${maxEngineers} engineers (max parallelism from multi-agent analysis)`)
 
         // Phase 9: Build Dependency Graph from Tasks
-        this.writeProgress(session.id, 'PHASE-9', '🔗 BUILDING DEPENDENCY GRAPH FROM TASKS...');
+        this.writeProgress(session.id, 'PHASE-9', '🔗 ANALYZING TASK DEPENDENCIES...');
         phases.push('Dependency Analysis');
         await this.delay(300);
 
@@ -970,35 +945,28 @@ export class PlanningService {
         
         this.writeProgress(session.id, 'DEPS', '');
         this.writeProgress(session.id, 'DEPS', '  ┌─────────────────────────────────────────────────────┐');
-        this.writeProgress(session.id, 'DEPS', '  │              TASK DEPENDENCY GRAPH                  │');
+        this.writeProgress(session.id, 'DEPS', '  │              TASK DEPENDENCIES                      │');
+        this.writeProgress(session.id, 'DEPS', '  ├─────────────────────────────────────────────────────┤');
+        this.writeProgress(session.id, 'DEPS', `  │  Total tasks: ${String(depGraph.taskCount).padEnd(36)}│`);
+        this.writeProgress(session.id, 'DEPS', `  │  Total dependencies: ${String(depGraph.dependencyCount).padEnd(29)}│`);
+        this.writeProgress(session.id, 'DEPS', `  │  Independent tasks: ${String(depGraph.independentTasks.length).padEnd(30)}│`);
         this.writeProgress(session.id, 'DEPS', '  ├─────────────────────────────────────────────────────┤');
         
-        // Show tasks organized by wave
-        for (let wave = 1; wave <= depGraph.waves.length; wave++) {
-            const waveTasks = depGraph.waves[wave - 1] || [];
-            const taskNames = waveTasks.map((t: string) => `[${t.substring(0, 12)}]`).join(' ');
-            this.writeProgress(session.id, 'DEPS', `  │  Wave ${wave}: ${taskNames.padEnd(42)}│`);
+        // Show independent tasks (can start immediately)
+        if (depGraph.independentTasks.length > 0) {
+            this.writeProgress(session.id, 'DEPS', '  │  Can start immediately:                            │');
+            for (const task of depGraph.independentTasks.slice(0, 5)) {
+                this.writeProgress(session.id, 'DEPS', `  │    • ${task.substring(0, 44).padEnd(44)}│`);
+            }
+            if (depGraph.independentTasks.length > 5) {
+                this.writeProgress(session.id, 'DEPS', `  │    ... and ${depGraph.independentTasks.length - 5} more${' '.repeat(33)}│`);
+            }
         }
         
         this.writeProgress(session.id, 'DEPS', '  └─────────────────────────────────────────────────────┘');
+        this.writeProgress(session.id, 'DEPS', '');
+        this.writeProgress(session.id, 'DEPS', '  ℹ️  Coordinator will dynamically dispatch tasks as dependencies complete');
         await this.delay(400);
-
-        // Phase 10: Parallelization Analysis
-        this.writeProgress(session.id, 'PHASE-10', '⚡ ANALYZING PARALLELIZATION OPPORTUNITIES...');
-        phases.push('Parallelization Analysis');
-        await this.delay(300);
-
-        // Show wave parallelization
-        for (let wave = 1; wave <= depGraph.waves.length; wave++) {
-            const waveTasks = depGraph.waves[wave - 1] || [];
-            this.writeProgress(session.id, 'PARALLEL', `  Wave ${wave}: ${waveTasks.length} parallel task(s)`);
-        }
-        
-        this.writeProgress(session.id, 'PARALLEL', '');
-        this.writeProgress(session.id, 'PARALLEL', `  Max parallel width: ${depGraph.maxParallelWidth}`);
-        this.writeProgress(session.id, 'PARALLEL', `  Total waves: ${depGraph.waves.length}`);
-        this.writeProgress(session.id, 'PARALLEL', `  Critical path length: ${depGraph.criticalPathLength}`);
-        await this.delay(200);
 
         // Use maximum engineer count from agent recommendations
         const engineerCount = maxEngineers;
@@ -1109,6 +1077,343 @@ ${recommendations.map(r => `- ${r}`).join('\n') || '- None identified'}`
     // Phase 11 now just updates the status and adds consensus info
 
     /**
+     * Generate a plan file from the requirement (fallback template - not normally used)
+
+#### Task 2.1: Cluster Detection Algorithm
+**Engineer**: Engineer-1
+**Files to create**:
+- \`Assets/Scripts/Core/ClusterDetector.cs\`
+- \`Assets/Scripts/Core/MatchPattern.cs\`
+
+**Algorithm**: Flood-fill based, optimized for 10x10 boards
+**Reference**: Performance concern - needs optimization for large boards
+**Acceptance**: Detect all 3+ matches in <1ms for 10x10 board
+
+**Tests to Write** (EditMode):
+\`\`\`
+Assets/Tests/EditMode/ClusterDetectorTests.cs
+├── FindMatches_HorizontalThree_ReturnsMatch
+├── FindMatches_VerticalThree_ReturnsMatch
+├── FindMatches_LShape_ReturnsTwoMatches
+├── FindMatches_TShape_ReturnsTwoMatches
+├── FindMatches_NoMatch_ReturnsEmpty
+├── FindMatches_10x10Board_Under1ms
+└── FindMatches_EntireBoard_FindsAll
+\`\`\`
+**Run tests**: \`mcp_unityMCP_run_tests({ mode: "EditMode" })\`
+
+#### Task 2.2: Input Handling & Gem Swapping
+**Engineer**: Engineer-2
+**Files to create**:
+- \`Assets/Scripts/Input/TouchInputHandler.cs\`
+- \`Assets/Scripts/Core/SwapValidator.cs\`
+
+**Reference**: TDD Section 3.2 - Input system requirements
+**Acceptance**: Swap gems via touch/click, validate legal moves
+
+**Tests to Write** (EditMode + PlayMode):
+\`\`\`
+Assets/Tests/EditMode/SwapValidatorTests.cs
+├── IsValidSwap_AdjacentCells_ReturnsTrue
+├── IsValidSwap_NonAdjacent_ReturnsFalse
+├── IsValidSwap_SameCell_ReturnsFalse
+├── IsValidSwap_OutOfBounds_ReturnsFalse
+└── IsValidSwap_ObstacleCell_ReturnsFalse
+
+Assets/Tests/PlayMode/InputHandlerTests.cs
+├── OnPointerDown_SelectsGem
+├── OnDrag_ToAdjacent_TriggersSwap
+└── OnPointerUp_ClearsSelection
+\`\`\`
+**Run tests**: \`mcp_unityMCP_run_tests({ mode: "EditMode" })\` then \`mcp_unityMCP_run_tests({ mode: "PlayMode" })\`
+
+#### Task 2.3: Spawning & Gravity
+**Engineer**: Engineer-3
+**Files to create**:
+- \`Assets/Scripts/Core/GemSpawner.cs\`
+- \`Assets/Scripts/Core/GravityController.cs\`
+
+**Reference**: GDD Section 4 - Board behavior
+**Acceptance**: Gems fall, new gems spawn from top
+
+**Tests to Write** (PlayMode):
+\`\`\`
+Assets/Tests/PlayMode/GravityTests.cs
+├── ApplyGravity_EmptyCellBelow_GemFalls
+├── ApplyGravity_NoEmptyBelow_GemStays
+├── ApplyGravity_MultipleGaps_AllFall
+└── SpawnNew_EmptyTopRow_SpawnsGems
+\`\`\`
+**Run tests**: \`mcp_unityMCP_run_tests({ mode: "PlayMode", timeout_seconds: 30 })\`
+
+### Wave 3: Obstacles & Levels (Parallel - ${Math.ceil(engineerCount / 3)} engineers)
+
+#### Task 3.1: Obstacle System
+**Files to create**:
+- \`Assets/Scripts/Obstacles/IObstacle.cs\`
+- \`Assets/Scripts/Obstacles/BoxObstacle.cs\`
+- \`Assets/Scripts/Obstacles/StoneObstacle.cs\`
+- \`Assets/Scripts/Obstacles/IceObstacle.cs\`
+
+**Reference**: GDD Section 5 - Obstacle types
+**Acceptance**: Each obstacle type with correct behavior
+
+**Tests to Write** (EditMode):
+\`\`\`
+Assets/Tests/EditMode/ObstacleTests.cs
+├── BoxObstacle_OnHit_DestroyedOneHit
+├── StoneObstacle_OnHit_NeverDestroyed
+├── IceObstacle_OnHit_ReducesHealth
+├── IceObstacle_OnHitTwice_Destroyed
+└── Obstacle_BlocksGemSwap_ReturnsTrue
+\`\`\`
+**Run tests**: \`mcp_unityMCP_run_tests({ mode: "EditMode" })\`
+
+#### Task 3.2: Level Loading from JSON
+**Files to create**:
+- \`Assets/Scripts/Levels/LevelData.cs\`
+- \`Assets/Scripts/Levels/LevelLoader.cs\`
+- \`Assets/Resources/Levels/level_001.json\`
+
+**Reference**: TDD Section 6 - Data format specification
+**Acceptance**: Load level config, spawn board accordingly
+
+**Tests to Write** (EditMode):
+\`\`\`
+Assets/Tests/EditMode/LevelLoaderTests.cs
+├── Load_ValidJson_ReturnsLevelData
+├── Load_InvalidJson_ThrowsException
+├── Load_MissingFile_ThrowsException
+├── LevelData_HasCorrectDimensions
+└── LevelData_HasCorrectObstaclePlacements
+\`\`\`
+**Run tests**: \`mcp_unityMCP_run_tests({ mode: "EditMode" })\`
+
+### Wave 4: Win/Lose & Integration (Sequential)
+
+#### Task 4.1: Goal Tracking System
+**Files to create**:
+- \`Assets/Scripts/Goals/IGoal.cs\`
+- \`Assets/Scripts/Goals/ScoreGoal.cs\`
+- \`Assets/Scripts/Goals/CollectGoal.cs\`
+- \`Assets/Scripts/Goals/GoalTracker.cs\`
+
+**Reference**: GDD Section 7 - Victory conditions
+**Acceptance**: Track multiple goal types simultaneously
+
+**Tests to Write** (EditMode):
+\`\`\`
+Assets/Tests/EditMode/GoalTrackerTests.cs
+├── ScoreGoal_ReachTarget_IsComplete
+├── ScoreGoal_BelowTarget_NotComplete
+├── CollectGoal_CollectAll_IsComplete
+├── GoalTracker_AllGoalsComplete_TriggersWin
+└── GoalTracker_OneGoalIncomplete_NoWin
+\`\`\`
+**Run tests**: \`mcp_unityMCP_run_tests({ mode: "EditMode" })\`
+
+#### Task 4.2: Win/Lose Conditions
+**Files to create**:
+- \`Assets/Scripts/Core/GameStateManager.cs\`
+
+**Events**:
+- \`OnGameWon\` - All goals complete
+- \`OnGameLost\` - Out of moves/time
+
+**Tests to Write** (PlayMode):
+\`\`\`
+Assets/Tests/PlayMode/GameStateTests.cs
+├── GameState_AllGoalsComplete_FiresWinEvent
+├── GameState_OutOfMoves_FiresLoseEvent
+├── GameState_OutOfTime_FiresLoseEvent
+└── GameState_StillPlaying_NoEvent
+\`\`\`
+**Run tests**: \`mcp_unityMCP_run_tests({ mode: "PlayMode", timeout_seconds: 30 })\`
+
+### Wave 5: Testing & Polish
+
+#### Task 5.1: Unit Test Consolidation
+**Files to verify**:
+- All EditMode test files from previous waves
+
+**Acceptance**: 80%+ code coverage on core logic
+
+**Verify all tests pass**: \`mcp_unityMCP_run_tests({ mode: "EditMode" })\`
+
+#### Task 5.2: Integration Tests
+**Files to create**:
+- \`Assets/Tests/PlayMode/GameplayIntegrationTests.cs\`
+
+**Tests to Write** (PlayMode):
+\`\`\`
+Assets/Tests/PlayMode/GameplayIntegrationTests.cs
+├── FullGameLoop_LoadLevel_BoardPopulated
+├── FullGameLoop_MakeMatch_ScoreIncreases
+├── FullGameLoop_WinCondition_TransitionsToWin
+├── FullGameLoop_LoseCondition_TransitionsToLose
+└── FullGameLoop_ObstacleInteraction_Works
+\`\`\`
+
+**Run full test suite**:
+\`\`\`bash
+mcp_unityMCP_run_tests({ mode: "EditMode" })   # Fast unit tests
+mcp_unityMCP_run_tests({ mode: "PlayMode", timeout_seconds: 60 })  # Integration tests
+\`\`\`
+
+**Acceptance**: Full game loop test (load → play → win/lose)
+
+---
+
+## 🧪 Tests to Write
+
+| Test File | Type | Tests | Priority |
+|-----------|------|-------|----------|
+| \`ClusterDetectorTests.cs\` | Unit | Horizontal match, Vertical match, L-shape, T-shape, No match | High |
+| \`BoardStateTests.cs\` | Unit | Create board, Serialize/deserialize, Swap cells, Validate bounds | High |
+| \`GoalTrackerTests.cs\` | Unit | Score goal, Collect goal, Multi-goal, Goal completion events | Medium |
+| \`GemPoolTests.cs\` | Unit | Spawn, Return, Pool exhaustion, Dynamic expansion | Medium |
+| \`GameplayIntegrationTests.cs\` | PlayMode | Full game loop, Level load, Win condition, Lose condition | High |
+
+---
+
+## 📄 Documents to Update
+
+| Document | Updates Required |
+|----------|------------------|
+| \`Match3_TDD.md\` | Add implementation details for each service interface |
+| \`Match3_GDD.md\` | Update with final obstacle behaviors after implementation |
+| \`README.md\` | Add setup instructions, architecture overview |
+| \`CHANGELOG.md\` | Create and document Phase 1 features |
+
+---
+
+## 🔗 Existing Code References
+
+### Classes to Extend/Integrate
+- **GAOS.ServiceLocator.ServiceLocator** - Use for all DI registration
+- **GAOS.EventSystem.EventBus** - Use for code-only gameplay events
+- **GAOS.EventSystem.SOEvent** - Use for UI notification events
+- **GAOS.Logger.GLog** - Replace all Debug.Log calls
+
+### Existing Patterns to Follow
+- Check \`Assets/Scripts/\` for existing code style conventions
+- Follow existing namespace patterns (e.g., \`GemBurst.Core\`, \`GemBurst.UI\`)
+- Use existing ScriptableObject patterns if present
+
+---
+
+## 🎮 Unity Context
+
+### Scenes to Modify
+- \`Assets/Scenes/GameScene.unity\` - Add board container, UI elements
+- \`Assets/Scenes/MainMenu.unity\` - Add level selection (if exists)
+
+### Prefabs to Create
+- \`Assets/Prefabs/Gems/Gem_Red.prefab\`
+- \`Assets/Prefabs/Gems/Gem_Blue.prefab\`
+- \`Assets/Prefabs/Gems/Gem_Green.prefab\`
+- \`Assets/Prefabs/Gems/Gem_Yellow.prefab\`
+- \`Assets/Prefabs/Gems/Gem_Purple.prefab\`
+- \`Assets/Prefabs/Obstacles/Obstacle_Box.prefab\`
+- \`Assets/Prefabs/Obstacles/Obstacle_Stone.prefab\`
+- \`Assets/Prefabs/Obstacles/Obstacle_Ice.prefab\`
+
+### Required Assets
+**📂 See full asset details in**: \`_AiDevLog/Context/assets_catalog.md\`
+
+| Asset Type | Requirement | Catalog Reference |
+|------------|-------------|-------------------|
+| Gem Sprites | 5 colors minimum | See: assets_catalog.md → Sprites & Textures |
+| Obstacle Sprites | 3 types | See: assets_catalog.md → Sprites & Textures |
+| UI Elements | Score, moves, goals panel | See: assets_catalog.md → UI Elements |
+| Sound Effects | Match, swap, win, lose | See: assets_catalog.md → Audio |
+
+**Note**: The Context Gatherer has cataloged available assets and recommended matches/placeholders.
+Tasks referencing assets should check the catalog for specific paths, dimensions, and import settings.
+
+---
+
+## 🔗 Task Dependency Graph
+
+\`\`\`
+                    ┌─────────────────────────────────────────────────────┐
+                    │              TASK DEPENDENCY GRAPH                  │
+                    ├─────────────────────────────────────────────────────┤
+                    │                                                     │
+                    │   [1.1 Services] ──┐                               │
+                    │                    │                               │
+                    │   [1.2 Board] ─────┼──► [2.1 Cluster] ──► [3.1]   │
+                    │        │          │         │                     │
+                    │        └──────────┼─────────┴──► [3.2 Levels]     │
+                    │                    │                               │
+                    │   [1.3 Pool] ──────┴──► [2.3 Spawn] ──► [2.2]     │
+                    │                                                     │
+                    └─────────────────────────────────────────────────────┘
+\`\`\`
+
+### Parallelization Analysis
+- **Wave 1**: [1.1] [1.2] [1.3] → 3 parallel tracks
+- **Wave 2**: [2.1] [2.3] → 2 parallel (2.2 waits for 2.3)
+- **Wave 3**: [3.1] [3.2] → 2 parallel tracks
+- **Wave 4**: [4.1] [4.2] → 2 parallel
+- **Wave 5**: [5.1] [5.2] → Sequential (integration tests need all code)
+
+**Max parallel width**: 3 (Wave 1)
+**Bottleneck**: Wave 5 (sequential testing phase)
+
+---
+
+## 👥 Engineer Allocation
+
+### Recommendation: ${engineerCount} Engineers
+
+| Option | Score | Rationale |
+|--------|-------|-----------|
+| 2 Engineers | 6/10 | Low overhead, but Wave 1 takes 2 cycles (+40% time) |
+| **3 Engineers** | **9/10** | **Matches max parallel width, no idle in Waves 1-3** |
+| 4+ Engineers | 4/10 | Exceeds parallel width, idle time, merge conflicts |
+
+### Why 3 is Optimal (Not More)
+- ✓ Matches maximum parallel width (Wave 1 has 3 independent tasks)
+- ✓ No engineer sits idle during Waves 1-3
+- ✓ Moderate coordination overhead (daily sync sufficient)
+- ✓ Minimal merge conflict risk
+- ~ Slight idle in Wave 4-5 is acceptable (testing is inherently sequential)
+
+### Assignment Matrix
+
+| Engineer | Wave 1 | Wave 2 | Wave 3 | Wave 4-5 |
+|----------|--------|--------|--------|----------|
+| Engineer-1 | Task 1.1 | Task 2.1 | Task 3.1 | Task 4.1 |
+| Engineer-2 | Task 1.2 | Task 2.2 | Task 3.2 | Task 4.2 |
+| Engineer-3 | Task 1.3 | Task 2.3 | Support | Task 5.1-5.2 |
+
+---
+
+## ⚠️ Risk Mitigation
+
+${concerns.map((c, i) => `${i + 1}. **${c}**
+   - Mitigation: ${recommendations[i] || 'To be addressed during implementation'}`).join('\n\n')}
+
+---
+
+## 📎 References
+
+- GAOS-ServiceLocator: https://github.com/yugao-gaos/GAOS-ServiceLocator
+- GAOS-EventSystem: https://github.com/yugao-gaos/GAOS-EventSystem
+- GAOS-Logger: https://github.com/yugao-gaos/GAOS-Logger
+
+---
+
+*Generated by Agentic Planning Coordinator v0.1.0*
+*Review this plan and use \`apc plan approve ${session.id}\` when ready to execute*
+`;
+
+        fs.writeFileSync(planPath, planContent);
+        return planPath;
+    }
+
+    /**
      * Generate a plan file from the requirement
      */
     private async generatePlan(session: PlanningSession): Promise<string> {
@@ -1132,30 +1437,27 @@ ${session.requirement}
 
 ## Tasks
 
-### Wave 1 (Parallel)
-- [ ] Task 1.1: Initial setup and scaffolding
-- [ ] Task 1.2: Core data structures
-- [ ] Task 1.3: Basic UI components
+### Core Setup
+- [ ] Task 1: Initial setup and scaffolding
+- [ ] Task 2: Core data structures
+- [ ] Task 3: Basic UI components
 
-### Wave 2 (Parallel, depends on Wave 1)
-- [ ] Task 2.1: Business logic implementation
-- [ ] Task 2.2: Integration with existing systems
-- [ ] Task 2.3: Unit tests
+### Implementation
+- [ ] Task 4: Business logic implementation
+- [ ] Task 5: Integration with existing systems
+- [ ] Task 6: Unit tests
 
-### Wave 3 (Sequential)
-- [ ] Task 3.1: Integration testing
-- [ ] Task 3.2: Documentation
-- [ ] Task 3.3: Final review
+### Finalization
+- [ ] Task 7: Integration testing
+- [ ] Task 8: Documentation
+- [ ] Task 9: Final review
 
 ---
 
 ## Engineer Allocation
 Recommended: ${this.estimateEngineerCount(session.requirement)} engineers
 
-### Suggested Assignment
-- **Engineer 1**: Wave 1 tasks (setup, scaffolding)
-- **Engineer 2**: Wave 1 tasks (data structures)
-- **Engineer 3**: Wave 1 tasks (UI components)
+_Coordinator will dynamically dispatch tasks based on dependencies._
 
 ---
 
@@ -1166,7 +1468,7 @@ Recommended: ${this.estimateEngineerCount(session.requirement)} engineers
 - None identified
 
 ## Notes
-This is an auto-generated plan template. Review and modify as needed.
+This is an auto-generated plan template. Tasks will be dispatched dynamically by the coordinator.
 `;
 
         fs.writeFileSync(planPath, planContent);
@@ -1622,7 +1924,6 @@ _Reviewing feedback impact on testing..._
                 startedAt: new Date().toISOString(),
                 engineers: {},
                 progress: { completed: 0, total: 0, percentage: 0 },
-                currentWave: 1,
                 lastActivityAt: new Date().toISOString()
             };
             

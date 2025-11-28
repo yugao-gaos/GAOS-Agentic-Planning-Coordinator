@@ -87,8 +87,7 @@ export interface ManagedTask {
     requirements: TaskRequirements; // What stages are required
     dependencies: string[];         // Task IDs this depends on
     dependents: string[];           // Task IDs that depend on this
-    priority: number;               // Lower = higher priority
-    wave?: number;                  // Original wave assignment
+    priority: number;               // Lower = higher priority (based on dependency depth)
     
     // Timing
     createdAt: string;
@@ -230,7 +229,6 @@ export class TaskManager {
                     dependencies: planTask.dependencies || [],
                     dependents: [],
                     priority: taskIndex++,
-                    wave: planTask.wave,
                     createdAt: new Date().toISOString(),
                     filesModified: [],
                     unityRequests: [],

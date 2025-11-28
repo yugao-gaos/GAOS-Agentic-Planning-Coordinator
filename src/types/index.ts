@@ -112,7 +112,6 @@ export interface ExecutionState {
     /** Snapshot of engineer states for UI display (synced from coordinator) */
     engineers: Record<string, EngineerExecutionState>;
     progress: TaskProgress;
-    currentWave: number;
     lastActivityAt: string;
 }
 
@@ -202,7 +201,6 @@ export interface PlanTask {
     assignedTo?: string;
     status: 'pending' | 'in_progress' | 'completed' | 'blocked';
     dependencies?: string[];
-    wave?: number;
 }
 
 // ============================================================================

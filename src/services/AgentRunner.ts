@@ -422,9 +422,9 @@ Pool has ${poolSize} engineers available - use them all if tasks parallelize!_
 
 ---
 
-## 9. Execution Phases
+## 9. Execution Strategy
 
-_Will be organized into parallel execution waves after task analysis_
+_Tasks will be dynamically dispatched based on dependencies (coordinator handles parallelization)_
 
 ---
 
@@ -1502,8 +1502,8 @@ cat > /tmp/${analyst.id}_analysis.md << 'ANALYSIS_EOF'
 - Engineers are AI agents with NO communication overhead
 - More engineers = faster execution IF tasks can parallelize
 - Pool has ${poolSize} engineers available - recommend up to that many
-- Count the MAXIMUM number of tasks that can run simultaneously at any wave
-- Example: 5 independent tasks in a wave = recommend 5 engineers
+- Count the MAXIMUM number of independent tasks (no dependencies between them)
+- Example: 5 independent tasks = recommend 5 engineers
 
 #### Response to Other Analysts
 - [If you read other analysts' findings, respond here]
