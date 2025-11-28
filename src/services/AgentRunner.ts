@@ -1505,6 +1505,12 @@ cat > /tmp/${analyst.id}_analysis.md << 'ANALYSIS_EOF'
 - Count the MAXIMUM number of independent tasks (no dependencies between them)
 - Example: 5 independent tasks = recommend 5 engineers
 
+**DO NOT use "waves" or "phases" for execution order:**
+- The coordinator DYNAMICALLY dispatches tasks based on dependencies
+- Just specify task dependencies - coordinator handles parallelization
+- Tasks without dependencies can start immediately in parallel
+- Tasks with dependencies wait until those complete - no manual wave grouping needed
+
 #### Response to Other Analysts
 - [If you read other analysts' findings, respond here]
 - [Agree/disagree with specific points]
