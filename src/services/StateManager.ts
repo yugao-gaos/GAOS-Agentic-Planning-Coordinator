@@ -156,9 +156,9 @@ export class StateManager {
         await this.ensureDirectories();
         
         // Load existing state from files
-        await this.loadStateFromFiles();
+        this.loadStateFromFilesSync();
         
-        console.log('StateManager initialized');
+        console.log(`StateManager initialized. Found ${this.planningSessions.size} sessions, ${this.coordinators.size} coordinators`);
     }
 
     private async ensureDirectories(): Promise<void> {
@@ -190,7 +190,24 @@ export class StateManager {
         };
     }
 
-    private async loadStateFromFiles(): Promise<void> {
+    /**
+     * Public method to reload state from files (used by file watcher)
+     * This is called when external processes (CLI, bash scripts) modify state files
+     */
+    reloadFromFiles(): void {
+        // Clear existing state before reloading
+        this.planningSessions.clear();
+        this.coordinators.clear();
+        
+        // Load fresh from files (synchronous operations inside)
+        this.loadStateFromFilesSync();
+        console.log(`StateManager: Reloaded state from files. Found ${this.planningSessions.size} sessions, ${this.coordinators.size} coordinators`);
+    }
+    
+    /**
+     * Synchronous version of loadStateFromFiles for reloading
+     */
+    private loadStateFromFilesSync(): void {
         // Load extension state
         const extensionStatePath = path.join(this.workingDir, '.extension_state.json');
         if (fs.existsSync(extensionStatePath)) {
@@ -213,13 +230,14 @@ export class StateManager {
             }
         }
 
-        // Load planning sessions and coordinators from new plan folder structure
-        // Structure: _AiDevLog/Plans/{sessionId}/session.json and coordinator.json
+        // Load planning sessions and coordinators from plan folder structure
         const plansDir = path.join(this.workingDir, 'Plans');
         if (fs.existsSync(plansDir)) {
             const planFolders = fs.readdirSync(plansDir, { withFileTypes: true })
                 .filter(d => d.isDirectory())
                 .map(d => d.name);
+
+            console.log(`StateManager: Found plan folders: ${planFolders.join(', ')}`);
 
             for (const sessionId of planFolders) {
                 const planFolder = path.join(plansDir, sessionId);
@@ -230,6 +248,7 @@ export class StateManager {
                     try {
                         const data = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'));
                         this.planningSessions.set(data.id, data);
+                        console.log(`StateManager: Loaded session ${data.id}`);
                     } catch (e) {
                         console.error(`Failed to load planning session ${sessionId}:`, e);
                     }
@@ -247,47 +266,6 @@ export class StateManager {
                 }
             }
         }
-
-        // Backwards compatibility: Load from old structure if exists
-        // TODO: Remove this after migration is complete
-        const oldSessionsDir = path.join(this.workingDir, 'planning_sessions');
-        if (fs.existsSync(oldSessionsDir)) {
-            const files = fs.readdirSync(oldSessionsDir).filter(f => f.endsWith('.json'));
-            for (const file of files) {
-                try {
-                    const data = JSON.parse(fs.readFileSync(path.join(oldSessionsDir, file), 'utf-8'));
-                    if (!this.planningSessions.has(data.id)) {
-                        this.planningSessions.set(data.id, data);
-                    }
-                } catch (e) {
-                    console.error(`Failed to load legacy planning session ${file}:`, e);
-                }
-            }
-        }
-
-        const oldCoordinatorsDir = path.join(this.workingDir, 'coordinators');
-        if (fs.existsSync(oldCoordinatorsDir)) {
-            const files = fs.readdirSync(oldCoordinatorsDir).filter(f => f.endsWith('.json'));
-            for (const file of files) {
-                try {
-                    const data = JSON.parse(fs.readFileSync(path.join(oldCoordinatorsDir, file), 'utf-8'));
-                    if (!this.coordinators.has(data.id)) {
-                        this.coordinators.set(data.id, data);
-                    }
-                } catch (e) {
-                    console.error(`Failed to load legacy coordinator ${file}:`, e);
-                }
-            }
-        }
-    }
-
-    /**
-     * Public method to reload state from files (used by file watcher)
-     * This is called when external processes (CLI, bash scripts) modify state files
-     */
-    reloadFromFiles(): void {
-        this.loadStateFromFiles();
-        console.log('StateManager: Reloaded state from files');
     }
 
     async updateStateFiles(): Promise<void> {
