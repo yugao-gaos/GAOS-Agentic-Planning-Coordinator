@@ -31,10 +31,16 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('Agentic Planning: No workspace folder open');
         return;
     }
+    console.log(`Agentic Planning: Workspace root = ${workspaceRoot}`);
 
     // Initialize services
     stateManager = new StateManager(workspaceRoot, context);
     await stateManager.initialize();
+    
+    // Debug: Log what we loaded
+    const sessions = stateManager.getAllPlanningSessions();
+    console.log(`Agentic Planning: Loaded ${sessions.length} planning sessions`);
+    sessions.forEach(s => console.log(`  - Session: ${s.id}, status: ${s.status}`));
 
     engineerPoolService = new EngineerPoolService(stateManager);
     terminalManager = new TerminalManager();
