@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import { execSync, spawn } from 'child_process';
 import { StateManager } from './StateManager';
 import { PlanningSession, PlanningStatus, PlanVersion, RevisionEntry, ExecutionState, EngineerExecutionState } from '../types';
-import { AgentRunner, AgentAnalysis } from './AgentRunner';
+import { PlanningAgentRunner, AgentAnalysis } from './PlanningAgentRunner';
 import { CoordinatorService } from './CoordinatorService';
 import { OutputChannelManager } from './OutputChannelManager';
 
@@ -28,7 +28,7 @@ export class PlanningService {
     private _onSessionsChanged = new vscode.EventEmitter<void>();
     readonly onSessionsChanged = this._onSessionsChanged.event;
     private bestPractices: string = '';
-    private agentRunner: AgentRunner;
+    private agentRunner: PlanningAgentRunner;
     private outputManager: OutputChannelManager;
     
     // CoordinatorService for execution (set via setCoordinatorService to avoid circular deps)
@@ -39,7 +39,7 @@ export class PlanningService {
 
     constructor(stateManager: StateManager, extensionPath?: string) {
         this.stateManager = stateManager;
-        this.agentRunner = new AgentRunner(stateManager.getWorkspaceRoot(), extensionPath);
+        this.agentRunner = new PlanningAgentRunner(stateManager.getWorkspaceRoot(), extensionPath);
         this.loadBestPractices();
         
         // Use unified output channel
@@ -122,7 +122,7 @@ export class PlanningService {
         
         if (taskType.includes('Script') || taskType.includes('Component')) {
             practices.push('⚠️ See UnityBestPractices.md Section 1: MonoBehaviour vs Pure C#');
-            practices.push('⚠️ After creating scripts: Delegate compilation to UnityControlAgent, check error registry.');
+            practices.push('⚠️ After creating scripts: Delegate compilation to UnityControlManager via CLI, check error registry.');
         }
         
         if (taskType.includes('Pool') || taskType.includes('Spawn')) {
@@ -1500,8 +1500,102 @@ _Reviewing feedback impact on testing..._
     }
 
     /**
+     * Review plan format before approval
+     * Validates that the plan has proper checkbox format for task tracking
+     * Returns validation result with any issues found
+     */
+    async reviewPlanFormat(sessionId: string): Promise<{
+        valid: boolean;
+        issues: string[];
+        taskCount: number;
+        tasksFound: Array<{ id: string; description: string; deps: string[] }>;
+    }> {
+        const session = this.stateManager.getPlanningSession(sessionId);
+        if (!session || !session.currentPlanPath) {
+            return { valid: false, issues: ['Plan file not found'], taskCount: 0, tasksFound: [] };
+        }
+
+        const planContent = fs.readFileSync(session.currentPlanPath, 'utf-8');
+        const issues: string[] = [];
+        const tasksFound: Array<{ id: string; description: string; deps: string[] }> = [];
+
+        // Check for checkbox format tasks
+        // Format: - [ ] **T{N}**: {Description} | Deps: {dependencies} | Engineer: {name}
+        const checkboxPattern = /^-\s*\[[ xX]\]\s*\*\*T(\d+)\*\*:\s*(.+?)(?:\s*\|\s*Deps?:\s*([^|]+))?(?:\s*\|\s*Engineer:\s*\w+)?$/gm;
+        
+        let match;
+        while ((match = checkboxPattern.exec(planContent)) !== null) {
+            const taskId = `T${match[1]}`;
+            const description = match[2].trim();
+            const depsStr = match[3]?.trim() || 'None';
+            
+            // Parse dependencies
+            const deps: string[] = [];
+            if (depsStr.toLowerCase() !== 'none' && depsStr !== '-') {
+                const depMatches = depsStr.match(/T\d+/gi) || [];
+                deps.push(...depMatches.map(d => d.toUpperCase()));
+            }
+            
+            tasksFound.push({ id: taskId, description, deps });
+        }
+
+        // Validation checks
+        if (tasksFound.length === 0) {
+            issues.push('No tasks found in checkbox format. Expected format: - [ ] **T1**: Task description | Deps: None');
+            
+            // Check if tasks exist in table format (old format)
+            const tablePattern = /\|\s*T\d+\s*\|/g;
+            const tableMatches = planContent.match(tablePattern);
+            if (tableMatches && tableMatches.length > 0) {
+                issues.push(`Found ${tableMatches.length} tasks in TABLE format. Please convert to CHECKBOX format for tracking.`);
+            }
+        }
+
+        // Check for duplicate task IDs
+        const taskIds = tasksFound.map(t => t.id);
+        const duplicates = taskIds.filter((id, idx) => taskIds.indexOf(id) !== idx);
+        if (duplicates.length > 0) {
+            issues.push(`Duplicate task IDs found: ${[...new Set(duplicates)].join(', ')}`);
+        }
+
+        // Check for missing dependency references
+        for (const task of tasksFound) {
+            for (const dep of task.deps) {
+                if (!taskIds.includes(dep)) {
+                    issues.push(`Task ${task.id} depends on ${dep} which doesn't exist`);
+                }
+            }
+        }
+
+        // Check for circular dependencies (simple check)
+        for (const task of tasksFound) {
+            if (task.deps.includes(task.id)) {
+                issues.push(`Task ${task.id} has circular dependency on itself`);
+            }
+        }
+
+        // Write review results to progress log
+        this.writeProgress(sessionId, 'REVIEW', `Plan format review: ${tasksFound.length} tasks found`);
+        if (issues.length > 0) {
+            for (const issue of issues) {
+                this.writeProgress(sessionId, 'REVIEW', `  ⚠️ ${issue}`);
+            }
+        } else {
+            this.writeProgress(sessionId, 'REVIEW', '  ✅ Plan format valid');
+        }
+
+        return {
+            valid: issues.length === 0,
+            issues,
+            taskCount: tasksFound.length,
+            tasksFound
+        };
+    }
+
+    /**
      * Approve a plan for execution
      * If autoStart is true, immediately starts execution
+     * Now includes format validation before approval
      */
     async approvePlan(sessionId: string, autoStart: boolean = true): Promise<void> {
         const session = this.stateManager.getPlanningSession(sessionId);
@@ -1511,6 +1605,16 @@ _Reviewing feedback impact on testing..._
 
         if (session.status !== 'reviewing') {
             throw new Error(`Plan is not ready for approval (status: ${session.status})`);
+        }
+
+        // Run format review before approval
+        const reviewResult = await this.reviewPlanFormat(sessionId);
+        if (!reviewResult.valid) {
+            const errorMsg = `Plan format validation failed:\n${reviewResult.issues.join('\n')}`;
+            vscode.window.showWarningMessage(
+                `Plan has format issues. Fix them before approval:\n${reviewResult.issues.slice(0, 3).join(', ')}${reviewResult.issues.length > 3 ? '...' : ''}`
+            );
+            throw new Error(errorMsg);
         }
 
         session.status = 'approved';
@@ -2072,6 +2176,26 @@ _Reviewing feedback impact on testing..._
         } catch (error) {
             return { success: false, error: `Failed to remove session: ${error}` };
         }
+    }
+    
+    /**
+     * Dispose resources
+     * Call this on extension deactivation to prevent memory leaks
+     */
+    dispose(): void {
+        // Stop execution sync interval
+        if (this.executionSyncInterval) {
+            clearInterval(this.executionSyncInterval);
+            this.executionSyncInterval = undefined;
+        }
+        
+        // Dispose event emitter
+        this._onSessionsChanged.dispose();
+        
+        // Stop any running agents
+        this.agentRunner.stopAll().catch(() => {});
+        
+        console.log('PlanningService disposed');
     }
 }
 

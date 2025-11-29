@@ -12,7 +12,8 @@ import { CoordinatorsProvider } from './ui/CoordinatorsProvider';
 import { EngineerPoolProvider } from './ui/EngineerPoolProvider';
 import { DependencyStatusProvider } from './ui/DependencyStatusProvider';
 import { UnityControlStatusProvider } from './ui/UnityControlStatusProvider';
-import { UnityControlAgent } from './services/UnityControlAgent';
+import { UnityControlManager } from './services/UnityControlManager';
+import { AgentRunner, AgentBackendType } from './services/AgentBackend';
 
 let stateManager: StateManager;
 let engineerPoolService: EngineerPoolService;
@@ -32,6 +33,13 @@ export async function activate(context: vscode.ExtensionContext) {
         return;
     }
     console.log(`Agentic Planning: Workspace root = ${workspaceRoot}`);
+    
+    // Initialize AgentRunner with configured backend
+    const config = vscode.workspace.getConfiguration('agenticPlanning');
+    const backendType = config.get<string>('defaultBackend', 'cursor') as AgentBackendType;
+    const agentRunner = AgentRunner.getInstance();
+    agentRunner.setBackend(backendType);
+    console.log(`Agentic Planning: Agent backend = ${backendType}`);
 
     // Create placeholder providers first so TreeViews are always registered
     // This prevents "no data provider" errors even if initialization fails
@@ -80,15 +88,16 @@ export async function activate(context: vscode.ExtensionContext) {
     }
     
     // Initialize Unity Control Agent and connect to UI
-    const unityControlAgent = UnityControlAgent.getInstance();
+    const unityControlManager = UnityControlManager.getInstance();
     if (workspaceRoot) {
-        unityControlAgent.initialize(workspaceRoot);
+        unityControlManager.initialize(workspaceRoot);
     }
     
-    // Connect Unity Control Agent events to UI
-    unityControlAgent.onStatusChanged((state) => {
+    // Connect Unity Control Manager events to UI
+    unityControlManager.onStatusChanged((state) => {
+        const unityStatus = unityControlManager.getUnityStatus();
         unityControlStatusProvider.updateStatus({
-            isRunning: state.status !== 'idle' || unityControlAgent.getQueue().length > 0,
+            isRunning: state.status !== 'idle' || unityControlManager.getQueue().length > 0,
             currentTask: state.currentTask ? {
                 id: state.currentTask.id,
                 type: state.currentTask.type as 'prep_editor' | 'test_framework_editmode' | 'test_framework_playmode' | 'test_player_playmode',
@@ -98,15 +107,24 @@ export async function activate(context: vscode.ExtensionContext) {
                 phase: state.currentTask.phase
             } : null,
             queueLength: state.queueLength,
-            queue: unityControlAgent.getQueue().map(t => ({
+            queue: unityControlManager.getQueue().map(t => ({
                 id: t.id,
                 type: t.type as 'prep_editor' | 'test_framework_editmode' | 'test_framework_playmode' | 'test_player_playmode',
                 requestedBy: t.requestedBy.map(r => r.engineerName),
                 status: t.status as 'queued' | 'executing' | 'completed' | 'failed',
                 queuedAt: t.createdAt
             })),
-            estimatedWaitTime: Math.floor(unityControlAgent.getEstimatedWaitTime('prep_editor') / 1000),
-            lastActivity: state.lastActivity
+            estimatedWaitTime: Math.floor(unityControlManager.getEstimatedWaitTime('prep_editor') / 1000),
+            lastActivity: state.lastActivity,
+            // Unity Editor state from polling agent
+            unityState: unityStatus ? {
+                isCompiling: unityStatus.isCompiling,
+                isPlaying: unityStatus.isPlaying,
+                isPaused: unityStatus.isPaused,
+                hasErrors: unityStatus.hasErrors,
+                errorCount: unityStatus.errorCount
+            } : undefined,
+            pollingAgentRunning: unityControlManager.isPollingAgentRunning()
         });
     });
 
@@ -134,9 +152,9 @@ export async function activate(context: vscode.ExtensionContext) {
         if (refreshTimeout) {
             clearTimeout(refreshTimeout);
         }
-        refreshTimeout = setTimeout(() => {
-            // Reload state from files
-            stateManager.reloadFromFiles();
+        refreshTimeout = setTimeout(async () => {
+            // Reload state from files (async with locking)
+            await stateManager.reloadFromFiles();
             // Refresh all UI providers
             engineerPoolProvider.refresh();
             planningSessionsProvider.refresh();
@@ -772,8 +790,104 @@ This will trigger the multi-agent debate to revise the plan.`;
     vscode.window.showInformationMessage('Agentic Planning Coordinator ready!');
 }
 
-export function deactivate() {
+export async function deactivate() {
     console.log('Agentic Planning Coordinator deactivating...');
-    // Cleanup will be handled by disposal of subscriptions
+    
+    // Stop CLI IPC service
+    if (cliIpcService) {
+        cliIpcService.stop();
+        console.log('CLI IPC service stopped');
+    }
+    
+    // Dispose CoordinatorService (stops coordinators, clears intervals)
+    if (coordinatorService) {
+        try {
+            await coordinatorService.dispose();
+            console.log('CoordinatorService disposed');
+        } catch (e) {
+            console.error('Error disposing CoordinatorService:', e);
+        }
+    }
+    
+    // Dispose PlanningService (stops agent runner, clears intervals)
+    if (planningService) {
+        try {
+            planningService.dispose();
+            console.log('PlanningService disposed');
+        } catch (e) {
+            console.error('Error disposing PlanningService:', e);
+        }
+    }
+    
+    // Dispose TerminalManager (closes all terminals)
+    if (terminalManager) {
+        try {
+            terminalManager.dispose();
+            console.log('TerminalManager disposed');
+        } catch (e) {
+            console.error('Error disposing TerminalManager:', e);
+        }
+    }
+    
+    // Dispose UnityControlManager
+    try {
+        const unityControlManager = UnityControlManager.getInstance();
+        await unityControlManager.dispose();
+        console.log('UnityControlManager disposed');
+    } catch (e) {
+        console.error('Error disposing UnityControlManager:', e);
+    }
+    
+    // Dispose AgentRunner (stops all running agents)
+    try {
+        const agentRunner = AgentRunner.getInstance();
+        await agentRunner.dispose();
+        console.log('AgentRunner disposed');
+    } catch (e) {
+        console.error('Error disposing AgentRunner:', e);
+    }
+    
+    // Dispose DependencyService
+    try {
+        const dependencyService = DependencyService.getInstance();
+        dependencyService.dispose();
+        console.log('DependencyService disposed');
+    } catch (e) {
+        console.error('Error disposing DependencyService:', e);
+    }
+    
+    // Clean up ProcessManager - stop all processes and clear callbacks
+    try {
+        const { ProcessManager } = await import('./services/ProcessManager');
+        const processManager = ProcessManager.getInstance();
+        await processManager.dispose();
+        console.log('ProcessManager disposed');
+    } catch (e) {
+        console.error('Error disposing ProcessManager:', e);
+    }
+    
+    // Kill any orphan cursor-agent processes
+    try {
+        const { ProcessManager } = await import('./services/ProcessManager');
+        const processManager = ProcessManager.getInstance();
+        const killed = await processManager.killOrphanCursorAgents();
+        if (killed > 0) {
+            console.log(`Killed ${killed} orphan cursor-agent processes`);
+        }
+    } catch (e) {
+        // Ignore cleanup errors
+    }
+    
+    // Dispose StateManager (releases file lock)
+    if (stateManager) {
+        try {
+            stateManager.dispose();
+            console.log('StateManager disposed');
+        } catch (e) {
+            console.error('Error disposing StateManager:', e);
+        }
+    }
+    
+    console.log('Agentic Planning Coordinator deactivated');
 }
 

@@ -55,9 +55,10 @@ export class ProcessManager {
     private readonly HEALTH_CHECK_INTERVAL_MS = 30 * 1000;  // Check health every 30 seconds
     private readonly STUCK_THRESHOLD_MS = 5 * 60 * 1000;  // Consider stuck if no output for 5 minutes
     
-    // Event emitters for monitoring
-    private onStuckCallbacks: Array<(id: string, state: ProcessState) => void> = [];
-    private onTimeoutCallbacks: Array<(id: string, state: ProcessState) => void> = [];
+    // Event emitters for monitoring - use WeakRef-like pattern with IDs for cleanup
+    private onStuckCallbacks: Map<string, (id: string, state: ProcessState) => void> = new Map();
+    private onTimeoutCallbacks: Map<string, (id: string, state: ProcessState) => void> = new Map();
+    private callbackIdCounter: number = 0;
 
     private constructor() {
         this.outputManager = OutputChannelManager.getInstance();
@@ -65,16 +66,45 @@ export class ProcessManager {
 
     /**
      * Register callback for when a process appears stuck (no output for STUCK_THRESHOLD_MS)
+     * Returns a callback ID that can be used to unregister the callback
      */
-    onProcessStuck(callback: (id: string, state: ProcessState) => void): void {
-        this.onStuckCallbacks.push(callback);
+    onProcessStuck(callback: (id: string, state: ProcessState) => void): string {
+        const callbackId = `stuck_${++this.callbackIdCounter}`;
+        this.onStuckCallbacks.set(callbackId, callback);
+        return callbackId;
     }
 
     /**
      * Register callback for when a process times out
+     * Returns a callback ID that can be used to unregister the callback
      */
-    onProcessTimeout(callback: (id: string, state: ProcessState) => void): void {
-        this.onTimeoutCallbacks.push(callback);
+    onProcessTimeout(callback: (id: string, state: ProcessState) => void): string {
+        const callbackId = `timeout_${++this.callbackIdCounter}`;
+        this.onTimeoutCallbacks.set(callbackId, callback);
+        return callbackId;
+    }
+    
+    /**
+     * Unregister a stuck callback by ID
+     */
+    offProcessStuck(callbackId: string): boolean {
+        return this.onStuckCallbacks.delete(callbackId);
+    }
+    
+    /**
+     * Unregister a timeout callback by ID
+     */
+    offProcessTimeout(callbackId: string): boolean {
+        return this.onTimeoutCallbacks.delete(callbackId);
+    }
+    
+    /**
+     * Clear all registered callbacks (for cleanup on deactivation)
+     */
+    clearAllCallbacks(): void {
+        this.onStuckCallbacks.clear();
+        this.onTimeoutCallbacks.clear();
+        this.log('Cleared all process manager callbacks');
     }
 
     static getInstance(): ProcessManager {
@@ -218,6 +248,112 @@ export class ProcessManager {
         this.log(`Started process ${id}: ${command} ${args.slice(0, 3).join(' ')}...`);
 
         return proc;
+    }
+
+    /**
+     * Register an externally-spawned process for tracking
+     * Use this when you spawn a process outside of ProcessManager but want it tracked
+     * for stuck detection, cleanup, and visibility in the UI.
+     */
+    registerExternalProcess(
+        id: string,
+        proc: ChildProcess,
+        options: {
+            command: string;
+            args: string[];
+            cwd: string;
+            env?: NodeJS.ProcessEnv;
+            metadata?: Record<string, any>;
+            maxRuntimeMs?: number;
+            enableHealthCheck?: boolean;
+        }
+    ): void {
+        // Kill existing process with same ID if any
+        if (this.processes.has(id)) {
+            this.log(`Process ${id} already registered, stopping it first`);
+            this.stopProcess(id, true);
+        }
+
+        const state: ProcessState = {
+            id,
+            command: options.command,
+            args: options.args,
+            cwd: options.cwd,
+            env: options.env,
+            startTime: new Date().toISOString(),
+            status: 'running',
+            metadata: options.metadata
+        };
+
+        const managed: ManagedProcess = {
+            proc,
+            state,
+            outputBuffer: [],
+            lastActivityTime: Date.now()
+        };
+
+        // Track stdout activity (if available)
+        proc.stdout?.on('data', (data: Buffer) => {
+            managed.lastActivityTime = Date.now();
+            const text = data.toString();
+            managed.outputBuffer.push(text);
+            if (managed.outputBuffer.length > 100) {
+                managed.outputBuffer.shift();
+            }
+            state.lastOutput = text;
+        });
+
+        // Track stderr activity (if available)
+        proc.stderr?.on('data', (data: Buffer) => {
+            managed.lastActivityTime = Date.now();
+            const text = data.toString();
+            managed.outputBuffer.push(`[stderr] ${text}`);
+            if (managed.outputBuffer.length > 100) {
+                managed.outputBuffer.shift();
+            }
+        });
+
+        // Handle exit
+        proc.on('exit', (code) => {
+            if (state.status === 'running') {
+                state.status = code === 0 ? 'completed' : 'error';
+            }
+            if (managed.timeoutId) clearTimeout(managed.timeoutId);
+            if (managed.healthCheckId) clearInterval(managed.healthCheckId);
+            this.processes.delete(id);
+            this.log(`External process ${id} exited with code ${code}`);
+        });
+
+        proc.on('error', (err) => {
+            this.log(`External process ${id} error: ${err.message}`);
+            state.status = 'error';
+        });
+
+        this.processes.set(id, managed);
+
+        // Set up timeout if specified
+        const maxRuntime = options.maxRuntimeMs ?? this.DEFAULT_MAX_RUNTIME_MS;
+        if (maxRuntime > 0) {
+            managed.timeoutId = setTimeout(() => {
+                this.log(`⏰ External process ${id} exceeded max runtime (${maxRuntime}ms), killing...`);
+                this.onTimeoutCallbacks.forEach(cb => cb(id, state));
+                this.stopProcess(id, true);
+            }, maxRuntime);
+        }
+
+        // Set up health check if enabled
+        const enableHealthCheck = options.enableHealthCheck !== false;
+        if (enableHealthCheck) {
+            managed.healthCheckId = setInterval(() => {
+                const timeSinceActivity = Date.now() - managed.lastActivityTime;
+                if (timeSinceActivity > this.STUCK_THRESHOLD_MS && state.status === 'running') {
+                    this.log(`⚠️ External process ${id} appears stuck (no output for ${Math.round(timeSinceActivity / 1000)}s)`);
+                    this.onStuckCallbacks.forEach(cb => cb(id, state));
+                }
+            }, this.HEALTH_CHECK_INTERVAL_MS);
+        }
+
+        this.log(`Registered external process ${id}: ${options.command} ${options.args.slice(0, 3).join(' ')}...`);
     }
 
     /**
@@ -426,46 +562,98 @@ export class ProcessManager {
     /**
      * Find and kill orphan cursor-agent processes not tracked by ProcessManager
      * This catches processes that survived extension restarts
+     * Works on Windows, macOS, and Linux
      */
     async killOrphanCursorAgents(): Promise<number> {
-        if (process.platform === 'win32') {
-            // TODO: Windows implementation
-            return 0;
-        }
-
         const { execSync } = require('child_process');
         let killedCount = 0;
         
-        try {
-            // Find cursor-agent processes
-            const result = execSync(
-                'ps aux | grep -E "cursor-agent.*(agent|status)" | grep -v grep | awk \'{print $2}\'',
-                { encoding: 'utf-8', timeout: 5000 }
-            ).trim();
-            
-            if (!result) return 0;
-            
-            const pids = result.split('\n').filter((p: string) => p.trim());
-            const trackedPids = new Set(
-                Array.from(this.processes.values())
-                    .map(m => m.proc.pid)
-                    .filter(pid => pid !== undefined)
-            );
-            
-            for (const pid of pids) {
-                const pidNum = parseInt(pid, 10);
-                if (!isNaN(pidNum) && !trackedPids.has(pidNum)) {
-                    try {
-                        process.kill(pidNum, 'SIGKILL');
-                        this.log(`🗑️ Killed orphan cursor-agent process ${pidNum}`);
-                        killedCount++;
-                    } catch (e) {
-                        // Process might already be dead
+        // Get PIDs currently tracked by ProcessManager
+        const trackedPids = new Set(
+            Array.from(this.processes.values())
+                .map(m => m.proc.pid)
+                .filter(pid => pid !== undefined)
+        );
+
+        if (process.platform === 'win32') {
+            // Windows implementation using WMIC or PowerShell
+            try {
+                // Use WMIC to find cursor-agent processes
+                // WMIC returns: Handle  Name  CommandLine
+                let result: string;
+                try {
+                    // Try WMIC first (available on most Windows versions)
+                    result = execSync(
+                        'wmic process where "commandline like \'%cursor%agent%\'" get processid,commandline /format:csv',
+                        { encoding: 'utf-8', timeout: 10000, windowsHide: true }
+                    ).trim();
+                } catch {
+                    // Fall back to PowerShell if WMIC is not available (Windows 11+)
+                    result = execSync(
+                        'powershell -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like \'*cursor*agent*\' } | Select-Object ProcessId | ConvertTo-Csv -NoTypeInformation"',
+                        { encoding: 'utf-8', timeout: 10000, windowsHide: true }
+                    ).trim();
+                }
+                
+                if (!result) return 0;
+                
+                // Parse CSV output to extract PIDs
+                const lines = result.split('\n').filter((line: string) => line.trim());
+                for (const line of lines) {
+                    // Skip header lines
+                    if (line.includes('ProcessId') || line.includes('Node')) continue;
+                    
+                    // Extract PID from CSV (last number in line for WMIC, quoted for PowerShell)
+                    const pidMatch = line.match(/(\d+)\s*$/);
+                    if (pidMatch) {
+                        const pidNum = parseInt(pidMatch[1], 10);
+                        if (!isNaN(pidNum) && !trackedPids.has(pidNum) && pidNum !== process.pid) {
+                            try {
+                                // Use taskkill to terminate the process tree
+                                execSync(`taskkill /PID ${pidNum} /T /F`, { 
+                                    timeout: 5000,
+                                    windowsHide: true,
+                                    stdio: 'ignore'
+                                });
+                                this.log(`🗑️ Killed orphan cursor-agent process ${pidNum} (Windows)`);
+                                killedCount++;
+                            } catch (e) {
+                                // Process might already be dead or access denied
+                            }
+                        }
                     }
                 }
+            } catch (e) {
+                this.log(`Error finding orphan processes on Windows: ${e}`);
             }
-        } catch (e) {
-            this.log(`Error finding orphan processes: ${e}`);
+        } else {
+            // Unix (macOS/Linux) implementation
+            try {
+                // Find cursor-agent processes
+                const result = execSync(
+                    'ps aux | grep -E "cursor.*(agent|--model)" | grep -v grep | awk \'{print $2}\'',
+                    { encoding: 'utf-8', timeout: 5000 }
+                ).trim();
+                
+                if (!result) return 0;
+                
+                const pids = result.split('\n').filter((p: string) => p.trim());
+                
+                for (const pid of pids) {
+                    const pidNum = parseInt(pid, 10);
+                    if (!isNaN(pidNum) && !trackedPids.has(pidNum) && pidNum !== process.pid) {
+                        try {
+                            process.kill(pidNum, 'SIGKILL');
+                            this.log(`🗑️ Killed orphan cursor-agent process ${pidNum}`);
+                            killedCount++;
+                        } catch (e) {
+                            // Process might already be dead
+                        }
+                    }
+                }
+            } catch (e) {
+                this.log(`Error finding orphan processes: ${e}`);
+            }
         }
         
         return killedCount;
@@ -617,6 +805,29 @@ export class ProcessManager {
 
     private log(message: string): void {
         this.outputManager.log(message, 'PROC');
+    }
+    
+    /**
+     * Full cleanup - stop all processes and clear all state
+     * Call this on extension deactivation to prevent memory leaks
+     */
+    async dispose(): Promise<void> {
+        this.log('Disposing ProcessManager...');
+        
+        // Stop all running processes
+        await this.stopAll(true);
+        
+        // Clear all callbacks to prevent memory leaks
+        this.clearAllCallbacks();
+        
+        // Clear all internal state
+        this.processes.clear();
+        this.pausedStates.clear();
+        
+        // Clean up temp files
+        this.cleanupAllPausedStates();
+        
+        this.log('ProcessManager disposed');
     }
 }
 

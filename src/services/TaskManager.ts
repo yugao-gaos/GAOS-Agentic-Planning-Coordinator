@@ -12,25 +12,31 @@ import { OutputChannelManager } from './OutputChannelManager';
  * Task stage - represents completion stages
  * 
  * Flow:
- * pending → in_progress → implemented → compiling → compiled
- *                                                      ↓
- *     ┌─────────────────────────────────────────────────┘
+ * pending → in_progress → implemented → awaiting_unity → compiled
+ *                                                          ↓
+ *     ┌────────────────────────────────────────────────────┘
  *     ↓
  * testing_editmode (if needed) → testing_playmode (if needed)
  *     ↓
- * waiting_player_test (if needed) → test_passed → completed
+ * test_passed OR test_failed → (fix cycle) → completed
+ * 
+ * Can be deferred if overlaps with ongoing work
  */
 export type TaskStage = 
     | 'pending'              // Not started
     | 'in_progress'          // Engineer actively coding
     | 'implemented'          // Code written, needs compile
+    | 'awaiting_unity'       // Waiting for Unity pipeline (engineer stopped)
     | 'compiling'            // Waiting in Unity queue for compile
+    | 'compile_failed'       // Compilation errors found
     | 'error_fixing'         // Fixing compilation errors  
     | 'compiled'             // Compile passed
     | 'testing_editmode'     // Running EditMode tests (framework)
     | 'testing_playmode'     // Running PlayMode tests (framework)
     | 'waiting_player_test'  // Waiting for manual player testing
     | 'test_passed'          // Tests passed
+    | 'test_failed'          // Tests failed, needs fixing
+    | 'deferred'             // Deferred due to overlap with ongoing work
     | 'completed'            // All required stages passed
     | 'failed';              // Failed and won't retry
 
@@ -815,6 +821,19 @@ export class TaskManager {
     }
 
     /**
+     * Mark an engineer as available (idle)
+     * Used when engineer process fails gracefully
+     */
+    markEngineerAvailable(engineerName: string): void {
+        const engineer = this.engineers.get(engineerName);
+        if (engineer) {
+            engineer.status = 'idle';
+            engineer.currentTask = undefined;
+            this.log(`Engineer ${engineerName} marked as available`);
+        }
+    }
+
+    /**
      * Extract keywords from text for matching
      */
     private extractKeywords(text: string): string[] {
@@ -1067,6 +1086,194 @@ export class TaskManager {
         // Can take work if idle or if only waiting for Unity
         return engineer.status === 'idle' || 
                (engineer.status === 'waiting' && !engineer.currentTask);
+    }
+
+    // ========================================================================
+    // Task Status Updates - For Coordinator to update after pipeline results
+    // ========================================================================
+
+    /**
+     * Update task stage with reason
+     * Used by coordinator after pipeline completion
+     */
+    updateTaskStage(taskId: string, stage: TaskStage, reason?: string): void {
+        const task = this.tasks.get(taskId);
+        if (!task) {
+            this.log(`Task ${taskId} not found for stage update`);
+            return;
+        }
+
+        const oldStage = task.stage;
+        task.stage = stage;
+
+        // Update status based on stage
+        if (stage === 'completed') {
+            task.status = 'completed';
+            task.completedAt = new Date().toISOString();
+            this.updateReadyTasks();
+            this.onTaskCompletedCallback?.(task);
+        } else if (stage === 'failed') {
+            task.status = 'failed';
+            task.completedAt = new Date().toISOString();
+        } else if (stage === 'awaiting_unity') {
+            task.status = 'waiting_unity';
+        } else if (stage === 'test_failed' || stage === 'compile_failed') {
+            task.status = 'error_fixing';
+        } else if (stage === 'deferred') {
+            // Keep status as-is but mark deferred
+        }
+
+        this.log(`Task ${taskId}: ${oldStage} → ${stage}${reason ? ` (${reason})` : ''}`);
+    }
+
+    /**
+     * Mark task as test failed with details
+     */
+    markTaskTestFailed(taskId: string, failures: string[], reason?: string): void {
+        const task = this.tasks.get(taskId);
+        if (!task) return;
+
+        task.stage = 'test_failed';
+        task.status = 'error_fixing';
+        task.errors.push(...failures);
+        
+        this.log(`Task ${taskId} test failed: ${reason || failures.length + ' failures'}`);
+    }
+
+    /**
+     * Mark task as compile failed with errors
+     */
+    markTaskCompileFailed(taskId: string, errors: string[], reason?: string): void {
+        const task = this.tasks.get(taskId);
+        if (!task) return;
+
+        task.stage = 'compile_failed';
+        task.status = 'error_fixing';
+        task.errors.push(...errors);
+        
+        this.log(`Task ${taskId} compile failed: ${reason || errors.length + ' errors'}`);
+    }
+
+    /**
+     * Defer a task (overlap with ongoing work)
+     */
+    deferTask(taskId: string, reason: string, blockedBy?: string): void {
+        const task = this.tasks.get(taskId);
+        if (!task) return;
+
+        const previousStage = task.stage;
+        task.stage = 'deferred';
+        
+        // Store context for un-deferring
+        if (!task.sessionSummary) {
+            task.sessionSummary = '';
+        }
+        task.sessionSummary += `[DEFERRED from ${previousStage}] ${reason}`;
+        if (blockedBy) {
+            task.sessionSummary += ` (blocked by ${blockedBy})`;
+        }
+
+        this.log(`Task ${taskId} deferred: ${reason}`);
+    }
+
+    /**
+     * Un-defer a task (when blocker completes)
+     */
+    undeferTask(taskId: string): TaskStage | undefined {
+        const task = this.tasks.get(taskId);
+        if (!task || task.stage !== 'deferred') return undefined;
+
+        // Restore to a reasonable state - error_fixing since it needs attention
+        task.stage = 'error_fixing';
+        task.status = 'ready';
+        
+        this.log(`Task ${taskId} un-deferred, now ready for error fixing`);
+        this.updateReadyTasks();
+        
+        return task.stage;
+    }
+
+    /**
+     * Get all tasks currently in progress (for overlap detection)
+     */
+    getInProgressTasks(): Array<{
+        taskId: string;
+        engineerName: string;
+        stage: TaskStage;
+        filesModified: string[];
+    }> {
+        const inProgress: Array<{
+            taskId: string;
+            engineerName: string;
+            stage: TaskStage;
+            filesModified: string[];
+        }> = [];
+
+        for (const engineer of this.engineers.values()) {
+            if (engineer.status === 'working' && engineer.currentTask) {
+                inProgress.push({
+                    taskId: engineer.currentTask.id,
+                    engineerName: engineer.engineerName,
+                    stage: engineer.currentTask.stage,
+                    filesModified: engineer.filesModified
+                });
+            }
+        }
+
+        return inProgress;
+    }
+
+    /**
+     * Check if any file overlaps with ongoing work
+     * Returns the task/engineer working on overlapping file, or null
+     */
+    checkFileOverlap(files: string[]): {
+        taskId: string;
+        engineerName: string;
+        overlappingFiles: string[];
+    } | null {
+        const inProgress = this.getInProgressTasks();
+        
+        for (const work of inProgress) {
+            const overlapping = files.filter(f => 
+                work.filesModified.some(wf => 
+                    wf === f || 
+                    wf.endsWith(path.basename(f)) ||
+                    f.endsWith(path.basename(wf))
+                )
+            );
+            
+            if (overlapping.length > 0) {
+                return {
+                    taskId: work.taskId,
+                    engineerName: work.engineerName,
+                    overlappingFiles: overlapping
+                };
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Get deferred tasks
+     */
+    getDeferredTasks(): ManagedTask[] {
+        return Array.from(this.tasks.values()).filter(t => t.stage === 'deferred');
+    }
+
+    /**
+     * Get tasks awaiting Unity pipeline results
+     */
+    getAwaitingUnityTasks(): ManagedTask[] {
+        return Array.from(this.tasks.values()).filter(t => t.stage === 'awaiting_unity');
+    }
+
+    /**
+     * Get a specific task by ID
+     */
+    getTask(taskId: string): ManagedTask | undefined {
+        return this.tasks.get(taskId);
     }
 
     /**

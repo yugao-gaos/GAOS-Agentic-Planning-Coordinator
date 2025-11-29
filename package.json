@@ -174,7 +174,7 @@
         },
         {
           "id": "agenticPlanning.unityControlView",
-          "name": "Unity Control Agent"
+          "name": "Unity Control Manager"
         }
       ]
     },
@@ -191,8 +191,10 @@
         "agenticPlanning.defaultBackend": {
           "type": "string",
           "default": "cursor",
-          "enum": ["cursor", "claude-code", "codex"],
-          "description": "Default AI backend for engineer sessions"
+          "enum": [
+            "cursor"
+          ],
+          "description": "AI backend for agent sessions (only 'cursor' is currently supported)"
         },
         "agenticPlanning.workingDirectory": {
           "type": "string",
@@ -348,14 +350,17 @@
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
+    "@types/uuid": "^10.0.0",
     "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.18.1",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
+    "@vscode/vsce": "^2.22.0",
     "eslint": "^8.54.0",
-    "typescript": "^5.3.0",
-    "@vscode/vsce": "^2.22.0"
+    "typescript": "^5.3.0"
   },
-  "dependencies": {}
+  "dependencies": {
+    "uuid": "^13.0.0",
+    "ws": "^8.18.3"
+  }
 }
-
-

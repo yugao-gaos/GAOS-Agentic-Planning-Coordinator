@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import * as crypto from 'crypto';
 import { CliHandler } from '../cli/CliHandler';
 import { StateManager } from './StateManager';
@@ -34,11 +35,12 @@ export class CliIpcService {
         this.stateManager = stateManager;
         this.cliHandler = cliHandler;
         
-        // Use /tmp for IPC files to keep project clean
+        // Use os.tmpdir() for cross-platform IPC files
+        // This works on Windows (%TEMP%), macOS (/var/folders/...), and Linux (/tmp)
         // Hash workspace root to avoid conflicts between projects
         const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
         const hash = crypto.createHash('md5').update(workspaceRoot).digest('hex').substring(0, 8);
-        this.ipcDir = `/tmp/apc_ipc_${hash}`;
+        this.ipcDir = path.join(os.tmpdir(), `apc_ipc_${hash}`);
         
         // Ensure IPC directory exists
         if (!fs.existsSync(this.ipcDir)) {
@@ -47,6 +49,9 @@ export class CliIpcService {
         
         this.requestFile = path.join(this.ipcDir, 'request.json');
         this.responseFile = path.join(this.ipcDir, 'response.json');
+        
+        // Load last processed request ID to prevent re-processing on restart
+        this.lastProcessedRequestId = this.loadLastRequestId();
     }
 
     start(): void {
@@ -56,6 +61,9 @@ export class CliIpcService {
         console.log(`CliIpcService: IPC directory: ${this.ipcDir}`);
         console.log(`CliIpcService: Request file: ${this.requestFile}`);
         console.log(`CliIpcService: Response file: ${this.responseFile}`);
+
+        // Clean up stale IPC files from previous sessions
+        this.cleanupStaleFiles();
 
         // Process any existing request on startup
         this.checkForRequest();
@@ -77,6 +85,38 @@ export class CliIpcService {
         } catch (error) {
             console.error('CliIpcService: Failed to start file watcher:', error);
             vscode.window.showErrorMessage(`APC IPC Service failed: ${error}`);
+        }
+    }
+    
+    /**
+     * Clean up stale IPC files from previous sessions
+     * Called on startup to prevent processing old requests
+     */
+    private cleanupStaleFiles(): void {
+        try {
+            // Clean up old response file (CLI should have read it, but may have crashed)
+            if (fs.existsSync(this.responseFile)) {
+                const stats = fs.statSync(this.responseFile);
+                const ageMs = Date.now() - stats.mtimeMs;
+                // If response file is older than 30 seconds, delete it
+                if (ageMs > 30000) {
+                    fs.unlinkSync(this.responseFile);
+                    console.log('CliIpcService: Cleaned up stale response file');
+                }
+            }
+            
+            // Clean up old request file if it's too old (likely orphaned)
+            if (fs.existsSync(this.requestFile)) {
+                const stats = fs.statSync(this.requestFile);
+                const ageMs = Date.now() - stats.mtimeMs;
+                // If request file is older than 60 seconds, it's likely orphaned
+                if (ageMs > 60000) {
+                    fs.unlinkSync(this.requestFile);
+                    console.log('CliIpcService: Cleaned up stale request file');
+                }
+            }
+        } catch (e) {
+            console.log('CliIpcService: Error during cleanup:', e);
         }
     }
 
@@ -118,6 +158,7 @@ export class CliIpcService {
             vscode.window.showInformationMessage(`APC: Processing ${request.command}...`);
             
             this.lastProcessedRequestId = request.id;
+            this.persistLastRequestId(request.id);
 
             // Process the request
             const response = await this.processRequest(request);
@@ -327,9 +368,54 @@ export class CliIpcService {
         try {
             fs.writeFileSync(this.responseFile, JSON.stringify(response, null, 2));
             console.log(`CliIpcService: Wrote response for ${response.requestId}`);
+            
+            // Schedule cleanup of response file after 30 seconds
+            // In case CLI crashes or doesn't read the response
+            setTimeout(() => {
+                try {
+                    if (fs.existsSync(this.responseFile)) {
+                        const content = fs.readFileSync(this.responseFile, 'utf-8');
+                        const parsed = JSON.parse(content);
+                        // Only delete if it's the same response we wrote
+                        if (parsed.requestId === response.requestId) {
+                            fs.unlinkSync(this.responseFile);
+                            console.log(`CliIpcService: Cleaned up response file for ${response.requestId}`);
+                        }
+                    }
+                } catch {
+                    // Ignore cleanup errors
+                }
+            }, 30000);
         } catch (error) {
             console.error('CliIpcService: Failed to write response:', error);
         }
+    }
+    
+    /**
+     * Persist the last processed request ID to prevent re-processing on restart
+     */
+    private persistLastRequestId(requestId: string): void {
+        try {
+            const stateFile = path.join(this.ipcDir, '.last_request_id');
+            fs.writeFileSync(stateFile, requestId);
+        } catch {
+            // Ignore persistence errors
+        }
+    }
+    
+    /**
+     * Load the last processed request ID from disk
+     */
+    private loadLastRequestId(): string {
+        try {
+            const stateFile = path.join(this.ipcDir, '.last_request_id');
+            if (fs.existsSync(stateFile)) {
+                return fs.readFileSync(stateFile, 'utf-8').trim();
+            }
+        } catch {
+            // Ignore load errors
+        }
+        return '';
     }
 }
 

@@ -108,7 +108,15 @@ interface ContextIndex {
     folders: Record<string, { scanned: string; fileCount: number }>;
 }
 
-export class AgentRunner {
+/**
+ * PlanningAgentRunner - Runs multiple Cursor agent CLI sessions for multi-model debate
+ * 
+ * This is a planning-specific agent runner that handles the multi-agent debate process.
+ * It is used exclusively by PlanningService for running analyst agents and context gatherers.
+ * 
+ * For general cursor agent execution, use AgentRunner from AgentBackend.ts instead.
+ */
+export class PlanningAgentRunner {
     private workspaceRoot: string;
     private extensionPath: string;
     private debateDir: string;
@@ -2432,4 +2440,8 @@ ${consensus.agreedRecommendations.length > 0
 }
 
 // Re-export for compatibility
+// Note: For general agent execution, use AgentRunner from AgentBackend.ts
 export type AgentType = 'cursor';
+
+// Alias for backward compatibility during migration
+export { PlanningAgentRunner as AgentRunner };

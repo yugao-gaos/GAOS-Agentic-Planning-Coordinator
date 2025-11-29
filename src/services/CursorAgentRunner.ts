@@ -1,8 +1,9 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, ChildProcess, execSync } from 'child_process';
 import { ProcessManager, ProcessState } from './ProcessManager';
+import { IAgentBackend } from './AgentBackend';
 
 /**
  * Result from running a cursor agent
@@ -44,8 +45,10 @@ export interface AgentRunOptions {
 /**
  * Runs Cursor CLI agents with proper process management and streaming output parsing.
  * This is the canonical way to run cursor agents in the extension.
+ * 
+ * Implements IAgentBackend for use with the AgentRunner abstraction layer.
  */
-export class CursorAgentRunner {
+export class CursorAgentRunner implements IAgentBackend {
     private static instance: CursorAgentRunner;
     private processManager: ProcessManager;
     private activeRuns: Map<string, {
@@ -123,16 +126,14 @@ export class CursorAgentRunner {
 
             this.activeRuns.set(id, { proc, startTime, collectedOutput: '' });
 
-            // Register with ProcessManager for tracking
-            const processState: ProcessState = {
-                id,
+            // Register the externally-spawned process with ProcessManager for tracking
+            // This ensures the process can be found by killStuckProcesses() and killOrphanCursorAgents()
+            this.processManager.registerExternalProcess(id, proc, {
                 command: 'cursor',
                 args: ['agent', '--model', model],
                 cwd,
-                startTime: new Date().toISOString(),
-                status: 'running',
-                metadata: { ...metadata, model, promptFile }
-            };
+                metadata: { ...metadata, model, promptFile, managedByCursorAgentRunner: true }
+            });
 
             // Set up timeout
             const timeoutId = setTimeout(() => {
@@ -193,6 +194,15 @@ export class CursorAgentRunner {
                 const duration = Date.now() - startTime;
 
                 this.activeRuns.delete(id);
+                
+                // Clean up temp prompt file (in case shell didn't delete it)
+                try {
+                    if (fs.existsSync(promptFile)) {
+                        fs.unlinkSync(promptFile);
+                    }
+                } catch {
+                    // Ignore cleanup errors
+                }
 
                 const success = code === 0 && !error;
                 const statusIcon = success ? '✅' : '❌';
@@ -220,6 +230,17 @@ export class CursorAgentRunner {
                 clearTimeout(timeoutId);
                 error = err.message;
                 onOutput?.(err.message, 'error');
+                
+                this.activeRuns.delete(id);
+                
+                // Clean up temp prompt file
+                try {
+                    if (fs.existsSync(promptFile)) {
+                        fs.unlinkSync(promptFile);
+                    }
+                } catch {
+                    // Ignore cleanup errors
+                }
                 
                 resolve({
                     success: false,
@@ -388,6 +409,39 @@ export class CursorAgentRunner {
      */
     isRunning(id: string): boolean {
         return this.activeRuns.has(id);
+    }
+    
+    /**
+     * Check if Cursor CLI is available on the system
+     * Implements IAgentBackend.isAvailable()
+     */
+    async isAvailable(): Promise<boolean> {
+        try {
+            if (process.platform === 'win32') {
+                execSync('where cursor', { stdio: 'ignore' });
+            } else {
+                execSync('which cursor', { stdio: 'ignore' });
+            }
+            return true;
+        } catch {
+            return false;
+        }
+    }
+    
+    /**
+     * Dispose resources used by this runner
+     * Implements IAgentBackend.dispose()
+     */
+    async dispose(): Promise<void> {
+        console.log('[CursorAgentRunner] Disposing...');
+        
+        // Stop all active runs
+        const runningIds = this.getRunningAgents();
+        for (const id of runningIds) {
+            await this.stop(id);
+        }
+        
+        console.log('[CursorAgentRunner] Disposed');
     }
 
     private killProcess(id: string, proc: ChildProcess): void {

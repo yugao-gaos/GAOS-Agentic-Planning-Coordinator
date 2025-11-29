@@ -192,13 +192,13 @@ export interface UnityConsoleMessage {
 }
 
 // ============================================================================
-// Unity Control Agent State
+// Unity Control Manager State
 // ============================================================================
 
 /**
- * Unity Control Agent status
+ * Unity Control Manager status
  */
-export type UnityControlAgentStatus =
+export type UnityControlManagerStatus =
     | 'idle'           // Waiting for tasks
     | 'executing'      // Running a task
     | 'waiting_unity'  // Waiting for Unity to finish (compile/import)
@@ -206,14 +206,99 @@ export type UnityControlAgentStatus =
     | 'error';         // Error state
 
 /**
- * Unity Control Agent state
+ * Unity Control Manager state
  */
-export interface UnityControlAgentState {
-    status: UnityControlAgentStatus;
+export interface UnityControlManagerState {
+    status: UnityControlManagerStatus;
     currentTask?: UnityTask;
     queueLength: number;
     tempScenePath: string;
     lastActivity: string;
     errorRegistryPath: string;
+}
+
+// Legacy aliases for backwards compatibility
+export type UnityControlAgentStatus = UnityControlManagerStatus;
+export type UnityControlAgentState = UnityControlManagerState;
+
+// ============================================================================
+// Pipeline Types - For batched Unity operations
+// ============================================================================
+
+/**
+ * Pipeline operation types - sequential steps
+ */
+export type PipelineOperation = 
+    | 'prep'                      // Reimport + Compile
+    | 'test_editmode'             // EditMode tests
+    | 'test_playmode'             // PlayMode tests  
+    | 'test_player_playmode';     // Manual player testing
+
+/**
+ * Task context - which task triggered this pipeline request
+ */
+export interface PipelineTaskContext {
+    taskId: string;                    // e.g., 'T1'
+    stage: string;                     // e.g., 'implementation_v1', 'fix_v1'
+    engineerName: string;              // For context (engineer already stopped)
+    filesModified: string[];           // For overlap analysis
+}
+
+/**
+ * Pipeline step result
+ */
+export interface PipelineStepResult {
+    operation: PipelineOperation;
+    success: boolean;
+    duration: number;                  // ms
+    errors?: UnityError[];
+    warnings?: UnityWarning[];
+    testResults?: {
+        passed: number;
+        failed: number;
+        failures?: TestResult[];
+    };
+}
+
+/**
+ * Pipeline request - queued for execution
+ */
+export interface PipelineRequest {
+    id: string;
+    
+    // Operations to run in sequence (fail-fast)
+    operations: PipelineOperation[];
+    
+    // Context for coordinator notification
+    coordinatorId: string;
+    tasksInvolved: PipelineTaskContext[];
+    
+    // Execution state
+    status: 'queued' | 'running' | 'completed' | 'failed';
+    currentStep: number;
+    stepResults: PipelineStepResult[];
+    
+    // Timing
+    createdAt: string;
+    startedAt?: string;
+    completedAt?: string;
+    
+    // For merging
+    mergeEnabled: boolean;             // Can merge with next request in queue
+}
+
+/**
+ * Pipeline completion result - sent to coordinator
+ */
+export interface PipelineResult {
+    pipelineId: string;
+    success: boolean;
+    failedAtStep: PipelineOperation | null;
+    stepResults: PipelineStepResult[];
+    tasksInvolved: PipelineTaskContext[];
+    
+    // Aggregated errors for easy access
+    allErrors: UnityError[];
+    allTestFailures: TestResult[];
 }
 

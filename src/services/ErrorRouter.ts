@@ -1,7 +1,6 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { spawn } from 'child_process';
 import {
     UnityError,
     ErrorRegistryEntry,
@@ -11,6 +10,7 @@ import {
 } from '../types/unity';
 import { CoordinatorState } from '../types';
 import { OutputChannelManager } from './OutputChannelManager';
+import { AgentRunner } from './AgentBackend';
 
 // ============================================================================
 // Error Router - AI-Based Error Assignment
@@ -412,36 +412,47 @@ ${context}
     }
 
     /**
-     * Run cursor agent command
+     * Run cursor agent command using AgentRunner
+     * Provides consistent timeout handling and retry support
      */
-    private async runCursorAgent(prompt: string): Promise<string> {
-        return new Promise((resolve, reject) => {
-            const proc = spawn('cursor', [
-                'agent',
-                '--print',
-                '--output-format', 'text',
-                '--approve-mcps',
-                '--force',
-                '--model', 'gpt-4o-mini',
-                '--workspace', this.workspaceRoot,
-                prompt
-            ]);
-
-            let output = '';
-            proc.stdout?.on('data', (data) => {
-                output += data.toString();
-            });
-
-            proc.on('close', (code) => {
-                if (code === 0) {
-                    resolve(output);
-                } else {
-                    reject(new Error(`Cursor agent failed with code ${code}`));
+    private async runCursorAgent(prompt: string, retries: number = 2): Promise<string> {
+        const agentRunner = AgentRunner.getInstance();
+        const processId = `error_router_${Date.now()}`;
+        
+        let lastError: Error | null = null;
+        
+        for (let attempt = 0; attempt <= retries; attempt++) {
+            try {
+                if (attempt > 0) {
+                    this.log(`Retrying error routing (attempt ${attempt + 1}/${retries + 1})...`);
                 }
-            });
-
-            proc.on('error', reject);
-        });
+                
+                let output = '';
+                
+                const result = await agentRunner.run({
+                    id: `${processId}_${attempt}`,
+                    prompt,
+                    cwd: this.workspaceRoot,
+                    model: 'gpt-4o-mini',
+                    timeoutMs: 120000, // 2 minute timeout for error routing
+                    metadata: { type: 'error_routing', attempt },
+                    onOutput: (text) => {
+                        output += text;
+                    }
+                });
+                
+                if (result.success) {
+                    return output || result.output || '';
+                } else {
+                    lastError = new Error(result.error || `Error routing failed (exit code: ${result.exitCode})`);
+                }
+            } catch (err) {
+                lastError = err instanceof Error ? err : new Error(String(err));
+                this.log(`Error routing attempt ${attempt + 1} failed: ${lastError.message}`);
+            }
+        }
+        
+        throw lastError || new Error('Error routing failed after all retries');
     }
 
     /**
@@ -456,6 +467,14 @@ ${context}
      */
     showOutput(): void {
         this.outputManager.show();
+    }
+    
+    /**
+     * Dispose resources
+     */
+    dispose(): void {
+        // No resources to dispose currently, but method exists for consistency
+        this.log('ErrorRouter disposed');
     }
 }
 

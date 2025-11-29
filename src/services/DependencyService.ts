@@ -518,6 +518,13 @@ export class DependencyService {
             vscode.window.showInformationMessage(`Install command copied: ${dep.installCommand}`);
         }
     }
+    
+    /**
+     * Dispose resources
+     */
+    dispose(): void {
+        this._onStatusChanged.dispose();
+    }
 
     // ========================================================================
     // Workspace Setup Checks (Run after workspace is opened)
@@ -658,26 +665,26 @@ export class DependencyService {
 
         // Scene doesn't exist - we'll need to create it via MCP
         // But we can't do that here directly - mark as needing creation
-        // The UnityControlAgent will create it when it initializes
+        // The UnityControlManager will create it when it initializes
 
         return {
             name: 'Temp Compile Scene',
-            passed: true,  // Pass for now, UnityControlAgent will handle creation
+            passed: true,  // Pass for now, UnityControlManager will handle creation
             message: 'Scene will be created by Unity Control Agent when Unity is available'
         };
     }
 
     /**
      * Create temp scene via Unity MCP
-     * Call this from UnityControlAgent when Unity is available
+     * Call this from UnityControlManager when Unity is available
      */
     async createTempSceneViaMcp(): Promise<{ success: boolean; message: string }> {
-        // This method is called by UnityControlAgent
+        // This method is called by UnityControlManager
         // It should use MCP to create the scene
-        // For now, return a placeholder - actual implementation in UnityControlAgent
+        // For now, return a placeholder - actual implementation in UnityControlManager
         return {
             success: false,
-            message: 'Use UnityControlAgent.ensureTempSceneExists() instead'
+            message: 'Use UnityControlManager.ensureTempSceneExists() instead'
         };
     }
 

@@ -14,7 +14,18 @@ interface QueuedUnityTask {
 }
 
 /**
- * Unity Control Agent status
+ * Unity Editor state from polling agent
+ */
+interface UnityEditorState {
+    isCompiling: boolean;
+    isPlaying: boolean;
+    isPaused: boolean;
+    hasErrors: boolean;
+    errorCount: number;
+}
+
+/**
+ * Unity Control Manager status
  */
 interface UnityControlStatus {
     isRunning: boolean;
@@ -23,6 +34,9 @@ interface UnityControlStatus {
     queue: QueuedUnityTask[];
     estimatedWaitTime: number; // seconds
     lastActivity?: string;
+    // Unity Editor state
+    unityState?: UnityEditorState;
+    pollingAgentRunning?: boolean;
 }
 
 export class UnityControlStatusProvider implements vscode.TreeDataProvider<UnityControlItem> {
@@ -46,7 +60,7 @@ export class UnityControlStatusProvider implements vscode.TreeDataProvider<Unity
     }
 
     /**
-     * Update status from UnityControlAgent
+     * Update status from UnityControlManager
      */
     updateStatus(status: UnityControlStatus): void {
         this.status = status;
@@ -75,7 +89,7 @@ export class UnityControlStatusProvider implements vscode.TreeDataProvider<Unity
         // Root level
         const items: UnityControlItem[] = [];
 
-        // Status indicator
+        // Manager Status indicator (always first)
         if (this.status.currentTask) {
             // Currently executing a task - show detailed status
             const task = this.status.currentTask;
@@ -85,7 +99,7 @@ export class UnityControlStatusProvider implements vscode.TreeDataProvider<Unity
             
             // Main status item
             items.push(new UnityControlItem(
-                `🔄 Working: ${taskLabel}`,
+                `Working: ${taskLabel}`,
                 phaseLabel,
                 vscode.TreeItemCollapsibleState.None,
                 'sync~spin',
@@ -95,7 +109,7 @@ export class UnityControlStatusProvider implements vscode.TreeDataProvider<Unity
             // Show who requested the task
             if (requesters) {
                 items.push(new UnityControlItem(
-                    `👤 Requested by`,
+                    `Requested by`,
                     requesters,
                     vscode.TreeItemCollapsibleState.None,
                     'account',
@@ -105,8 +119,8 @@ export class UnityControlStatusProvider implements vscode.TreeDataProvider<Unity
         } else if (this.status.isRunning) {
             // Running but idle
             items.push(new UnityControlItem(
-                'Unity Control Agent',
-                'Idle - Ready',
+                'Manager: Ready',
+                'Idle - Waiting for tasks',
                 vscode.TreeItemCollapsibleState.None,
                 'circle-filled',
                 'idle'
@@ -114,19 +128,70 @@ export class UnityControlStatusProvider implements vscode.TreeDataProvider<Unity
         } else {
             // Not running
             items.push(new UnityControlItem(
-                'Unity Control Agent',
-                'Not Active',
+                'Manager: Inactive',
+                'Not initialized',
                 vscode.TreeItemCollapsibleState.None,
                 'circle-outline',
                 'inactive'
             ));
         }
 
+        // Unity Editor State (only show when polling agent is running)
+        if (this.status.pollingAgentRunning) {
+            if (this.status.unityState) {
+                const state = this.status.unityState;
+                
+                if (state.isCompiling) {
+                    items.push(new UnityControlItem(
+                        'Unity: Compiling',
+                        'Scripts are being compiled...',
+                        vscode.TreeItemCollapsibleState.None,
+                        'sync~spin',
+                        'unity-compiling'
+                    ));
+                } else if (state.isPlaying) {
+                    const playStatus = state.isPaused ? 'Paused' : 'Running';
+                    items.push(new UnityControlItem(
+                        `Unity: Play Mode ${playStatus}`,
+                        state.isPaused ? 'Game is paused' : 'Game is running',
+                        vscode.TreeItemCollapsibleState.None,
+                        state.isPaused ? 'debug-pause' : 'play',
+                        'unity-playing'
+                    ));
+                } else if (state.hasErrors) {
+                    items.push(new UnityControlItem(
+                        `Unity: ${state.errorCount} Errors`,
+                        'Compilation errors detected',
+                        vscode.TreeItemCollapsibleState.None,
+                        'error',
+                        'unity-errors'
+                    ));
+                } else {
+                    items.push(new UnityControlItem(
+                        'Unity: Ready',
+                        'No errors, ready to work',
+                        vscode.TreeItemCollapsibleState.None,
+                        'check',
+                        'unity-ready'
+                    ));
+                }
+            } else {
+                // Polling agent running but no state yet
+                items.push(new UnityControlItem(
+                    'Unity: Polling...',
+                    'Waiting for status update',
+                    vscode.TreeItemCollapsibleState.None,
+                    'loading~spin',
+                    'unity-polling'
+                ));
+            }
+        }
+
         // Queue status
         if (this.status.queueLength > 0) {
             const waitTime = this.formatWaitTime(this.status.estimatedWaitTime);
             items.push(new UnityControlItem(
-                `📋 Queue: ${this.status.queueLength} tasks`,
+                `Queue: ${this.status.queueLength} tasks`,
                 `Est. wait: ${waitTime}`,
                 vscode.TreeItemCollapsibleState.Expanded,
                 'list-ordered',
@@ -134,7 +199,7 @@ export class UnityControlStatusProvider implements vscode.TreeDataProvider<Unity
             ));
         } else {
             items.push(new UnityControlItem(
-                '📋 Queue: Empty',
+                'Queue: Empty',
                 'No pending tasks',
                 vscode.TreeItemCollapsibleState.None,
                 'list-ordered',
@@ -168,12 +233,12 @@ export class UnityControlStatusProvider implements vscode.TreeDataProvider<Unity
 
     private getPhaseLabel(phase?: string): string {
         switch (phase) {
-            case 'preparing': return '⏳ Preparing Unity...';
-            case 'waiting_compile': return '🔨 Waiting for compilation...';
-            case 'waiting_import': return '📦 Waiting for import...';
-            case 'running_tests': return '🧪 Running tests...';
-            case 'monitoring': return '👀 Monitoring playtest...';
-            default: return '⏳ Processing...';
+            case 'preparing': return 'Preparing Unity...';
+            case 'waiting_compile': return 'Waiting for compilation...';
+            case 'waiting_import': return 'Waiting for import...';
+            case 'running_tests': return 'Running tests...';
+            case 'monitoring': return 'Monitoring playtest...';
+            default: return 'Processing...';
         }
     }
 
@@ -208,16 +273,18 @@ class UnityControlItem extends vscode.TreeItem {
         
         if (iconId) {
             // Color based on status
-            if (contextValue === 'executing') {
+            if (contextValue === 'executing' || contextValue === 'unity-compiling' || contextValue === 'unity-polling') {
                 this.iconPath = new vscode.ThemeIcon(iconId, new vscode.ThemeColor('charts.yellow'));
-            } else if (contextValue === 'idle') {
+            } else if (contextValue === 'idle' || contextValue === 'unity-ready') {
                 this.iconPath = new vscode.ThemeIcon(iconId, new vscode.ThemeColor('charts.green'));
             } else if (contextValue === 'inactive') {
                 this.iconPath = new vscode.ThemeIcon(iconId, new vscode.ThemeColor('disabledForeground'));
             } else if (contextValue === 'task-completed') {
                 this.iconPath = new vscode.ThemeIcon(iconId, new vscode.ThemeColor('charts.green'));
-            } else if (contextValue === 'task-failed') {
+            } else if (contextValue === 'task-failed' || contextValue === 'unity-errors') {
                 this.iconPath = new vscode.ThemeIcon(iconId, new vscode.ThemeColor('errorForeground'));
+            } else if (contextValue === 'unity-playing') {
+                this.iconPath = new vscode.ThemeIcon(iconId, new vscode.ThemeColor('charts.blue'));
             } else {
                 this.iconPath = new vscode.ThemeIcon(iconId);
             }

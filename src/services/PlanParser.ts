@@ -119,19 +119,41 @@ export class PlanParser {
         // Try modern format: ### Section with #### Task X.Y
         const modernTasks = this.parseModernFormat(content);
 
+        // Try table format: | ID | Task | Dependencies | Files | Tests |
+        const tableTasks = this.parseTableFormat(content);
+
         // Use whichever format found more tasks
-        const tasks = modernTasks.length > legacyTasks.length ? modernTasks : legacyTasks;
+        let tasks = legacyTasks;
+        if (modernTasks.length > tasks.length) tasks = modernTasks;
+        if (tableTasks.length > tasks.length) tasks = tableTasks;
         
         if (tasks.length === 0) {
             console.warn(`[PlanParser] No tasks found in plan: ${planPath}`);
+        } else {
+            console.log(`[PlanParser] Found ${tasks.length} tasks using ${tasks === tableTasks ? 'table' : tasks === modernTasks ? 'modern' : 'legacy'} format`);
         }
 
         // Assign actual engineer names to tasks
         const engineerMapping = this.createEngineerMapping(tasks, engineerCount);
         
+        // Check if all tasks have the same generic engineer (table format)
+        // In that case, distribute tasks round-robin among available engineers
+        const uniqueEngineers = new Set(tasks.map(t => t.engineer));
+        const isTableFormat = uniqueEngineers.size === 1 && tasks[0]?.engineer.match(/Engineer-?\d+/i);
+        
+        let taskIndex = 0;
         for (const task of tasks) {
+            let mappedName: string;
+            
+            if (isTableFormat) {
+                // Table format: distribute tasks round-robin among engineers
+                // This allows dynamic dispatch based on dependencies
+                mappedName = ENGINEERS[taskIndex % engineerCount];
+                taskIndex++;
+            } else {
             // Map Engineer-N to actual name
-            const mappedName = engineerMapping[task.engineer] || task.engineer;
+                mappedName = engineerMapping[task.engineer] || task.engineer;
+            }
             task.engineer = mappedName;
             
             // Add to engineer checklists
@@ -239,6 +261,108 @@ export class PlanParser {
                 dependencies: [],
                 section: section
             });
+        }
+        
+        return tasks;
+    }
+
+    /**
+     * Parse table format: | ID | Task | Dependencies | Files | Tests |
+     * This format is used in plans with Task Breakdown tables
+     */
+    private static parseTableFormat(content: string): PlanTask[] {
+        const tasks: PlanTask[] = [];
+        
+        // Find task breakdown table section
+        // Look for tables with ID/Task/Dependencies columns
+        const lines = content.split('\n');
+        let inTaskTable = false;
+        let headerFound = false;
+        let idCol = -1;
+        let taskCol = -1;
+        let depsCol = -1;
+        
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            
+            // Skip empty lines
+            if (!line) continue;
+            
+            // Check if this is a table row
+            if (!line.startsWith('|')) {
+                inTaskTable = false;
+                headerFound = false;
+                continue;
+            }
+            
+            // Parse table cells
+            const cells = line.split('|')
+                .map(c => c.trim())
+                .filter((c, idx, arr) => idx > 0 && idx < arr.length - 1); // Remove first/last empty cells
+            
+            // Check for header row with ID, Task, Dependencies
+            if (!headerFound) {
+                const headerLower = cells.map(c => c.toLowerCase());
+                idCol = headerLower.findIndex(c => c === 'id');
+                taskCol = headerLower.findIndex(c => c === 'task' || c === 'task name' || c === 'description');
+                depsCol = headerLower.findIndex(c => c === 'dependencies' || c === 'deps' || c === 'depends on');
+                
+                if (idCol >= 0 && taskCol >= 0) {
+                    headerFound = true;
+                    inTaskTable = true;
+                    continue;
+                }
+            }
+            
+            // Skip separator row (|---|---|---|)
+            if (line.match(/^\|[\s\-:]+\|/)) {
+                continue;
+            }
+            
+            // Parse task row
+            if (inTaskTable && headerFound && cells.length > Math.max(idCol, taskCol)) {
+                const taskId = cells[idCol]?.trim();
+                const taskDesc = cells[taskCol]?.trim();
+                const depsStr = depsCol >= 0 ? cells[depsCol]?.trim() : '';
+                
+                // Skip if no valid task ID (must start with T followed by number, or just be a number)
+                if (!taskId || !taskId.match(/^T?\d+/i)) {
+                    continue;
+                }
+                
+                // Normalize task ID (ensure T prefix)
+                const normalizedId = taskId.toUpperCase().startsWith('T') ? taskId.toUpperCase() : `T${taskId}`;
+                
+                // Parse dependencies
+                const dependencies: string[] = [];
+                if (depsStr && depsStr.toLowerCase() !== 'none' && depsStr !== '-' && depsStr !== '') {
+                    // Split by comma, "and", or space, then normalize each
+                    const depParts = depsStr.split(/[,\s]+(?:and\s+)?/).map(d => d.trim()).filter(d => d);
+                    for (const dep of depParts) {
+                        // Extract T-number pattern
+                        const depMatch = dep.match(/T?\d+/i);
+                        if (depMatch) {
+                            const normalizedDep = depMatch[0].toUpperCase().startsWith('T') 
+                                ? depMatch[0].toUpperCase() 
+                                : `T${depMatch[0]}`;
+                            dependencies.push(normalizedDep);
+                        }
+                    }
+                }
+                
+                // Check for completion markers in task description
+                const isComplete = /✅|✓|\[x\]/i.test(taskDesc) || /COMPLETED|DONE/i.test(taskDesc);
+                
+                tasks.push({
+                    id: normalizedId,
+                    description: taskDesc.replace(/✅|✓|\[x\]/gi, '').trim(),
+                    engineer: 'Engineer-1',  // Will be assigned dynamically
+                    completed: isComplete,
+                    approved: true,
+                    dependencies: dependencies,
+                    section: 'Task Breakdown'
+                });
+            }
         }
         
         return tasks;
