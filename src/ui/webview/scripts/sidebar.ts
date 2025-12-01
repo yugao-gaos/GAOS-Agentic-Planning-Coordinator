@@ -133,11 +133,6 @@ export function getSidebarScript(): string {
                         if (progressPath) {
                             vscode.postMessage({ type: 'openProgressLog', progressLogPath: progressPath });
                         }
-                    } else if (action === 'showWorkflowAgent') {
-                        const agentName = el.dataset.agentName;
-                        if (agentName) {
-                            vscode.postMessage({ type: 'showAgentTerminal', agentName });
-                        }
                     } else if (action === 'retryTask') {
                         const taskId = el.dataset.taskId;
                         if (taskId) {

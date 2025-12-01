@@ -150,13 +150,8 @@ function renderWorkflowItem(wf: WorkflowInfo, agent?: AgentInfo): string {
     // Build agent badge if agent is assigned to this workflow
     const agentBadge = agent ? `<span class="workflow-agent" style="color: ${agent.roleColor || '#f97316'};">${agent.name}</span>` : '';
     
-    // Click action: show agent terminal if agent assigned, otherwise show progress log
-    const clickAction = agent ? 'showWorkflowAgent' : 'openProgressLog';
-    const clickData = agent ? `data-agent-name="${agent.name}"` : '';
-    const clickHint = agent ? `Click to view ${agent.name}'s output` : 'Click to view progress log';
-    
     return `
-        <div class="workflow-item ${wf.status}" data-action="${clickAction}" ${clickData} title="${clickHint}" style="cursor: pointer;">
+        <div class="workflow-item ${wf.status}" data-action="openProgressLog" title="Click to view progress log" style="cursor: pointer;">
             <div class="workflow-type-icon ${typeInfo.class}">
                 ${typeInfo.icon}
             </div>
