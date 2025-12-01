@@ -172,16 +172,17 @@ async function startHeadlessMode(config: CoreConfig, verbose: boolean): Promise<
  * Start daemon in VS Code mode (services injected later)
  */
 async function startVsCodeMode(config: CoreConfig, verbose: boolean): Promise<ApcDaemon> {
-    console.log('[APC] Starting daemon for VS Code (services will be injected)...');
+    console.log('[APC] Starting daemon for VS Code...');
     
-    // Bootstrap services for ServiceLocator (required by ApcDaemon constructor)
-    bootstrapServices();
+    // Initialize services (same as headless mode)
+    // This allows CLI to work even when VS Code started the daemon
+    const services = await initializeServices(config);
     
-    // Create daemon without services
-    // VS Code extension will call daemon.setServices() after initialization
+    // Create daemon with services
     const daemon = new ApcDaemon({
         port: config.port,
         workspaceRoot: config.workspaceRoot,
+        services,
         verbose
     });
     

@@ -344,14 +344,38 @@ export class ApiHandler {
             
             case 'revise':
                 const reviseResult = await this.services.planningService.revisePlan(params.id, params.feedback);
+                // Broadcast session update so UI refreshes
+                this.broadcaster.broadcast('session.updated', { 
+                    sessionId: params.id, 
+                    status: 'revising',
+                    previousStatus: 'pending_review',
+                    changes: ['feedback_added'],
+                    updatedAt: new Date().toISOString()
+                });
                 return { data: reviseResult, message: 'Plan revision started' };
             
             case 'approve':
                 await this.services.planningService.approvePlan(params.id, params.autoStart);
+                // Broadcast session update so UI refreshes
+                this.broadcaster.broadcast('session.updated', { 
+                    sessionId: params.id, 
+                    status: 'approved',
+                    previousStatus: 'pending_review',
+                    changes: ['status_changed'],
+                    updatedAt: new Date().toISOString()
+                });
                 return { message: `Plan ${params.id} approved` };
             
             case 'cancel':
                 await this.services.planningService.cancelPlan(params.id);
+                // Broadcast session update so UI refreshes
+                this.broadcaster.broadcast('session.updated', { 
+                    sessionId: params.id, 
+                    status: 'cancelled',
+                    previousStatus: 'unknown',
+                    changes: ['status_changed'],
+                    updatedAt: new Date().toISOString()
+                });
                 return { message: `Plan ${params.id} cancelled` };
             
             default:
