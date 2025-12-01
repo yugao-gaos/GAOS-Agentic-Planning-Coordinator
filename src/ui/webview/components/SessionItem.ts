@@ -104,9 +104,9 @@ function getExecutionInfo(status: string): { buttons: string; status: string; ba
                 badgeClass: 'draft'
             };
         case 'cancelled':
-            // Cancelled during planning - can restart planning
+            // Cancelled during planning - can restart (will resume revision if cancelled during revision)
             return {
-                buttons: `<button class="sub-item-btn" data-action="restartPlanning">Restart Planning</button>`,
+                buttons: `<button class="sub-item-btn" data-action="restartPlanning">Restart</button>`,
                 status: 'Cancelled',
                 badgeClass: 'draft'
             };

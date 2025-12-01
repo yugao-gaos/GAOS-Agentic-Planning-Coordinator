@@ -795,7 +795,10 @@ export class PlanningService extends EventEmitter {
             // - stopped: stopped during execution (can resume where left off)
             if (wasDuringPlanning) {
                 session.status = 'cancelled';
-                this.writeProgress(sessionId, 'STOP', `✅ Planning cancelled (use Restart to plan again)`);
+                // Store whether it was initial planning or revision for proper restart
+                session.metadata = session.metadata || {};
+                session.metadata.cancelledDuring = previousStatus === 'revising' ? 'revision' : 'initial';
+                this.writeProgress(sessionId, 'STOP', `✅ Planning cancelled (use Restart to ${previousStatus === 'revising' ? 'resume revision' : 'plan again'})`);
             } else {
                 session.status = 'stopped';
                 this.writeProgress(sessionId, 'STOP', `✅ Execution stopped (can resume)`);
@@ -864,7 +867,8 @@ export class PlanningService extends EventEmitter {
 
     /**
      * Restart planning for a cancelled session
-     * This re-runs the planning workflow from scratch
+     * - If cancelled during initial planning: re-runs planning_new workflow
+     * - If cancelled during revision: re-runs planning_revision with the last feedback
      */
     async restartPlanning(sessionId: string): Promise<{ success: boolean; error?: string }> {
         try {
@@ -877,30 +881,64 @@ export class PlanningService extends EventEmitter {
                 return { success: false, error: `Session ${sessionId} is not cancelled (current: ${session.status}). Only cancelled sessions can restart planning.` };
             }
 
+            // Check if this was a revision cancellation
+            const wasRevision = session.metadata?.cancelledDuring === 'revision';
+            const lastRevision = session.revisionHistory?.[session.revisionHistory.length - 1];
+            
             this.writeProgress(sessionId, 'RESTART', '='.repeat(60));
-            this.writeProgress(sessionId, 'RESTART', `🔄 RESTARTING PLANNING: ${sessionId}`);
-            this.writeProgress(sessionId, 'RESTART', `   Original requirement: ${session.requirement.substring(0, 50)}...`);
+            if (wasRevision && lastRevision) {
+                this.writeProgress(sessionId, 'RESTART', `🔄 RESTARTING REVISION: ${sessionId}`);
+                this.writeProgress(sessionId, 'RESTART', `   Last feedback: ${lastRevision.feedback.substring(0, 50)}...`);
+            } else {
+                this.writeProgress(sessionId, 'RESTART', `🔄 RESTARTING PLANNING: ${sessionId}`);
+                this.writeProgress(sessionId, 'RESTART', `   Original requirement: ${session.requirement.substring(0, 50)}...`);
+            }
             this.writeProgress(sessionId, 'RESTART', '='.repeat(60));
 
-            // Dispatch new planning workflow
-            const input = {
-                requirement: session.requirement,
-                docs: [] // Original docs not stored - starts fresh
-            };
+            let workflowId: string;
             
-            const workflowId = await this.coordinator.dispatchWorkflow(
-                sessionId,
-                'planning_new',
-                input,
-                { priority: 5, blocking: true }
-            );
+            if (wasRevision && lastRevision) {
+                // Restart revision workflow with the last feedback
+                const input = {
+                    feedback: lastRevision.feedback
+                };
+                
+                workflowId = await this.coordinator.dispatchWorkflow(
+                    sessionId,
+                    'planning_revision',
+                    input,
+                    { priority: 5, blocking: true }
+                );
+                
+                session.status = 'revising';
+                this.writeProgress(sessionId, 'RESTART', `✅ Revision restarted (workflow: ${workflowId})`);
+            } else {
+                // Restart initial planning workflow
+                const input = {
+                    requirement: session.requirement,
+                    docs: [] // Original docs not stored - starts fresh
+                };
+                
+                workflowId = await this.coordinator.dispatchWorkflow(
+                    sessionId,
+                    'planning_new',
+                    input,
+                    { priority: 5, blocking: true }
+                );
+                
+                session.status = 'debating';
+                this.writeProgress(sessionId, 'RESTART', `✅ Planning restarted (workflow: ${workflowId})`);
+            }
             
-            session.status = 'debating';
+            // Clear the cancellation metadata
+            if (session.metadata) {
+                delete session.metadata.cancelledDuring;
+            }
+            
             session.updatedAt = new Date().toISOString();
             this.stateManager.savePlanningSession(session);
             this.notifyChange();
             
-            this.writeProgress(sessionId, 'RESTART', `✅ Planning restarted (workflow: ${workflowId})`);
             return { success: true };
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
