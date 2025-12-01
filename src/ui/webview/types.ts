@@ -38,6 +38,7 @@ export interface SessionInfo {
     executionStatus?: string;
     progressLogPath?: string;
     activeWorkflows: WorkflowInfo[];
+    workflowHistory: WorkflowInfo[];  // Completed workflows (newest first)
     isRevising: boolean;
     failedTasks: FailedTaskInfo[];
     sessionAgents: AgentInfo[];

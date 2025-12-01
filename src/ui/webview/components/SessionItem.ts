@@ -171,6 +171,38 @@ function renderWorkflowItem(wf: WorkflowInfo, agent?: AgentInfo): string {
 }
 
 /**
+ * Render a completed workflow history item (simplified view).
+ */
+function renderHistoryItem(wf: WorkflowInfo): string {
+    const typeInfo = WORKFLOW_TYPE_INFO[wf.type] || {
+        icon: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/></svg>',
+        class: '',
+        label: wf.type
+    };
+    
+    // Use taskId as label for task workflows
+    const label = wf.type === 'task_implementation' && wf.taskId 
+        ? wf.taskId 
+        : typeInfo.label;
+    
+    const statusIcon = wf.status === 'completed' 
+        ? '<span style="color: #10b981;">✓</span>' 
+        : '<span style="color: #f14c4c;">✗</span>';
+    
+    return `
+        <div class="workflow-item history ${wf.status}" style="opacity: 0.7;">
+            <div class="workflow-type-icon ${typeInfo.class}" style="opacity: 0.6;">
+                ${typeInfo.icon}
+            </div>
+            <div class="workflow-info">
+                <span class="workflow-type-label">${label}</span>
+                <span class="workflow-phase">${statusIcon} ${wf.phase}</span>
+            </div>
+        </div>
+    `;
+}
+
+/**
  * Find the agent assigned to a specific workflow.
  */
 function findAgentForWorkflow(wf: WorkflowInfo, agents: AgentInfo[]): AgentInfo | undefined {
@@ -306,17 +338,29 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                     <div class="sub-item-actions">${execInfo.buttons}</div>
                 </div>
                 
-                <!-- Coordinator children (Workflows + Failed Tasks) -->
+                <!-- Coordinator children (Workflows + History + Failed Tasks) -->
                 <div class="coordinator-children" data-coord-children="${session.id}">
-                    <!-- Active Workflows with inline agents -->
+                    <!-- Active Workflows (running first) -->
                     ${session.activeWorkflows && session.activeWorkflows.length > 0 ? `
                         <div class="nested-item">
                             <div class="nested-icon" style="color: #007acc;">
                                 ${ICONS.workflow}
                             </div>
-                            <span class="nested-label">Workflows (${session.activeWorkflows.length})</span>
+                            <span class="nested-label">Active (${session.activeWorkflows.length})</span>
                         </div>
                         ${session.activeWorkflows.map(wf => renderWorkflowItem(wf, findAgentForWorkflow(wf, session.sessionAgents || []))).join('')}
+                    ` : ''}
+                    
+                    <!-- Workflow History (completed, newest first) -->
+                    ${session.workflowHistory && session.workflowHistory.length > 0 ? `
+                        <div class="nested-item" style="margin-top: 8px;">
+                            <div class="nested-icon" style="color: #6b7280;">
+                                ${ICONS.list}
+                            </div>
+                            <span class="nested-label" style="opacity: 0.7;">History (${session.workflowHistory.length})</span>
+                        </div>
+                        ${session.workflowHistory.slice(0, 5).map(wf => renderHistoryItem(wf)).join('')}
+                        ${session.workflowHistory.length > 5 ? `<div class="nested-item" style="opacity: 0.5; font-size: 10px; padding-left: 32px;">+ ${session.workflowHistory.length - 5} more</div>` : ''}
                     ` : ''}
                     
                     <!-- Failed Tasks -->

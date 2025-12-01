@@ -282,6 +282,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         for (const s of allSessions) {
             // Get active workflows for this session from proxy or coordinator
             let activeWorkflows: WorkflowInfo[] = [];
+            let workflowHistory: WorkflowInfo[] = [];
             let isRevising = false;
             let taskCount = 0;
             let completedTasks = 0;
@@ -295,6 +296,21 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             if (sessionState) {
                 try {
                     isRevising = sessionState.isRevising;
+                    
+                    // Build workflow history from completed workflows (newest first)
+                    for (const hist of sessionState.workflowHistory || []) {
+                        workflowHistory.push({
+                            id: hist.id,
+                            type: hist.type,
+                            status: hist.status,
+                            phase: hist.status === 'completed' ? 'Done' : 'Failed',
+                            phaseIndex: 0,
+                            totalPhases: 1,
+                            percentage: hist.status === 'completed' ? 100 : 0,
+                            startedAt: hist.startedAt,
+                            taskId: hist.taskId
+                        });
+                    }
                     
                     // Collect active workflows from activeWorkflows Map<string, WorkflowProgress>
                     for (const [workflowId, progress] of sessionState.activeWorkflows) {
@@ -458,6 +474,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 executionStatus,
                 progressLogPath,
                 activeWorkflows,
+                workflowHistory,
                 isRevising,
                 failedTasks,
                 sessionAgents

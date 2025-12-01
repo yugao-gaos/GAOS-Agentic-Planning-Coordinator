@@ -105,6 +105,19 @@ export interface RevisionState {
 }
 
 /**
+ * Summary of a completed workflow for history display
+ */
+export interface CompletedWorkflowSummary {
+    id: string;
+    type: string;
+    status: 'completed' | 'failed' | 'cancelled';
+    taskId?: string;
+    startedAt: string;
+    completedAt: string;
+    result?: string;
+}
+
+/**
  * Session workflow state - tracks all workflows for a planning session
  */
 export interface SessionWorkflowState {
@@ -112,6 +125,7 @@ export interface SessionWorkflowState {
     activeWorkflows: Map<string, WorkflowProgress>;
     pendingWorkflows: string[];      // Workflow IDs waiting to start
     completedWorkflows: string[];    // Workflow IDs that finished
+    workflowHistory: CompletedWorkflowSummary[];  // Completed workflow details (newest first)
     
     // Cross-workflow state
     isRevising: boolean;             // Planning revision in progress

@@ -13,7 +13,7 @@ import {
     AgentStatus,
     AgentRole
 } from '../types';
-import { WorkflowProgress, FailedTask } from '../types/workflow';
+import { WorkflowProgress, FailedTask, CompletedWorkflowSummary } from '../types/workflow';
 
 // ============================================================================
 // Types
@@ -36,6 +36,7 @@ export interface BusyAgentInfo {
 export interface SessionState {
     isRevising: boolean;
     activeWorkflows: Map<string, WorkflowProgress>;
+    workflowHistory: CompletedWorkflowSummary[];
 }
 
 export interface UnityStatus {
@@ -273,7 +274,7 @@ export class DaemonStateProxy {
     // ========================================================================
 
     /**
-     * Get session state (workflows, revision status)
+     * Get session state (workflows, revision status, history)
      */
     async getSessionState(sessionId: string): Promise<SessionState | undefined> {
         if (!this.vsCodeClient.isConnected()) {
@@ -281,7 +282,13 @@ export class DaemonStateProxy {
         }
 
         try {
-            type SessionStateResponse = { state?: { isRevising: boolean; activeWorkflows?: Array<WorkflowProgress & { id: string }> } };
+            type SessionStateResponse = { 
+                state?: { 
+                    isRevising: boolean; 
+                    activeWorkflows?: Array<WorkflowProgress & { id: string }>;
+                    workflowHistory?: CompletedWorkflowSummary[];
+                } 
+            };
             const response: SessionStateResponse = await this.vsCodeClient.send('session.state', { id: sessionId });
             if (response.state) {
                 // Convert workflows array to Map
@@ -293,7 +300,8 @@ export class DaemonStateProxy {
                 }
                 return {
                     isRevising: response.state.isRevising,
-                    activeWorkflows: workflowsMap
+                    activeWorkflows: workflowsMap,
+                    workflowHistory: response.state.workflowHistory || []
                 };
             }
             return undefined;

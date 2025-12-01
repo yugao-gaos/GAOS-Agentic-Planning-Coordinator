@@ -30,6 +30,7 @@ import {
     AgentRequest,
     SessionWorkflowState,
     WorkflowSummary,
+    CompletedWorkflowSummary,
     TaskImplementationInput,
     RevisionState,
     FailedTask,
@@ -61,6 +62,7 @@ interface SessionState {
     workflows: Map<string, IWorkflow>;
     pendingWorkflowIds: string[];
     completedWorkflowIds: string[];
+    workflowHistory: CompletedWorkflowSummary[];  // Completed workflow summaries (newest first)
     createdAt: string;
     updatedAt: string;
     
@@ -239,6 +241,7 @@ export class UnifiedCoordinatorService {
             workflows: new Map(),
             pendingWorkflowIds: [],
             completedWorkflowIds: [],
+            workflowHistory: [],
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             
@@ -278,6 +281,7 @@ export class UnifiedCoordinatorService {
             activeWorkflows,
             pendingWorkflows: state.pendingWorkflowIds,
             completedWorkflows: state.completedWorkflowIds,
+            workflowHistory: state.workflowHistory,
             isRevising: state.isRevising,
             pausedForRevision: state.pausedForRevision,
             revisionState: state.revisionState
@@ -876,11 +880,23 @@ export class UnifiedCoordinatorService {
         state.completedWorkflowIds.push(workflowId);
         state.updatedAt = new Date().toISOString();
         
+        // Add to workflow history (newest first)
+        const workflow = state.workflows.get(workflowId);
+        const taskId = state.workflowToTaskMap.get(workflowId);
+        const historySummary: CompletedWorkflowSummary = {
+            id: workflowId,
+            type: workflow?.type || 'unknown',
+            status: result.success ? 'completed' : 'failed',
+            taskId,
+            startedAt: workflow?.getProgress().startedAt || state.createdAt,
+            completedAt: new Date().toISOString(),
+            result: result.error
+        };
+        state.workflowHistory.unshift(historySummary); // Add to front (newest first)
+        
         this.log(`Workflow ${workflowId.substring(0,8)} completed: ${result.success ? 'SUCCESS' : 'FAILED'}`);
         
-        // Get task info for this workflow
-        const taskId = state.workflowToTaskMap.get(workflowId);
-        const workflow = state.workflows.get(workflowId);
+        // Get task manager and global task ID
         const taskManager = ServiceLocator.resolve(TaskManager);
         const globalTaskId = taskId ? `${sessionId}_${taskId}` : undefined;
         

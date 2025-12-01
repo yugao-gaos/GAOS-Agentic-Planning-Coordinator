@@ -106,6 +106,8 @@ export interface SessionState {
     activeWorkflows: Map<string, any>;
     pendingWorkflows?: string[];
     completedWorkflows?: string[];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    workflowHistory?: any[];
 }
 
 /**
@@ -398,14 +400,15 @@ export class ApiHandler {
         }
     }
     
-    private sessionState(id: string): { isRevising: boolean; activeWorkflows: unknown[] } | null {
+    private sessionState(id: string): { isRevising: boolean; activeWorkflows: unknown[]; workflowHistory: unknown[] } | null {
         const state = this.services.coordinator.getSessionState(id);
         if (!state) {
             return null;
         }
         return {
             isRevising: state.isRevising,
-            activeWorkflows: Array.from(state.activeWorkflows.values())
+            activeWorkflows: Array.from(state.activeWorkflows.values()),
+            workflowHistory: state.workflowHistory || []
         };
     }
     
