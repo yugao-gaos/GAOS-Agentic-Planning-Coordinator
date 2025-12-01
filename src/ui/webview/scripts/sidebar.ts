@@ -27,7 +27,11 @@ export function getSidebarScript(): string {
         document.getElementById('refreshBtn').onclick = () => vscode.postMessage({ type: 'refresh' });
         document.getElementById('settingsBtn').onclick = () => vscode.postMessage({ type: 'settings' });
         document.getElementById('newSessionBtn').onclick = () => vscode.postMessage({ type: 'newSession' });
-        document.getElementById('roleSettingsBtn').onclick = () => vscode.postMessage({ type: 'openRoleSettings' });
+        
+        const roleSettingsBtn = document.getElementById('roleSettingsBtn');
+        if (roleSettingsBtn) {
+            roleSettingsBtn.onclick = () => vscode.postMessage({ type: 'openRoleSettings' });
+        }
         
         statusInfo.onclick = () => {
             if (statusDot.classList.contains('missing')) {
