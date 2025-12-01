@@ -102,6 +102,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     }
     
     private refreshDebounceTimer?: NodeJS.Timeout;
+    private periodicRefreshTimer?: NodeJS.Timeout;
+    private lastSystemStatus: 'checking' | 'ready' | 'missing' | 'daemon_missing' = 'checking';
+    
     private debouncedRefresh(): void {
         if (this.refreshDebounceTimer) {
             clearTimeout(this.refreshDebounceTimer);
@@ -109,6 +112,27 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         this.refreshDebounceTimer = setTimeout(() => {
             this.refresh();
         }, 100); // 100ms debounce
+    }
+    
+    /**
+     * Start periodic refresh with adaptive interval.
+     * - 1 second when system is not ready (checking/missing/daemon_missing)
+     * - 30 seconds when system is ready
+     */
+    private startPeriodicRefresh(): void {
+        this.stopPeriodicRefresh();
+        
+        const interval = this.lastSystemStatus === 'ready' ? 30000 : 1000;
+        this.periodicRefreshTimer = setInterval(() => {
+            this.refresh();
+        }, interval);
+    }
+    
+    private stopPeriodicRefresh(): void {
+        if (this.periodicRefreshTimer) {
+            clearInterval(this.periodicRefreshTimer);
+            this.periodicRefreshTimer = undefined;
+        }
     }
 
     public resolveWebviewView(
@@ -201,12 +225,12 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             }
         });
 
-        // No periodic refresh needed - we use event-based updates:
-        // 1. Workflow events (onWorkflowProgress, onSessionStateChanged)
-        // 2. File watcher for state changes (CLI updates)
-        // 3. Manual refresh button
+        // Start periodic refresh with adaptive interval
+        // Fast (1s) when system not ready, slow (30s) when ready
+        this.startPeriodicRefresh();
         
         webviewView.onDidDispose(() => {
+            this.stopPeriodicRefresh();
             if (this.refreshDebounceTimer) {
                 clearTimeout(this.refreshDebounceTimer);
             }
@@ -223,6 +247,12 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
 
         // Use async state building
         this._buildStateAsync().then(state => {
+            // Check if system status changed - restart periodic refresh with new interval
+            if (state.systemStatus !== this.lastSystemStatus) {
+                this.lastSystemStatus = state.systemStatus;
+                this.startPeriodicRefresh();
+            }
+            
             // Build client state with pre-computed values and pre-rendered HTML
             const clientState = buildClientState(state);
             

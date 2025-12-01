@@ -86,6 +86,25 @@ export function getSidebarScript(): string {
         }
 
         /**
+         * Reapply expanded state to session items after HTML update.
+         * This preserves the user's expand/collapse choices across refreshes.
+         */
+        function reapplyExpandedState() {
+            expandedSessions.forEach(sessionId => {
+                const header = sessionsContent.querySelector('.session-header[data-toggle="' + sessionId + '"]');
+                if (header) {
+                    const item = header.closest('.session-item');
+                    const body = item.querySelector('.session-body');
+                    const expand = item.querySelector('.session-expand');
+                    
+                    if (item) item.classList.add('expanded');
+                    if (body) body.classList.add('expanded');
+                    if (expand) expand.classList.add('expanded');
+                }
+            });
+        }
+
+        /**
          * Attach event handlers to session items.
          */
         function attachSessionHandlers() {
@@ -213,6 +232,8 @@ export function getSidebarScript(): string {
             // Sessions - use pre-rendered HTML from server
             if (state.sessionsHtml) {
                 sessionsContent.innerHTML = state.sessionsHtml;
+                // Reapply expanded state to sessions
+                reapplyExpandedState();
                 attachSessionHandlers();
             }
 
