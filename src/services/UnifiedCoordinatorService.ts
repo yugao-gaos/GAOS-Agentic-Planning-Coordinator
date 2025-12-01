@@ -1118,6 +1118,18 @@ export class UnifiedCoordinatorService {
         const state = this.sessions.get(sessionId);
         if (!state) return;
         
+        // Don't auto-complete sessions that are still in planning/review states
+        // These require explicit user approval before execution can start
+        const session = this.stateManager.getPlanningSession(sessionId);
+        if (!session) return;
+        
+        const planningStates = ['debating', 'reviewing', 'revising', 'approved'];
+        if (planningStates.includes(session.status)) {
+            // Session is still in planning phase - don't auto-complete
+            // The session needs to go through approval -> execution flow
+            return;
+        }
+        
         const taskManager = ServiceLocator.resolve(TaskManager);
         
         // Check if all workflows are done
@@ -1138,20 +1150,22 @@ export class UnifiedCoordinatorService {
             taskProgress.ready === 0
         );
         
-        // Only mark complete if BOTH workflows AND tasks are done
+        // Only mark complete if:
+        // 1. Session is in executing state (not planning)
+        // 2. All workflows are done
+        // 3. All tasks are done (and there were tasks to begin with)
         const isSessionComplete = (
-            (allWorkflowsComplete && state.workflows.size > 0) || 
-            (allTasksComplete && taskProgress.total > 0)
-        ) && allWorkflowsComplete && allTasksComplete;
+            session.status === 'executing' &&
+            allWorkflowsComplete && 
+            allTasksComplete && 
+            taskProgress.total > 0
+        );
         
         if (isSessionComplete) {
-            const session = this.stateManager.getPlanningSession(sessionId);
-            if (session) {
-                session.status = 'completed';
-                session.updatedAt = new Date().toISOString();
-                this.stateManager.savePlanningSession(session);
-                this.log(`Session ${sessionId} completed (workflows: ${state.workflows.size} done, tasks: ${taskProgress.completed}/${taskProgress.total} complete)`);
-            }
+            session.status = 'completed';
+            session.updatedAt = new Date().toISOString();
+            this.stateManager.savePlanningSession(session);
+            this.log(`Session ${sessionId} completed (workflows: ${state.workflows.size} done, tasks: ${taskProgress.completed}/${taskProgress.total} complete)`);
             
             // Clean up TaskManager (but don't unregister ERROR_RESOLUTION - it lives forever)
             if (sessionId !== ERROR_RESOLUTION_SESSION_ID) {
