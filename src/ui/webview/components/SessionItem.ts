@@ -119,9 +119,9 @@ function getPlanBadgeClass(planStatus?: string): string {
 }
 
 /**
- * Render a single workflow item.
+ * Render a single workflow item with optional agent info.
  */
-function renderWorkflowItem(wf: WorkflowInfo): string {
+function renderWorkflowItem(wf: WorkflowInfo, agent?: AgentInfo): string {
     const typeInfo = WORKFLOW_TYPE_INFO[wf.type] || {
         icon: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/></svg>',
         class: '',
@@ -132,6 +132,9 @@ function renderWorkflowItem(wf: WorkflowInfo): string {
     const label = wf.type === 'task_implementation' && wf.taskId 
         ? wf.taskId 
         : typeInfo.label;
+    
+    // Build agent badge if agent is assigned to this workflow
+    const agentBadge = agent ? `<span class="workflow-agent" style="color: ${agent.roleColor || '#f97316'};">${agent.name}</span>` : '';
     
     return `
         <div class="workflow-item ${wf.status}">
@@ -148,27 +151,27 @@ function renderWorkflowItem(wf: WorkflowInfo): string {
                 </div>
                 <span class="workflow-percentage">${Math.round(wf.percentage)}%</span>
             </div>
+            ${agentBadge}
         </div>
     `;
 }
 
 /**
- * Render agents assigned to this session.
+ * Find the agent assigned to a specific workflow.
  */
-function renderSessionAgents(agents: AgentInfo[]): string {
-    if (!agents || agents.length === 0) {
-        return '';
-    }
+function findAgentForWorkflow(wf: WorkflowInfo, agents: AgentInfo[]): AgentInfo | undefined {
+    if (!agents || agents.length === 0) return undefined;
     
-    return agents.map(agent => `
-        <div class="nested-item nested-agent" style="padding-left: 48px;">
-            <div class="agent-dot" style="background: ${agent.roleColor || '#73c991'};"></div>
-            <span class="nested-label">${agent.name}</span>
-            <span class="nested-badge" style="color: ${agent.roleColor || '#73c991'};">
-                ${agent.roleId || 'Working'}${agent.currentPhase ? ' | ' + agent.currentPhase : ''}
-            </span>
-        </div>
-    `).join('');
+    // Match by workflow type to role
+    const roleForType: Record<string, string[]> = {
+        'planning_new': ['planner'],
+        'planning_revision': ['planner'],
+        'task_implementation': ['engineer'],
+        'error_resolution': ['engineer']
+    };
+    
+    const matchingRoles = roleForType[wf.type] || [];
+    return agents.find(a => matchingRoles.includes(a.roleId || ''));
 }
 
 /**
@@ -199,33 +202,17 @@ function renderFailedTasks(failedTasks: FailedTaskInfo[]): string {
 }
 
 /**
- * Render coordinator progress section.
+ * Get execution progress summary for the header badge.
  */
-function renderCoordinatorProgress(session: SessionInfo): string {
+function getExecutionProgressText(session: SessionInfo): string {
     const runningWf = session.activeWorkflows?.find(w => w.status === 'running');
     
     if (runningWf) {
-        return `
-            <div class="progress-container">
-                <div class="progress-bar">
-                    <div class="progress-fill running" style="width: ${Math.round(runningWf.percentage)}%;"></div>
-                </div>
-                <span class="progress-percentage">${Math.round(runningWf.percentage)}%</span>
-                <span class="progress-label">${runningWf.phase}</span>
-            </div>
-        `;
+        return `${Math.round(runningWf.percentage)}%`;
     }
     
     if (session.taskCount > 0) {
-        const progress = Math.round((session.completedTasks / session.taskCount) * 100);
-        return `
-            <div class="progress-container">
-                <div class="progress-bar">
-                    <div class="progress-fill" style="width: ${progress}%;"></div>
-                </div>
-                <span class="progress-percentage">${progress}%</span>
-            </div>
-        `;
+        return `${session.completedTasks}/${session.taskCount}`;
     }
     
     return '';
@@ -243,8 +230,13 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
     const execInfo = getExecutionInfo(session.status);
     const planBadgeClass = getPlanBadgeClass(session.planStatus);
     
+    // Determine if session is active (has running workflows)
+    const hasRunningWorkflow = session.activeWorkflows?.some(w => w.status === 'running') || false;
+    const isRevising = session.status === 'revising' || session.isRevising;
+    const activityClass = isRevising ? 'revising' : (hasRunningWorkflow || session.status === 'executing' ? 'active' : '');
+    
     return `
-        <div class="session-item ${isExpanded ? 'expanded' : ''}" 
+        <div class="session-item ${isExpanded ? 'expanded' : ''} ${activityClass}" 
              data-session-id="${session.id}" 
              data-plan-path="${session.planPath || ''}">
             <!-- Session Header -->
@@ -296,13 +288,13 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                     <span class="sub-item-label">Execution</span>
                     <span class="sub-item-badge ${execInfo.badgeClass}">${execInfo.status}</span>
                     <div class="sub-item-spacer"></div>
-                    ${renderCoordinatorProgress(session)}
+                    ${getExecutionProgressText(session) ? `<span class="execution-progress-text">${getExecutionProgressText(session)}</span>` : ''}
                     <div class="sub-item-actions">${execInfo.buttons}</div>
                 </div>
                 
-                <!-- Coordinator children (Workflows + Agents + Failed Tasks) -->
+                <!-- Coordinator children (Workflows + Failed Tasks) -->
                 <div class="coordinator-children" data-coord-children="${session.id}">
-                    <!-- Active Workflows -->
+                    <!-- Active Workflows with inline agents -->
                     ${session.activeWorkflows && session.activeWorkflows.length > 0 ? `
                         <div class="nested-item">
                             <div class="nested-icon" style="color: #007acc;">
@@ -310,15 +302,8 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                             </div>
                             <span class="nested-label">Workflows (${session.activeWorkflows.length})</span>
                         </div>
-                        ${session.activeWorkflows.map(wf => renderWorkflowItem(wf)).join('')}
+                        ${session.activeWorkflows.map(wf => renderWorkflowItem(wf, findAgentForWorkflow(wf, session.sessionAgents || []))).join('')}
                     ` : ''}
-                    
-                    <!-- Agents under coordinator -->
-                    <div class="nested-item">
-                        <div class="nested-icon">${ICONS.person}</div>
-                        <span class="nested-label">Agents (${session.sessionAgents?.length || 0})</span>
-                    </div>
-                    ${renderSessionAgents(session.sessionAgents)}
                     
                     <!-- Failed Tasks -->
                     ${renderFailedTasks(session.failedTasks)}

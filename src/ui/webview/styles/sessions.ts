@@ -9,6 +9,7 @@ export const sessionStyles = `
     margin-bottom: 8px;
     overflow: hidden;
     background: transparent;
+    position: relative;
 }
 
 .session-item:last-child {
@@ -17,6 +18,24 @@ export const sessionStyles = `
 
 .session-item.expanded {
     background: var(--vscode-list-hoverBackground);
+}
+
+/* Radio dial spinner for active sessions */
+.session-item.active::after {
+    content: '';
+    position: absolute;
+    top: 8px;
+    right: 32px;
+    width: 12px;
+    height: 12px;
+    border: 2px solid transparent;
+    border-top-color: #007acc;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+.session-item.revising::after {
+    border-top-color: #a855f7;
 }
 
 .session-header {
@@ -332,6 +351,81 @@ export const sessionStyles = `
 
 .sub-item-btn.danger:hover {
     background: rgba(241, 76, 76, 0.2);
+}
+
+/* Spin animation for session activity */
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+/* Responsive improvements for narrow sidebars */
+@media (max-width: 280px) {
+    .session-header {
+        flex-wrap: wrap;
+        gap: 4px;
+    }
+    
+    .session-title {
+        min-width: 100px;
+        font-size: 10px;
+    }
+    
+    .sub-item {
+        flex-wrap: wrap;
+        gap: 4px;
+        padding: 6px 8px 6px 20px;
+    }
+    
+    .sub-item-label {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        flex: 1;
+    }
+    
+    .sub-item-badge {
+        font-size: 8px;
+        padding: 1px 4px;
+    }
+    
+    .sub-item-actions {
+        width: 100%;
+        justify-content: flex-end;
+        margin-top: 2px;
+    }
+    
+    .sub-item-btn {
+        font-size: 9px;
+        padding: 2px 4px;
+    }
+    
+    .workflow-item {
+        flex-wrap: wrap;
+        gap: 4px;
+        padding: 5px 8px 5px 36px;
+        margin-left: 24px;
+    }
+    
+    .workflow-info {
+        flex-wrap: wrap;
+        gap: 2px;
+    }
+    
+    .workflow-phase {
+        font-size: 9px;
+    }
+    
+    .workflow-progress {
+        width: 100%;
+        justify-content: flex-end;
+    }
+    
+    .workflow-progress-bar {
+        flex: 1;
+        max-width: 80px;
+    }
 }
 `;
 

@@ -30,18 +30,14 @@ function renderBusyAgent(agent: AgentInfo): string {
     const roleColor = agent.roleColor || '#f97316';
     const roleColorRgb = hexToRgb(roleColor);
     
-    // Build status line
+    // Build status line - role name
     const statusLine = agent.roleId || 'Working';
     
-    // Build detail line: taskId | phase or just phase
-    const detailParts: string[] = [];
-    if (agent.taskId) {
-        detailParts.push(agent.taskId);
+    // Build detail line: current phase (skip if same as role to avoid duplication)
+    let detailLine = '';
+    if (agent.currentPhase && agent.currentPhase !== agent.roleId) {
+        detailLine = agent.currentPhase;
     }
-    if (agent.currentPhase) {
-        detailParts.push(agent.currentPhase);
-    }
-    const detailLine = detailParts.length > 0 ? detailParts.join(' | ') : '';
     
     // Session line
     const sessionLine = agent.sessionId ? `Session: ${agent.sessionId}` : '';

@@ -118,7 +118,8 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
     return {
         stateManager: {
             getAllPlanningSessions: () => stateManager.getAllPlanningSessions(),
-            getPlanningSession: (id: string) => stateManager.getPlanningSession(id)
+            getPlanningSession: (id: string) => stateManager.getPlanningSession(id),
+            deletePlanningSession: (id: string) => stateManager.deletePlanningSession(id)
         },
         agentPoolService: {
             getPoolStatus: () => agentPoolService.getPoolStatus(),

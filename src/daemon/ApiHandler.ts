@@ -60,6 +60,7 @@ export interface PlanningSessionData {
 export interface IStateManagerApi {
     getAllPlanningSessions(): PlanningSessionData[];
     getPlanningSession(id: string): PlanningSessionData | undefined;
+    deletePlanningSession(id: string): void;
 }
 
 /**
@@ -374,6 +375,16 @@ export class ApiHandler {
             case 'failed_tasks': {
                 const failedTasks = this.services.coordinator.getFailedTasks(params.id as string);
                 return { data: { failedTasks } };
+            }
+            
+            case 'stop': {
+                await this.services.coordinator.cancelSession(params.id as string);
+                return { message: `Session ${params.id} stopped` };
+            }
+            
+            case 'remove': {
+                this.services.stateManager.deletePlanningSession(params.id as string);
+                return { message: `Session ${params.id} removed` };
             }
             
             default:

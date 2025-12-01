@@ -103,5 +103,26 @@ export const workflowStyles = `
     opacity: 0.7;
     white-space: nowrap;
 }
+
+/* Agent badge in workflow item */
+.workflow-agent {
+    font-size: 9px;
+    font-weight: 500;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.05);
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+/* Execution progress text in header */
+.execution-progress-text {
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: rgba(0, 122, 204, 0.15);
+    margin-right: 4px;
+}
 `;
 
