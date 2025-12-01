@@ -108,6 +108,12 @@ body {
     flex-shrink: 0;
 }
 
+.section-header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
 .section-content {
     overflow-y: auto;
     padding: 8px;

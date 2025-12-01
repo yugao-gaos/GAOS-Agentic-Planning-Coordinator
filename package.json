@@ -2,7 +2,7 @@
   "name": "agentic-planning-coordinator",
   "displayName": "Agentic Planning Coordinator",
   "description": "Multi-agent AI planning and execution system for Unity game development",
-  "version": "0.1.0",
+  "version": "0.5.0",
   "publisher": "GAOS",
   "author": {
     "name": "Yu Gao",
@@ -86,7 +86,8 @@
       },
       {
         "command": "apc.openRoleSettings",
-        "title": "APC: Configure Agent Roles"
+        "title": "APC: Configure Agent Roles",
+        "icon": "$(gear)"
       },
       {
         "command": "agenticPlanning.refreshPlanningSessions",

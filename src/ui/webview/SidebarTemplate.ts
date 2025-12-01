@@ -107,8 +107,13 @@ ${getSidebarStyles()}
         <!-- Agent Pool -->
         <div class="section scrollable" style="flex: 1; min-height: 100px;">
             <div class="section-header">
-                <span>Agent Pool</span>
-                <span class="badge" id="agentBadge">${agentBadgeText}</span>
+                <span class="section-header-left">
+                    <span>Agent Pool</span>
+                    <span class="badge" id="agentBadge">${agentBadgeText}</span>
+                </span>
+                <button class="icon-btn" id="roleSettingsBtn" title="Configure Agent Roles">
+                    ${ICONS.gear}
+                </button>
             </div>
             <div class="section-content" id="agentsContent">
                 ${agentsHtml}
