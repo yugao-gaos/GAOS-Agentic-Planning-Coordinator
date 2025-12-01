@@ -61,6 +61,25 @@ export const agentStyles = `
     animation: borderPulse 2s ease-in-out infinite;
 }
 
+/* Spinning indicator for busy agents */
+.agent-card.busy::after {
+    content: '';
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 12px;
+    height: 12px;
+    border: 2px solid transparent;
+    border-top-color: var(--role-color, #f97316);
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
 .agent-header {
     display: flex;
     align-items: center;

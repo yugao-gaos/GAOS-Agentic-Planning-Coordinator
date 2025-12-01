@@ -742,6 +742,23 @@ This will trigger the multi-agent debate to revise the plan.`;
             }
         }),
         
+        // Cancel/stop ongoing plan revision
+        vscode.commands.registerCommand('agenticPlanning.cancelPlan', async (item?: { session?: { id: string } }) => {
+            const sessionId = item?.session?.id;
+            if (!sessionId) {
+                vscode.window.showWarningMessage('No session selected');
+                return;
+            }
+            
+            try {
+                await planningService.cancelPlan(sessionId);
+                vscode.window.showInformationMessage(`Revision cancelled for ${sessionId}`);
+                sidebarProvider.refresh();
+            } catch (err) {
+                vscode.window.showErrorMessage(`Failed to cancel: ${err}`);
+            }
+        }),
+        
         vscode.commands.registerCommand('agenticPlanning.refreshAgentPool', () => {
             // Also sync with settings when manually refreshed
             const configSize = vscode.workspace.getConfiguration('agenticPlanning').get<number>('agentPoolSize', 5);

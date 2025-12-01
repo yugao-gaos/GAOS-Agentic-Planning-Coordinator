@@ -41,6 +41,9 @@ function getPlanButtons(status: string): string {
             <button class="sub-item-btn primary" data-action="approvePlan">Approve</button>
         `;
     }
+    if (status === 'revising') {
+        return `<button class="sub-item-btn danger" data-action="stopRevision">Stop</button>`;
+    }
     if (status === 'approved') {
         return `<button class="sub-item-btn" data-action="revisePlan">Revise</button>`;
     }
@@ -289,8 +292,8 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                     <div class="sub-item-expand">
                         ${ICONS.chevronRight}
                     </div>
-                    <div class="sub-item-icon">${ICONS.play}</div>
-                    <span class="sub-item-label">Coordinator</span>
+                    <div class="sub-item-icon">${ICONS.workflow}</div>
+                    <span class="sub-item-label">Execution</span>
                     <span class="sub-item-badge ${execInfo.badgeClass}">${execInfo.status}</span>
                     <div class="sub-item-spacer"></div>
                     ${renderCoordinatorProgress(session)}

@@ -597,6 +597,7 @@ export class ApiHandler {
                 name: b.name,
                 roleId: b.roleId,
                 coordinatorId: b.coordinatorId,
+                sessionId: b.sessionId,
                 task: b.task
             }))
         };

@@ -181,6 +181,16 @@ export const sessionStyles = `
 .sub-item-badge.paused { background: rgba(249, 115, 22, 0.2); color: #f97316; }
 .sub-item-badge.completed { background: rgba(115, 201, 145, 0.2); color: #73c991; }
 .sub-item-badge.reviewing { background: rgba(168, 85, 247, 0.2); color: #a855f7; }
+.sub-item-badge.revising { 
+    background: rgba(168, 85, 247, 0.2); 
+    color: #a855f7; 
+    animation: badgePulse 1.5s ease-in-out infinite;
+}
+
+@keyframes badgePulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.7; transform: scale(1.05); }
+}
 
 /* Coordinator expand/collapse */
 .sub-item-expand {
