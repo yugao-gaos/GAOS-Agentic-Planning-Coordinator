@@ -12,12 +12,15 @@
  */
 export type WorkflowType = 
     // Planning workflows
-    | 'planning_new'           // Full planning loop: Context → (Planner → Analysts)* → Finalize
-    | 'planning_revision'      // Quick revision: Planner → Codex → Finalize
+    | 'planning_new'           // Full planning loop: (Planner → Analysts)* → Finalize
+    | 'planning_revision'      // Quick revision: Planner → Review → Finalize
     
     // Execution workflows  
-    | 'task_implementation'    // Per-task: Context → Engineer → Review → Approval → Delta → Unity
-    | 'error_resolution';      // Error fixing after Unity failure
+    | 'task_implementation'    // Per-task: Engineer → Review → Approval → Delta → Unity
+    | 'error_resolution'       // Error fixing after Unity failure
+    
+    // Context workflows
+    | 'context_gathering';     // Standalone: Gather → Summarize → Persist to Context folder
 
 /**
  * Workflow lifecycle states
@@ -166,6 +169,84 @@ export interface ErrorResolutionInput {
     }>;
     coordinatorId: string;
     sourceWorkflowId?: string;
+    
+    /** Number of previous fix attempts for these errors */
+    previousAttempts?: number;
+    
+    /** Summary of what the previous fix attempt tried */
+    previousFixSummary?: string;
+}
+
+// ============================================================================
+// Context Gathering Workflow Types
+// ============================================================================
+
+/**
+ * Configuration for a context gathering preset.
+ * Presets define specialized prompts for different asset/code types.
+ */
+export interface ContextGatheringPresetConfig {
+    /** Unique identifier for the preset */
+    id: string;
+    
+    /** Human-readable name */
+    name: string;
+    
+    /** Description of what this preset analyzes */
+    description: string;
+    
+    /** Prompt additions for the gather phase */
+    gatherPrompt: string;
+    
+    /** Prompt additions for the summarize phase */
+    summarizePrompt: string;
+    
+    /** File extensions this preset handles (e.g., ['.vue', '.svelte']) */
+    filePatterns: string[];
+    
+    /** Whether this preset requires Unity features */
+    requiresUnity?: boolean;
+    
+    /** Whether this is a built-in preset (vs user-defined) */
+    isBuiltIn?: boolean;
+}
+
+/**
+ * User configuration for custom presets and extension overrides.
+ * Loaded from _AiDevLog/Config/context_presets.json
+ */
+export interface ContextPresetUserConfig {
+    /** Custom presets defined by user */
+    customPresets?: ContextGatheringPresetConfig[];
+    
+    /** Override default extension → preset mappings */
+    extensionOverrides?: Record<string, string>;
+}
+
+/**
+ * Context gathering workflow specific input
+ */
+export interface ContextGatheringInput {
+    /** Target folders/files to analyze */
+    targets: string[];
+    
+    /** Manual override to use a single preset (skips auto-detection) */
+    preset?: string;
+    
+    /** Optional focus areas (combined with preset prompts) */
+    focusAreas?: string[];
+    
+    /** Optional task ID if gathering context for a specific task */
+    taskId?: string;
+    
+    /** Output filename (without extension). Defaults to 'context' */
+    outputName?: string;
+    
+    /** Depth of analysis: 'shallow' (quick scan) | 'deep' (thorough) */
+    depth?: 'shallow' | 'deep';
+    
+    /** Whether to auto-detect asset types from file extensions. Default: true */
+    autoDetect?: boolean;
 }
 
 /**
@@ -290,6 +371,7 @@ export function getWorkflowTypeName(type: WorkflowType): string {
         case 'planning_revision': return 'Plan Revision';
         case 'task_implementation': return 'Task Implementation';
         case 'error_resolution': return 'Error Resolution';
+        case 'context_gathering': return 'Context Gathering';
         default: return type;
     }
 }
@@ -303,6 +385,7 @@ export function getWorkflowTypeIcon(type: WorkflowType): string {
         case 'planning_revision': return 'edit';
         case 'task_implementation': return 'tools';
         case 'error_resolution': return 'bug';
+        case 'context_gathering': return 'search';
         default: return 'circle-outline';
     }
 }
@@ -378,4 +461,30 @@ export interface FailedTaskSummary {
     /** The failed task entries */
     tasks: FailedTask[];
 }
+
+// ============================================================================
+// Workflow Settings (User Customization)
+// ============================================================================
+
+/**
+ * Per-workflow user settings stored in _AiDevLog/Config/workflow_settings.json
+ */
+export interface WorkflowUserSettings {
+    /** Per-workflow coordinator prompt overrides */
+    coordinatorPrompts: Record<WorkflowType, string>;
+    
+    /** Context gathering specific settings (presets, extension mappings) */
+    contextGathering?: ContextPresetUserConfig;
+}
+
+/**
+ * Default workflow user settings
+ */
+export const DEFAULT_WORKFLOW_USER_SETTINGS: WorkflowUserSettings = {
+    coordinatorPrompts: {} as Record<WorkflowType, string>,
+    contextGathering: {
+        customPresets: [],
+        extensionOverrides: {}
+    }
+};
 

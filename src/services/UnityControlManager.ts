@@ -23,7 +23,7 @@ import {
 import { OutputChannelManager } from './OutputChannelManager';
 import { AgentRunner, AgentRunResult } from './AgentBackend';
 import { AgentRoleRegistry } from './AgentRoleRegistry';
-import { TaskManager, ErrorInfo, ERROR_RESOLUTION_SESSION_ID } from './TaskManager';
+import { TaskManager, ERROR_RESOLUTION_SESSION_ID } from './TaskManager';
 import { UnifiedCoordinatorService } from './UnifiedCoordinatorService';
 import { ServiceLocator } from './ServiceLocator';
 
@@ -1687,15 +1687,6 @@ Begin polling now. First poll:`;
 
         this.log(`handlePipelineErrors: Processing ${errors.length} errors`);
 
-        // Convert Unity errors to ErrorInfo format
-        const errorInfos: ErrorInfo[] = errors.map(e => ({
-            id: e.id,
-            message: e.message,
-            file: e.file,
-            line: e.line,
-            code: e.code
-        }));
-
         // Get global TaskManager
         const taskManager = ServiceLocator.resolve(TaskManager);
 
@@ -1728,25 +1719,33 @@ Begin polling now. First poll:`;
             }
         }
 
-        // 2. Create error-fixing tasks and add to ERROR_RESOLUTION plan
-        const errorTaskIds = taskManager.createErrorFixingTasks(
-            errorInfos,
-            affectedTaskIds
-        );
+        // 2. Build raw error text for coordinator
+        const rawErrorText = errors
+            .map(e => `${e.file || 'unknown'}(${e.line || 0}): ${e.code || ''} ${e.message}`)
+            .join('\n');
 
-        this.log(`handlePipelineErrors: Created ${errorTaskIds.length} error-fixing tasks in ERROR_RESOLUTION plan`);
-
-        // 3. Tell coordinator to execute ERROR_RESOLUTION plan
+        // 3. Trigger coordinator with raw error text - it will create tasks via CLI
         try {
             const coordinator = ServiceLocator.resolve(UnifiedCoordinatorService);
-            await coordinator.startExecution(ERROR_RESOLUTION_SESSION_ID);
-            this.log(`handlePipelineErrors: Started ERROR_RESOLUTION plan execution`);
+            await coordinator.triggerCoordinatorEvaluation(
+                ERROR_RESOLUTION_SESSION_ID,
+                'unity_error',
+                {
+                    type: 'unity_error',
+                    errorText: rawErrorText,
+                    errorCount: errors.length,
+                    affectedTaskIds,
+                    files: errorFiles
+                }
+            );
+            this.log(`handlePipelineErrors: Triggered coordinator with ${errors.length} errors`);
         } catch (e) {
             // Coordinator may not be initialized yet - that's ok
-            this.log(`handlePipelineErrors: Could not start ERROR_RESOLUTION execution: ${e}`);
+            this.log(`handlePipelineErrors: Could not trigger coordinator: ${e}`);
         }
 
-        return errorTaskIds;
+        // Return empty - tasks are now created via CLI by coordinator
+        return [];
     }
 
     /**

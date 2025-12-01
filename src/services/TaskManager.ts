@@ -1,6 +1,5 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { PlanParser, ParsedPlan, PlanTask } from './PlanParser';
 import { OutputChannelManager } from './OutputChannelManager';
 import { FailedTask, TaskOccupancyEntry } from '../types';
 import { ErrorClassifier } from './workflows/ErrorClassifier';
@@ -12,162 +11,89 @@ import { ServiceLocator } from './ServiceLocator';
 // ============================================================================
 
 /**
- * Task stage - represents the execution pipeline stages
- * 
- * Per-Task Pipeline Flow:
- * pending → context_gathering → ready_for_agent → implementing
- *     ↓
- * ready_for_review → reviewing ←──┐
- *     ↓                           │
- * approved ──────────────────────-┘ (if changes requested)
- *     ↓
- * [Queue Unity + Delta Context in parallel]
- *     ↓
- * implemented (when delta context done)
- *     ↓
- * [Unity callback triggers Completion Reviewer]
- *     ↓
- * completed (or needs_work if related to errors)
- */
-export type TaskStage = 
-    // === Initial Stages ===
-    | 'pending'                  // Waiting for dependencies
-    
-    // === Context Gathering ===
-    | 'context_gathering'        // Context agent gathering task-specific info
-    | 'ready_for_agent'          // Context done, waiting for implementation agent
-    
-    // === Agent Work ===
-    | 'implementing'             // Agent actively coding
-    | 'ready_for_review'         // Agent done, waiting for code reviewer
-    
-    // === Code Review Loop ===
-    | 'reviewing'                // Code reviewer checking
-    | 'review_changes_requested' // Reviewer requested changes, back to engineer
-    
-    // === Post-Approval ===
-    | 'approved'                 // Code review passed, queue Unity + start delta context
-    | 'delta_context_updating'   // Delta context agent updating _AiDevLog/Context/
-    | 'implemented'              // Delta context done, awaiting Unity verification
-    
-    // === Unity Pipeline ===
-    | 'awaiting_unity'           // Waiting for Unity pipeline
-    | 'compiling'                // In Unity queue for compile
-    | 'compile_failed'           // Compilation errors found
-    | 'error_fixing'             // Fixing compilation/test errors  
-    | 'compiled'                 // Compile passed
-    | 'testing_editmode'         // Running EditMode tests
-    | 'testing_playmode'         // Running PlayMode tests
-    | 'waiting_player_test'      // Waiting for manual player testing
-    | 'test_passed'              // Tests passed
-    | 'test_failed'              // Tests failed
-    | 'deferred'                 // Deferred due to overlap or blocked by error
-    | 'paused'                   // Paused due to error in related task
-    
-    // === Final States ===
-    | 'needs_work'               // Completion reviewer flagged as needing work
-    | 'completed'                // Completion reviewer confirmed done
-    | 'failed';                  // Failed and won't retry
-
-/**
- * Task status in the coordinator's tracking (for dependency resolution and dispatch)
+ * Simplified task status (6 values)
+ * Coordinator manages task lifecycle via CLI commands
+ * Workflows handle their own internal phases
  */
 export type TaskStatus = 
-    | 'pending'           // Not yet ready (dependencies not met)
-    | 'ready'             // Dependencies satisfied, can start context gathering
-    | 'context_in_progress' // Context agent working
-    | 'ready_for_agent'    // Context done, waiting for agent dispatch
-    | 'agent_assigned'     // Agent dispatched but not yet started
-    | 'agent_working'      // Agent actively implementing
-    | 'ready_for_review'   // Agent done, waiting for reviewer dispatch
-    | 'review_in_progress'  // Reviewer working
-    | 'review_changes'      // Changes requested, back to engineer
-    | 'approved'            // Review approved, finalizing
-    | 'implemented'         // Delta context done, awaiting Unity verification
-    | 'waiting_unity'       // Waiting for Unity (compile/test)
-    | 'error_fixing'        // Fixing Unity errors
-    | 'paused'              // Paused due to error
-    | 'needs_work'          // Completion reviewer flagged issues
-    | 'completed'           // Successfully completed
-    | 'failed';             // Failed and won't retry
+    | 'created'      // Task exists, no workflow started yet
+    | 'in_progress'  // Workflow running on this task
+    | 'blocked'      // Waiting for dependencies
+    | 'paused'       // Manually paused
+    | 'completed'    // Coordinator marked complete via CLI
+    | 'failed';      // Coordinator marked failed via CLI
 
 /**
- * Task type - determines what testing is appropriate
+ * Simple task type for categorization
  */
-export type TaskType = 
-    | 'data_logic'    // Algorithms, state, calculations → EditMode only
-    | 'component'     // MonoBehaviours, services → EditMode (if complex)
-    | 'scene_ui'      // Layouts, prefabs, canvas → PlayMode only
-    | 'gameplay'      // Mechanics, feel, balance → All tests
-    | 'error_fix';    // Error-fixing task → Just compile verification
+export type TaskType = 'implementation' | 'error_fix';
 
 /**
- * Task requirements - which stages are required for this task
+ * Parameters for creating a task via CLI
  */
-export interface TaskRequirements {
-    taskType: TaskType;
-    needsCompile: boolean;        // Default: true
-    needsEditModeTest: boolean;   // For pure logic testing
-    needsPlayModeTest: boolean;   // For scene/component integration
-    needsPlayerTest: boolean;     // For gameplay feel verification
+export interface TaskCreateParams {
+    sessionId: string;
+    taskId: string;
+    description: string;
+    dependencies?: string[];
+    taskType?: TaskType;
+    priority?: number;
+    errorText?: string;
+    planSection?: string;
+    targetFiles?: string[];
+    notes?: string;
+    
+    /** Number of previous fix attempts (for error_fix tasks) */
+    previousAttempts?: number;
+    
+    /** Summary of what the previous fix attempt tried (for error_fix tasks) */
+    previousFixSummary?: string;
 }
 
 /**
- * Managed task with full tracking
- * Now includes sessionId for cross-plan coordination
+ * Managed task - simplified model
+ * Coordinator creates tasks via CLI, workflows handle execution details
  */
 export interface ManagedTask {
-    id: string;                   // Globally unique: "ps_001_T1" or "ERR_FIX_xxx"
+    id: string;                   // Globally unique: "ps_001_T1" or "ERR_xxx"
     sessionId: string;            // Which plan/session this belongs to
     description: string;
-    assignedAgent?: string;       // Which agent should do this (from plan)
-    actualAgent?: string;         // Who is actually doing it
-    status: TaskStatus;
-    stage: TaskStage;             // Current completion stage
-    requirements: TaskRequirements; // What stages are required
-    dependencies: string[];       // Task IDs this depends on
+    status: TaskStatus;           // Simplified status
+    taskType: TaskType;           // implementation or error_fix
+    dependencies: string[];       // Task IDs this depends on (global IDs)
     dependents: string[];         // Task IDs that depend on this
-    priority: number;             // Lower = higher priority (based on dependency depth)
+    priority: number;             // Lower = higher priority
+    
+    // Rich metadata (set via CLI)
+    errorText?: string;           // Raw error text for error tasks
+    planSection?: string;         // Relevant plan excerpt
+    targetFiles?: string[];       // Expected files to modify
+    notes?: string;               // Additional context
+    
+    // Workflow tracking
+    workflowHistory: string[];    // All workflow IDs run on this task
+    currentWorkflow?: string;     // Currently running workflow (if any)
     
     // Timing
     createdAt: string;
-    dispatchedAt?: string;
-    startedAt?: string;
+    startedAt?: string;           // First workflow started
     completedAt?: string;
     
-    // Context for error routing
-    filesModified: string[];      // Files touched during this task
-    unityRequests: string[];      // Unity task IDs requested
-    errors: string[];             // Error IDs assigned to this task
-    
-    // Session continuity
-    sessionSummary?: string;      // Summary from previous session (for continuation)
+    // Files modified (accumulated across workflows)
+    filesModified: string[];
     
     // Pause tracking
-    pausedAt?: string;            // When task was paused
-    pausedReason?: string;        // Why task was paused
-    previousStage?: TaskStage;    // Stage before pause (for resume)
+    pausedAt?: string;
+    pausedReason?: string;
     
-    // === Execution Pipeline Tracking ===
+    // Error fix context (for error_fix tasks)
+    previousAttempts?: number;       // Number of previous fix attempts
+    previousFixSummary?: string;     // What previous fixes tried
     
-    // Context agent tracking
-    contextAgentName?: string;     // Agent doing pre-task context gathering
-    contextBriefPath?: string;     // Path to the task context brief file
-    
-    // Review loop tracking
-    reviewIterations: number;      // How many review cycles (starts at 0)
-    currentReviewerName?: string;  // Agent doing code review
-    lastReviewFeedback?: string;   // Feedback from last review (if changes requested)
-    lastReviewResult?: 'approved' | 'changes_requested';
-    
-    // Post-approval tracking
-    deltaContextAgentName?: string;  // Agent doing delta context update
-    deltaContextDone: boolean;       // Whether delta context update is complete
-    unityRequestQueued: boolean;     // Whether Unity request has been queued
-    
-    // Completion tracking
-    completionReviewResult?: 'complete' | 'needs_work' | 'unclear';
-    relatedErrors?: string[];        // Errors related to this task (from completion review)
+    // Legacy fields for compatibility during migration
+    // TODO: Remove these after full migration
+    assignedAgent?: string;
+    actualAgent?: string;
 }
 
 /**
@@ -190,7 +116,7 @@ export interface SessionContext {
     pendingErrors: string[];         // Errors waiting to be fixed
     lastTaskState?: {
         taskId: string;
-        stage: TaskStage;
+        status: TaskStatus;
         filesModified: string[];
     };
 }
@@ -198,7 +124,7 @@ export interface SessionContext {
 /**
  * Agent role in the execution pipeline
  */
-export type AgentRole = 'context' | 'engineer' | 'reviewer' | 'delta_context';
+export type AgentRole = 'context' | 'engineer' | 'reviewer';
 
 /**
  * Agent assignment tracking (unified for all roles)
@@ -261,17 +187,6 @@ export interface PausedTaskNotification {
     taskIds: string[];
     reason: string;
     pausedAt: string;
-}
-
-/**
- * Error for creating error-fixing tasks
- */
-export interface ErrorInfo {
-    id: string;
-    message: string;
-    file?: string;
-    line?: number;
-    code?: string;
 }
 
 /**
@@ -420,74 +335,11 @@ export class TaskManager {
     
     /**
      * Derive TaskStatus from TaskStage
-     * This helper ensures consistency between stage and status tracking.
-     * 
-     * The relationship:
-     * - stage = execution pipeline position (what phase of implementation)
-     * - status = coordinator tracking (for dependency resolution and dispatch)
-     * 
-     * @param stage The current task stage
-     * @returns The corresponding task status
+     * Map a status string to TaskStatus type (for legacy compatibility)
      */
-    static stageToStatus(stage: TaskStage): TaskStatus {
-        switch (stage) {
-            case 'pending':
-                return 'pending';
-            case 'context_gathering':
-                return 'context_in_progress';
-            case 'ready_for_agent':
-                return 'ready_for_agent';
-            case 'implementing':
-                return 'agent_working';
-            case 'ready_for_review':
-                return 'ready_for_review';
-            case 'reviewing':
-                return 'review_in_progress';
-            case 'review_changes_requested':
-                return 'review_changes';
-            case 'approved':
-            case 'delta_context_updating':
-            case 'implemented':
-                return 'approved';
-            case 'awaiting_unity':
-            case 'compiling':
-            case 'compiled':
-            case 'testing_editmode':
-            case 'testing_playmode':
-            case 'waiting_player_test':
-            case 'test_passed':
-                return 'waiting_unity';
-            case 'compile_failed':
-            case 'test_failed':
-            case 'error_fixing':
-                return 'error_fixing';
-            case 'paused':
-            case 'deferred':
-                return 'paused';
-            case 'needs_work':
-                return 'needs_work';
-            case 'completed':
-                return 'completed';
-            case 'failed':
-                return 'failed';
-            default:
-                return 'pending';
-        }
-    }
-    
-    /**
-     * Update task status to match stage (for consistency)
-     * Call this after updating a task's stage to ensure status is synchronized.
-     */
-    syncTaskStatusWithStage(taskId: string): void {
-        const task = this.tasks.get(taskId);
-        if (task) {
-            const derivedStatus = TaskManager.stageToStatus(task.stage);
-            if (task.status !== derivedStatus) {
-                this.log(`Syncing status for ${taskId}: ${task.status} -> ${derivedStatus} (from stage ${task.stage})`);
-                task.status = derivedStatus;
-            }
-        }
+    static mapToStatus(status: string): TaskStatus {
+        const validStatuses: TaskStatus[] = ['created', 'in_progress', 'blocked', 'paused', 'completed', 'failed'];
+        return validStatuses.includes(status as TaskStatus) ? status as TaskStatus : 'created';
     }
 
     // ========================================================================
@@ -538,180 +390,184 @@ export class TaskManager {
     }
 
     // ========================================================================
-    // Task Initialization
+    // Task Creation (via CLI)
     // ========================================================================
 
     /**
-     * Initialize tasks from plan file for a specific session
-     * Task IDs are prefixed with sessionId for global uniqueness
+     * Create a task from CLI command
+     * This is the only way tasks should be created in the new architecture
      */
-    initializeFromPlan(sessionId: string, planData: ParsedPlan): void {
-        this.log(`Initializing tasks for session ${sessionId}...`);
+    createTaskFromCli(params: TaskCreateParams): { success: boolean; error?: string } {
+        const { 
+            sessionId, 
+            taskId, 
+            description, 
+            dependencies = [], 
+            taskType = 'implementation',
+            priority = 10,
+            errorText,
+            planSection,
+            targetFiles,
+            notes,
+            previousAttempts,
+            previousFixSummary
+        } = params;
 
-        let taskIndex = 0;
-        let completedCount = 0;
-        let pendingCount = 0;
+        const globalTaskId = `${sessionId}_${taskId}`;
         
-        for (const [engineerName, planTasks] of Object.entries(planData.engineerChecklists)) {
-            for (const planTask of planTasks) {
-                // Create globally unique task ID
-                const globalTaskId = `${sessionId}_${planTask.id}`;
-                
-                // Determine requirements from task description
-                const requirements = this.inferTaskRequirements(planTask.description);
-                
-                const isCompleted = planTask.completed;
-                if (isCompleted) {
-                    completedCount++;
-                    this.log(`  ✓ Task ${globalTaskId} already completed (skipping)`);
-                } else {
-                    pendingCount++;
+        // Check if task already exists
+        if (this.tasks.has(globalTaskId)) {
+            return { success: false, error: `Task ${taskId} already exists in session ${sessionId}` };
+        }
+        
+        // Convert dependencies to global IDs if they're not already
+        const globalDependencies = dependencies.map(dep => 
+            dep.includes('_') ? dep : `${sessionId}_${dep}`
+        );
+        
+        // Check if dependencies exist (for non-error tasks)
+        if (sessionId !== ERROR_RESOLUTION_SESSION_ID) {
+            for (const depId of globalDependencies) {
+                if (!this.tasks.has(depId)) {
+                    this.log(`Warning: Dependency ${depId} not found for task ${taskId}`);
                 }
-                
-                // Convert dependencies to global IDs
-                const globalDependencies = (planTask.dependencies || []).map(
-                    dep => `${sessionId}_${dep}`
-                );
-                
-                const managedTask: ManagedTask = {
-                    id: globalTaskId,
-                    sessionId,
-                    description: planTask.description,
-                    assignedAgent: engineerName,
-                    status: isCompleted ? 'completed' : 'pending',
-                    stage: isCompleted ? 'completed' : 'pending',
-                    requirements,
-                    dependencies: globalDependencies,
-                    dependents: [],
-                    priority: taskIndex++,
-                    createdAt: new Date().toISOString(),
-                    filesModified: [],
-                    unityRequests: [],
-                    errors: [],
-                    reviewIterations: 0,
-                    deltaContextDone: false,
-                    unityRequestQueued: false
-                };
-
-                this.tasks.set(globalTaskId, managedTask);
             }
         }
         
-        this.log(`  ${completedCount} tasks already completed, ${pendingCount} tasks pending`);
-
-        // Build dependents graph (reverse of dependencies) for this session
-        for (const task of this.tasks.values()) {
-            if (task.sessionId !== sessionId) continue;
+        // Determine initial status based on dependencies
+        const hasDependencies = globalDependencies.length > 0;
+        const allDepsComplete = globalDependencies.every(depId => {
+            const depTask = this.tasks.get(depId);
+            return depTask && depTask.status === 'completed';
+        });
+        
+        const initialStatus: TaskStatus = hasDependencies && !allDepsComplete ? 'blocked' : 'created';
+        
+        const managedTask: ManagedTask = {
+            id: globalTaskId,
+            sessionId,
+            description,
+            status: initialStatus,
+            taskType,
+            dependencies: globalDependencies,
+            dependents: [],
+            priority,
             
-            for (const depId of task.dependencies) {
-                const depTask = this.tasks.get(depId);
-                if (depTask) {
-                    depTask.dependents.push(task.id);
-                }
+            // Rich metadata
+            errorText,
+            planSection,
+            targetFiles,
+            notes,
+            
+            // Workflow tracking
+            workflowHistory: [],
+            currentWorkflow: undefined,
+            
+            // Timing
+            createdAt: new Date().toISOString(),
+            
+            // Files
+            filesModified: [],
+            
+            // Error fix context
+            previousAttempts,
+            previousFixSummary,
+        };
+
+        this.tasks.set(globalTaskId, managedTask);
+        
+        // Update dependents of dependency tasks
+        for (const depId of globalDependencies) {
+            const depTask = this.tasks.get(depId);
+            if (depTask && !depTask.dependents.includes(globalTaskId)) {
+                depTask.dependents.push(globalTaskId);
             }
         }
-
-        // Calculate initial ready status
-        this.updateReadyTasksForSession(sessionId);
-
-        const sessionTasks = this.getTasksForSession(sessionId);
-        this.log(`Initialized ${sessionTasks.length} tasks for session ${sessionId}`);
-        this.log(`Ready tasks: ${this.getReadyTasksForSession(sessionId).length}`);
-    }
-
-    /**
-     * Infer task requirements from description
-     */
-    private inferTaskRequirements(description: string): TaskRequirements {
-        const descLower = description.toLowerCase();
-        const taskType = this.inferTaskType(descLower);
         
-        switch (taskType) {
-            case 'data_logic':
-                return {
-                    taskType,
-                    needsCompile: true,
-                    needsEditModeTest: true,
-                    needsPlayModeTest: false,
-                    needsPlayerTest: false
-                };
-                
-            case 'scene_ui':
-                return {
-                    taskType,
-                    needsCompile: true,
-                    needsEditModeTest: false,
-                    needsPlayModeTest: true,
-                    needsPlayerTest: false
-                };
-                
-            case 'gameplay':
-                return {
-                    taskType,
-                    needsCompile: true,
-                    needsEditModeTest: true,
-                    needsPlayModeTest: true,
-                    needsPlayerTest: true
-                };
-                
-            case 'error_fix':
-                // Error-fixing tasks just need compile verification
-                return {
-                    taskType,
-                    needsCompile: true,
-                    needsEditModeTest: false,
-                    needsPlayModeTest: false,
-                    needsPlayerTest: false
-                };
-                
-            case 'component':
-            default:
-                const isComplex = descLower.includes('logic') || 
-                                  descLower.includes('algorithm') ||
-                                  descLower.includes('state') ||
-                                  descLower.includes('calculate');
-                return {
-                    taskType,
-                    needsCompile: true,
-                    needsEditModeTest: isComplex,
-                    needsPlayModeTest: false,
-                    needsPlayerTest: false
-                };
-        }
+        this.log(`Created task ${globalTaskId}: ${description.substring(0, 50)}...`);
+        
+        return { success: true };
     }
     
     /**
-     * Infer task type from description keywords
+     * Set the current workflow for a task
+     * Called when starting a workflow on a task
      */
-    private inferTaskType(descLower: string): TaskType {
-        const gameplayKeywords = [
-            'gameplay', 'mechanic', 'player', 'input', 'movement',
-            'combat', 'physics', 'feel', 'balance', 'game loop',
-            'controller', 'character'
-        ];
-        if (gameplayKeywords.some(k => descLower.includes(k))) {
-            return 'gameplay';
+    setTaskCurrentWorkflow(taskId: string, workflowId: string): void {
+        const task = this.tasks.get(taskId);
+        if (!task) {
+            this.log(`Task ${taskId} not found for workflow assignment`);
+            return;
         }
         
-        const sceneUiKeywords = [
-            'scene', 'ui', 'canvas', 'prefab', 'layout', 'menu',
-            'panel', 'button', 'screen', 'hud', 'animation', 
-            'visual', 'spawn', 'instantiate'
-        ];
-        if (sceneUiKeywords.some(k => descLower.includes(k))) {
-            return 'scene_ui';
+        task.currentWorkflow = workflowId;
+        task.workflowHistory.push(workflowId);
+        task.status = 'in_progress';
+        
+        if (!task.startedAt) {
+            task.startedAt = new Date().toISOString();
         }
         
-        const dataLogicKeywords = [
-            'data', 'logic', 'algorithm', 'calculate', 'detect',
-            'match', 'score', 'state machine', 'validator', 'parser',
-            'utility', 'helper', 'service locator', 'math'
-        ];
-        if (dataLogicKeywords.some(k => descLower.includes(k))) {
-            return 'data_logic';
+        this.log(`Task ${taskId} started workflow ${workflowId}`);
+    }
+    
+    /**
+     * Clear the current workflow when it completes
+     * Does NOT automatically complete the task - coordinator decides
+     */
+    clearTaskCurrentWorkflow(taskId: string): void {
+        const task = this.tasks.get(taskId);
+        if (!task) return;
+        
+        task.currentWorkflow = undefined;
+        // Keep status as in_progress - coordinator will decide next step
+        this.log(`Task ${taskId} workflow cleared, awaiting coordinator decision`);
+    }
+    
+    /**
+     * Mark task as completed via CLI (coordinator decision)
+     */
+    markTaskCompletedViaCli(taskId: string, summary?: string): void {
+        const task = this.tasks.get(taskId);
+        if (!task) {
+            this.log(`Task ${taskId} not found for completion`);
+            return;
         }
         
-        return 'component';
+        task.status = 'completed';
+        task.completedAt = new Date().toISOString();
+        task.currentWorkflow = undefined;
+        
+        if (summary) {
+            task.notes = task.notes ? `${task.notes}\n\nCompletion: ${summary}` : `Completion: ${summary}`;
+        }
+        
+        // Update dependent tasks - they may now be unblocked
+        this.updateDependentStatuses(task);
+        
+        this.onTaskCompletedCallback?.(task);
+        this.log(`Task ${taskId} marked completed via CLI`);
+    }
+    
+    /**
+     * Update status of tasks that depend on the completed task
+     */
+    private updateDependentStatuses(completedTask: ManagedTask): void {
+        for (const dependentId of completedTask.dependents) {
+            const depTask = this.tasks.get(dependentId);
+            if (!depTask || depTask.status !== 'blocked') continue;
+            
+            // Check if all dependencies are now complete
+            const allDepsComplete = depTask.dependencies.every(depId => {
+                const dt = this.tasks.get(depId);
+                return dt && dt.status === 'completed';
+            });
+            
+            if (allDepsComplete) {
+                depTask.status = 'created';
+                this.log(`Task ${dependentId} unblocked (dependencies complete)`);
+            }
+        }
     }
 
     // ========================================================================
@@ -727,20 +583,20 @@ export class TaskManager {
     }
     
     /**
-     * Get ready tasks for a specific session
+     * Get ready tasks for a specific session (tasks with status 'created' that can have workflows started)
      */
     getReadyTasksForSession(sessionId: string): ManagedTask[] {
         return Array.from(this.tasks.values())
-            .filter(t => t.sessionId === sessionId && t.status === 'ready')
+            .filter(t => t.sessionId === sessionId && t.status === 'created')
             .sort((a, b) => a.priority - b.priority);
     }
     
     /**
-     * Get all ready tasks across ALL sessions (for global dispatch)
+     * Get all ready tasks across ALL sessions (tasks with status 'created')
      */
     getAllReadyTasks(): ManagedTask[] {
         return Array.from(this.tasks.values())
-            .filter(t => t.status === 'ready')
+            .filter(t => t.status === 'created')
             .sort((a, b) => a.priority - b.priority);
     }
     
@@ -831,12 +687,11 @@ export class TaskManager {
             // Don't pause already completed/failed tasks
             if (task.status === 'completed' || task.status === 'failed') continue;
             
-            // Store previous state for resume
-            task.previousStage = task.stage;
-            task.stage = 'paused';
+            // Store previous status for resume (using pausedReason to store it)
+            const previousStatus = task.status;
             task.status = 'paused';
             task.pausedAt = now;
-            task.pausedReason = reason;
+            task.pausedReason = `${reason} (was: ${previousStatus})`;
             
             // Track by session
             if (!pausedBySession.has(task.sessionId)) {
@@ -866,139 +721,45 @@ export class TaskManager {
     resumePausedTasks(taskIds: string[]): void {
         for (const taskId of taskIds) {
             const task = this.tasks.get(taskId);
-            if (!task || task.stage !== 'paused') continue;
+            if (!task || task.status !== 'paused') continue;
             
-            // Restore previous state
-            if (task.previousStage) {
-                task.stage = task.previousStage;
-                // Map stage to appropriate status
-                task.status = this.stageToStatus(task.stage);
-            } else {
-                task.stage = 'ready_for_agent';
-                task.status = 'ready';
-            }
-            
-            task.pausedAt = undefined;
-            task.pausedReason = undefined;
-            task.previousStage = undefined;
-            
-            this.log(`Resumed task ${taskId}`);
-        }
-        
-        // Update ready tasks for affected sessions
-        const sessions = new Set(taskIds.map(id => this.tasks.get(id)?.sessionId).filter(Boolean));
-        for (const sessionId of sessions) {
-            this.updateReadyTasksForSession(sessionId!);
-        }
-    }
-    
-    /**
-     * Map stage to status
-     */
-    private stageToStatus(stage: TaskStage): TaskStatus {
-        const mapping: Partial<Record<TaskStage, TaskStatus>> = {
-            'pending': 'pending',
-            'context_gathering': 'context_in_progress',
-            'ready_for_agent': 'ready_for_agent',
-            'implementing': 'agent_working',
-            'ready_for_review': 'ready_for_review',
-            'reviewing': 'review_in_progress',
-            'review_changes_requested': 'review_changes',
-            'approved': 'approved',
-            'implemented': 'implemented',
-            'awaiting_unity': 'waiting_unity',
-            'error_fixing': 'error_fixing',
-            'completed': 'completed',
-            'failed': 'failed'
-        };
-        return mapping[stage] || 'ready';
-    }
-
-    // ========================================================================
-    // Error-Fixing Task Creation
-    // ========================================================================
-    
-    /**
-     * Create error-fixing tasks from Unity errors
-     * Groups errors by file and creates tasks in the ERROR_RESOLUTION session
-     * 
-     * @returns Created task IDs
-     */
-    createErrorFixingTasks(
-        errors: ErrorInfo[],
-        affectedTaskIds?: string[]
-    ): string[] {
-        const createdTaskIds: string[] = [];
-        
-        // Group errors by file
-        const errorsByFile = new Map<string, ErrorInfo[]>();
-        for (const error of errors) {
-            const key = error.file || 'unknown';
-            if (!errorsByFile.has(key)) {
-                errorsByFile.set(key, []);
-            }
-            errorsByFile.get(key)!.push(error);
-        }
-        
-        // Create one task per file (or group of related files)
-        let errorTaskIndex = 0;
-        const now = Date.now();
-        
-        for (const [file, fileErrors] of errorsByFile) {
-            const taskId = `ERR_FIX_${now}_${errorTaskIndex++}`;
-            
-            // Find related original task by checking filesModified
-            let relatedTask: ManagedTask | undefined;
-            let relatedSessionId: string | undefined;
-            
-            for (const task of this.tasks.values()) {
-                if (task.filesModified.some(f => f.includes(file) || file.includes(path.basename(f)))) {
-                    relatedTask = task;
-                    relatedSessionId = task.sessionId;
-                    break;
+            // Extract previous status from pausedReason if stored
+            let previousStatus: TaskStatus = 'created';
+            if (task.pausedReason) {
+                const match = task.pausedReason.match(/\(was: (\w+)\)$/);
+                if (match) {
+                    previousStatus = TaskManager.mapToStatus(match[1]);
                 }
             }
             
-            const description = fileErrors.length === 1
-                ? `Fix error: ${fileErrors[0].message.substring(0, 80)}`
-                : `Fix ${fileErrors.length} errors in ${path.basename(file)}`;
+            task.status = previousStatus;
+            task.pausedAt = undefined;
+            task.pausedReason = undefined;
             
-            const errorTask: ManagedTask = {
-                id: taskId,
-                sessionId: ERROR_RESOLUTION_SESSION_ID,
-                description,
-                assignedAgent: relatedTask?.actualAgent || relatedTask?.assignedAgent,
-                status: 'ready',  // Error tasks are immediately ready
-                stage: 'error_fixing',
-                requirements: {
-                    taskType: 'error_fix',
-                    needsCompile: true,
-                    needsEditModeTest: false,
-                    needsPlayModeTest: false,
-                    needsPlayerTest: false
-                },
-                dependencies: [],  // No dependencies - fix ASAP
-                dependents: affectedTaskIds || [],  // Tasks blocked by this error
-                priority: -1,  // Highest priority (negative = before normal tasks)
-                createdAt: new Date().toISOString(),
-                filesModified: [file],
-                unityRequests: [],
-                errors: fileErrors.map(e => e.id),
-                reviewIterations: 0,
-                deltaContextDone: false,
-                unityRequestQueued: false,
-                // Store related session for attribution
-                sessionSummary: relatedSessionId ? `Related to session: ${relatedSessionId}` : undefined
-            };
-            
-            this.tasks.set(taskId, errorTask);
-            createdTaskIds.push(taskId);
-            
-            this.log(`Created error-fixing task ${taskId}: ${description}`);
+            this.log(`Resumed task ${taskId} to status ${previousStatus}`);
         }
         
-        return createdTaskIds;
+        // Update dependent statuses for affected sessions
+        const sessions = new Set(taskIds.map(id => this.tasks.get(id)?.sessionId).filter(Boolean));
+        for (const sessionId of sessions) {
+            // Re-evaluate blocked tasks in this session
+            for (const task of this.getTasksForSession(sessionId!)) {
+                if (task.status === 'blocked') {
+                    const allDepsComplete = task.dependencies.every(depId => {
+                        const dt = this.tasks.get(depId);
+                        return dt && dt.status === 'completed';
+                    });
+                    if (allDepsComplete) {
+                        task.status = 'created';
+                    }
+                }
+            }
+        }
     }
+
+    // ========================================================================
+    // Error Task Queries
+    // ========================================================================
     
     /**
      * Get all error-fixing tasks
@@ -1017,27 +778,6 @@ export class TaskManager {
             .filter(t => t.status !== 'completed' && t.status !== 'failed');
     }
     
-    /**
-     * Mark error-fixing task as resolved and resume affected tasks
-     */
-    resolveErrorFixingTask(taskId: string): void {
-        const task = this.tasks.get(taskId);
-        if (!task || task.sessionId !== ERROR_RESOLUTION_SESSION_ID) return;
-        
-        task.status = 'completed';
-        task.stage = 'completed';
-        task.completedAt = new Date().toISOString();
-        
-        // Resume tasks that were blocked by this error
-        if (task.dependents.length > 0) {
-            this.resumePausedTasks(task.dependents);
-            this.log(`Resumed ${task.dependents.length} tasks after error fix`);
-        }
-        
-        this.log(`Error-fixing task ${taskId} resolved`);
-        this.onTaskCompletedCallback?.(task);
-    }
-
     // ========================================================================
     // Agent Management
     // ========================================================================
@@ -1116,11 +856,12 @@ export class TaskManager {
 
     /**
      * Update which tasks are ready (dependencies satisfied) for a session
+     * In the new model: blocked -> created when all deps are complete
      */
     private updateReadyTasksForSession(sessionId: string): void {
         for (const task of this.tasks.values()) {
             if (task.sessionId !== sessionId) continue;
-            if (task.status !== 'pending') continue;
+            if (task.status !== 'blocked') continue;
 
             const depsCompleted = task.dependencies.every(depId => {
                 const depTask = this.tasks.get(depId);
@@ -1128,7 +869,7 @@ export class TaskManager {
             });
 
             if (depsCompleted) {
-                task.status = 'ready';
+                task.status = 'created';
             }
         }
     }
@@ -1143,17 +884,14 @@ export class TaskManager {
     }
 
     /**
-     * Get all ready tasks for a session (can be dispatched)
+     * Get all ready tasks for a session (status 'created')
      */
     getReadyTasks(): ManagedTask[] {
         return Array.from(this.tasks.values())
-            .filter(t => t.status === 'ready')
+            .filter(t => t.status === 'created')
             .sort((a, b) => a.priority - b.priority);
     }
 
-    /**
-     * Get idle engineers
-     */
     /**
      * Get idle agents
      */
@@ -1171,7 +909,7 @@ export class TaskManager {
         
         // Priority 1: Error-fixing tasks (highest priority)
         const errorTasks = this.getPendingErrorFixingTasks()
-            .filter(t => t.status === 'ready');
+            .filter(t => t.status === 'created');
         if (errorTasks.length > 0) {
             return errorTasks[0];
         }
@@ -1241,9 +979,11 @@ export class TaskManager {
             return;
         }
 
-        task.status = 'agent_assigned';
+        task.status = 'in_progress';
         task.actualAgent = agentName;
-        task.dispatchedAt = new Date().toISOString();
+        if (!task.startedAt) {
+            task.startedAt = new Date().toISOString();
+        }
 
         agent.status = 'working';
         agent.currentTask = task;
@@ -1253,40 +993,42 @@ export class TaskManager {
     }
 
     /**
-     * Mark task as in progress
+     * Mark task as in progress (legacy support)
      */
     markTaskInProgress(taskId: string): void {
         const task = this.tasks.get(taskId);
         if (task) {
-            task.status = 'agent_working';
-            task.stage = 'implementing';
-            task.startedAt = new Date().toISOString();
+            task.status = 'in_progress';
+            if (!task.startedAt) {
+                task.startedAt = new Date().toISOString();
+            }
             this.log(`Task ${taskId} in progress`);
         }
     }
 
     /**
-     * Reset task to ready
+     * Reset task to created state
      */
     resetTaskToReady(taskId: string): void {
         const task = this.tasks.get(taskId);
-        if (task && (task.status === 'agent_working' || task.status === 'agent_assigned')) {
-            task.status = 'ready';
+        if (task && task.status === 'in_progress') {
+            task.status = 'created';
             task.actualAgent = undefined;
-            this.log(`Task ${taskId} reset to ready`);
+            task.currentWorkflow = undefined;
+            this.log(`Task ${taskId} reset to created`);
         }
     }
 
     /**
-     * Mark task as completed
+     * Mark task as completed (internal - use markTaskCompletedViaCli for CLI)
      */
     markTaskCompleted(taskId: string, filesModified?: string[]): void {
         const task = this.tasks.get(taskId);
         if (!task) return;
 
         task.status = 'completed';
-        task.stage = 'completed';
         task.completedAt = new Date().toISOString();
+        task.currentWorkflow = undefined;
         
         if (filesModified) {
             const oldFiles = task.filesModified;
@@ -1308,8 +1050,8 @@ export class TaskManager {
             }
         }
 
-        // Update ready tasks for this session
-        this.updateReadyTasksForSession(task.sessionId);
+        // Update dependent tasks
+        this.updateDependentStatuses(task);
         
         this.onTaskCompletedCallback?.(task);
         this.log(`Task ${taskId} completed`);
@@ -1323,8 +1065,8 @@ export class TaskManager {
         if (!task) return;
 
         task.status = 'failed';
-        task.stage = 'failed';
         task.completedAt = new Date().toISOString();
+        task.currentWorkflow = undefined;
 
         if (task.actualAgent) {
             const agent = this.agents.get(task.actualAgent);
@@ -1339,39 +1081,75 @@ export class TaskManager {
     }
 
     // ========================================================================
-    // Task Stage Management
+    // Task Status Management
     // ========================================================================
 
     /**
-     * Update task stage with reason
+     * Update task status with reason
+     * In the new architecture, status is simplified to 6 values
+     * Legacy code may call this with old stage names - we map them
      */
-    updateTaskStage(taskId: string, stage: TaskStage, reason?: string): void {
+    updateTaskStage(taskId: string, stage: string, reason?: string): void {
         const task = this.tasks.get(taskId);
         if (!task) {
-            this.log(`Task ${taskId} not found for stage update`);
+            this.log(`Task ${taskId} not found for status update`);
             return;
         }
 
-        const oldStage = task.stage;
-        task.stage = stage;
-        task.status = this.stageToStatus(stage);
+        // Map legacy stage names to new status values
+        const oldStatus = task.status;
+        const newStatus = this.mapLegacyStageToStatus(stage);
+        task.status = newStatus;
 
-        if (stage === 'completed') {
+        if (newStatus === 'completed') {
             task.completedAt = new Date().toISOString();
-            this.updateReadyTasksForSession(task.sessionId);
+            this.updateDependentStatuses(task);
             this.onTaskCompletedCallback?.(task);
-        } else if (stage === 'failed') {
+        } else if (newStatus === 'failed') {
             task.completedAt = new Date().toISOString();
         }
 
-        this.log(`Task ${taskId}: ${oldStage} → ${stage}${reason ? ` (${reason})` : ''}`);
+        this.log(`Task ${taskId}: ${oldStatus} → ${newStatus}${reason ? ` (${reason})` : ''}`);
+    }
+    
+    /**
+     * Map legacy stage names to simplified status values
+     */
+    private mapLegacyStageToStatus(stage: string): TaskStatus {
+        const mapping: Record<string, TaskStatus> = {
+            // Direct mappings
+            'created': 'created',
+            'in_progress': 'in_progress',
+            'blocked': 'blocked',
+            'paused': 'paused',
+            'completed': 'completed',
+            'failed': 'failed',
+            
+            // Legacy stage mappings
+            'pending': 'blocked',
+            'ready': 'created',
+            'ready_for_agent': 'created',
+            'context_gathering': 'in_progress',
+            'implementing': 'in_progress',
+            'reviewing': 'in_progress',
+            'approved': 'in_progress',
+            'waiting_unity': 'in_progress',
+            'compiling': 'in_progress',
+            'testing_editmode': 'in_progress',
+            'testing_playmode': 'in_progress',
+            'error_fixing': 'in_progress',
+            'deferred': 'blocked',
+            'needs_work': 'in_progress',
+        };
+        
+        return mapping[stage] || 'created';
     }
 
     /**
-     * Get task's current stage
+     * Get task's current status
      */
-    getTaskStage(taskId: string): TaskStage | undefined {
-        return this.tasks.get(taskId)?.stage;
+    getTaskStatus(taskId: string): TaskStatus | undefined {
+        return this.tasks.get(taskId)?.status;
     }
 
     /**
@@ -1427,24 +1205,20 @@ export class TaskManager {
     } {
         const tasks = this.getTasksForSession(sessionId);
         const completed = tasks.filter(t => t.status === 'completed').length;
-        const inProgress = tasks.filter(t => 
-            ['agent_assigned', 'agent_working', 'context_in_progress', 
-             'review_in_progress', 'approved', 'waiting_unity', 'error_fixing'].includes(t.status)
-        ).length;
-        const ready = tasks.filter(t => 
-            ['ready', 'ready_for_agent', 'ready_for_review'].includes(t.status)
-        ).length;
-        const pending = tasks.filter(t => t.status === 'pending').length;
+        const failed = tasks.filter(t => t.status === 'failed').length;
+        const inProgress = tasks.filter(t => t.status === 'in_progress').length;
+        const ready = tasks.filter(t => t.status === 'created').length;
+        const pending = tasks.filter(t => t.status === 'blocked').length;
         const paused = tasks.filter(t => t.status === 'paused').length;
 
         return {
-            completed,
+            completed: completed + failed,  // Count failed as "done" for progress
             inProgress,
             ready,
             pending,
             paused,
             total: tasks.length,
-            percentage: tasks.length > 0 ? (completed / tasks.length) * 100 : 0
+            percentage: tasks.length > 0 ? ((completed + failed) / tasks.length) * 100 : 0
         };
     }
 

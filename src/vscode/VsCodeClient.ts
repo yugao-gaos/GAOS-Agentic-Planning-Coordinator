@@ -223,6 +223,239 @@ export class VsCodeClient extends BaseApcClient {
     }
     
     // ========================================================================
+    // Execution Control
+    // ========================================================================
+    
+    /**
+     * Start execution for an approved plan
+     */
+    async startExecution(sessionId: string): Promise<{ success: boolean; workflowIds?: string[]; engineerCount?: number; error?: string }> {
+        try {
+            const response = await this.send<{ workflowIds: string[]; message: string }>('exec.start', { sessionId });
+            return { 
+                success: true, 
+                workflowIds: response.workflowIds,
+                engineerCount: response.workflowIds?.length || 0
+            };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Pause execution for a session
+     */
+    async pauseExecution(sessionId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('exec.pause', { sessionId });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Resume execution for a session
+     */
+    async resumeExecution(sessionId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('exec.resume', { sessionId });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Stop execution for a session
+     */
+    async stopExecution(sessionId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('exec.stop', { sessionId });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Get execution status for a session
+     */
+    async getExecStatus(sessionId: string): Promise<any> {
+        return this.send('exec.status', { sessionId });
+    }
+    
+    // ========================================================================
+    // Session Management
+    // ========================================================================
+    
+    /**
+     * Get a specific session by ID
+     */
+    async getSession(sessionId: string): Promise<any> {
+        return this.send('session.get', { id: sessionId });
+    }
+    
+    /**
+     * Pause a session
+     */
+    async pauseSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('session.pause', { id: sessionId });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Resume a session
+     */
+    async resumeSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('session.resume', { id: sessionId });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Stop a planning session
+     */
+    async stopSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('session.stop', { id: sessionId });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Remove/delete a planning session
+     */
+    async removeSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('session.remove', { id: sessionId });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    // ========================================================================
+    // Plan Management
+    // ========================================================================
+    
+    /**
+     * Cancel a plan/revision
+     */
+    async cancelPlan(sessionId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('plan.cancel', { id: sessionId });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Get plan status
+     */
+    async getPlanStatus(sessionId: string): Promise<any> {
+        return this.send('plan.status', { id: sessionId });
+    }
+    
+    // ========================================================================
+    // Pool Management
+    // ========================================================================
+    
+    /**
+     * Resize the agent pool
+     */
+    async resizePool(size: number): Promise<{ success: boolean; added?: string[]; removed?: string[]; error?: string }> {
+        try {
+            const response = await this.send<{ newSize: number; added: string[]; removed: string[] }>('pool.resize', { size });
+            return { success: true, added: response.added, removed: response.removed };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Release an agent from their current coordinator
+     */
+    async releaseAgent(agentName: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('agent.release', { agentName });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    // ========================================================================
+    // Workflow Management
+    // ========================================================================
+    
+    /**
+     * Retry a failed task
+     */
+    async retryTask(sessionId: string, taskId: string): Promise<{ success: boolean; workflowId?: string; error?: string }> {
+        try {
+            const response = await this.send<{ workflowId: string }>('workflow.retry', { sessionId, taskId });
+            return { success: true, workflowId: response.workflowId };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    // ========================================================================
+    // Roles Management
+    // ========================================================================
+    
+    /**
+     * Get all agent roles
+     */
+    async getRoles(): Promise<any[]> {
+        const response = await this.send<{ roles: any[] }>('roles.list');
+        return response.roles || [];
+    }
+    
+    /**
+     * Get a specific role
+     */
+    async getRole(roleId: string): Promise<any> {
+        const response = await this.send('roles.get', { roleId });
+        return response;
+    }
+    
+    /**
+     * Update a role
+     */
+    async updateRole(roleId: string, updates: Record<string, any>): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('roles.update', { roleId, updates });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Reset a role to default
+     */
+    async resetRole(roleId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('roles.reset', { roleId });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    // ========================================================================
     // VS Code Integration Helpers
     // ========================================================================
     

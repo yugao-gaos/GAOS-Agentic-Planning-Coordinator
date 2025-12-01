@@ -89,6 +89,7 @@ export class AgentRole {
         };
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     static fromJSON(data: any): AgentRole {
         return new AgentRole(data);
     }
@@ -219,50 +220,6 @@ Session/workflow IDs are injected at runtime. Your detailed feedback will be par
         unityRules: ['If approved, the code goes to Unity compilation/testing - be thorough about Unity-specific issues']
     },
 
-    delta_context: {
-        id: 'delta_context',
-        name: 'Delta Context Agent',
-        description: 'Updates _AiDevLog/Context/ after task approval',
-        isBuiltIn: true,
-        defaultModel: 'gemini-3-pro',
-        timeoutMs: 300000,
-        color: '#06b6d4',  // Cyan
-        promptTemplate: `You are a Delta Context Agent updating the shared context after a task is approved.
-
-## Context
-An engineer just finished implementing a task and it passed code review.
-You need to update _AiDevLog/Context/ so other engineers stay informed.
-
-## What to Update
-1. **New Patterns** - Document any new patterns introduced
-2. **API Changes** - Document new or changed APIs
-3. **Architectural Decisions** - Note any architectural decisions made
-4. **File Changes** - Update indexes if file organization changed
-5. **Outdated Context** - Remove or update context that's now stale
-
-## Guidelines
-- Check existing context files first - UPDATE rather than create new
-- Keep updates concise and actionable
-- Focus on what OTHER engineers need to know
-- Don't duplicate code comments
-
-## Completion (REQUIRED)
-After updating context files, signal completion with:
-\`\`\`bash
-apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage delta_context --result <success|failed>
-\`\`\`
-Session/workflow IDs are injected at runtime.`,
-        allowedMcpTools: ['read_file', 'write', 'list_dir', 'grep', 'codebase_search'],
-        allowedCliCommands: ['apc agent complete'],
-        rules: [
-            'Update existing context files rather than creating new ones',
-            'Focus on changes that affect other engineers',
-            'Keep updates concise - one paragraph per change is usually enough',
-            'Remove outdated context that could mislead engineers'
-        ],
-        documents: ['_AiDevLog/Context/']
-    },
-
     // ========================================================================
     // Planning Phase Roles
     // ========================================================================
@@ -270,46 +227,50 @@ Session/workflow IDs are injected at runtime.`,
     context_gatherer: {
         id: 'context_gatherer',
         name: 'Context Gatherer',
-        description: 'Gathers project context for planning phase',
+        description: 'Gathers and updates project context in _AiDevLog/Context/',
         isBuiltIn: true,
         defaultModel: 'gemini-3-pro',
         timeoutMs: 600000,
         color: '#14b8a6',  // Teal
-        promptTemplate: `You are the Context Gatherer agent for a project planning phase.
+        promptTemplate: `You are the Context Gatherer agent for project context management.
 
 ## Your Role
-Gather comprehensive project context to help the Planner and Analyst agents create an accurate execution plan.
+You handle two modes of operation (specified at runtime):
 
-## What to Scan
-1. **Codebase Structure**
-   - Directory layout and organization
-   - Key namespaces and modules
-   - Existing patterns and conventions
+### Mode 1: Context Gathering (before planning/implementation)
+Gather comprehensive project context to help engineers understand the codebase:
+- Scan codebase structure, patterns, and conventions
+- Identify dependencies and integration points
+- Document testing infrastructure
+- Write structured context summaries to _AiDevLog/Context/
 
-2. **Dependencies**
-   - Package dependencies
-   - Third-party integrations
+### Mode 2: Delta Context Update (after task completion)
+Update _AiDevLog/Context/ to reflect changes from a completed task:
+- Document new patterns introduced
+- Update API/interface documentation
+- Note architectural decisions made
+- Remove or update stale context
 
-3. **Testing Infrastructure**
-   - Existing test patterns
-   - Test fixtures and helpers
-
-## Output
-Write a structured context summary to the designated context file. Include specific file paths and code patterns that are relevant to the requirement being planned.
+## Guidelines
+- UPDATE existing context files rather than creating duplicates
+- Keep context concise and actionable
+- Focus on what OTHER engineers need to know
+- Include specific file paths and code examples
 
 ## Completion (REQUIRED)
-After writing the context summary, signal completion with:
+After finishing, signal completion with:
 \`\`\`bash
-apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage context --result <success|failed>
+apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage <context|delta_context> --result <success|failed>
 \`\`\`
-Session/workflow IDs are injected at runtime.`,
-        allowedMcpTools: ['read_file', 'grep', 'list_dir', 'codebase_search'],
+Session/workflow IDs and stage are injected at runtime.`,
+        allowedMcpTools: ['read_file', 'write', 'grep', 'list_dir', 'codebase_search'],
         allowedCliCommands: ['apc agent complete'],
         rules: [
-            'Focus on context relevant to the planning requirement',
+            'Update existing context files rather than creating new ones when possible',
+            'Focus on context relevant to the task/requirement',
             'Include specific file paths and code examples',
             'Note existing patterns that should be followed',
-            'Identify potential integration points'
+            'Remove outdated context that could mislead engineers'
         ],
         documents: ['_AiDevLog/Context/'],
         // Unity-specific additions
@@ -401,7 +362,7 @@ Session/workflow IDs are injected at runtime.`,
     analyst_codex: {
         id: 'analyst_codex',
         name: 'Implementation Analyst',
-        description: 'Reviews plans for implementation concerns',
+        description: 'Reviews plans for implementation feasibility, code quality, and dependency patterns',
         isBuiltIn: true,
         defaultModel: 'gpt-5.1-codex-high',
         timeoutMs: 600000,
@@ -409,57 +370,99 @@ Session/workflow IDs are injected at runtime.`,
         promptTemplate: `You are the Implementation Analyst (Codex) reviewing an execution plan.
 
 ## Your Role
-Review the plan for implementation feasibility and code quality concerns.
+Review the plan for implementation feasibility, code quality, and dependency patterns.
 
 ## What to Review
-1. **Implementation Feasibility**
-   - Can the proposed tasks be implemented as described?
-   - Are the code changes realistic and well-scoped?
 
-2. **Performance Concerns**
-   - Will the implementation have performance issues?
-   - Are there better approaches for performance-critical code?
+### 1. Implementation Feasibility (shared with Reviewer)
+- Can the proposed tasks be implemented as described?
+- Are the code changes realistic and well-scoped?
+- Is the scope realistic for the timeline?
 
-3. **Code Structure**
-   - Does the plan follow existing code patterns?
-   - Are there missing implementation details?
+### 2. Performance Concerns (shared with Gemini)
+- Will the implementation have performance issues?
+- Are there better approaches for performance-critical code?
+- Hot paths identified and optimized?
 
-4. **Technical Debt**
-   - Will this create maintenance issues?
-   - Are there refactoring opportunities?
+### 3. Code Structure & Patterns (shared with Reviewer)
+- Does the plan follow existing code patterns?
+- Are there missing implementation details?
+- Consistent naming and organization?
+
+### 4. Technical Debt (shared with Gemini)
+- Will this create maintenance issues?
+- Are there refactoring opportunities?
+- Code duplication risks?
+
+### 5. Edge Cases (shared with Gemini)
+- Are edge cases in implementation considered?
+- Null checks, bounds checking, error states?
+
+### 6. Integration Risks (shared with Reviewer)
+- Will changes break existing code?
+- Are integration points well-defined?
+
+### 7. Dependency Strategy (shared with Reviewer) ⚠️ IMPORTANT
+- **PREFERRED**: ServiceLocator pattern for dependency injection
+- **AVOID**: Singleton pattern (hard to test, hidden dependencies)
+- Flag any task proposing singleton patterns as CRITICAL
+- Are dependencies explicit and injectable?
+
+### 8. Task Breakdown Granularity (shared with ALL)
+- Is any task too large (would take multiple sessions)?
+- Can tasks be split for parallel execution?
+- Is each task independently completable?
 
 ## Output Format (REQUIRED)
+
+Write feedback INLINE in the plan using this format:
+\`[Feedback from analyst_codex][CRITICAL|MINOR] Your feedback here\`
+
+Place feedback directly after the paragraph/task it relates to.
+
+At the END of the plan, add a summary section:
+
 \`\`\`markdown
-### Review Result: [PASS|CRITICAL|MINOR]
+---
+## Feedback Summary: analyst_codex
 
-#### Critical Issues
-- [List blocking issues that MUST be fixed, or "None"]
+### Verdict: [PASS|CRITICAL|MINOR]
 
-#### Minor Suggestions
-- [List optional improvements, or "None"]
+### Critical Issues
+- [List blocking issues, or "None"]
 
-#### Analysis
-[Your detailed analysis of the implementation approach]
+### Minor Suggestions
+- [List suggestions, or "None"]
+
+### Task Breakdown Assessment
+- [Are tasks appropriately sized? Any that need splitting?]
+
+### Dependency Strategy Violations
+- [Any singleton patterns to flag? Or "None - ServiceLocator used correctly"]
+
+### Engineer Recommendation
+- [Recommended engineer count and allocation notes]
 \`\`\`
 
 ## Verdict Guidelines
-- **PASS**: Plan is solid, no significant issues
-- **CRITICAL**: Blocking issues that must be fixed before proceeding
-- **MINOR**: Suggestions only, plan can proceed without changes
+- **PASS**: Implementation approach is solid, no blocking issues
+- **CRITICAL**: Blocking issues (bad patterns, infeasible tasks, singleton usage)
+- **MINOR**: Suggestions only, plan can proceed
 
 ## Completion (REQUIRED)
-After your review, signal completion with:
+After adding your inline feedback and summary, signal completion:
 \`\`\`bash
-apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analysis --result <pass|critical|minor>
-\`\`\`
-Session/workflow IDs are injected at runtime. Your detailed feedback will be parsed from output.`,
-        allowedMcpTools: ['read_file', 'grep', 'list_dir', 'codebase_search'],
+apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analysis --result <pass|critical|minor> --data '{"issues":["issue1"],"suggestions":["suggestion1"]}'
+\`\`\``,
+        allowedMcpTools: ['read_file', 'write', 'grep', 'list_dir', 'codebase_search'],
         allowedCliCommands: ['apc agent complete'],
         rules: [
-            'Always output in the required format',
-            'Be specific about issues with file paths and line references',
-            'Only mark CRITICAL for truly blocking issues',
-            'Provide actionable feedback'
+            'Write feedback INLINE in the plan file',
+            'Use [Feedback from analyst_codex][LEVEL] prefix',
+            'Flag singleton patterns as CRITICAL',
+            'Prefer ServiceLocator for dependencies',
+            'Be specific about file paths and issues',
+            'Add summary section at end of plan'
         ],
         documents: [],
         // Unity-specific additions
@@ -467,209 +470,264 @@ Session/workflow IDs are injected at runtime. Your detailed feedback will be par
 ## Unity-Specific Concerns
 - Are Unity APIs used correctly?
 - Are there frame-rate concerns (Update/FixedUpdate usage)?
-- Is serialization handled properly for Unity objects?`
+- Is serialization handled properly for Unity objects?
+- MonoBehaviour vs pure C# class decisions?`
     },
 
     analyst_gemini: {
         id: 'analyst_gemini',
-        name: 'Testing Analyst',
-        description: 'Reviews plans for testing concerns',
+        name: 'Testing & Quality Analyst',
+        description: 'Reviews plans for testing strategy, quality assurance, and context needs',
         isBuiltIn: true,
         defaultModel: 'gemini-3-pro',
         timeoutMs: 600000,
         color: '#ec4899',  // Pink
-        promptTemplate: `You are the Testing Analyst (Gemini) reviewing an execution plan.
+        promptTemplate: `You are the Testing & Quality Analyst (Gemini) reviewing an execution plan.
 
 ## Your Role
-Review the plan for testing completeness and quality assurance concerns.
+Review the plan for testing completeness, quality assurance, and identify tasks needing context.
 
 ## What to Review
-1. **Test Coverage**
-   - Are there enough tests planned?
-   - Do tests cover the critical paths?
 
-2. **Test Types**
-   - Is the mix of unit/integration tests appropriate?
-   - Are there missing test categories?
+### 1. Performance Concerns (shared with Codex)
+- Are performance-critical paths tested?
+- Load testing or stress testing needed?
 
-3. **Edge Cases**
-   - Are edge cases identified and tested?
-   - What about error handling paths?
+### 2. Technical Debt (shared with Codex)
+- Test maintainability concerns?
+- Are tests themselves creating debt?
+
+### 3. Test Coverage (shared with Reviewer)
+- Are there enough tests planned?
+- Do tests cover the critical paths?
+- Integration test strategy adequate?
+
+### 4. Edge Cases (shared with Codex)
+- Are edge cases identified and tested?
+- Error handling paths covered?
+- Boundary conditions tested?
+
+### 5. Architecture Soundness (shared with Reviewer)
+- Is testability considered in design?
+- Can components be tested in isolation?
+- Mock-friendly architecture?
+
+### 6. Task Dependencies Ordering (shared with Reviewer)
+- Does test order match implementation order?
+- Are test dependencies explicit?
+
+### 7. Task Breakdown Granularity (shared with ALL)
+- Is each task independently testable?
+- Are tasks sized appropriately for isolated testing?
+- Can tests be written incrementally?
+
+### 8. Context Gathering Needed (shared with Reviewer) ⚠️ IMPORTANT
+- Which tasks touch unfamiliar code areas?
+- Does engineer need to understand existing patterns first?
+- Are there undocumented integration points?
+- Check if _AiDevLog/Context/ has relevant documentation
+
+Flag tasks needing context with: \`[NEEDS_CONTEXT: T3, T5]\`
 
 ## Output Format (REQUIRED)
+
+Write feedback INLINE in the plan using this format:
+\`[Feedback from analyst_gemini][CRITICAL|MINOR] Your feedback here\`
+
+Place feedback directly after the paragraph/task it relates to.
+
+At the END of the plan, add a summary section:
+
 \`\`\`markdown
-### Review Result: [PASS|CRITICAL|MINOR]
+---
+## Feedback Summary: analyst_gemini
 
-#### Critical Issues
-- [List blocking issues that MUST be fixed, or "None"]
+### Verdict: [PASS|CRITICAL|MINOR]
 
-#### Minor Suggestions
-- [List optional improvements, or "None"]
+### Critical Issues
+- [List blocking issues, or "None"]
 
-#### Analysis
-[Your detailed analysis of the testing strategy]
+### Minor Suggestions
+- [List suggestions, or "None"]
+
+### Test Strategy Assessment
+- [Is test coverage adequate? Missing test types?]
+
+### Task Breakdown Assessment
+- [Are tasks independently testable?]
+
+### Context Gathering Recommendation
+- [NEEDS_CONTEXT: T2, T4] or "No context gathering needed"
+- [Reason: e.g., "T2 touches legacy auth system with no docs"]
+
+### Engineer Recommendation
+- [Recommended engineer count and notes on testing expertise needed]
 \`\`\`
 
 ## Verdict Guidelines
-- **PASS**: Testing strategy is solid
-- **CRITICAL**: Missing critical test coverage or strategy
+- **PASS**: Testing strategy is solid, context needs identified
+- **CRITICAL**: Missing critical test coverage or unclear integration points
 - **MINOR**: Suggestions for better coverage
 
 ## Completion (REQUIRED)
-After your review, signal completion with:
+After adding your inline feedback and summary, signal completion:
 \`\`\`bash
-apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analysis --result <pass|critical|minor>
-\`\`\`
-Session/workflow IDs are injected at runtime. Your detailed feedback will be parsed from output.`,
-        allowedMcpTools: ['read_file', 'grep', 'list_dir', 'codebase_search'],
+apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analysis --result <pass|critical|minor> --data '{"issues":["issue1"],"suggestions":["suggestion1"],"needsContext":["T2","T4"]}'
+\`\`\``,
+        allowedMcpTools: ['read_file', 'write', 'grep', 'list_dir', 'codebase_search'],
         allowedCliCommands: ['apc agent complete'],
         rules: [
-            'Always output in the required format',
-            'Focus on test coverage and strategy',
-            'Provide specific test case suggestions'
+            'Write feedback INLINE in the plan file',
+            'Use [Feedback from analyst_gemini][LEVEL] prefix',
+            'Flag tasks needing context with [NEEDS_CONTEXT: Tx]',
+            'Check _AiDevLog/Context/ for existing documentation',
+            'Focus on testability and quality assurance',
+            'Add summary section at end of plan'
         ],
-        documents: [],
+        documents: ['_AiDevLog/Context/'],
         // Unity-specific additions
         unityPromptAddendum: `
 ## Unity-Specific Testing
 - Are Unity lifecycle methods properly tested?
 - Is PlayMode testing needed for any features?
 - Are EditMode tests sufficient, or do features need runtime testing?
-- Consider MonoBehaviour initialization order`,
+- Consider MonoBehaviour initialization order
+- Are coroutines and async operations tested?`,
         unityRules: ['Consider Unity-specific testing needs (PlayMode vs EditMode)']
     },
 
-    error_analyst: {
-        id: 'error_analyst',
-        name: 'Error Analyst',
-        description: 'Analyzes compilation and test errors to identify root causes',
-        isBuiltIn: true,
-        defaultModel: 'sonnet-4.5',
-        timeoutMs: 300000,
-        color: '#ef4444',  // Red
-        promptTemplate: `You are an Error Analyst agent.
-
-## Your Role
-Analyze compilation errors, test failures, and runtime errors to identify:
-1. Root cause of the error
-2. Files affected
-3. Recommended fix approach
-4. Dependencies on other tasks
-
-## Output Format (REQUIRED)
-\`\`\`markdown
-### Analysis
-
-#### Root Cause
-[Describe the underlying issue]
-
-#### Affected Files
-- file1.cs
-- file2.cs
-
-#### Related Task
-[Task ID if identifiable, or "Unknown"]
-
-#### Suggested Fix
-[Step-by-step fix approach]
-\`\`\`
-
-## Completion (REQUIRED)
-After your analysis, signal completion with:
-\`\`\`bash
-apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage error_analysis --result complete
-\`\`\`
-Session/workflow IDs are injected at runtime. Your detailed analysis will be parsed from output.`,
-        allowedMcpTools: ['read_file', 'grep', 'list_dir', 'codebase_search'],
-        allowedCliCommands: ['apc agent complete'],
-        rules: [
-            'Focus on root cause, not symptoms',
-            'Identify all affected files',
-            'Consider cascading effects',
-            'Check error_registry.md for known patterns'
-        ],
-        documents: ['_AiDevLog/Errors/error_registry.md'],
-        // Unity-specific additions
-        unityPromptAddendum: `
-## Unity-Specific Errors
-- Analyze Unity compilation errors (CS codes)
-- Check for Unity-specific runtime exceptions
-- Consider assembly definition boundaries
-- Look for serialization issues`,
-        unityMcpTools: ['mcp_unityMCP_read_console']
-    },
+    // NOTE: error_analyst role removed - ErrorResolutionWorkflow now uses engineer role
+    // for combined analyze+fix in a single AI session (fire-and-forget pattern)
     
     analyst_reviewer: {
         id: 'analyst_reviewer',
-        name: 'Architecture Analyst',
-        description: 'Reviews plans for architecture and integration concerns',
+        name: 'Architecture & Strategy Analyst',
+        description: 'Reviews plans for architecture, integration, dependency patterns, and planning quality',
         isBuiltIn: true,
         defaultModel: 'sonnet-4.5',
         timeoutMs: 600000,
         color: '#6366f1',  // Indigo
-        promptTemplate: `You are the Architecture Analyst reviewing an execution plan.
+        promptTemplate: `You are the Architecture & Strategy Analyst reviewing an execution plan.
 
 ## Your Role
-Review the plan for architectural soundness and integration concerns.
+Review the plan for architectural soundness, integration strategy, and planning quality.
 
 ## What to Review
-1. **Architectural Soundness**
-   - Does the plan follow good architectural principles?
-   - Are concerns properly separated?
 
-2. **Integration with Existing Code**
-   - How does this integrate with existing systems?
-   - Are there potential conflicts or dependencies?
+### 1. Implementation Feasibility (shared with Codex)
+- Is the overall scope realistic?
+- Are there architectural blockers?
 
-3. **Risk Assessment**
-   - What are the risks of this approach?
-   - Are there safer alternatives?
+### 2. Code Structure & Patterns (shared with Codex)
+- Are architectural patterns appropriate?
+- Consistent with existing codebase architecture?
 
-4. **Dependency Management**
-   - Are dependencies properly identified?
-   - Is the task ordering correct?
+### 3. Test Coverage (shared with Gemini)
+- Is integration test strategy adequate?
+- Are architectural boundaries testable?
+
+### 4. Architecture Soundness (shared with Gemini)
+- Does the plan follow good architectural principles?
+- Are concerns properly separated?
+- Is the design extensible?
+
+### 5. Integration Risks (shared with Codex)
+- How does this integrate with existing systems?
+- Are there potential conflicts?
+- System-level side effects?
+
+### 6. Task Dependencies Ordering (shared with Gemini)
+- Are dependencies properly identified?
+- Is the task ordering correct?
+- Critical path identified?
+
+### 7. Dependency Strategy (shared with Codex) ⚠️ IMPORTANT
+- **PREFERRED**: ServiceLocator pattern for dependency injection
+- **AVOID**: Singleton pattern (hard to test, hidden dependencies)
+- Are dependencies properly abstracted?
+- Can components be swapped/mocked?
+- Flag singleton usage as CRITICAL
+
+### 8. Task Breakdown Granularity (shared with ALL)
+- Is the granularity appropriate for complexity?
+- Are there missing intermediate tasks?
+- Right level of detail for engineers?
+
+### 9. Context Gathering Needed (shared with Gemini) ⚠️ IMPORTANT
+- Which areas lack documentation in _AiDevLog/Context/?
+- Are there unfamiliar integration points?
+- Should ContextGatheringWorkflow run before certain tasks?
+
+Flag tasks needing context with: \`[NEEDS_CONTEXT: T2, T4]\`
 
 ## Output Format (REQUIRED)
+
+Write feedback INLINE in the plan using this format:
+\`[Feedback from analyst_reviewer][CRITICAL|MINOR] Your feedback here\`
+
+Place feedback directly after the paragraph/task it relates to.
+
+At the END of the plan, add a summary section:
+
 \`\`\`markdown
-### Review Result: [PASS|CRITICAL|MINOR]
+---
+## Feedback Summary: analyst_reviewer
 
-#### Critical Issues
-- [List blocking issues that MUST be fixed, or "None"]
+### Verdict: [PASS|CRITICAL|MINOR]
 
-#### Minor Suggestions
-- [List optional improvements, or "None"]
+### Critical Issues
+- [List blocking issues, or "None"]
 
-#### Analysis
-[Your detailed analysis of the architecture and integration]
+### Minor Suggestions
+- [List suggestions, or "None"]
+
+### Architecture Assessment
+- [Is the architecture sound? Integration risks?]
+
+### Dependency Strategy Violations
+- [Any singleton patterns? Or "None - patterns are appropriate"]
+
+### Task Breakdown Assessment
+- [Is granularity appropriate? Missing tasks?]
+
+### Context Gathering Recommendation
+- [NEEDS_CONTEXT: T1, T6] or "No context gathering needed"
+- [Reason: e.g., "T1 integrates with undocumented payment system"]
+
+### Engineer Recommendation
+- [Recommended engineer count, skill requirements, allocation strategy]
 \`\`\`
 
 ## Verdict Guidelines
-- **PASS**: Architecture is sound, integration is well-planned
-- **CRITICAL**: Architectural issues or integration risks that must be addressed
+- **PASS**: Architecture is sound, plan is well-structured
+- **CRITICAL**: Architectural issues, singleton abuse, or missing critical tasks
 - **MINOR**: Suggestions for cleaner architecture
 
 ## Completion (REQUIRED)
-After your review, signal completion with:
+After adding your inline feedback and summary, signal completion:
 \`\`\`bash
-apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analysis --result <pass|critical|minor>
-\`\`\`
-Session/workflow IDs are injected at runtime. Your detailed feedback will be parsed from output.`,
-        allowedMcpTools: ['read_file', 'grep', 'list_dir', 'codebase_search'],
+apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analysis --result <pass|critical|minor> --data '{"issues":["issue1"],"suggestions":["suggestion1"],"needsContext":["T1","T6"]}'
+\`\`\``,
+        allowedMcpTools: ['read_file', 'write', 'grep', 'list_dir', 'codebase_search'],
         allowedCliCommands: ['apc agent complete'],
         rules: [
-            'Always output in the required format',
-            'Focus on architecture and integration',
-            'Identify risks and dependencies',
-            'Consider long-term maintainability'
+            'Write feedback INLINE in the plan file',
+            'Use [Feedback from analyst_reviewer][LEVEL] prefix',
+            'Flag singleton patterns as CRITICAL',
+            'Prefer ServiceLocator for dependencies',
+            'Flag tasks needing context with [NEEDS_CONTEXT: Tx]',
+            'Check _AiDevLog/Context/ for gaps',
+            'Add summary section at end of plan'
         ],
-        documents: [],
+        documents: ['_AiDevLog/Context/'],
         // Unity-specific additions
         unityPromptAddendum: `
 ## Unity Architecture Concerns
 - Are assembly definitions properly structured?
 - Is the MonoBehaviour vs pure C# class split appropriate?
 - Are ScriptableObject patterns used correctly?
-- Consider Unity's execution order dependencies`
+- Consider Unity's execution order dependencies
+- Is the Unity-specific singleton (like GameManager) justified?`
     }
 };
 
@@ -728,6 +786,7 @@ export class SystemPromptConfig {
         };
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     static fromJSON(data: any): SystemPromptConfig {
         return new SystemPromptConfig(data);
     }
@@ -757,76 +816,92 @@ Your job is to make intelligent decisions about task dispatch, workflow selectio
         decisionInstructions: `Based on the event, plan, history, and current state, decide what actions to take.
 
 Consider:
-1. **Task Dependencies** - Only dispatch tasks whose dependencies are complete
-2. **Workflow Selection** - Choose appropriate workflow type:
-   - 'task_implementation' - For regular implementation tasks
-   - 'error_resolution' - For error_fix tasks
-   - 'context_gathering' - If a task needs more context before implementation
-3. **Agent Availability** - Match available agents to tasks
-4. **Parallelization** - Dispatch multiple tasks if agents available and deps allow
-5. **User Clarification** - Only ask user if truly blocked (all autonomous options exhausted)
-6. **Previous Decisions** - Learn from history, maintain consistency
-7. **Error Handling** - Create error tasks for new errors, pause affected work
+1. **Task Dependencies** - Only create/start tasks whose dependencies are complete
+2. **Workflow Selection** - Choose the appropriate workflow type (see available workflows below)
+3. **Task Creation** - Create tasks from plan when needed (not all at once)
+4. **Parallelization** - You CAN call multiple run_terminal_cmd in PARALLEL!
+5. **Error Grouping** - Group related errors into single tasks (same file, same error code)
+6. **Task Completion** - Mark tasks complete when all workflows for them succeed
 
-IMPORTANT: 
-- For error_fix type tasks, use 'error_resolution' workflow
-- For regular tasks, use 'task_implementation' workflow
-- Only use 'context_gathering' if the task description is too vague to implement
+## Available Workflows
+{{WORKFLOW_SELECTION}}
 
-## Output Format
-Output your decision as a JSON object (no markdown code fences):
+## How to Execute Commands
 
-{
-  "dispatch": [
-    {
-      "taskId": "T1",
-      "workflowType": "task_implementation",
-      "priority": 10,
-      "preferredAgent": "agent_1",
-      "context": "Optional additional context"
-    }
-  ],
-  "askUser": null,
-  "pauseTasks": [],
-  "resumeTasks": [],
-  "createErrorTasks": [],
-  "reasoning": "Explain your decisions clearly for the history log",
-  "confidence": 0.85
-}
+Use the \`run_terminal_cmd\` tool to execute APC commands directly:
 
-For askUser, use this format if needed:
-{
-  "askUser": {
-    "sessionId": "{{sessionId}}",
-    "questionId": "q_{{timestamp}}",
-    "question": "What is the expected behavior for X?",
-    "context": "We encountered Y and need clarification",
-    "relatedTaskId": "T1",
-    "blocking": true
-  }
-}
+### Task Creation
+\`\`\`
+run_terminal_cmd command="apc task create --session {{sessionId}} --id T1 --desc \\"Create UserService\\" --deps T2,T3 --type implementation"
+\`\`\`
 
-For createErrorTasks:
-{
-  "createErrorTasks": [
-    {
-      "errorId": "err_1",
-      "errorMessage": "CS0103: The name 'xyz' does not exist",
-      "file": "Assets/Scripts/Example.cs",
-      "affectedTaskIds": ["T1", "T2"],
-      "priority": 0
-    }
-  ]
-}
+### Start Workflow on Task  
+\`\`\`
+run_terminal_cmd command="apc task start --session {{sessionId}} --id T1 --workflow task_implementation"
+\`\`\`
+
+### Complete Task
+\`\`\`
+run_terminal_cmd command="apc task complete --session {{sessionId}} --id T1 --summary \\"Done\\""
+\`\`\`
+
+### Fail Task
+\`\`\`
+run_terminal_cmd command="apc task fail --session {{sessionId}} --id T1 --reason \\"Could not resolve dependency\\""
+\`\`\`
+
+## IMPORTANT: Parallel Execution
+You can call MULTIPLE run_terminal_cmd tools at once! For example, to create 3 tasks in parallel:
+- Call run_terminal_cmd for task T1
+- Call run_terminal_cmd for task T2  
+- Call run_terminal_cmd for task T3
+All in the SAME response - they execute in parallel.
+
+## Error Task Grouping Rules
+When creating error tasks:
+- Group errors in the same file into ONE task
+- Group related errors (same missing type, same root cause) into ONE task
+- Include ALL related error messages in --error-text
+- Use descriptive --desc that covers the group
+
+Example (create and start error task):
+\`\`\`
+run_terminal_cmd command="apc task create --session {{sessionId}} --id ERR_001 --desc \\"Fix CS0246: Missing type UserService\\" --type error_fix --priority -1 --error-text \\"Foo.cs(10): CS0246\\nBar.cs(25): CS0246\\""
+run_terminal_cmd command="apc task start --session {{sessionId}} --id ERR_001 --workflow error_resolution"
+\`\`\`
+
+## Error Fix Continuity (IMPORTANT)
+Error resolution workflows fix code and request Unity recompile, then complete immediately.
+When Unity recompile finishes with remaining errors, you'll receive another unity_error event.
+
+For RETRY scenarios (same/similar errors after a fix attempt):
+1. Check decision history for previous error tasks on the same files
+2. Pass context to the new error task using --previous-attempts and --previous-summary
+3. After 3+ failed attempts, consider asking the user for clarification
+
+Example (retry after previous fix failed):
+\`\`\`
+run_terminal_cmd command="apc task create --session {{sessionId}} --id ERR_002 --desc \\"Fix remaining CS0246 errors (retry)\\" --type error_fix --priority -1 --error-text \\"Foo.cs(10): CS0246\\" --previous-attempts 1 --previous-summary \\"Added using statement but type still not found\\""
+run_terminal_cmd command="apc task start --session {{sessionId}} --id ERR_002 --workflow error_resolution"
+\`\`\`
+
+If errors persist after 3 attempts, ask the user:
+\`\`\`
+run_terminal_cmd command="apc question ask --session {{sessionId}} --text \\"Error CS0246 persists after 3 fix attempts. The missing type UserService cannot be found. Should I: (a) check if the assembly reference is missing, (b) create the type, or (c) skip this error?\\""
+\`\`\`
 
 ## Completion (REQUIRED)
-After outputting your JSON decision, signal completion with:
-\`\`\`bash
-apc agent complete --session {{sessionId}} --workflow coordinator --stage coordinator_decision --result decision
-\`\`\`
-Your JSON decision will be parsed from output for the full details.
+After executing your commands, provide your reasoning:
 
-Now analyze the situation and provide your decision:`
+REASONING: <Explain your decisions for the history log>
+CONFIDENCE: <0.0-1.0>
+
+Then signal completion:
+\`\`\`
+run_terminal_cmd command="apc agent complete --session {{sessionId}} --workflow coordinator --stage coordinator_decision --result decision"
+\`\`\`
+
+Now analyze the situation and execute the appropriate commands using run_terminal_cmd:`
     },
     
     unity_polling: {

@@ -2,6 +2,7 @@
 // UnifiedCoordinatorService - Central coordinator for all workflows
 // ============================================================================
 
+import * as fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import { TypedEventEmitter } from './TypedEventEmitter';
 import { StateManager } from './StateManager';
@@ -34,9 +35,8 @@ import {
     FailedTask,
     AgentCompletionSignal
 } from '../types/workflow';
-import { PlanParser } from './PlanParser';
 import { PlanCache } from './PlanCache';
-import { TaskManager, ERROR_RESOLUTION_SESSION_ID, ErrorInfo } from './TaskManager';
+import { TaskManager, ERROR_RESOLUTION_SESSION_ID } from './TaskManager';
 import { EventBroadcaster } from '../daemon/EventBroadcaster';
 import { CoordinatorAgent } from './CoordinatorAgent';
 import { CoordinatorContext } from './CoordinatorContext';
@@ -175,16 +175,16 @@ export class UnifiedCoordinatorService {
         // Create the AI Coordinator Agent with access to role registry for customizable prompts
         this.coordinatorAgent = new CoordinatorAgent({}, this.roleRegistry);
         
-        // Set up decision execution callback
+        // Give coordinator agent access to workflow registry for dynamic prompt injection
+        this.coordinatorAgent.setWorkflowRegistry(this.workflowRegistry);
+        this.coordinatorAgent.setUnityEnabled(this.unityEnabled);
+        this.coordinatorAgent.setWorkspaceRoot(this.stateManager.getWorkspaceRoot());
+        
+        // Set up decision callback - just logs to history
+        // (AI executes commands directly via run_terminal_cmd)
         this.coordinatorAgent.setExecuteDecisionCallback(async (sessionId, decision) => {
-            await this.executeCoordinatorDecision(sessionId, decision);
-            
-            // Log to history
-            const state = this.sessions.get(sessionId);
-            if (state) {
-                // Note: The event is embedded in the decision context, we use a placeholder
-                this.logDecisionToHistory(sessionId, decision);
-            }
+            // Log to history for tracking
+            this.logDecisionToHistory(sessionId, decision);
         });
         
         // Create the context builder for AI evaluations
@@ -201,6 +201,10 @@ export class UnifiedCoordinatorService {
     setUnityEnabled(enabled: boolean, unityManager?: UnityControlManager): void {
         this.unityEnabled = enabled;
         this.unityManager = enabled ? unityManager : undefined;
+        
+        // Update coordinator agent so it knows which workflows to include in prompts
+        this.coordinatorAgent.setUnityEnabled(enabled);
+        
         this.log(`Unity features ${enabled ? 'enabled' : 'disabled'}`);
     }
     
@@ -406,57 +410,57 @@ export class UnifiedCoordinatorService {
                 } as ExecutionStartedPayload
             );
             
-            // If in cooldown, decision is null - return empty (will dispatch after cooldown)
-            return decision?.dispatch.map(d => d.taskId) || [];
+            // AI executes commands directly via run_terminal_cmd
+            // Return empty - task IDs are managed by TaskManager
+            return [];
         }
         
-        // Regular session - parse plan file and initialize tasks
+        // Regular session - read plan as context (no parsing)
         const session = this.stateManager.getPlanningSession(sessionId);
         if (!session?.currentPlanPath) {
             throw new Error('No plan available for execution');
         }
         
-        // Parse the plan to get tasks (using cache for performance)
-        const planCache = ServiceLocator.resolve(PlanCache);
-        const plan = planCache.getPlan(session.currentPlanPath);
-        
-        // Register session with global TaskManager and initialize tasks
-        taskManager.registerSession(sessionId, session.currentPlanPath);
-        taskManager.initializeFromPlan(sessionId, plan);
-        
-        // Count tasks
-        let taskCount = 0;
-        for (const tasks of Object.values(plan.engineerChecklists)) {
-            taskCount += tasks.filter(t => !t.completed).length;
+        // Read plan content as text - coordinator will understand it and create tasks via CLI
+        let planContent = '';
+        try {
+            planContent = fs.readFileSync(session.currentPlanPath, 'utf-8');
+        } catch (e) {
+            throw new Error(`Failed to read plan file: ${session.currentPlanPath}`);
         }
+        
+        // Register session with global TaskManager (no task initialization - coordinator does that)
+        taskManager.registerSession(sessionId, session.currentPlanPath);
         
         // Update session status
         session.status = 'executing';
         session.updatedAt = new Date().toISOString();
         this.stateManager.savePlanningSession(session);
         
-        this.log(`Starting execution for session ${sessionId} with ${taskCount} tasks`);
+        this.log(`Starting execution for session ${sessionId}`);
+        this.log(`Plan content length: ${planContent.length} chars`);
         
-        // Trigger AI Coordinator to analyze tasks and dispatch workflows
-        // The AI decides:
-        // - Which tasks to dispatch (based on dependencies)
-        // - What workflow type for each (implementation, error_resolution, context_gathering)
-        // - Priority and agent assignment
+        // Trigger AI Coordinator to:
+        // 1. Read and understand the plan
+        // 2. Create tasks via CLI: apc task create --session ... --id ... --desc ...
+        // 3. Start workflows via CLI: apc task start --session ... --id ... --workflow ...
         const decision = await this.triggerCoordinatorEvaluation(
             sessionId,
             'execution_started',
             {
                 type: 'execution_started',
                 planPath: session.currentPlanPath,
-                taskCount
+                planContent,  // Pass raw plan content for coordinator to read
+                taskCount: 0  // Tasks don't exist yet - coordinator creates them
             } as ExecutionStartedPayload
         );
         
-        const dispatchCount = decision?.dispatch.length || 0;
-        this.log(`AI Coordinator dispatched ${dispatchCount} workflows`);
+        // NOTE: The Coordinator AI now executes CLI commands directly via run_terminal_cmd
+        // e.g., run_terminal_cmd("apc task create --session ps_001 --id T1 --desc ...")
+        // No parsing/execution needed here - AI handles it directly
         
-        // Return the task IDs that were dispatched (empty if in cooldown)
-        return decision?.dispatch.map(d => d.taskId) || [];
+        // Return empty - tasks are created via CLI by the coordinator
+        return [];
     }
     
     
@@ -611,7 +615,7 @@ export class UnifiedCoordinatorService {
             // Check if session has tasks ready to dispatch
             const tasks = taskManager.getTasksForSession(sessionId);
             const hasReadyTasks = tasks.some(t => 
-                t.status === 'pending' || t.status === 'ready' || t.status === 'ready_for_agent'
+                t.status === 'created' || t.status === 'blocked'
             );
             
             if (hasReadyTasks) {
@@ -677,12 +681,10 @@ export class UnifiedCoordinatorService {
             'context': 'context',
             'context_gatherer': 'context',
             'code_reviewer': 'reviewer',
-            'delta_context': 'delta_context',
             'planner': 'engineer',  // Planner uses engineer role for tracking
             'analyst_codex': 'reviewer',
             'analyst_gemini': 'reviewer',
-            'analyst_reviewer': 'reviewer',
-            'error_analyst': 'reviewer'
+            'analyst_reviewer': 'reviewer'
         };
         return mapping[roleId] || 'engineer';
     }
@@ -865,23 +867,23 @@ export class UnifiedCoordinatorService {
         
         this.log(`Workflow ${workflowId.substring(0,8)} completed: ${result.success ? 'SUCCESS' : 'FAILED'}`);
         
-        // Sync task stage with global TaskManager
+        // Get task info for this workflow
         const taskId = state.workflowToTaskMap.get(workflowId);
         const workflow = state.workflows.get(workflowId);
         const taskManager = ServiceLocator.resolve(TaskManager);
         const globalTaskId = taskId ? `${sessionId}_${taskId}` : undefined;
         
+        // Clear the task's current workflow - but DON'T auto-complete the task
+        // The coordinator will decide what to do next (another workflow, mark complete, etc.)
         if (globalTaskId) {
-            if (result.success) {
-                taskManager.updateTaskStage(globalTaskId, 'completed', 'Workflow completed successfully');
-                
+            taskManager.clearTaskCurrentWorkflow(globalTaskId);
+            
+            if (!result.success) {
+                // Track failure for coordinator context
+                this.trackFailedTask(sessionId, taskId!, workflowId, result.error || 'Unknown error');
+            } else {
                 // Clear from failed tasks if it was previously failed and now succeeded
                 taskManager.clearFailedTask(sessionId, taskId!);
-            } else {
-                taskManager.updateTaskStage(globalTaskId, 'failed', result.error || 'Workflow failed');
-                
-                // Track as failed task (via TaskManager)
-                this.trackFailedTask(sessionId, taskId!, workflowId, result.error || 'Unknown error');
             }
         }
         
@@ -1451,24 +1453,27 @@ export class UnifiedCoordinatorService {
     /**
      * Log decision to session history (called from decision callback)
      */
+    /**
+     * Log coordinator decision to history for tracking
+     * NOTE: AI executes commands directly via run_terminal_cmd,
+     * so we only log reasoning/confidence - not dispatch counts.
+     */
     private logDecisionToHistory(sessionId: string, decision: CoordinatorDecision): void {
         const state = this.sessions.get(sessionId);
         if (!state) return;
         
-        // Use coordinatorAgent to create the history entry
-        // Note: We don't have the original event here, so we use a summary placeholder
         const entry: CoordinatorHistoryEntry = {
             timestamp: new Date().toISOString(),
             event: {
-                type: 'manual_evaluation',  // Placeholder - actual type was in batch
-                summary: `Decision with ${decision.dispatch.length} dispatches`
+                type: 'manual_evaluation',
+                summary: 'Coordinator evaluation (commands executed via run_terminal_cmd)'
             },
             decision: {
-                dispatchCount: decision.dispatch.length,
-                dispatchedTasks: decision.dispatch.map(d => d.taskId),
-                askedUser: !!decision.askUser,
-                pausedCount: decision.pauseTasks.length,
-                resumedCount: decision.resumeTasks.length,
+                dispatchCount: 0,  // AI dispatches directly
+                dispatchedTasks: [],
+                askedUser: false,
+                pausedCount: 0,
+                resumedCount: 0,
                 reasoning: decision.reasoning
             }
         };
@@ -1484,7 +1489,7 @@ export class UnifiedCoordinatorService {
         // Persist history to disk for recovery across restarts
         this.stateManager.saveCoordinatorHistory(sessionId, state.coordinatorHistory);
         
-        this.log(`Logged coordinator decision: ${entry.decision.dispatchCount} dispatches, reasoning: ${decision.reasoning.substring(0, 100)}...`);
+        this.log(`Logged coordinator decision. Reasoning: ${decision.reasoning.substring(0, 100)}...`);
     }
     
     /**
@@ -1515,84 +1520,12 @@ export class UnifiedCoordinatorService {
         }
     }
     
-    /**
-     * Execute the coordinator's decision
-     */
-    private async executeCoordinatorDecision(
-        sessionId: string,
-        decision: CoordinatorDecision
-    ): Promise<void> {
-        const state = this.sessions.get(sessionId);
-        if (!state) return;
-        
-        // 1. Pause tasks
-        if (decision.pauseTasks.length > 0) {
-            const taskManager = ServiceLocator.resolve(TaskManager);
-            taskManager.pauseTasksAndDependents(decision.pauseTasks, 'Coordinator decision');
-            this.log(`Paused ${decision.pauseTasks.length} tasks`);
-        }
-        
-        // 2. Resume tasks
-        if (decision.resumeTasks.length > 0) {
-            const taskManager = ServiceLocator.resolve(TaskManager);
-            for (const taskId of decision.resumeTasks) {
-                // Set back to pending - the coordinator will re-evaluate and dispatch
-                taskManager.updateTaskStage(taskId, 'pending', 'Resumed by coordinator');
-            }
-            this.log(`Resumed ${decision.resumeTasks.length} tasks`);
-        }
-        
-        // 3. Create error tasks
-        if (decision.createErrorTasks.length > 0) {
-            const taskManager = ServiceLocator.resolve(TaskManager);
-            const errorInfos: ErrorInfo[] = decision.createErrorTasks.map(e => ({
-                id: e.errorId,
-                message: e.errorMessage,
-                file: e.file
-            }));
-            const affectedIds = decision.createErrorTasks.flatMap(e => e.affectedTaskIds);
-            taskManager.createErrorFixingTasks(errorInfos, affectedIds);
-            this.log(`Created ${decision.createErrorTasks.length} error tasks`);
-        }
-        
-        // 4. Ask user (store question for UI to display)
-        if (decision.askUser) {
-            state.pendingQuestions.push({
-                id: decision.askUser.questionId,
-                question: decision.askUser.question,
-                context: decision.askUser.context,
-                askedAt: new Date().toISOString(),
-                relatedTaskId: decision.askUser.relatedTaskId
-            });
-            this.log(`Asked user: ${decision.askUser.question}`);
-            
-            // Fire state change to notify UI of pending question
-            this._onSessionStateChanged.fire(sessionId);
-        }
-        
-        // 5. Dispatch workflows
-        for (const dispatch of decision.dispatch) {
-            try {
-                const session = this.stateManager.getPlanningSession(sessionId);
-                await this.dispatchWorkflow(
-                    sessionId,
-                    dispatch.workflowType,
-                    {
-                        taskId: dispatch.taskId,
-                        taskDescription: dispatch.context || '',
-                        dependencies: [],
-                        planPath: session?.currentPlanPath || ''
-                    },
-                    { priority: dispatch.priority }
-                );
-                this.log(`Dispatched ${dispatch.workflowType} for task ${dispatch.taskId}`);
-            } catch (e) {
-                this.log(`Failed to dispatch for task ${dispatch.taskId}: ${e}`);
-            }
-        }
-        
-        this._onSessionStateChanged.fire(sessionId);
-    }
+    // =========================================================================
+    // NOTE: executeCoordinatorDecision removed
+    // The Coordinator AI now calls run_terminal_cmd directly to execute commands.
+    // This allows parallel execution and eliminates fragile text parsing.
+    // If AI fails, it throws an error and the caller can retry.
+    // =========================================================================
     
     // =========================================================================
     // AGENT CLI COMPLETION SIGNALS

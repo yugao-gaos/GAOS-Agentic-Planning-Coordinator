@@ -115,7 +115,7 @@ export class DaemonStateProxy {
         }
 
         try {
-            const response = await this.vsCodeClient.send('session.get', { id: sessionId });
+            const response = await this.vsCodeClient.send<{ session: PlanningSession }>('session.get', { id: sessionId });
             return response.session;
         } catch (err) {
             console.warn('[DaemonStateProxy] Failed to get session from daemon:', err);
@@ -132,7 +132,7 @@ export class DaemonStateProxy {
         }
 
         try {
-            const response = await this.vsCodeClient.send('session.get', { id: sessionId });
+            const response = await this.vsCodeClient.send<{ session?: { progressLogPath?: string } }>('session.get', { id: sessionId });
             return response.session?.progressLogPath;
         } catch (err) {
             console.warn('[DaemonStateProxy] Failed to get progress log path:', err);
@@ -214,7 +214,7 @@ export class DaemonStateProxy {
         }
 
         try {
-            const response = await this.vsCodeClient.send('pool.agent.status', { name: agentName });
+            const response = await this.vsCodeClient.send<{ agent?: AgentStatus }>('pool.agent.status', { name: agentName });
             return response.agent;
         } catch (err) {
             console.warn('[DaemonStateProxy] Failed to get agent status from daemon:', err);
@@ -231,7 +231,7 @@ export class DaemonStateProxy {
         }
 
         try {
-            const response = await this.vsCodeClient.send('pool.role', { id: roleId });
+            const response = await this.vsCodeClient.send<{ role?: AgentRole }>('pool.role', { id: roleId });
             return response.role;
         } catch (err) {
             console.warn('[DaemonStateProxy] Failed to get role from daemon:', err);
@@ -252,7 +252,7 @@ export class DaemonStateProxy {
         }
 
         try {
-            const response = await this.vsCodeClient.send('task.assignments');
+            const response = await this.vsCodeClient.send<{ assignments?: AgentAssignment[] }>('task.assignments');
             return response.assignments || [];
         } catch (err) {
             console.warn('[DaemonStateProxy] Failed to get assignments from daemon:', err);
@@ -281,7 +281,7 @@ export class DaemonStateProxy {
         }
 
         try {
-            const response = await this.vsCodeClient.send('session.state', { id: sessionId });
+            const response = await this.vsCodeClient.send<{ state?: { isRevising: boolean; activeWorkflows?: Array<WorkflowProgress & { id: string }> } }>('session.state', { id: sessionId });
             if (response.state) {
                 // Convert workflows array to Map
                 const workflowsMap = new Map<string, WorkflowProgress>();
@@ -311,7 +311,7 @@ export class DaemonStateProxy {
         }
 
         try {
-            const response = await this.vsCodeClient.send('session.failed_tasks', { id: sessionId });
+            const response = await this.vsCodeClient.send<{ failedTasks?: FailedTask[] }>('session.failed_tasks', { id: sessionId });
             return response.failedTasks || [];
         } catch (err) {
             console.warn('[DaemonStateProxy] Failed to get failed tasks from daemon:', err);

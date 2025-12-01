@@ -269,16 +269,14 @@ export class AgentRoleRegistry {
             // Core execution roles
             'engineer',
             'code_reviewer',
-            'delta_context',
-            // Task context roles
+            // Context roles (gathering + delta updates)
             'context_gatherer',
             // Planning roles  
             'planner',
             'analyst_codex',
             'analyst_gemini',
-            'analyst_reviewer',
-            // Error handling
-            'error_analyst'
+            'analyst_reviewer'
+            // Note: error_analyst removed - ErrorResolutionWorkflow uses engineer role
         ];
         
         const builtIn = this.getBuiltInRoles()

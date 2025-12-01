@@ -18,7 +18,7 @@ export interface ApcRequest {
     /** Command to execute (e.g., 'session.create', 'pool.status') */
     cmd: string;
     /** Command parameters */
-    params?: Record<string, any>;
+    params?: Record<string, unknown>;
     /** Client identifier for multi-client scenarios */
     clientId?: string;
 }
@@ -32,7 +32,7 @@ export interface ApcResponse {
     /** Whether the command succeeded */
     success: boolean;
     /** Result data (command-specific) */
-    data?: any;
+    data?: unknown;
     /** Error message if success is false */
     error?: string;
     /** Human-readable message */
@@ -46,7 +46,7 @@ export interface ApcEvent {
     /** Event type (e.g., 'session.updated', 'agent.progress') */
     event: string;
     /** Event payload */
-    data: any;
+    data: unknown;
     /** When the event occurred */
     timestamp: string;
     /** Session ID if event is session-scoped */
@@ -227,7 +227,7 @@ export interface ExecStatusResponse {
 export interface WorkflowDispatchParams {
     sessionId: string;
     type: string;
-    input?: Record<string, any>;
+    input?: Record<string, unknown>;
 }
 
 export interface WorkflowDispatchResponse {
@@ -382,7 +382,7 @@ export interface UnityWaitResponse {
     taskId: string;
     waited: number;
     status: string;
-    result?: any;
+    result?: unknown;
 }
 
 // ============================================================================
@@ -501,7 +501,7 @@ export function generateRequestId(): string {
 /**
  * Create a request message
  */
-export function createRequest(cmd: string, params?: Record<string, any>): ApcRequest {
+export function createRequest(cmd: string, params?: Record<string, unknown>): ApcRequest {
     return {
         id: generateRequestId(),
         cmd,
@@ -512,7 +512,7 @@ export function createRequest(cmd: string, params?: Record<string, any>): ApcReq
 /**
  * Create an event message
  */
-export function createEvent(event: ApcEventType, data: any, sessionId?: string): ApcEvent {
+export function createEvent(event: ApcEventType, data: unknown, sessionId?: string): ApcEvent {
     return {
         event,
         data,
@@ -524,14 +524,14 @@ export function createEvent(event: ApcEventType, data: any, sessionId?: string):
 /**
  * Type guard for ApcResponse
  */
-export function isApcResponse(msg: any): msg is ApcResponse {
-    return msg && typeof msg.id === 'string' && typeof msg.success === 'boolean';
+export function isApcResponse(msg: unknown): msg is ApcResponse {
+    return typeof msg === 'object' && msg !== null && 'id' in msg && 'success' in msg && typeof (msg as ApcResponse).id === 'string' && typeof (msg as ApcResponse).success === 'boolean';
 }
 
 /**
  * Type guard for ApcEvent
  */
-export function isApcEvent(msg: any): msg is ApcEvent {
-    return msg && typeof msg.event === 'string' && msg.timestamp;
+export function isApcEvent(msg: unknown): msg is ApcEvent {
+    return typeof msg === 'object' && msg !== null && 'event' in msg && 'timestamp' in msg && typeof (msg as ApcEvent).event === 'string';
 }
 

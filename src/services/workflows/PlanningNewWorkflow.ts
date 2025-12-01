@@ -1,5 +1,6 @@
 // ============================================================================
-// PlanningNewWorkflow - Full planning loop: Context → (Planner → Analysts)* → Finalize
+// PlanningNewWorkflow - Full planning loop: (Planner → Analysts)* → Finalize
+// Note: Context phase removed - coordinator provides context via task metadata
 // ============================================================================
 
 import * as path from 'path';
@@ -19,17 +20,17 @@ import { ServiceLocator } from '../ServiceLocator';
  * Planning workflow for creating new plans
  * 
  * Phases:
- * 1. context - Gather project context
- * 2. planner - Initial plan creation
- * 3. analysts - Parallel analyst reviews
- * 4. (iteration) - Repeat planner → analysts if critical issues
- * 5. finalize - Finalize the plan
+ * 1. planner - Initial plan creation
+ * 2. analysts - Parallel analyst reviews
+ * 3. (iteration) - Repeat planner → analysts if critical issues
+ * 4. finalize - Finalize the plan
+ * 
+ * Note: Context phase removed - coordinator provides context via task metadata.
  * 
  * Max iterations: 3
  */
 export class PlanningNewWorkflow extends BaseWorkflow {
     private static readonly PHASES = [
-        'context',
         'planner',
         'analysts',
         'finalize'
@@ -70,10 +71,6 @@ export class PlanningNewWorkflow extends BaseWorkflow {
         const phase = this.getPhases()[phaseIndex];
         
         switch (phase) {
-            case 'context':
-                await this.executeContextPhase();
-                break;
-                
             case 'planner':
                 await this.executePlannerPhase();
                 break;
@@ -135,34 +132,20 @@ export class PlanningNewWorkflow extends BaseWorkflow {
     // PHASE IMPLEMENTATIONS
     // =========================================================================
     
-    private async executeContextPhase(): Promise<void> {
-        // Initialize paths
-        this.stateManager.ensurePlanDirectories(this.sessionId);
-        this.planPath = this.stateManager.getPlanFilePath(this.sessionId);
-        this.contextPath = path.join(
-            this.stateManager.getPlanFolder(this.sessionId), 
-            'context.md'
-        );
-        
-        this.log('📂 PHASE: CONTEXT PREPARATION');
-        
-        const role = this.getRole('context_gatherer');
-        const prompt = this.buildContextPrompt(role);
-        
-        this.log(`Running context gatherer (${role?.defaultModel || 'gemini-3-pro'})...`);
-        
-        const result = await this.runAgentTask('context_gatherer', prompt, role);
-        
-        if (result.success && result.output) {
-            fs.writeFileSync(this.contextPath, result.output);
-            this.log(`✓ Context saved to ${path.basename(this.contextPath)}`);
-        } else {
-            this.log(`⚠️ Context gathering failed, using minimal context`);
-            fs.writeFileSync(this.contextPath, `# Project Context\n\nRequirement: ${this.requirement}\n`);
-        }
-    }
+    // Note: Context phase removed - coordinator provides context via task metadata
+    // Context is now gathered separately via ContextGatheringWorkflow if needed
     
     private async executePlannerPhase(): Promise<void> {
+        // Initialize paths on first iteration
+        if (this.iteration === 0) {
+            this.stateManager.ensurePlanDirectories(this.sessionId);
+            this.planPath = this.stateManager.getPlanFilePath(this.sessionId);
+            this.contextPath = path.join(
+                this.stateManager.getPlanFolder(this.sessionId), 
+                'context.md'
+            );
+        }
+        
         this.iteration++;
         
         this.log('');
@@ -256,6 +239,10 @@ export class PlanningNewWorkflow extends BaseWorkflow {
     // PROMPT BUILDERS
     // =========================================================================
     
+    /**
+     * @deprecated Context phase removed - coordinator provides context via task metadata.
+     * Use ContextGatheringWorkflow for explicit context gathering.
+     */
     private buildContextPrompt(role: AgentRole | undefined): string {
         if (!role?.promptTemplate) {
             throw new Error('Missing prompt template for context_gatherer role');

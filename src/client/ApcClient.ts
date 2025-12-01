@@ -23,8 +23,7 @@ import {
     PoolResizeResponse,
     AgentPoolResponse,
     AgentRolesResponse,
-    UnityStatusResponse,
-    WorkflowSummaryData
+    UnityStatusResponse
 } from './Protocol';
 
 // ============================================================================
@@ -72,12 +71,12 @@ export interface IApcClient {
      * @param params Command parameters
      * @returns Promise with response data
      */
-    send<T = any>(cmd: string, params?: Record<string, any>): Promise<T>;
+    send<T = unknown>(cmd: string, params?: Record<string, unknown>): Promise<T>;
     
     /**
      * Send a request without waiting for response (fire-and-forget)
      */
-    sendAsync(cmd: string, params?: Record<string, any>): void;
+    sendAsync(cmd: string, params?: Record<string, unknown>): void;
     
     // ========================================================================
     // Event Handling
@@ -89,7 +88,7 @@ export interface IApcClient {
      * @param handler Callback function
      * @returns Unsubscribe function
      */
-    on(event: ApcEventType | 'connected' | 'disconnected' | 'error', handler: (data: any) => void): () => void;
+    on(event: ApcEventType | 'connected' | 'disconnected' | 'error', handler: (data: unknown) => void): () => void;
     
     /**
      * Subscribe to all events
@@ -101,7 +100,7 @@ export interface IApcClient {
     /**
      * Remove event listener
      */
-    off(event: string, handler: (...args: any[]) => void): void;
+    off(event: string, handler: (...args: unknown[]) => void): void;
 }
 
 // ============================================================================
@@ -155,6 +154,7 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
     protected options: Required<ApcClientOptions>;
     protected state: ConnectionState = 'disconnected';
     protected reconnectAttempts: number = 0;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     protected pendingRequests: Map<string, {
         resolve: (value: any) => void;
         reject: (error: Error) => void;
@@ -198,7 +198,7 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
     // Command Execution
     // ========================================================================
     
-    async send<T = any>(cmd: string, params?: Record<string, any>): Promise<T> {
+    async send<T = unknown>(cmd: string, params?: Record<string, unknown>): Promise<T> {
         if (!this.isConnected()) {
             throw new Error('Not connected to APC daemon');
         }
@@ -231,7 +231,7 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
         });
     }
     
-    sendAsync(cmd: string, params?: Record<string, any>): void {
+    sendAsync(cmd: string, params?: Record<string, unknown>): void {
         if (!this.isConnected()) {
             console.warn('Not connected to APC daemon, dropping async message');
             return;
@@ -258,7 +258,7 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
     /**
      * Subscribe to an event. Returns an unsubscribe function.
      */
-    subscribe(event: ApcEventType | 'connected' | 'disconnected' | 'error' | string, handler: (data: any) => void): () => void {
+    subscribe(event: ApcEventType | 'connected' | 'disconnected' | 'error' | string, handler: (data: unknown) => void): () => void {
         super.on(event, handler);
         return () => super.removeListener(event, handler);
     }
@@ -273,8 +273,8 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
     }
     
     // Implement IApcClient interface methods using the subscribe methods
-    // @ts-ignore - Return type differs from EventEmitter but matches IApcClient
-    on(event: ApcEventType | 'connected' | 'disconnected' | 'error' | string, handler: (data: any) => void): () => void {
+    // @ts-expect-error - Return type differs from EventEmitter but matches IApcClient
+    on(event: ApcEventType | 'connected' | 'disconnected' | 'error' | string, handler: (data: unknown) => void): () => void {
         return this.subscribe(event, handler);
     }
     
@@ -282,8 +282,8 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
         return this.subscribeAll(handler);
     }
     
-    // @ts-ignore - Return type differs from EventEmitter but matches IApcClient
-    off(event: string, handler: (...args: any[]) => void): void {
+    // @ts-expect-error - Return type differs from EventEmitter but matches IApcClient
+    off(event: string, handler: (...args: unknown[]) => void): void {
         super.removeListener(event, handler);
     }
     
@@ -379,7 +379,7 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
     
     dispose(): void {
         // Cancel all pending requests
-        for (const [id, pending] of this.pendingRequests) {
+        for (const [_id, pending] of this.pendingRequests) {
             clearTimeout(pending.timeout);
             pending.reject(new Error('Client disposed'));
         }

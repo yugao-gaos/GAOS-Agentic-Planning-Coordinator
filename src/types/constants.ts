@@ -44,7 +44,7 @@ export function getModelLabel(value: string): string {
  */
 export const ROLE_WORKFLOW_MAP: Record<string, string[]> = {
     // Planning phase roles
-    'context_gatherer': ['planning_new', 'task_implementation'],
+    'context_gatherer': ['planning_new', 'task_implementation', 'context_gathering'],
     'planner': ['planning_new', 'planning_revision'],
     'analyst_codex': ['planning_new', 'planning_revision'],
     'analyst_gemini': ['planning_new'],
@@ -52,11 +52,8 @@ export const ROLE_WORKFLOW_MAP: Record<string, string[]> = {
     
     // Execution phase roles
     'engineer': ['task_implementation', 'error_resolution'],
-    'code_reviewer': ['task_implementation'],
-    'delta_context': ['task_implementation'],
-    
-    // Error handling
-    'error_analyst': ['error_resolution']
+    'code_reviewer': ['task_implementation']
+    // Note: error_analyst removed - ErrorResolutionWorkflow uses engineer role
 };
 
 /**

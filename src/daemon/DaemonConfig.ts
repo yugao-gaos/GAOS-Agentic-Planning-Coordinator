@@ -41,6 +41,9 @@ export interface CoreConfig {
     /** Path to Unity best practices document */
     unityBestPracticesPath: string;
     
+    /** Whether Unity features are enabled */
+    enableUnityFeatures: boolean;
+    
     /** Daemon port */
     port: number;
     
@@ -58,6 +61,7 @@ export const DEFAULT_CONFIG: Omit<CoreConfig, 'workspaceRoot'> = {
     useIterativePlanning: true,
     stateUpdateInterval: 5000,
     unityBestPracticesPath: '',
+    enableUnityFeatures: true,  // Unity enabled by default
     port: 19840,
     logLevel: 'info'
 };
@@ -173,6 +177,10 @@ export class ConfigLoader {
             sanitized.unityBestPracticesPath = raw.unityBestPracticesPath;
         }
         
+        if (typeof raw.enableUnityFeatures === 'boolean') {
+            sanitized.enableUnityFeatures = raw.enableUnityFeatures;
+        }
+        
         if (typeof raw.port === 'number' && raw.port >= 1024 && raw.port <= 65535) {
             sanitized.port = raw.port;
         }
@@ -217,6 +225,11 @@ export class ConfigLoader {
         // APC_LOG_LEVEL
         if (process.env.APC_LOG_LEVEL && ['debug', 'info', 'warn', 'error'].includes(process.env.APC_LOG_LEVEL)) {
             config.logLevel = process.env.APC_LOG_LEVEL as CoreConfig['logLevel'];
+        }
+        
+        // APC_ENABLE_UNITY
+        if (process.env.APC_ENABLE_UNITY !== undefined) {
+            config.enableUnityFeatures = process.env.APC_ENABLE_UNITY !== 'false';
         }
     }
     

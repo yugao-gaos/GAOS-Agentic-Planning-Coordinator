@@ -114,6 +114,12 @@ body {
     gap: 8px;
 }
 
+.section-header-right {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
 .section-content {
     overflow-y: auto;
     padding: 8px;

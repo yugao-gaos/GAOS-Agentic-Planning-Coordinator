@@ -12,9 +12,8 @@
 // structured decisions that the UnifiedCoordinatorService executes.
 
 import * as fs from 'fs';
-import { AgentRunner, AgentRunOptions } from './AgentBackend';
+import { AgentRunner } from './AgentBackend';
 import { OutputChannelManager } from './OutputChannelManager';
-import { ErrorClassifier, ErrorClassification } from './workflows/ErrorClassifier';
 import { AgentRoleRegistry } from './AgentRoleRegistry';
 import { ServiceLocator } from './ServiceLocator';
 import {
@@ -27,15 +26,13 @@ import {
     DEFAULT_COORDINATOR_CONFIG,
     TaskSummary,
     ActiveWorkflowSummary,
-    DispatchInstruction,
-    UserQuestion,
-    ErrorTaskInstruction,
     ExecutionStartedPayload,
     WorkflowCompletedPayload,
     WorkflowFailedPayload,
     UnityErrorPayload
 } from '../types/coordinator';
 import { DefaultCoordinatorPrompt } from '../types';
+import { getEffectiveCoordinatorPrompts } from './WorkflowSettingsManager';
 
 /**
  * AI Coordinator Agent - Makes intelligent decisions about workflow dispatch
@@ -71,6 +68,9 @@ export class CoordinatorAgent {
     private outputManager: OutputChannelManager;
     private config: CoordinatorAgentConfig;
     private roleRegistry?: AgentRoleRegistry;
+    private workflowRegistry?: import('./workflows').WorkflowRegistry;
+    private unityEnabled: boolean = true;
+    private workspaceRoot: string = process.cwd();
     private evaluationCount: number = 0;
     
     // Debounce state
@@ -97,12 +97,37 @@ export class CoordinatorAgent {
     setRoleRegistry(registry: AgentRoleRegistry): void {
         this.roleRegistry = registry;
     }
+    
+    /**
+     * Set the workflow registry (for dynamic workflow prompts)
+     */
+    setWorkflowRegistry(registry: import('./workflows').WorkflowRegistry): void {
+        this.workflowRegistry = registry;
+    }
+    
+    /**
+     * Set whether Unity features are enabled (affects which workflows are available)
+     */
+    setUnityEnabled(enabled: boolean): void {
+        this.unityEnabled = enabled;
+    }
+    
+    /**
+     * Set the workspace root (for loading user settings)
+     */
+    setWorkspaceRoot(root: string): void {
+        this.workspaceRoot = root;
+    }
 
     /**
      * Evaluate the current situation and make decisions
      * 
+     * The AI executes commands directly via run_terminal_cmd.
+     * If evaluation fails, throws an error for retry handling upstream.
+     * 
      * @param input - Full context including event, plan, history, and state
-     * @returns Structured decision about what actions to take
+     * @returns Structured decision (mostly for logging - AI executes directly)
+     * @throws Error if AI evaluation fails (caller should retry)
      */
     async evaluate(input: CoordinatorInput): Promise<CoordinatorDecision> {
         this.evaluationCount++;
@@ -110,49 +135,36 @@ export class CoordinatorAgent {
         
         this.log(`Starting evaluation #${this.evaluationCount} for event: ${input.event.type}`);
         
-        try {
-            // Build the prompt with full context
-            const prompt = this.buildPrompt(input);
-            
-            if (this.config.debug) {
-                this.log(`[DEBUG] Prompt length: ${prompt.length} chars`);
-            }
-            
-            // Run the AI agent
-            const result = await this.agentRunner.run({
-                id: evalId,
-                prompt,
-                cwd: process.cwd(),
-                model: this.config.model,
-                timeoutMs: this.config.evaluationTimeout,
-                onProgress: (msg) => this.log(`[eval] ${msg}`)
-            });
-            
-            if (!result.success) {
-                this.log(`Evaluation failed: ${result.error || 'Unknown error'}`);
-                return this.createFallbackDecision(input, result.error);
-            }
-            
-            // Parse the decision from AI output
-            const decision = this.parseDecision(result.output, input);
-            
-            this.log(`Evaluation complete: dispatch=${decision.dispatch.length}, askUser=${!!decision.askUser}, pause=${decision.pauseTasks.length}`);
-            
-            return decision;
-            
-        } catch (error) {
-            const errorMsg = error instanceof Error ? error.message : String(error);
-            
-            // Classify the error to provide better fallback reasoning
-            const classifier = ServiceLocator.resolve(ErrorClassifier);
-            const classification = classifier.classify(errorMsg);
-            
-            this.log(`Evaluation error: ${errorMsg}`);
-            this.log(`  Error type: ${classification.type} (${classification.category})`);
-            this.log(`  Suggested action: ${classification.suggestedAction}`);
-            
-            return this.createFallbackDecision(input, errorMsg, classification);
+        // Build the prompt with full context
+        const prompt = this.buildPrompt(input);
+        
+        if (this.config.debug) {
+            this.log(`[DEBUG] Prompt length: ${prompt.length} chars`);
         }
+        
+        // Run the AI agent - it will call run_terminal_cmd directly
+        const result = await this.agentRunner.run({
+            id: evalId,
+            prompt,
+            cwd: process.cwd(),
+            model: this.config.model,
+            timeoutMs: this.config.evaluationTimeout,
+            onProgress: (msg) => this.log(`[eval] ${msg}`)
+        });
+        
+        if (!result.success) {
+            const error = result.error || 'Unknown error';
+            this.log(`Evaluation failed: ${error}`);
+            throw new Error(`Coordinator AI evaluation failed: ${error}`);
+        }
+        
+        // Parse reasoning/confidence from output (for logging only)
+        // The AI already executed commands via run_terminal_cmd
+        const decision = this.parseDecision(result.output, input);
+        
+        this.log(`Evaluation complete. Reasoning: ${decision.reasoning.substring(0, 100)}...`);
+        
+        return decision;
     }
 
     /**
@@ -174,10 +186,17 @@ export class CoordinatorAgent {
         // Get customizable prompt parts from registry (or use defaults)
         const promptConfig = this.roleRegistry?.getCoordinatorPrompt() || DefaultCoordinatorPrompt;
         
+        // Get user-configured workflow prompts (overrides + defaults)
+        const userOverrides = getEffectiveCoordinatorPrompts(this.workspaceRoot);
+        
+        // Get dynamic workflow prompts from registry, with user overrides applied
+        const workflowPrompts = this.workflowRegistry?.getCoordinatorPrompts(this.unityEnabled, userOverrides) || '';
+        
         // Replace template variables in decision instructions
         const decisionInstructions = promptConfig.decisionInstructions
             .replace('{{sessionId}}', input.sessionId)
-            .replace('{{timestamp}}', String(Date.now()));
+            .replace('{{timestamp}}', String(Date.now()))
+            .replace('{{WORKFLOW_SELECTION}}', workflowPrompts || 'No workflows registered');
         
         return `${promptConfig.roleIntro}
 
@@ -392,168 +411,29 @@ ${JSON.stringify(input.event.payload, null, 2)}`;
 
     /**
      * Parse AI output into structured decision
-     */
-    private parseDecision(output: string, input: CoordinatorInput): CoordinatorDecision {
-        try {
-            // Extract JSON from output (handle potential markdown fences)
-            let jsonStr = output;
-            
-            // Remove markdown code fences if present
-            const jsonMatch = output.match(/```(?:json)?\s*([\s\S]*?)```/);
-            if (jsonMatch) {
-                jsonStr = jsonMatch[1];
-            }
-            
-            // Find JSON object in output
-            const jsonStart = jsonStr.indexOf('{');
-            const jsonEnd = jsonStr.lastIndexOf('}');
-            if (jsonStart >= 0 && jsonEnd > jsonStart) {
-                jsonStr = jsonStr.substring(jsonStart, jsonEnd + 1);
-            }
-            
-            const parsed = JSON.parse(jsonStr);
-            
-            // Validate and normalize the decision
-            return this.normalizeDecision(parsed);
-            
-        } catch (error) {
-            this.log(`Failed to parse AI decision: ${error}`);
-            return this.createFallbackDecision(input, `Parse error: ${error}`);
-        }
-    }
-
-    /**
-     * Normalize and validate parsed decision
-     */
-    private normalizeDecision(raw: any): CoordinatorDecision {
-        return {
-            dispatch: Array.isArray(raw.dispatch) 
-                ? raw.dispatch.map((d: any) => ({
-                    taskId: String(d.taskId || ''),
-                    workflowType: d.workflowType || 'task_implementation',
-                    priority: typeof d.priority === 'number' ? d.priority : 10,
-                    preferredAgent: d.preferredAgent,
-                    context: d.context
-                } as DispatchInstruction))
-                : [],
-            askUser: raw.askUser ? {
-                sessionId: String(raw.askUser.sessionId || ''),
-                questionId: String(raw.askUser.questionId || `q_${Date.now()}`),
-                question: String(raw.askUser.question || ''),
-                context: String(raw.askUser.context || ''),
-                relatedTaskId: raw.askUser.relatedTaskId,
-                options: raw.askUser.options,
-                blocking: Boolean(raw.askUser.blocking)
-            } as UserQuestion : null,
-            pauseTasks: Array.isArray(raw.pauseTasks) ? raw.pauseTasks.map(String) : [],
-            resumeTasks: Array.isArray(raw.resumeTasks) ? raw.resumeTasks.map(String) : [],
-            createErrorTasks: Array.isArray(raw.createErrorTasks)
-                ? raw.createErrorTasks.map((e: any) => ({
-                    errorId: String(e.errorId || `err_${Date.now()}`),
-                    errorMessage: String(e.errorMessage || ''),
-                    file: e.file,
-                    affectedTaskIds: Array.isArray(e.affectedTaskIds) ? e.affectedTaskIds.map(String) : [],
-                    priority: typeof e.priority === 'number' ? e.priority : 0
-                } as ErrorTaskInstruction))
-                : [],
-            reasoning: String(raw.reasoning || 'No reasoning provided'),
-            confidence: typeof raw.confidence === 'number' ? raw.confidence : 0.5
-        };
-    }
-
-    /**
-     * Create a fallback decision when AI evaluation fails
-     * Uses priority-based task selection when AI is unavailable
      * 
-     * @param input The coordinator input
-     * @param error Optional error message
-     * @param classification Optional error classification from ErrorClassifier
+     * New architecture: The AI executes commands directly via run_terminal_cmd.
+     * We only extract reasoning/confidence for logging - no command parsing needed.
      */
-    private createFallbackDecision(
-        input: CoordinatorInput, 
-        error?: string,
-        classification?: ErrorClassification
-    ): CoordinatorDecision {
-        // Filter to tasks that can be dispatched
-        // TaskSummary.status is a narrower type, so we check for 'pending' which means ready to start
-        const dispatchableTasks = input.tasks.filter(t => 
-            t.status === 'pending' && 
-            t.dependencyStatus === 'all_complete'
-        );
+    /**
+     * Parse AI output for logging purposes only.
+     * AI executes commands directly via run_terminal_cmd - no command parsing needed.
+     */
+    private parseDecision(output: string, _input: CoordinatorInput): CoordinatorDecision {
+        // Extract reasoning and confidence for logging
+        const reasoningMatch = output.match(/REASONING:\s*(.+?)(?=CONFIDENCE:|```|$)/s);
+        const confidenceMatch = output.match(/CONFIDENCE:\s*([\d.]+)/);
         
-        // Priority 1: Error tasks (highest priority)
-        const errorTasks = dispatchableTasks.filter(t => t.type === 'error_fix');
+        const reasoning = reasoningMatch 
+            ? reasoningMatch[1].trim() 
+            : 'No reasoning provided';
+        const confidence = confidenceMatch 
+            ? parseFloat(confidenceMatch[1]) 
+            : 0.7;
         
-        // Priority 2: High priority tasks (priority < 5)
-        const highPriorityTasks = dispatchableTasks.filter(t => 
-            t.type !== 'error_fix' && t.priority < 5
-        );
-        
-        // Priority 3: Regular tasks
-        const regularTasks = dispatchableTasks.filter(t => 
-            t.type !== 'error_fix' && t.priority >= 5
-        );
-        
-        // Combine in priority order
-        const sortedTasks = [
-            ...errorTasks.sort((a, b) => a.priority - b.priority),
-            ...highPriorityTasks.sort((a, b) => a.priority - b.priority),
-            ...regularTasks.sort((a, b) => a.priority - b.priority)
-        ];
-        
-        const dispatch: DispatchInstruction[] = [];
-        const availableAgents = [...input.availableAgents];
-        
-        // Dispatch up to number of available agents
-        const maxDispatch = Math.min(sortedTasks.length, availableAgents.length);
-        
-        for (let i = 0; i < maxDispatch; i++) {
-            const task = sortedTasks[i];
-            dispatch.push({
-                taskId: task.id,
-                workflowType: task.type === 'error_fix' ? 'error_resolution' : 'task_implementation',
-                priority: task.priority,
-                preferredAgent: availableAgents[i],
-                context: task.type === 'error_fix' 
-                    ? 'Fallback: prioritizing error resolution'
-                    : task.priority < 5 
-                        ? 'Fallback: high priority task'
-                        : 'Fallback: ready task with complete dependencies'
-            });
-        }
-        
-        // Build detailed reasoning
-        const reasoningParts = [
-            `Fallback decision due to: ${error || 'AI evaluation unavailable'}`
-        ];
-        
-        // Add error classification details if available
-        if (classification) {
-            reasoningParts.push(
-                `Error type: ${classification.type} (${classification.category})`,
-                `Suggested action: ${classification.suggestedAction}`
-            );
-        }
-        
-        reasoningParts.push(
-            `Available agents: ${availableAgents.length}`,
-            `Dispatchable tasks: ${dispatchableTasks.length} (${errorTasks.length} errors, ${highPriorityTasks.length} high-priority, ${regularTasks.length} regular)`,
-            `Dispatching: ${dispatch.length} tasks`
-        );
-        
-        if (dispatch.length > 0) {
-            reasoningParts.push(`First dispatch: ${dispatch[0].taskId} (${dispatch[0].workflowType})`);
-        }
-        
-        return {
-            dispatch,
-            askUser: null,
-            pauseTasks: [],
-            resumeTasks: [],
-            createErrorTasks: [],
-            reasoning: reasoningParts.join('. '),
-            confidence: 0.3
-        };
+        // AI executes commands directly via run_terminal_cmd
+        // This decision object is only for logging/history
+        return { reasoning, confidence };
     }
 
     /**
@@ -669,20 +549,41 @@ ${JSON.stringify(input.event.payload, null, 2)}`;
             eventsBySession.get(sessionId)!.push(event);
         }
         
-        // Run evaluations sequentially
+        // Run evaluations sequentially with retry
         for (const [sessionId, events] of eventsBySession) {
-            try {
-                const combinedEvent = this.combineEvents(sessionId, events);
-                this.log(`Running evaluation for session ${sessionId} with ${events.length} events`);
-                
-                const input = await buildInputFn(sessionId, combinedEvent);
-                const decision = await this.evaluate(input);
-                
-                if (this.executeDecisionCallback) {
-                    await this.executeDecisionCallback(sessionId, decision);
+            const combinedEvent = this.combineEvents(sessionId, events);
+            this.log(`Running evaluation for session ${sessionId} with ${events.length} events`);
+            
+            // Retry logic: try up to 3 times with exponential backoff
+            const maxRetries = 3;
+            let lastError: Error | null = null;
+            
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    const input = await buildInputFn(sessionId, combinedEvent);
+                    const decision = await this.evaluate(input);
+                    
+                    if (this.executeDecisionCallback) {
+                        await this.executeDecisionCallback(sessionId, decision);
+                    }
+                    
+                    // Success - break retry loop
+                    lastError = null;
+                    break;
+                    
+                } catch (e) {
+                    lastError = e instanceof Error ? e : new Error(String(e));
+                    
+                    if (attempt < maxRetries) {
+                        const delayMs = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s
+                        this.log(`Evaluation attempt ${attempt}/${maxRetries} failed: ${lastError.message}. Retrying in ${delayMs/1000}s...`);
+                        await new Promise(resolve => setTimeout(resolve, delayMs));
+                    }
                 }
-            } catch (e) {
-                this.log(`Evaluation failed for session ${sessionId}: ${e}`);
+            }
+            
+            if (lastError) {
+                this.log(`Evaluation failed for session ${sessionId} after ${maxRetries} attempts: ${lastError.message}`);
             }
         }
         
@@ -739,6 +640,8 @@ ${JSON.stringify(input.event.payload, null, 2)}`;
     
     /**
      * Create a history entry from an event and decision
+     * NOTE: AI executes commands directly via run_terminal_cmd,
+     * so dispatch/pause/resume counts are not tracked in decision anymore.
      */
     createHistoryEntry(event: CoordinatorEvent, decision: CoordinatorDecision): CoordinatorHistoryEntry {
         return {
@@ -748,11 +651,11 @@ ${JSON.stringify(input.event.payload, null, 2)}`;
                 summary: this.summarizeEvent(event)
             },
             decision: {
-                dispatchCount: decision.dispatch.length,
-                dispatchedTasks: decision.dispatch.map(d => d.taskId),
-                askedUser: !!decision.askUser,
-                pausedCount: decision.pauseTasks.length,
-                resumedCount: decision.resumeTasks.length,
+                dispatchCount: 0,  // AI dispatches directly via CLI
+                dispatchedTasks: [],
+                askedUser: false,
+                pausedCount: 0,
+                resumedCount: 0,
                 reasoning: decision.reasoning
             }
         };

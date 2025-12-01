@@ -1,17 +1,11 @@
 import * as vscode from 'vscode';
-import { StateManager } from './services/StateManager';
-import { AgentPoolService } from './services/AgentPoolService';
-import { AgentRoleRegistry } from './services/AgentRoleRegistry';
 import { TerminalManager } from './services/TerminalManager';
-import { UnifiedCoordinatorService } from './services/UnifiedCoordinatorService';
-import { PlanningService } from './services/PlanningService';
 import { DependencyService } from './services/DependencyService';
-import { CliHandler } from './cli/CliHandler';
 import { PlanningSessionsProvider, PlanningSessionItem } from './ui/PlanningSessionsProvider';
 import { AgentPoolProvider } from './ui/AgentPoolProvider';
 import { RoleSettingsPanel } from './ui/RoleSettingsPanel';
+import { WorkflowSettingsPanel } from './ui/WorkflowSettingsPanel';
 import { SidebarViewProvider } from './ui/SidebarViewProvider';
-import { UnityControlManager } from './services/UnityControlManager';
 import { AgentRunner, AgentBackendType } from './services/AgentBackend';
 import { EventBroadcaster } from './daemon/EventBroadcaster';
 import { TaskFailedFinalEventData } from './client/ClientEvents';
@@ -19,16 +13,10 @@ import { DaemonManager } from './vscode/DaemonManager';
 import { VsCodeClient } from './vscode/VsCodeClient';
 import { DaemonStateProxy } from './services/DaemonStateProxy';
 import { bootstrapServices, ServiceLocator } from './services/Bootstrap';
-import { WorkflowPauseManager } from './services/workflows/WorkflowPauseManager';
 import { ProcessManager } from './services/ProcessManager';
 
-let stateManager: StateManager;
-let agentPoolService: AgentPoolService;
-let agentRoleRegistry: AgentRoleRegistry;
+// Module-level references (kept minimal - only what must be local)
 let terminalManager: TerminalManager;
-let unifiedCoordinatorService: UnifiedCoordinatorService;
-let planningService: PlanningService;
-let cliHandler: CliHandler;
 let daemonManager: DaemonManager;
 let vsCodeClient: VsCodeClient;
 let daemonStateProxy: DaemonStateProxy;
@@ -105,12 +93,12 @@ export async function activate(context: vscode.ExtensionContext) {
     }
     console.log(`[APC] Step 1: Workspace root = ${workspaceRoot}`);
     
-    // Bootstrap all services with ServiceLocator
-    console.log('[APC] Step 2: Bootstrapping services...');
+    // Bootstrap base services with ServiceLocator (for local-only services)
+    console.log('[APC] Step 2: Bootstrapping base services...');
     bootstrapServices();
-    console.log('[APC] Step 2: Services bootstrapped');
+    console.log('[APC] Step 2: Base services bootstrapped');
     
-    // Initialize AgentRunner with configured backend
+    // Initialize AgentRunner with configured backend (needed for local agent spawning)
     console.log('[APC] Step 3: Setting up AgentRunner...');
     const config = vscode.workspace.getConfiguration('agenticPlanning');
     const backendType = config.get<string>('defaultBackend', 'cursor') as AgentBackendType;
@@ -118,96 +106,33 @@ export async function activate(context: vscode.ExtensionContext) {
     agentRunner.setBackend(backendType);
     console.log(`[APC] Step 3: Agent backend = ${backendType}`);
 
-    // Create placeholder providers first so TreeViews are always registered
-    // This prevents "no data provider" errors even if initialization fails
-    console.log('[APC] Step 4: Creating sidebar provider...');
-    const dependencyService = ServiceLocator.resolve(DependencyService);
-    dependencyService.setWorkspaceRoot(workspaceRoot);
-    const sidebarProvider = new SidebarViewProvider(context.extensionUri);
-    console.log('[APC] Step 4: Sidebar provider created');
-    let planningSessionsProvider: PlanningSessionsProvider;
-    let agentPoolProvider: AgentPoolProvider;
-    
-    try {
-    // Initialize services with config from VS Code settings
-    const vsConfig = vscode.workspace.getConfiguration('agenticPlanning');
-    stateManager = new StateManager({
-        workspaceRoot,
-        workingDirectory: vsConfig.get('workingDirectory', '_AiDevLog'),
-        agentPoolSize: vsConfig.get('agentPoolSize', 5),
-        defaultBackend: vsConfig.get('defaultBackend', 'cursor') as 'cursor' | 'claude-code' | 'codex'
-    });
-    await stateManager.initialize();
-        
-        // Debug: Log what we loaded
-        const sessions = stateManager.getAllPlanningSessions();
-        console.log(`Agentic Planning: Loaded ${sessions.length} planning sessions`);
-        sessions.forEach(s => console.log(`  - Session: ${s.id}, status: ${s.status}`));
-
-    agentRoleRegistry = new AgentRoleRegistry(stateManager);
-    agentPoolService = new AgentPoolService(stateManager, agentRoleRegistry);
+    // Initialize local-only services
     terminalManager = new TerminalManager();
     
-    // Check if Unity features are enabled
-    const unityFeaturesEnabled = vsConfig.get<boolean>('enableUnityFeatures', true);
-    console.log(`Agentic Planning: Unity features ${unityFeaturesEnabled ? 'enabled' : 'disabled'}`);
-    
-    // Configure services for Unity mode
-    agentRoleRegistry.setUnityEnabled(unityFeaturesEnabled);
-    
-    // Register and initialize unified coordinator service
-    ServiceLocator.register(UnifiedCoordinatorService, () => 
-        new UnifiedCoordinatorService(stateManager, agentPoolService, agentRoleRegistry)
-    );
-    unifiedCoordinatorService = ServiceLocator.resolve(UnifiedCoordinatorService);
-    
-    // Create PlanningService with coordinator (now required)
-    planningService = new PlanningService(stateManager, unifiedCoordinatorService);
-        
-        // Create providers with initialized services
-        planningSessionsProvider = new PlanningSessionsProvider(stateManager);
-        agentPoolProvider = new AgentPoolProvider(agentPoolService);
-        
-        // Set services on sidebar provider
-        sidebarProvider.setServices(stateManager, agentPoolService);
-    
-    cliHandler = new CliHandler(stateManager, agentPoolService, unifiedCoordinatorService, planningService, terminalManager);
-    
-    // Initialize WorkflowPauseManager with StateManager for persistence
-    const pauseManager = ServiceLocator.resolve(WorkflowPauseManager);
-    pauseManager.setStateManager(stateManager);
-    
-    // Recover any sessions that were paused when extension was deactivated
-    unifiedCoordinatorService.recoverAllSessions().then((count) => {
-        if (count > 0) {
-            console.log(`Agentic Planning: Recovered ${count} paused workflow(s)`);
-            vscode.window.showInformationMessage(
-                `Recovered ${count} paused workflow(s). Check the sidebar to resume.`
-            );
-        }
-    }).catch((e) => {
-        console.error('Agentic Planning: Failed to recover sessions:', e);
-    });
-    
-    // Clean up old temp files from previous sessions
-    const tempAgentRunner = ServiceLocator.resolve(AgentRunner);
-    const cleaned = (tempAgentRunner as any).cleanupTempFiles?.();
-    if (cleaned > 0) {
-        console.log(`Agentic Planning: Cleaned up ${cleaned} old temp files`);
-    }
+    // Initialize DependencyService (local utility)
+    const dependencyService = ServiceLocator.resolve(DependencyService);
+    dependencyService.setWorkspaceRoot(workspaceRoot);
+    const unityFeaturesEnabled = config.get<boolean>('enableUnityFeatures', true);
+    dependencyService.setUnityEnabled(unityFeaturesEnabled);
+
+    // Create UI providers
+    console.log('[APC] Step 4: Creating sidebar provider...');
+    const sidebarProvider = new SidebarViewProvider(context.extensionUri);
+    sidebarProvider.setUnityEnabled(unityFeaturesEnabled);
+    console.log('[APC] Step 4: Sidebar provider created');
     
     // ========================================================================
-    // Daemon Connection
+    // Daemon Connection - This is the main state source
     // ========================================================================
-    console.log('[APC] Step 6: Starting daemon connection...');
+    console.log('[APC] Step 5: Starting daemon connection...');
     
     // Initialize daemon manager and ensure daemon is running
     daemonManager = new DaemonManager(workspaceRoot, context.extensionPath);
     
     try {
-        console.log('[APC] Step 6a: Calling ensureDaemonRunning...');
+        console.log('[APC] Step 5a: Calling ensureDaemonRunning...');
         const daemonResult = await daemonManager.ensureDaemonRunning();
-        console.log(`[APC] Step 6b: Daemon on port ${daemonResult.port} (wasStarted: ${daemonResult.wasStarted}, isExternal: ${daemonResult.isExternal})`);
+        console.log(`[APC] Step 5b: Daemon on port ${daemonResult.port} (wasStarted: ${daemonResult.wasStarted}, isExternal: ${daemonResult.isExternal})`);
         
         // Create and connect VS Code client
         vsCodeClient = new VsCodeClient({
@@ -224,13 +149,13 @@ export async function activate(context: vscode.ExtensionContext) {
         });
         
         // Connect to daemon with retry (daemon may still be starting up)
-        console.log('[APC] Step 6c: Connecting to daemon...');
+        console.log('[APC] Step 5c: Connecting to daemon...');
         const maxRetries = 5;
         let lastError: Error | undefined;
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 await vsCodeClient.connect();
-                console.log(`[APC] Step 6d: Connected to daemon (attempt ${attempt})`);
+                console.log(`[APC] Step 5d: Connected to daemon (attempt ${attempt})`);
                 break;
             } catch (err) {
                 lastError = err as Error;
@@ -253,8 +178,7 @@ export async function activate(context: vscode.ExtensionContext) {
             );
         }
         
-        // Create DaemonStateProxy - always uses daemon API for state
-        const unityFeaturesEnabled = vscode.workspace.getConfiguration('agenticPlanning').get<boolean>('enableUnityFeatures', true);
+        // Create DaemonStateProxy - all state reads go through this
         daemonStateProxy = new DaemonStateProxy({
             vsCodeClient,
             unityEnabled: unityFeaturesEnabled
@@ -266,12 +190,10 @@ export async function activate(context: vscode.ExtensionContext) {
         
         // Subscribe to events for UI updates
         vsCodeClient.subscribe('session.updated', () => {
-            planningSessionsProvider?.refresh();
             sidebarProvider?.refresh();
         });
         
         vsCodeClient.subscribe('pool.changed', () => {
-            agentPoolProvider?.refresh();
             sidebarProvider?.refresh();
         });
         
@@ -288,7 +210,6 @@ export async function activate(context: vscode.ExtensionContext) {
         );
         
         // Create proxy with unconnected client - UI will show "daemon missing"
-        const unityFeaturesEnabled = vscode.workspace.getConfiguration('agenticPlanning').get<boolean>('enableUnityFeatures', true);
         vsCodeClient = new VsCodeClient({ clientId: 'vscode-extension' });
         daemonStateProxy = new DaemonStateProxy({
             vsCodeClient,
@@ -297,56 +218,11 @@ export async function activate(context: vscode.ExtensionContext) {
         sidebarProvider.setStateProxy(daemonStateProxy);
     }
     
-    } catch (error) {
-        console.error('Agentic Planning: Failed to initialize services:', error);
-        vscode.window.showErrorMessage(`Agentic Planning failed to initialize: ${error}`);
-    
-        // Create dummy state manager for error state providers
-        const fallbackConfig = vscode.workspace.getConfiguration('agenticPlanning');
-        stateManager = new StateManager({
-            workspaceRoot,
-            workingDirectory: fallbackConfig.get('workingDirectory', '_AiDevLog'),
-            agentPoolSize: fallbackConfig.get('agentPoolSize', 5),
-            defaultBackend: fallbackConfig.get('defaultBackend', 'cursor') as 'cursor' | 'claude-code' | 'codex'
-        });
-        agentRoleRegistry = new AgentRoleRegistry(stateManager);
-        // Set Unity enabled state even in fallback path
-        const unityEnabledFallback = fallbackConfig.get<boolean>('enableUnityFeatures', true);
-        agentRoleRegistry.setUnityEnabled(unityEnabledFallback);
-        
-        agentPoolService = new AgentPoolService(stateManager, agentRoleRegistry);
-        planningSessionsProvider = new PlanningSessionsProvider(stateManager);
-        agentPoolProvider = new AgentPoolProvider(agentPoolService);
+    // Clean up old temp files from previous sessions
+    const cleaned = (agentRunner as any).cleanupTempFiles?.();
+    if (cleaned > 0) {
+        console.log(`Agentic Planning: Cleaned up ${cleaned} old temp files`);
     }
-    
-    // Initialize Unity Control Manager only if Unity features are enabled AND services initialized
-    const unityFeaturesEnabledForUI = vscode.workspace.getConfiguration('agenticPlanning').get<boolean>('enableUnityFeatures', true);
-    let unityControlManager: UnityControlManager | undefined;
-    
-    if (unityFeaturesEnabledForUI && unifiedCoordinatorService) {
-        unityControlManager = ServiceLocator.resolve(UnityControlManager);
-        unityControlManager.setAgentRoleRegistry(agentRoleRegistry);
-        if (workspaceRoot) {
-            unityControlManager.initialize(workspaceRoot);
-        }
-        
-        // Connect Unity Control Manager events to UI
-        unityControlManager.onStatusChanged(() => {
-            sidebarProvider.refresh();
-        });
-        
-        // Connect coordinator service to Unity manager
-        unifiedCoordinatorService.setUnityEnabled(true, unityControlManager);
-        
-        console.log('Agentic Planning: Unity Control Manager initialized');
-    } else if (unifiedCoordinatorService) {
-        // Unity features disabled - notify coordinator service
-        unifiedCoordinatorService.setUnityEnabled(false);
-        console.log('Agentic Planning: Unity features disabled, skipping Unity Control Manager');
-    }
-    
-    // Pass Unity enabled state to sidebar provider
-    sidebarProvider.setUnityEnabled(unityFeaturesEnabledForUI);
     
     // Listen for task.failedFinal events to open agent chat for user intervention
     const broadcaster = ServiceLocator.resolve(EventBroadcaster);
@@ -387,24 +263,13 @@ Options:
         });
     });
 
-    console.log('[APC] Step 7: Registering webview provider...');
+    console.log('[APC] Step 6: Registering webview provider...');
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(SidebarViewProvider.viewType, sidebarProvider)
     );
-    console.log('[APC] Step 7: Webview provider registered');
+    console.log('[APC] Step 6: Webview provider registered');
 
-    // NOTE: File watcher removed - daemon events handle state synchronization
-    // The daemon broadcasts events (session.updated, pool.changed) which trigger UI refresh
-    // This is more efficient than watching files directly
-
-    // Connect planning service events to UI refresh
-    planningService.onSessionsChanged(() => {
-        sidebarProvider.refresh();
-    });
-
-    // Configure DependencyService for Unity mode and check dependencies on startup
-    const unityEnabledForDeps = vscode.workspace.getConfiguration('agenticPlanning').get<boolean>('enableUnityFeatures', true);
-    dependencyService.setUnityEnabled(unityEnabledForDeps);
+    // Check dependencies on startup
     dependencyService.checkAllDependencies().then(statuses => {
         const platform = process.platform;
         const relevantStatuses = statuses.filter(s => s.required && (s.platform === platform || s.platform === 'all'));
@@ -426,7 +291,9 @@ Options:
         }
     });
 
-    // Register commands
+    // ========================================================================
+    // Register Commands - All operations go through daemon via VsCodeClient
+    // ========================================================================
     context.subscriptions.push(
         vscode.commands.registerCommand('agenticPlanning.showDashboard', () => {
             vscode.window.showInformationMessage('Dashboard coming soon!');
@@ -462,40 +329,39 @@ Let's get started!`;
             openAgentChat();
         }),
 
-        // Execution commands (facade to CoordinatorService via PlanningService)
+        // Execution commands - all go through daemon
         vscode.commands.registerCommand('agenticPlanning.startExecution', async (item?: PlanningSessionItem) => {
-            const sessionId = item?.session?.id;
+            if (!vsCodeClient.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. Run "apc system run --headless" first.');
+                return;
+            }
+            
+            let sessionId = item?.session?.id;
             if (!sessionId) {
                 // No item selected - show picker
-                const sessions = planningService.listPlanningSessions()
-                    .filter(s => s.status === 'approved');
-                if (sessions.length === 0) {
+                const sessions = await daemonStateProxy.getPlanningSessions();
+                const approvedSessions = sessions.filter(s => s.status === 'approved');
+                if (approvedSessions.length === 0) {
                     vscode.window.showWarningMessage('No approved plans available to execute.');
                     return;
                 }
                 const selected = await vscode.window.showQuickPick(
-                    sessions.map(s => ({ 
+                    approvedSessions.map(s => ({ 
                         label: s.id, 
                         description: s.requirement.substring(0, 50) + '...',
                         session: s 
                     })),
                     { placeHolder: 'Select a plan to execute' }
                 );
-                if (!selected) {return;}
-                
-                const result = await planningService.startExecution(selected.session.id);
-                if (result.success) {
-                    vscode.window.showInformationMessage(`Execution started with ${result.engineerCount} engineers!`);
-                } else {
-                    vscode.window.showErrorMessage(`Failed to start: ${result.error}`);
-                }
+                if (!selected) return;
+                sessionId = selected.session.id;
+            }
+            
+            const result = await vsCodeClient.startExecution(sessionId);
+            if (result.success) {
+                vscode.window.showInformationMessage(`Execution started with ${result.engineerCount} engineers!`);
             } else {
-                const result = await planningService.startExecution(sessionId);
-                if (result.success) {
-                    vscode.window.showInformationMessage(`Execution started with ${result.engineerCount} engineers!`);
-                } else {
-                    vscode.window.showErrorMessage(`Failed to start: ${result.error}`);
-                }
+                vscode.window.showErrorMessage(`Failed to start: ${result.error}`);
             }
             sidebarProvider.refresh();
         }),
@@ -506,7 +372,7 @@ Let's get started!`;
                 vscode.window.showWarningMessage('No session selected');
                 return;
             }
-            const result = await planningService.pauseExecution(sessionId);
+            const result = await vsCodeClient.pauseExecution(sessionId);
             if (result.success) {
                 vscode.window.showInformationMessage(`Execution paused for ${sessionId}`);
             } else {
@@ -521,7 +387,7 @@ Let's get started!`;
                 vscode.window.showWarningMessage('No session selected');
                 return;
             }
-            const result = await planningService.resumeExecution(sessionId);
+            const result = await vsCodeClient.resumeExecution(sessionId);
             if (result.success) {
                 vscode.window.showInformationMessage(`Execution resumed for ${sessionId}`);
             } else {
@@ -544,7 +410,7 @@ Let's get started!`;
             );
             
             if (confirm === 'Stop Execution') {
-                const result = await planningService.stopExecution(sessionId);
+                const result = await vsCodeClient.stopExecution(sessionId);
                 if (result.success) {
                     vscode.window.showInformationMessage(`Execution stopped for ${sessionId}`);
                 } else {
@@ -563,20 +429,18 @@ Let's get started!`;
                 return;
             }
             
-            if (!unifiedCoordinatorService) {
-                vscode.window.showWarningMessage('Coordinator service not available');
-                return;
-            }
-            
-            const workflowId = await unifiedCoordinatorService.retryFailedTask(sessionId, taskId);
-            if (workflowId) {
+            const result = await vsCodeClient.retryTask(sessionId, taskId);
+            if (result.success) {
+                vscode.window.showInformationMessage(`Retry started: ${result.workflowId}`);
                 sidebarProvider.refresh();
+            } else {
+                vscode.window.showErrorMessage(result.error || 'Failed to retry task');
             }
         }),
 
         vscode.commands.registerCommand('agenticPlanning.showAgentTerminal', async (agentName?: string) => {
             if (!agentName) {
-                const busyAgents = agentPoolService.getBusyAgents();
+                const busyAgents = await daemonStateProxy.getBusyAgents();
                 if (busyAgents.length === 0) {
                     vscode.window.showWarningMessage('No active agents');
                     return;
@@ -594,16 +458,26 @@ Let's get started!`;
             }
         }),
 
-        vscode.commands.registerCommand('agenticPlanning.poolStatus', () => {
-            const status = agentPoolService.getPoolStatus();
+        vscode.commands.registerCommand('agenticPlanning.poolStatus', async () => {
+            const status = await daemonStateProxy.getPoolStatus();
             vscode.window.showInformationMessage(
                 `Agent Pool: ${status.available.length} available, ${status.busy.length} busy (Total: ${status.total})`
             );
         }),
         
-        // Role settings command
-        vscode.commands.registerCommand('apc.openRoleSettings', () => {
-            RoleSettingsPanel.show(agentRoleRegistry, context.extensionUri);
+        // Role settings command - uses daemon API for roles
+        vscode.commands.registerCommand('apc.openRoleSettings', async () => {
+            if (!vsCodeClient.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon');
+                return;
+            }
+            // Pass vsCodeClient to RoleSettingsPanel for daemon-based role management
+            RoleSettingsPanel.showWithClient(vsCodeClient, context.extensionUri);
+        }),
+        
+        // Workflow settings command
+        vscode.commands.registerCommand('apc.openWorkflowSettings', () => {
+            WorkflowSettingsPanel.show(context.extensionUri, workspaceRoot);
         }),
 
         // Refresh commands for tree views
@@ -626,7 +500,7 @@ Let's get started!`;
             );
             
             if (confirm === 'Stop') {
-                const result = await planningService.stopSession(sessionId);
+                const result = await vsCodeClient.stopSession(sessionId);
                 if (result.success) {
                     vscode.window.showInformationMessage(`Session ${sessionId} stopped`);
                     sidebarProvider.refresh();
@@ -650,7 +524,7 @@ Let's get started!`;
             );
             
             if (confirm === 'Remove') {
-                const result = await planningService.removeSession(sessionId);
+                const result = await vsCodeClient.removeSession(sessionId);
                 if (result.success) {
                     vscode.window.showInformationMessage(`Session ${sessionId} removed`);
                     sidebarProvider.refresh();
@@ -674,7 +548,7 @@ Let's get started!`;
             );
             
             if (confirm === 'Resume') {
-                const result = await planningService.resumeSession(sessionId);
+                const result = await vsCodeClient.resumeSession(sessionId);
                 if (result.success) {
                     vscode.window.showInformationMessage(`Session ${sessionId} resuming...`);
                     sidebarProvider.refresh();
@@ -692,8 +566,11 @@ Let's get started!`;
                 return;
             }
             
-            const session = planningService.getPlanningStatus(sessionId);
-            if (!session) {
+            let session;
+            try {
+                const response = await vsCodeClient.getPlanStatus(sessionId);
+                session = response;
+            } catch {
                 vscode.window.showErrorMessage(`Session ${sessionId} not found`);
                 return;
             }
@@ -701,8 +578,8 @@ Let's get started!`;
             // Pre-filled prompt for revision
             const revisionPrompt = `I want to revise the plan for session ${sessionId}.
 
-Current plan: ${session.currentPlanPath}
-Original requirement: ${session.requirement.substring(0, 200)}...
+Current plan: ${session.currentPlanPath || 'N/A'}
+Original requirement: ${(session.requirement || '').substring(0, 200)}...
 
 Please help me discuss what changes I want to make to this plan.
 
@@ -735,10 +612,13 @@ This will trigger the multi-agent debate to revise the plan.`;
             );
             
             if (confirm === 'Approve & Execute') {
-                // Approve plan with autoStart=true (handles execution internally)
-                await planningService.approvePlan(sessionId, true);
-                // Note: approvePlan with autoStart=true already starts execution and shows messages
-                sidebarProvider.refresh();
+                try {
+                    await vsCodeClient.approvePlan(sessionId, true);
+                    vscode.window.showInformationMessage(`Plan approved and execution started for ${sessionId}`);
+                    sidebarProvider.refresh();
+                } catch (err) {
+                    vscode.window.showErrorMessage(`Failed to approve: ${err}`);
+                }
             }
         }),
         
@@ -750,26 +630,29 @@ This will trigger the multi-agent debate to revise the plan.`;
                 return;
             }
             
-            try {
-                await planningService.cancelPlan(sessionId);
+            const result = await vsCodeClient.cancelPlan(sessionId);
+            if (result.success) {
                 vscode.window.showInformationMessage(`Revision cancelled for ${sessionId}`);
                 sidebarProvider.refresh();
-            } catch (err) {
-                vscode.window.showErrorMessage(`Failed to cancel: ${err}`);
+            } else {
+                vscode.window.showErrorMessage(`Failed to cancel: ${result.error}`);
             }
         }),
         
-        vscode.commands.registerCommand('agenticPlanning.refreshAgentPool', () => {
-            // Also sync with settings when manually refreshed
+        vscode.commands.registerCommand('agenticPlanning.refreshAgentPool', async () => {
+            // Sync pool size with settings via daemon
             const configSize = vscode.workspace.getConfiguration('agenticPlanning').get<number>('agentPoolSize', 5);
-            const currentSize = agentPoolService.getPoolStatus().total;
-            if (configSize !== currentSize) {
-                const result = agentPoolService.resizePool(configSize);
-                if (result.added.length > 0) {
-                    vscode.window.showInformationMessage(`Added agents: ${result.added.join(', ')}`);
-                }
-                if (result.removed.length > 0) {
-                    vscode.window.showInformationMessage(`Removed agents: ${result.removed.join(', ')}`);
+            const poolStatus = await daemonStateProxy.getPoolStatus();
+            
+            if (configSize !== poolStatus.total) {
+                const result = await vsCodeClient.resizePool(configSize);
+                if (result.success) {
+                    if (result.added && result.added.length > 0) {
+                        vscode.window.showInformationMessage(`Added agents: ${result.added.join(', ')}`);
+                    }
+                    if (result.removed && result.removed.length > 0) {
+                        vscode.window.showInformationMessage(`Removed agents: ${result.removed.join(', ')}`);
+                    }
                 }
             }
             sidebarProvider.refresh();
@@ -792,9 +675,13 @@ This will trigger the multi-agent debate to revise the plan.`;
             );
             
             if (confirm === 'Release') {
-                agentPoolService.releaseAgents([agentName]);
+                const result = await vsCodeClient.releaseAgent(agentName);
+                if (result.success) {
+                    vscode.window.showInformationMessage(`${agentName} released back to pool`);
+                } else {
+                    vscode.window.showErrorMessage(result.error || 'Failed to release agent');
+                }
                 sidebarProvider.refresh();
-                vscode.window.showInformationMessage(`${agentName} released back to pool`);
             }
         }),
 
@@ -861,7 +748,6 @@ This will trigger the multi-agent debate to revise the plan.`;
                 if (confirm === 'Kill') {
                     await processManager.stopProcess(selected.process.id, true);
                     vscode.window.showInformationMessage(`Process ${selected.process.id} killed`);
-                    sidebarProvider.refresh();
                     sidebarProvider.refresh();
                 }
             }
@@ -980,33 +866,25 @@ This will trigger the multi-agent debate to revise the plan.`;
                 return new vscode.TerminalProfile({
                     name: 'Agentic CLI',
                     shellPath: '/bin/bash',
-                    shellArgs: ['-c', 'echo "Agentic Planning CLI ready. Use: agentic <command>"']
+                    shellArgs: ['-c', 'echo "Agentic Planning CLI ready. Use: apc <command>"']
                 });
             }
         })
     );
 
-    // Start state update interval
-    const updateInterval = vscode.workspace.getConfiguration('agenticPlanning').get<number>('stateUpdateInterval', 5000);
-    const intervalId = setInterval(() => {
-        stateManager.updateStateFiles();
-    }, updateInterval);
-
-    context.subscriptions.push({
-        dispose: () => clearInterval(intervalId)
-    });
-
-    // Listen for configuration changes
+    // Listen for configuration changes - sync with daemon
     context.subscriptions.push(
-        vscode.workspace.onDidChangeConfiguration(e => {
+        vscode.workspace.onDidChangeConfiguration(async e => {
             if (e.affectsConfiguration('agenticPlanning.agentPoolSize')) {
                 const newSize = vscode.workspace.getConfiguration('agenticPlanning').get<number>('agentPoolSize', 5);
-                const result = agentPoolService.resizePool(newSize);
-                if (result.added.length > 0) {
-                    vscode.window.showInformationMessage(`Added agents: ${result.added.join(', ')}`);
-                }
-                if (result.removed.length > 0) {
-                    vscode.window.showInformationMessage(`Removed agents: ${result.removed.join(', ')}`);
+                const result = await vsCodeClient.resizePool(newSize);
+                if (result.success) {
+                    if (result.added && result.added.length > 0) {
+                        vscode.window.showInformationMessage(`Added agents: ${result.added.join(', ')}`);
+                    }
+                    if (result.removed && result.removed.length > 0) {
+                        vscode.window.showInformationMessage(`Removed agents: ${result.removed.join(', ')}`);
+                    }
                 }
                 sidebarProvider.refresh();
             }
@@ -1037,26 +915,6 @@ export async function deactivate() {
             console.log('DaemonManager disposed');
         } catch (e) {
             console.error('Error disposing DaemonManager:', e);
-        }
-    }
-    
-    // Dispose UnifiedCoordinatorService (stops all workflows and sessions)
-    if (unifiedCoordinatorService) {
-        try {
-            await unifiedCoordinatorService.dispose();
-            console.log('UnifiedCoordinatorService disposed');
-        } catch (e) {
-            console.error('Error disposing UnifiedCoordinatorService:', e);
-        }
-    }
-    
-    // Dispose PlanningService (stops agent runner, clears intervals)
-    if (planningService) {
-        try {
-            planningService.dispose();
-            console.log('PlanningService disposed');
-        } catch (e) {
-            console.error('Error disposing PlanningService:', e);
         }
     }
     
@@ -1091,16 +949,5 @@ export async function deactivate() {
         console.error('Error disposing ServiceLocator:', e);
     }
     
-    // Dispose StateManager (releases file lock)
-    if (stateManager) {
-        try {
-            stateManager.dispose();
-            console.log('StateManager disposed');
-        } catch (e) {
-            console.error('Error disposing StateManager:', e);
-        }
-    }
-    
     console.log('Agentic Planning Coordinator deactivated');
 }
-

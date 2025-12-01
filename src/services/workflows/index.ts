@@ -6,6 +6,7 @@ export {
     IWorkflow, 
     WorkflowFactory, 
     WorkflowServices,
+    WorkflowMetadata,
     TaskOccupancy,
     TaskConflict,
     ConflictResolution
@@ -18,6 +19,7 @@ export { PlanningNewWorkflow } from './PlanningNewWorkflow';
 export { PlanningRevisionWorkflow } from './PlanningRevisionWorkflow';
 export { TaskImplementationWorkflow } from './TaskImplementationWorkflow';
 export { ErrorResolutionWorkflow } from './ErrorResolutionWorkflow';
+export { ContextGatheringWorkflow } from './ContextGatheringWorkflow';
 
 // Re-export workflow types
 export * from '../../types/workflow';
@@ -28,27 +30,47 @@ import { PlanningNewWorkflow } from './PlanningNewWorkflow';
 import { PlanningRevisionWorkflow } from './PlanningRevisionWorkflow';
 import { TaskImplementationWorkflow } from './TaskImplementationWorkflow';
 import { ErrorResolutionWorkflow } from './ErrorResolutionWorkflow';
+import { ContextGatheringWorkflow } from './ContextGatheringWorkflow';
+import { DEFAULT_WORKFLOW_METADATA } from '../WorkflowSettingsManager';
 
 /**
  * Register all built-in workflow types with a registry
+ * 
+ * Uses DEFAULT_WORKFLOW_METADATA from WorkflowSettingsManager as the single
+ * source of truth for workflow names, descriptions, and coordinator prompts.
  */
 export function registerBuiltinWorkflows(registry: WorkflowRegistry): void {
     // Planning workflows
-    registry.register('planning_new', (config, services) => 
-        new PlanningNewWorkflow(config, services)
+    registry.register(
+        'planning_new',
+        (config, services) => new PlanningNewWorkflow(config, services),
+        DEFAULT_WORKFLOW_METADATA.planning_new
     );
     
-    registry.register('planning_revision', (config, services) => 
-        new PlanningRevisionWorkflow(config, services)
+    registry.register(
+        'planning_revision',
+        (config, services) => new PlanningRevisionWorkflow(config, services),
+        DEFAULT_WORKFLOW_METADATA.planning_revision
     );
     
     // Execution workflows
-    registry.register('task_implementation', (config, services) => 
-        new TaskImplementationWorkflow(config, services)
+    registry.register(
+        'task_implementation',
+        (config, services) => new TaskImplementationWorkflow(config, services),
+        DEFAULT_WORKFLOW_METADATA.task_implementation
     );
     
-    registry.register('error_resolution', (config, services) => 
-        new ErrorResolutionWorkflow(config, services)
+    registry.register(
+        'error_resolution',
+        (config, services) => new ErrorResolutionWorkflow(config, services),
+        DEFAULT_WORKFLOW_METADATA.error_resolution
+    );
+    
+    // Context workflows
+    registry.register(
+        'context_gathering',
+        (config, services) => new ContextGatheringWorkflow(config, services),
+        DEFAULT_WORKFLOW_METADATA.context_gathering
     );
     
     console.log(`[Workflows] Registered ${registry.size} workflow types`);

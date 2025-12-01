@@ -149,8 +149,8 @@ export class CoordinatorContext {
                 }
             }
             
-            // Determine task type
-            const taskType = task.requirements?.taskType === 'error_fix' 
+            // Determine task type from taskType field
+            const taskType = task.taskType === 'error_fix' 
                 ? 'error_fix' as const
                 : 'implementation' as const;
             
@@ -162,8 +162,8 @@ export class CoordinatorContext {
                 dependencies: task.dependencies || [],
                 dependencyStatus,
                 assignedAgent: task.actualAgent,
-                errors: task.errors,
-                attempts: 0,  // ManagedTask doesn't track attempts
+                errors: [],  // Errors are now stored in errorText field
+                attempts: 0,
                 priority: task.priority || 10
             };
         });

@@ -33,6 +33,11 @@ export function getSidebarScript(): string {
             roleSettingsBtn.onclick = () => vscode.postMessage({ type: 'openRoleSettings' });
         }
         
+        const workflowSettingsBtn = document.getElementById('workflowSettingsBtn');
+        if (workflowSettingsBtn) {
+            workflowSettingsBtn.onclick = () => vscode.postMessage({ type: 'openWorkflowSettings' });
+        }
+        
         statusInfo.onclick = () => {
             if (statusDot.classList.contains('missing')) {
                 vscode.postMessage({ type: 'showMissing' });

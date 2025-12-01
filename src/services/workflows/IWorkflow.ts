@@ -235,5 +235,15 @@ export interface WorkflowMetadata {
      * If true, workflow won't be available when Unity features are disabled
      */
     requiresUnity: boolean;
+    
+    /**
+     * Prompt text to inject into coordinator's workflow selection section.
+     * Describes when and how the coordinator should use this workflow.
+     * 
+     * Example:
+     * "- 'context_gathering' - Gather context on specific folders/files before implementation
+     *    Use when: Starting work on unfamiliar code, after errors, or to update project knowledge"
+     */
+    coordinatorPrompt: string;
 }
 

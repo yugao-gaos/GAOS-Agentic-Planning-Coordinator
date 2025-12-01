@@ -63,6 +63,11 @@ const ENGINEERS = ['Alex', 'Betty', 'Cleo', 'Dany', 'Echo', 'Finn', 'Gwen', 'Hug
 export class PlanParser {
     /**
      * Parse a plan markdown file
+     * 
+     * @deprecated In the new coordinator-driven architecture, tasks are created
+     * via CLI commands rather than parsed from the plan. Use calculateProgressFromFile()
+     * for simple progress tracking. This method is kept for backwards compatibility.
+     * 
      * Supports two formats:
      * 1. Legacy: ## Engineer's Checklist with - [ ] tasks
      * 2. Modern: ### Section with #### Task X.Y and **Engineer**: Engineer-N
@@ -468,76 +473,6 @@ export class PlanParser {
     }
 
     /**
-     * Get uncompleted tasks grouped by engineer
-     */
-    static getUncompletedTasks(plan: ParsedPlan): Record<string, PlanTask[]> {
-        const uncompleted: Record<string, PlanTask[]> = {};
-
-        for (const [engineer, tasks] of Object.entries(plan.engineerChecklists)) {
-            const engineerTasks = tasks.filter(t => !t.completed && t.approved);
-            if (engineerTasks.length > 0) {
-                uncompleted[engineer] = engineerTasks;
-            }
-        }
-
-        return uncompleted;
-    }
-
-    /**
-     * Get the next task for an engineer
-     */
-    static getNextTask(plan: ParsedPlan, engineer: string): PlanTask | undefined {
-        const tasks = plan.engineerChecklists[engineer];
-        if (!tasks) return undefined;
-
-        return tasks.find(t => !t.completed && t.approved);
-    }
-
-    /**
-     * Mark tasks as affected by revision (unapproved)
-     * Returns list of affected task IDs
-     */
-    static markTasksAffectedByRevision(
-        plan: ParsedPlan,
-        affectedTaskIds: string[]
-    ): string[] {
-        const marked: string[] = [];
-
-        for (const tasks of Object.values(plan.engineerChecklists)) {
-            for (const task of tasks) {
-                if (affectedTaskIds.includes(task.id)) {
-                    task.approved = false;
-                    marked.push(task.id);
-                }
-            }
-        }
-
-        // Also update flat task list
-        for (const task of plan.tasks) {
-            if (affectedTaskIds.includes(task.id)) {
-                task.approved = false;
-            }
-        }
-
-        return marked;
-    }
-
-    /**
-     * Re-approve tasks after revision is approved
-     */
-    static approveAllTasks(plan: ParsedPlan): void {
-        for (const tasks of Object.values(plan.engineerChecklists)) {
-            for (const task of tasks) {
-                task.approved = true;
-            }
-        }
-
-        for (const task of plan.tasks) {
-            task.approved = true;
-        }
-    }
-
-    /**
      * Update task completion status in the plan file
      * This is what engineers call when they complete a task
      */
@@ -589,6 +524,54 @@ export class PlanParser {
      */
     static planExists(planPath: string): boolean {
         return fs.existsSync(planPath);
+    }
+    
+    // ========================================================================
+    // SIMPLIFIED PROGRESS TRACKING (New Architecture)
+    // ========================================================================
+    // In the new coordinator-driven architecture, tasks are created via CLI
+    // commands, not parsed from the plan. These methods provide simple progress
+    // tracking by counting checkboxes in the markdown file.
+    
+    /**
+     * Calculate progress directly from a plan file by counting checkboxes
+     * This is simpler than parsing the full plan structure
+     */
+    static calculateProgressFromFile(planPath: string): PlanProgress {
+        if (!fs.existsSync(planPath)) {
+            return {
+                completed: 0,
+                total: 0,
+                percentage: 0,
+                byEngineer: {}
+            };
+        }
+        
+        const content = fs.readFileSync(planPath, 'utf-8');
+        return this.calculateProgressFromContent(content);
+    }
+    
+    /**
+     * Calculate progress from plan content by counting checkboxes
+     */
+    static calculateProgressFromContent(content: string): PlanProgress {
+        // Count completed checkboxes: [x] or [X]
+        const completedMatches = content.match(/\[x\]/gi) || [];
+        const completed = completedMatches.length;
+        
+        // Count uncompleted checkboxes: [ ]
+        const uncompletedMatches = content.match(/\[ \]/g) || [];
+        const uncompleted = uncompletedMatches.length;
+        
+        const total = completed + uncompleted;
+        const percentage = total > 0 ? (completed / total) * 100 : 0;
+        
+        return {
+            completed,
+            total,
+            percentage,
+            byEngineer: {} // Simplified - no engineer breakdown
+        };
     }
 }
 

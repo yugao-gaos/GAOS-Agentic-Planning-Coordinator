@@ -119,7 +119,7 @@ export interface WorkflowCompletedEventData {
     sessionId: string;
     type: string;
     success: boolean;
-    output?: any;
+    output?: unknown;
     error?: string;
     duration: number;
     completedAt: string;
@@ -306,7 +306,7 @@ export interface ClientDisconnectedEventData {
 export interface ErrorEventData {
     code: string;
     message: string;
-    details?: any;
+    details?: unknown;
     timestamp: string;
 }
 

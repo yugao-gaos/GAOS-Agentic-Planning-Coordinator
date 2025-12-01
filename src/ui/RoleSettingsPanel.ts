@@ -1,31 +1,39 @@
 import * as vscode from 'vscode';
 import { AgentRoleRegistry } from '../services/AgentRoleRegistry';
 import { AgentRole, DefaultRoleConfigs, SystemPromptConfig, DefaultSystemPrompts, CoordinatorPromptConfig, DefaultCoordinatorPrompt } from '../types';
+import { VsCodeClient } from '../vscode/VsCodeClient';
 
 /**
  * Webview panel for configuring agent roles and system prompts.
  * Provides a tabbed interface with:
  * - Agent Roles: Built-in (engineer, reviewer, context) + custom roles
  * - System Prompts: Coordinator, Context Gatherer, Planning Analyst, etc.
+ * 
+ * Supports two modes:
+ * - Legacy: Uses local AgentRoleRegistry (for backwards compatibility)
+ * - Client: Uses VsCodeClient to communicate with daemon (preferred)
  */
 export class RoleSettingsPanel {
     public static currentPanel: RoleSettingsPanel | undefined;
     private readonly panel: vscode.WebviewPanel;
-    private readonly registry: AgentRoleRegistry;
+    private readonly registry: AgentRoleRegistry | null;
+    private readonly vsCodeClient: VsCodeClient | null;
     private readonly extensionUri: vscode.Uri;
     private disposables: vscode.Disposable[] = [];
+    private cachedRoles: any[] = [];
+    private cachedSystemPrompts: any[] = [];
+    private cachedCoordinatorPrompt: any = null;
 
     private constructor(
         panel: vscode.WebviewPanel,
-        registry: AgentRoleRegistry,
-        extensionUri: vscode.Uri
+        extensionUri: vscode.Uri,
+        registry?: AgentRoleRegistry,
+        vsCodeClient?: VsCodeClient
     ) {
         this.panel = panel;
-        this.registry = registry;
+        this.registry = registry || null;
+        this.vsCodeClient = vsCodeClient || null;
         this.extensionUri = extensionUri;
-
-        // Set initial content
-        this.updateWebviewContent();
 
         // Handle messages from webview
         this.panel.webview.onDidReceiveMessage(
@@ -43,14 +51,48 @@ export class RoleSettingsPanel {
             this.disposables
         );
 
-        // Listen for role changes
-        this.registry.onRolesChanged(() => {
-            this.updateWebviewContent();
-        });
+        // Listen for role changes (only in local registry mode)
+        if (this.registry) {
+            this.registry.onRolesChanged(() => {
+                this.updateWebviewContent();
+            });
+        }
+        
+        // Set initial content
+        this.updateWebviewContent();
     }
 
     /**
-     * Show the role settings panel (create if doesn't exist, or reveal)
+     * Show the role settings panel using VsCodeClient (daemon mode)
+     */
+    public static showWithClient(client: VsCodeClient, extensionUri: vscode.Uri): void {
+        const column = vscode.window.activeTextEditor
+            ? vscode.window.activeTextEditor.viewColumn
+            : undefined;
+
+        // If panel already exists, reveal it
+        if (RoleSettingsPanel.currentPanel) {
+            RoleSettingsPanel.currentPanel.panel.reveal(column);
+            return;
+        }
+
+        // Create new panel
+        const panel = vscode.window.createWebviewPanel(
+            'apcRoleSettings',
+            'Agent Role Settings',
+            column || vscode.ViewColumn.One,
+            {
+                enableScripts: true,
+                retainContextWhenHidden: true,
+                localResourceRoots: [extensionUri]
+            }
+        );
+
+        RoleSettingsPanel.currentPanel = new RoleSettingsPanel(panel, extensionUri, undefined, client);
+    }
+
+    /**
+     * Show the role settings panel using local registry (legacy mode)
      */
     public static show(registry: AgentRoleRegistry, extensionUri: vscode.Uri): void {
         const column = vscode.window.activeTextEditor
@@ -75,7 +117,7 @@ export class RoleSettingsPanel {
             }
         );
 
-        RoleSettingsPanel.currentPanel = new RoleSettingsPanel(panel, registry, extensionUri);
+        RoleSettingsPanel.currentPanel = new RoleSettingsPanel(panel, extensionUri, registry);
     }
 
     /**
@@ -118,16 +160,28 @@ export class RoleSettingsPanel {
      */
     private async saveRole(roleData: any): Promise<void> {
         try {
-            const errors = this.registry.validateRole(roleData);
-            if (errors.length > 0) {
-                vscode.window.showErrorMessage(`Invalid role: ${errors.join(', ')}`);
-                return;
-            }
+            if (this.vsCodeClient) {
+                // Daemon mode: update via API
+                const result = await this.vsCodeClient.updateRole(roleData.id, roleData);
+                if (result.success) {
+                    vscode.window.showInformationMessage(`Role "${roleData.name}" saved successfully`);
+                    this.updateWebviewContent();
+                } else {
+                    vscode.window.showErrorMessage(`Failed to save role: ${result.error}`);
+                }
+            } else if (this.registry) {
+                // Local registry mode
+                const errors = this.registry.validateRole(roleData);
+                if (errors.length > 0) {
+                    vscode.window.showErrorMessage(`Invalid role: ${errors.join(', ')}`);
+                    return;
+                }
 
-            const role = AgentRole.fromJSON(roleData);
-            this.registry.updateRole(role);
-            vscode.window.showInformationMessage(`Role "${role.name}" saved successfully`);
-            this.updateWebviewContent();
+                const role = AgentRole.fromJSON(roleData);
+                this.registry.updateRole(role);
+                vscode.window.showInformationMessage(`Role "${role.name}" saved successfully`);
+                this.updateWebviewContent();
+            }
         } catch (e: any) {
             vscode.window.showErrorMessage(`Failed to save role: ${e.message}`);
         }
@@ -144,10 +198,22 @@ export class RoleSettingsPanel {
         );
 
         if (confirm === 'Reset') {
-            const role = this.registry.resetToDefault(roleId);
-            if (role) {
-                vscode.window.showInformationMessage(`Role "${role.name}" reset to defaults`);
-                this.updateWebviewContent();
+            if (this.vsCodeClient) {
+                // Daemon mode
+                const result = await this.vsCodeClient.resetRole(roleId);
+                if (result.success) {
+                    vscode.window.showInformationMessage(`Role reset to defaults`);
+                    this.updateWebviewContent();
+                } else {
+                    vscode.window.showErrorMessage(`Failed to reset: ${result.error}`);
+                }
+            } else if (this.registry) {
+                // Local registry mode
+                const role = this.registry.resetToDefault(roleId);
+                if (role) {
+                    vscode.window.showInformationMessage(`Role "${role.name}" reset to defaults`);
+                    this.updateWebviewContent();
+                }
             }
         }
     }
@@ -156,7 +222,7 @@ export class RoleSettingsPanel {
      * Delete a custom role
      */
     private async deleteRole(roleId: string): Promise<void> {
-        const role = this.registry.getRole(roleId);
+        const role = this.registry?.getRole(roleId) || this.cachedRoles.find(r => r.id === roleId);
         if (!role) return;
 
         const confirm = await vscode.window.showWarningMessage(
@@ -166,9 +232,21 @@ export class RoleSettingsPanel {
         );
 
         if (confirm === 'Delete') {
-            if (this.registry.deleteCustomRole(roleId)) {
-                vscode.window.showInformationMessage(`Role "${role.name}" deleted`);
-                this.updateWebviewContent();
+            if (this.vsCodeClient) {
+                // Daemon mode - use API to delete
+                try {
+                    await this.vsCodeClient.send('roles.delete', { roleId });
+                    vscode.window.showInformationMessage(`Role "${role.name}" deleted`);
+                    this.updateWebviewContent();
+                } catch (err) {
+                    vscode.window.showErrorMessage(`Failed to delete: ${err}`);
+                }
+            } else if (this.registry) {
+                // Local registry mode
+                if (this.registry.deleteCustomRole(roleId)) {
+                    vscode.window.showInformationMessage(`Role "${role.name}" deleted`);
+                    this.updateWebviewContent();
+                }
             }
         }
     }
@@ -178,15 +256,23 @@ export class RoleSettingsPanel {
      */
     private async createRole(roleData: any): Promise<void> {
         try {
-            const errors = this.registry.validateRole(roleData);
-            if (errors.length > 0) {
-                vscode.window.showErrorMessage(`Invalid role: ${errors.join(', ')}`);
-                return;
-            }
+            if (this.vsCodeClient) {
+                // Daemon mode: create via API
+                await this.vsCodeClient.send('roles.create', { role: roleData });
+                vscode.window.showInformationMessage(`Role "${roleData.name}" created successfully`);
+                this.updateWebviewContent();
+            } else if (this.registry) {
+                // Local registry mode
+                const errors = this.registry.validateRole(roleData);
+                if (errors.length > 0) {
+                    vscode.window.showErrorMessage(`Invalid role: ${errors.join(', ')}`);
+                    return;
+                }
 
-            const role = this.registry.createCustomRole(roleData);
-            vscode.window.showInformationMessage(`Role "${role.name}" created successfully`);
-            this.updateWebviewContent();
+                const role = this.registry.createCustomRole(roleData);
+                vscode.window.showInformationMessage(`Role "${role.name}" created successfully`);
+                this.updateWebviewContent();
+            }
         } catch (e: any) {
             vscode.window.showErrorMessage(`Failed to create role: ${e.message}`);
         }
@@ -197,10 +283,18 @@ export class RoleSettingsPanel {
      */
     private async saveSystemPrompt(promptData: any): Promise<void> {
         try {
-            const config = SystemPromptConfig.fromJSON(promptData);
-            this.registry.updateSystemPrompt(config);
-            vscode.window.showInformationMessage(`System prompt "${config.name}" saved successfully`);
-            this.updateWebviewContent();
+            if (this.vsCodeClient) {
+                // Daemon mode
+                await this.vsCodeClient.send('prompts.update', { prompt: promptData });
+                vscode.window.showInformationMessage(`System prompt "${promptData.name}" saved successfully`);
+                this.updateWebviewContent();
+            } else if (this.registry) {
+                // Local registry mode
+                const config = SystemPromptConfig.fromJSON(promptData);
+                this.registry.updateSystemPrompt(config);
+                vscode.window.showInformationMessage(`System prompt "${config.name}" saved successfully`);
+                this.updateWebviewContent();
+            }
         } catch (e: any) {
             vscode.window.showErrorMessage(`Failed to save system prompt: ${e.message}`);
         }
@@ -210,7 +304,7 @@ export class RoleSettingsPanel {
      * Reset a system prompt to defaults
      */
     private async resetSystemPrompt(promptId: string): Promise<void> {
-        const config = this.registry.getSystemPrompt(promptId);
+        const config = this.registry?.getSystemPrompt(promptId) || this.cachedSystemPrompts.find(p => p.id === promptId);
         if (!config) return;
 
         const confirm = await vscode.window.showWarningMessage(
@@ -220,10 +314,18 @@ export class RoleSettingsPanel {
         );
 
         if (confirm === 'Reset') {
-            const resetConfig = this.registry.resetSystemPromptToDefault(promptId);
-            if (resetConfig) {
-                vscode.window.showInformationMessage(`System prompt "${resetConfig.name}" reset to defaults`);
+            if (this.vsCodeClient) {
+                // Daemon mode
+                await this.vsCodeClient.send('prompts.reset', { promptId });
+                vscode.window.showInformationMessage(`System prompt reset to defaults`);
                 this.updateWebviewContent();
+            } else if (this.registry) {
+                // Local registry mode
+                const resetConfig = this.registry.resetSystemPromptToDefault(promptId);
+                if (resetConfig) {
+                    vscode.window.showInformationMessage(`System prompt "${resetConfig.name}" reset to defaults`);
+                    this.updateWebviewContent();
+                }
             }
         }
     }
@@ -233,9 +335,17 @@ export class RoleSettingsPanel {
      */
     private async saveCoordinatorPrompt(configData: any): Promise<void> {
         try {
-            this.registry.updateCoordinatorPrompt(configData);
-            vscode.window.showInformationMessage('Coordinator prompt saved successfully');
-            this.updateWebviewContent();
+            if (this.vsCodeClient) {
+                // Daemon mode
+                await this.vsCodeClient.send('prompts.updateCoordinator', { config: configData });
+                vscode.window.showInformationMessage('Coordinator prompt saved successfully');
+                this.updateWebviewContent();
+            } else if (this.registry) {
+                // Local registry mode
+                this.registry.updateCoordinatorPrompt(configData);
+                vscode.window.showInformationMessage('Coordinator prompt saved successfully');
+                this.updateWebviewContent();
+            }
         } catch (e: any) {
             vscode.window.showErrorMessage(`Failed to save coordinator prompt: ${e.message}`);
         }
@@ -252,16 +362,39 @@ export class RoleSettingsPanel {
         );
 
         if (confirm === 'Reset') {
-            this.registry.resetCoordinatorPromptToDefault();
-            vscode.window.showInformationMessage('Coordinator prompt reset to defaults');
-            this.updateWebviewContent();
+            if (this.vsCodeClient) {
+                // Daemon mode
+                await this.vsCodeClient.send('prompts.resetCoordinator', {});
+                vscode.window.showInformationMessage('Coordinator prompt reset to defaults');
+                this.updateWebviewContent();
+            } else if (this.registry) {
+                // Local registry mode
+                this.registry.resetCoordinatorPromptToDefault();
+                vscode.window.showInformationMessage('Coordinator prompt reset to defaults');
+                this.updateWebviewContent();
+            }
         }
     }
 
     /**
      * Update the webview content
      */
-    private updateWebviewContent(): void {
+    private async updateWebviewContent(): Promise<void> {
+        if (this.vsCodeClient) {
+            // Fetch from daemon
+            try {
+                const response = await this.vsCodeClient.send<{ roles: any[]; systemPrompts: any[]; coordinatorPrompt: any }>('roles.getAll', {});
+                this.cachedRoles = response.roles || [];
+                this.cachedSystemPrompts = response.systemPrompts || [];
+                this.cachedCoordinatorPrompt = response.coordinatorPrompt || DefaultCoordinatorPrompt;
+            } catch (err) {
+                console.error('[RoleSettingsPanel] Failed to fetch roles from daemon:', err);
+                // Use defaults if daemon fetch fails
+                this.cachedRoles = Object.values(DefaultRoleConfigs).map(c => ({ ...c, isBuiltIn: true }));
+                this.cachedSystemPrompts = Object.values(DefaultSystemPrompts);
+                this.cachedCoordinatorPrompt = DefaultCoordinatorPrompt;
+            }
+        }
         this.panel.webview.html = this.getWebviewContent();
     }
 
@@ -269,32 +402,66 @@ export class RoleSettingsPanel {
      * Generate the webview HTML content
      */
     private getWebviewContent(): string {
-        const roles = this.registry.getAllRoles();
-        const roleIds = this.registry.getRoleIdsSorted();
-        const systemPrompts = this.registry.getAllSystemPrompts();
-        const systemPromptIds = this.registry.getSystemPromptIdsSorted();
-        const coordinatorPrompt = this.registry.getCoordinatorPrompt();
+        // Get data from either daemon cache or local registry
+        let roles: any[];
+        let roleIds: string[];
+        let systemPrompts: any[];
+        let systemPromptIds: string[];
+        let coordinatorPrompt: any;
+        
+        if (this.vsCodeClient) {
+            // Daemon mode: use cached data
+            roles = this.cachedRoles;
+            roleIds = roles.map(r => r.id).sort((a, b) => {
+                const aBuiltIn = roles.find(r => r.id === a)?.isBuiltIn;
+                const bBuiltIn = roles.find(r => r.id === b)?.isBuiltIn;
+                if (aBuiltIn && !bBuiltIn) return -1;
+                if (!aBuiltIn && bBuiltIn) return 1;
+                return a.localeCompare(b);
+            });
+            systemPrompts = this.cachedSystemPrompts;
+            systemPromptIds = systemPrompts.map(p => p.id).sort();
+            coordinatorPrompt = this.cachedCoordinatorPrompt;
+        } else if (this.registry) {
+            // Local registry mode
+            roles = this.registry.getAllRoles().map(r => r.toJSON());
+            roleIds = this.registry.getRoleIdsSorted();
+            systemPrompts = this.registry.getAllSystemPrompts().map(p => p.toJSON());
+            systemPromptIds = this.registry.getSystemPromptIdsSorted();
+            coordinatorPrompt = this.registry.getCoordinatorPrompt();
+        } else {
+            // Fallback to defaults
+            roles = Object.values(DefaultRoleConfigs).map(c => ({ ...c, isBuiltIn: true }));
+            roleIds = Object.keys(DefaultRoleConfigs);
+            systemPrompts = Object.values(DefaultSystemPrompts);
+            systemPromptIds = Object.keys(DefaultSystemPrompts);
+            coordinatorPrompt = DefaultCoordinatorPrompt;
+        }
 
         // Generate tabs HTML with sections
+        // Note: Use local `roles` array instead of this.registry since registry may be null in daemon mode
         const roleTabsHtml = roleIds.map(id => {
-            const role = this.registry.getRole(id)!;
+            const role = roles.find(r => r.id === id);
+            if (!role) return '';
             const icon = role.isBuiltIn ? '🔧' : '✨';
             return `<button class="tab" data-type="role" data-id="${role.id}">${icon} ${role.name}</button>`;
-        }).join('') + '<button class="tab tab-add" data-type="role" data-id="__new__">+ Add Role</button>';
+        }).filter(Boolean).join('') + '<button class="tab tab-add" data-type="role" data-id="__new__">+ Add Role</button>';
 
         // System prompts tab: Coordinator first, then other system prompts
         const coordinatorTabHtml = `<button class="tab" data-type="coordinator" data-id="coordinator">🎯 Coordinator Agent</button>`;
         const otherSystemTabsHtml = systemPromptIds.map(id => {
-            const prompt = this.registry.getSystemPrompt(id)!;
+            const prompt = systemPrompts.find(p => p.id === id);
+            if (!prompt) return '';
             const categoryIcons: Record<string, string> = { execution: '🎯', planning: '📋', utility: '⚙️' };
             const icon = categoryIcons[prompt.category] || '📝';
             return `<button class="tab" data-type="system" data-id="${prompt.id}">${icon} ${prompt.name}</button>`;
-        }).join('');
+        }).filter(Boolean).join('');
         const systemTabsHtml = coordinatorTabHtml + otherSystemTabsHtml;
 
         // Generate data as JSON for JavaScript
-        const rolesJson = JSON.stringify(roles.map(r => r.toJSON()));
-        const systemPromptsJson = JSON.stringify(systemPrompts.map(p => p.toJSON()));
+        // In daemon mode, roles/systemPrompts are already plain objects; in local mode, they may be class instances
+        const rolesJson = JSON.stringify(roles.map(r => typeof r.toJSON === 'function' ? r.toJSON() : r));
+        const systemPromptsJson = JSON.stringify(systemPrompts.map(p => typeof p.toJSON === 'function' ? p.toJSON() : p));
         const coordinatorPromptJson = JSON.stringify(coordinatorPrompt);
         const defaultsJson = JSON.stringify(
             Object.fromEntries(

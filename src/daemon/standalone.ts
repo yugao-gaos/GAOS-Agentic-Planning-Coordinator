@@ -29,6 +29,7 @@ import { HeadlessTerminalManager } from '../services/HeadlessTerminalManager';
 import { AgentRunner } from '../services/AgentBackend';
 import { OutputChannelManager } from '../services/OutputChannelManager';
 import { TaskManager } from '../services/TaskManager';
+import { UnityControlManager } from '../services/UnityControlManager';
 import { bootstrapServices, ServiceLocator } from '../services/Bootstrap';
 
 /**
@@ -61,9 +62,8 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
     
     // Initialize AgentRoleRegistry
     const roleRegistry = new AgentRoleRegistry(stateManager);
-    // Disable Unity features by default in standalone mode
-    // Can be enabled via config
-    const enableUnity = process.env.APC_ENABLE_UNITY === 'true';
+    // Unity features enabled by default (can be disabled via config or APC_ENABLE_UNITY=false)
+    const enableUnity = config.enableUnityFeatures;
     roleRegistry.setUnityEnabled(enableUnity);
     console.log(`[Standalone] AgentRoleRegistry initialized, Unity: ${enableUnity ? 'enabled' : 'disabled'}`);
     
@@ -79,11 +79,27 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
     agentRunner.setBackend(config.defaultBackend);
     console.log(`[Standalone] AgentRunner initialized with backend: ${config.defaultBackend}`);
     
+    // Initialize UnityControlManager if Unity is enabled
+    let unityManager: UnityControlManager | undefined;
+    if (enableUnity) {
+        unityManager = ServiceLocator.resolve(UnityControlManager);
+        unityManager.setAgentRoleRegistry(roleRegistry);
+        await unityManager.initialize(config.workspaceRoot);
+        console.log('[Standalone] UnityControlManager initialized');
+    }
+    
     // Register and initialize UnifiedCoordinatorService
     ServiceLocator.register(UnifiedCoordinatorService, () => 
         new UnifiedCoordinatorService(stateManager, agentPoolService, roleRegistry)
     );
     const coordinator = ServiceLocator.resolve(UnifiedCoordinatorService);
+    
+    // Connect coordinator to Unity manager if available
+    if (enableUnity && unityManager) {
+        coordinator.setUnityEnabled(true, unityManager);
+    } else {
+        coordinator.setUnityEnabled(false);
+    }
     console.log('[Standalone] UnifiedCoordinatorService initialized');
     
     // Recover any paused sessions
@@ -184,8 +200,13 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
                 }
             },
             resetRoleToDefault: (roleId: string) => roleRegistry.resetToDefault(roleId) !== undefined
-        }
-        // Note: unityManager is optional and not included in standalone mode by default
+        },
+        // Unity manager - included when Unity features are enabled
+        unityManager: unityManager ? {
+            getState: () => unityManager!.getState(),
+            queueTask: (type: string, requester: any, options?: any) => 
+                unityManager!.queueTask(type as any, requester, options)
+        } : undefined
     };
 }
 

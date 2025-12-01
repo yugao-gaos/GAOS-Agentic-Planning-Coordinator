@@ -1,5 +1,6 @@
 // ============================================================================
-// TaskImplementationWorkflow - Per-task execution: Context → Engineer → Review → Unity
+// TaskImplementationWorkflow - Per-task execution: Engineer → Review → Unity → Finalize
+// Note: Context phase removed - coordinator provides context via task metadata
 // ============================================================================
 
 import * as path from 'path';
@@ -20,18 +21,19 @@ import { ServiceLocator } from '../ServiceLocator';
  * Task implementation workflow - implements a single task from the plan
  * 
  * Phases:
- * 1. context - Gather task-specific context
- * 2. implement - Engineer implements the task
- * 3. review - Code reviewer checks implementation
- * 4. approval - Handle review result (may loop back)
- * 5. delta_context - Update project context documents
- * 6. unity - Queue Unity pipeline and wait for result
- * 7. finalize - Mark task complete or needs_work
+ * 1. implement - Engineer implements the task
+ * 2. review - Code reviewer checks implementation
+ * 3. approval - Handle review result (may loop back)
+ * 4. delta_context - Update project context documents
+ * 5. unity - Queue Unity pipeline and wait for result
+ * 6. finalize - Mark task complete or needs_work
+ * 
+ * Note: Context phase removed - coordinator provides context via task metadata.
+ * Use ContextGatheringWorkflow for explicit context gathering.
  */
 export class TaskImplementationWorkflow extends BaseWorkflow {
     /** Base phases without Unity */
     private static readonly BASE_PHASES = [
-        'context',
         'implement',
         'review',
         'approval',
@@ -63,10 +65,9 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     private previousErrors: string[] = [];
     
     // Assigned agents
-    private contextAgentName?: string;
+    private contextAgentName?: string;  // Used for both context gathering and delta updates
     private engineerAgentName?: string;
     private reviewerAgentName?: string;
-    private deltaAgentName?: string;
     
     private agentRunner: AgentRunner;
     
@@ -117,7 +118,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     async executePhase(phaseIndex: number): Promise<void> {
         const phase = this.getPhases()[phaseIndex];
         
-        // Declare occupancy at the start of context phase
+        // Declare occupancy at the start of implement phase (first phase now)
         if (phaseIndex === 0) {
             this.declareTaskOccupancy(
                 [this.taskId],
@@ -127,10 +128,6 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         }
         
         switch (phase) {
-            case 'context':
-                await this.executeContextPhase();
-                break;
-                
             case 'implement':
                 await this.executeImplementPhase();
                 break;
@@ -216,6 +213,10 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     // PHASE IMPLEMENTATIONS
     // =========================================================================
     
+    /**
+     * @deprecated Context phase removed from workflow - coordinator provides context via task metadata.
+     * Use ContextGatheringWorkflow for explicit context gathering.
+     */
     private async executeContextPhase(): Promise<void> {
         this.log(`📂 PHASE: CONTEXT for task ${this.taskId}`);
         
@@ -393,13 +394,13 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     private async executeDeltaContextPhase(): Promise<void> {
         this.log(`\n📝 PHASE: DELTA CONTEXT for task ${this.taskId}`);
         
-        // Request a delta context agent
-        this.deltaAgentName = await this.requestAgent('delta_context');
+        // Request a context gatherer agent (in delta mode)
+        this.contextAgentName = await this.requestAgent('context_gatherer');
         
-        const role = this.getRole('delta_context');
+        const role = this.getRole('context_gatherer');
         const prompt = this.buildDeltaContextPrompt(role);
         
-        this.log(`Running delta context updater (${role?.defaultModel || 'sonnet-4.5'})...`);
+        this.log(`Running context gatherer in delta mode (${role?.defaultModel || 'gemini-3-pro'})...`);
         
         const result = await this.runAgentTask('delta_context', prompt, role);
         
@@ -409,10 +410,10 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             this.log(`⚠️ Delta context update failed, continuing`);
         }
         
-        // Release delta agent
-        if (this.deltaAgentName) {
-            this.releaseAgent(this.deltaAgentName);
-            this.deltaAgentName = undefined;
+        // Release context agent
+        if (this.contextAgentName) {
+            this.releaseAgent(this.contextAgentName);
+            this.contextAgentName = undefined;
         }
     }
     
@@ -490,6 +491,10 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     // PROMPT BUILDERS
     // =========================================================================
     
+    /**
+     * @deprecated Context phase removed - coordinator provides context via task metadata.
+     * Use ContextGatheringWorkflow for explicit context gathering.
+     */
     private buildContextPrompt(role: AgentRole | undefined): string {
         if (!role?.promptTemplate) {
             throw new Error('Missing prompt template for context_gatherer role');
@@ -618,11 +623,14 @@ ${this.filesModified.map(f => `- ${f}`).join('\n')}
     
     private buildDeltaContextPrompt(role: AgentRole | undefined): string {
         if (!role?.promptTemplate) {
-            throw new Error('Missing prompt template for delta_context role');
+            throw new Error('Missing prompt template for context_gatherer role');
         }
         const basePrompt = role.promptTemplate;
         
         return `${basePrompt}
+
+## MODE: DELTA CONTEXT UPDATE
+You are running in delta mode after a task was completed and approved.
 
 ## Completed Task
 ${this.taskId}: ${this.taskDescription}

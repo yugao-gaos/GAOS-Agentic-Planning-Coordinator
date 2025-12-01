@@ -111,9 +111,14 @@ ${getSidebarStyles()}
                     <span>Agent Pool</span>
                     <span class="badge" id="agentBadge">${agentBadgeText}</span>
                 </span>
-                <button class="icon-btn" id="roleSettingsBtn" title="Configure Agent Roles">
-                    ${ICONS.gear}
-                </button>
+                <span class="section-header-right">
+                    <button class="icon-btn" id="workflowSettingsBtn" title="Workflow Settings">
+                        ${ICONS.workflow}
+                    </button>
+                    <button class="icon-btn" id="roleSettingsBtn" title="Configure Agent Roles">
+                        ${ICONS.gear}
+                    </button>
+                </span>
             </div>
             <div class="section-content" id="agentsContent">
                 ${agentsHtml}

@@ -1,42 +1,37 @@
 // ============================================================================
-// ErrorResolutionWorkflow - Fix compilation/test errors
+// ErrorResolutionWorkflow - Fix compilation/test errors (Fire and Forget)
 // ============================================================================
 
-import * as path from 'path';
-import * as fs from 'fs';
 import { BaseWorkflow } from './BaseWorkflow';
 import { WorkflowServices } from './IWorkflow';
 import { 
     WorkflowConfig, 
-    WorkflowResult, 
     ErrorResolutionInput 
 } from '../../types/workflow';
-import { AgentRunner, AgentRunOptions } from '../AgentBackend';
-import { AgentRole, getDefaultRole } from '../../types';
+import { AgentRole } from '../../types';
 import { PipelineTaskContext } from '../../types/unity';
-import { ServiceLocator } from '../ServiceLocator';
 
 /**
  * Error resolution workflow - fixes compilation or test errors
  * 
- * Phases:
- * 1. analyze - Analyze errors and identify root cause
- * 2. route - Route errors to appropriate task/engineer
- * 3. fix - Apply fixes
- * 4. verify - Verify fixes (recompile/retest)
+ * Single phase: fix (analyze + fix in one AI session, fire and forget)
+ * 
+ * The workflow:
+ * 1. Analyzes errors and applies fixes in a single AI session
+ * 2. Requests Unity recompile (async, does not wait)
+ * 3. Completes immediately
+ * 
+ * When Unity recompile finishes:
+ * - If success: Coordinator resumes paused tasks
+ * - If errors remain: Coordinator creates new error task with attempt context
  */
 export class ErrorResolutionWorkflow extends BaseWorkflow {
-    private static readonly PHASES = [
-        'analyze',
-        'route',
-        'fix',
-        'verify'
-    ];
+    private static readonly PHASES = ['fix'];
     
-    /** This workflow works with or without Unity - just skips Unity verification */
+    /** This workflow works with or without Unity */
     static readonly requiresUnity = false;
     
-    // Error state
+    // Error state from input
     private errors: Array<{
         id: string;
         message: string;
@@ -47,28 +42,24 @@ export class ErrorResolutionWorkflow extends BaseWorkflow {
     private coordinatorId: string;
     private sourceWorkflowId?: string;
     
-    // Resolution state
-    private analysisResult: {
-        rootCause: string;
-        affectedFiles: string[];
-        suggestedFix: string;
-        relatedTaskId?: string;
-    } | null = null;
+    // Context from previous attempts (passed by Coordinator)
+    private previousAttempts: number;
+    private previousFixSummary?: string;
+    
+    // Fix state
     private fixerAgentName?: string;
     private fixApplied: boolean = false;
-    private verificationResult: { success: boolean; remainingErrors?: string[] } | null = null;
-    
-    private agentRunner: AgentRunner;
     
     constructor(config: WorkflowConfig, services: WorkflowServices) {
         super(config, services);
-        this.agentRunner = ServiceLocator.resolve(AgentRunner);
         
         // Extract input
         const input = config.input as ErrorResolutionInput;
         this.errors = input.errors;
         this.coordinatorId = input.coordinatorId;
         this.sourceWorkflowId = input.sourceWorkflowId;
+        this.previousAttempts = input.previousAttempts || 0;
+        this.previousFixSummary = input.previousFixSummary;
     }
     
     getPhases(): string[] {
@@ -79,20 +70,8 @@ export class ErrorResolutionWorkflow extends BaseWorkflow {
         const phase = this.getPhases()[phaseIndex];
         
         switch (phase) {
-            case 'analyze':
-                await this.executeAnalyzePhase();
-                break;
-                
-            case 'route':
-                await this.executeRoutePhase();
-                break;
-                
             case 'fix':
                 await this.executeFixPhase();
-                break;
-                
-            case 'verify':
-                await this.executeVerifyPhase();
                 break;
         }
     }
@@ -101,118 +80,35 @@ export class ErrorResolutionWorkflow extends BaseWorkflow {
         return {
             errors: this.errors,
             coordinatorId: this.coordinatorId,
-            analysisResult: this.analysisResult,
-            fixApplied: this.fixApplied,
-            verificationResult: this.verificationResult
+            previousAttempts: this.previousAttempts,
+            previousFixSummary: this.previousFixSummary,
+            fixApplied: this.fixApplied
         };
     }
     
     protected getProgressMessage(): string {
-        const phase = this.getPhases()[this.phaseIndex] || 'unknown';
-        switch (phase) {
-            case 'analyze':
-                return `Analyzing ${this.errors.length} error(s)...`;
-            case 'route':
-                return `Routing errors to fixer...`;
-            case 'fix':
-                return `Applying fix...`;
-            case 'verify':
-                return `Verifying fix...`;
-            default:
-                return `Processing errors...`;
-        }
+        const attemptStr = this.previousAttempts > 0 
+            ? ` (attempt ${this.previousAttempts + 1})` 
+            : '';
+        return `Fixing ${this.errors.length} error(s)${attemptStr}...`;
     }
     
     protected getOutput(): any {
         return {
             errors: this.errors,
-            analysisResult: this.analysisResult,
             fixApplied: this.fixApplied,
-            verificationResult: this.verificationResult,
-            success: this.verificationResult?.success ?? false
+            attempt: this.previousAttempts + 1,
+            success: this.fixApplied
         };
     }
     
     // =========================================================================
-    // PHASE IMPLEMENTATIONS
+    // FIX PHASE - Analyze and fix in single AI session, fire and forget
     // =========================================================================
     
-    private async executeAnalyzePhase(): Promise<void> {
-        this.log(`🔍 PHASE: ANALYZE (${this.errors.length} errors)`);
-        
-        // Request an error analyst agent
-        const analystName = await this.requestAgent('error_analyst');
-        
-        const role = this.getRole('error_analyst');
-        const prompt = this.buildAnalysisPrompt(role);
-        
-        this.log(`Running error analyst (${role?.defaultModel || 'sonnet-4.5'})...`);
-        
-        // Use CLI callback for structured completion
-        const result = await this.runAgentTaskWithCallback(
-            'error_analyze',
-            prompt,
-            'error_analyst',
-            {
-                expectedStage: 'error_analysis',
-                timeout: role?.timeoutMs || 300000,
-                model: role?.defaultModel,
-                cwd: this.stateManager.getWorkspaceRoot()
-            }
-        );
-        
-        if (result.fromCallback) {
-            // Got structured data from CLI callback - preferred path
-            this.analysisResult = {
-                rootCause: result.payload?.rootCause || 'Unknown',
-                affectedFiles: result.payload?.affectedFiles || this.errors.filter(e => e.file).map(e => e.file!),
-                suggestedFix: result.payload?.suggestedFix || 'Review and fix manually',
-                relatedTaskId: result.payload?.relatedTask
-            };
-            this.log(`✓ Analysis complete via CLI callback:`);
-            this.log(`  Root cause: ${this.analysisResult.rootCause.substring(0, 80)}...`);
-            this.log(`  Files affected: ${this.analysisResult.affectedFiles.length}`);
-            if (this.analysisResult.relatedTaskId) {
-                this.log(`  Related task: ${this.analysisResult.relatedTaskId}`);
-            }
-        } else {
-            // Legacy fallback: parse output
-            if (result.success && result.rawOutput) {
-                this.analysisResult = this.parseAnalysisResult(result.rawOutput);
-                this.log(`✓ Analysis complete via output parsing:`);
-                this.log(`  Root cause: ${this.analysisResult.rootCause.substring(0, 80)}...`);
-                this.log(`  Files affected: ${this.analysisResult.affectedFiles.length}`);
-            } else {
-                this.log(`⚠️ Analysis failed, using basic routing`);
-                this.analysisResult = {
-                    rootCause: 'Unknown',
-                    affectedFiles: this.errors.filter(e => e.file).map(e => e.file!),
-                    suggestedFix: 'Review and fix errors manually'
-                };
-            }
-        }
-        
-        // Release analyst
-        this.releaseAgent(analystName);
-    }
-    
-    private async executeRoutePhase(): Promise<void> {
-        this.log(`\n🔀 PHASE: ROUTE errors to fixer`);
-        
-        // Determine who should fix this
-        // Strategy: Use the task owner if we can identify the related task
-        let targetRole = 'engineer'; // Default
-        
-        if (this.analysisResult?.relatedTaskId) {
-            this.log(`Errors related to task: ${this.analysisResult.relatedTaskId}`);
-        }
-        
-        // For now, just note the routing decision
-        this.log(`✓ Routing to: ${targetRole}`);
-    }
-    
     private async executeFixPhase(): Promise<void> {
-        this.log(`\n🔧 PHASE: FIX errors`);
+        const attemptNum = this.previousAttempts + 1;
+        this.log(`🔧 PHASE: FIX (attempt ${attemptNum}, ${this.errors.length} errors)`);
         
         // Request a fixer agent
         this.fixerAgentName = await this.requestAgent('engineer');
@@ -258,75 +154,48 @@ export class ErrorResolutionWorkflow extends BaseWorkflow {
         // Release fixer
         if (this.fixerAgentName) {
             this.releaseAgent(this.fixerAgentName);
-            this.fixerAgentName = undefined;
-        }
-    }
-    
-    private async executeVerifyPhase(): Promise<void> {
-        this.log(`\n✓ PHASE: VERIFY fix`);
-        
-        // Check if Unity is available for verification
-        if (!this.isUnityAvailable() || !this.unityManager) {
-            this.log(`⚠️ Unity features disabled - skipping Unity verification`);
-            // When Unity is disabled, assume fix is successful (manual verification needed)
-            this.verificationResult = { 
-                success: true,
-                remainingErrors: []
-            };
-            this.log(`✅ Fix applied (manual verification required - Unity disabled)`);
-            return;
         }
         
-        // Queue a verification compile using 'prep' operation (reimport + compile)
-        this.setBlocked('Verifying fix via Unity');
-        
-        try {
-            const taskContext = {
+        // Fire and forget: request Unity recompile but DON'T wait
+        // Coordinator will handle the result when it comes back
+        if (this.isUnityAvailable() && this.unityManager) {
+            this.log(`📤 Requesting Unity recompile (async)...`);
+            
+            const taskContext: PipelineTaskContext = {
                 taskId: `error_fix_${this.id}`,
                 stage: 'verification',
                 agentName: this.fixerAgentName || 'error_fixer',
-                filesModified: [] // Error fixes may modify various files
+                filesModified: []
             };
             
-            const result = await this.unityManager.queuePipelineAndWait(
-                this.id, // coordinatorId
-                ['prep'], // Use 'prep' for compile/reimport
+            // Queue pipeline without waiting - Coordinator handles result
+            this.unityManager.queuePipeline(
+                this.coordinatorId,
+                ['prep'],
                 [taskContext],
-                false // Don't merge verification requests
+                true  // Allow merge with other pending compiles
             );
             
-            this.verificationResult = {
-                success: result.success,
-                remainingErrors: result.allErrors.map(e => e.message)
-            };
-            
-            if (result.success) {
-                this.log(`✅ Verification passed - errors fixed`);
-            } else {
-                this.log(`❌ Verification failed - ${result.allErrors.length} errors remain`);
-            }
-        } catch (error) {
-            const errorMsg = error instanceof Error ? error.message : String(error);
-            this.log(`❌ Verification error: ${errorMsg}`);
-            this.verificationResult = {
-                success: false,
-                remainingErrors: [errorMsg]
-            };
+            this.log(`✓ Recompile queued - workflow completing (Coordinator handles result)`);
+        } else {
+            this.log(`⚠️ Unity not available - fix applied, manual verification needed`);
         }
         
-        this.setUnblocked();
+        // Clear agent name after release
+        this.fixerAgentName = undefined;
     }
     
     // =========================================================================
-    // PROMPT BUILDERS
+    // PROMPT BUILDER
     // =========================================================================
     
-    private buildAnalysisPrompt(role: AgentRole | undefined): string {
+    private buildFixPrompt(role: AgentRole | undefined): string {
         if (!role?.promptTemplate) {
-            throw new Error('Missing prompt template for error_analyst role');
+            throw new Error('Missing prompt template for engineer role');
         }
         const basePrompt = role.promptTemplate;
         
+        // Format error list
         const errorList = this.errors.map(e => {
             let errorStr = `- ${e.message}`;
             if (e.file) errorStr += `\n  File: ${e.file}`;
@@ -335,154 +204,32 @@ export class ErrorResolutionWorkflow extends BaseWorkflow {
             return errorStr;
         }).join('\n\n');
         
-        return `${basePrompt}
-
-## Errors to Analyze
-${errorList}
-
-## Your Task
-1. Identify the root cause of these errors
-2. List affected files
-3. Suggest a fix approach
-
-## REQUIRED Output Format
-\`\`\`
-### Analysis
-
-#### Root Cause
-[Describe the underlying issue]
-
-#### Affected Files
-- file1.cs
-- file2.cs
-
-#### Related Task
-[Task ID if identifiable, or "Unknown"]
-
-#### Suggested Fix
-[Step-by-step fix approach]
-\`\`\``;
-    }
-    
-    private buildFixPrompt(role: AgentRole | undefined): string {
-        if (!role?.promptTemplate) {
-            throw new Error('Missing prompt template for engineer role');
+        // Build previous attempts context
+        let previousAttemptsSection = '';
+        if (this.previousAttempts > 0) {
+            previousAttemptsSection = `
+## Previous Attempts
+This is attempt ${this.previousAttempts + 1} to fix these errors.
+${this.previousFixSummary ? `\nPrevious fix tried:\n${this.previousFixSummary}\n\nThe errors still exist - try a DIFFERENT approach.` : ''}
+`;
         }
-        const basePrompt = role.promptTemplate;
-        
-        const errorList = this.errors.map(e => {
-            let errorStr = `- ${e.message}`;
-            if (e.file) errorStr += `\n  File: ${e.file}`;
-            if (e.line) errorStr += `, Line: ${e.line}`;
-            return errorStr;
-        }).join('\n\n');
-        
-        const analysis = this.analysisResult 
-            ? `
-## Analysis
-Root Cause: ${this.analysisResult.rootCause}
-
-Affected Files:
-${this.analysisResult.affectedFiles.map(f => `- ${f}`).join('\n')}
-
-Suggested Fix:
-${this.analysisResult.suggestedFix}`
-            : '';
         
         return `${basePrompt}
 
 ## Errors to Fix
 ${errorList}
-${analysis}
-
+${previousAttemptsSection}
 ## Your Task
-1. Fix the errors identified
-2. Do NOT introduce new issues
-3. Keep changes minimal and focused
+1. **Analyze** the errors to understand the root cause
+2. **Fix** the errors with minimal, focused changes
+3. Do NOT introduce new issues
 
 ## Instructions
-- Review the error messages carefully
-- Apply targeted fixes
-- Test your changes compile`;
+- Read error messages and affected files carefully
+- Understand WHY the errors occurred before fixing
+- Keep changes minimal - don't refactor unrelated code
+- Fix all related errors together
+${this.previousAttempts > 0 ? '- Previous fix did not work - try something different!' : ''}`;
     }
     
-    // =========================================================================
-    // HELPER METHODS
-    // =========================================================================
-    
-    private async runAgentTask(
-        taskId: string,
-        prompt: string,
-        role: AgentRole | undefined
-    ): Promise<{ success: boolean; output: string }> {
-        const workspaceRoot = this.stateManager.getWorkspaceRoot();
-        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs');
-        
-        if (!fs.existsSync(logDir)) {
-            fs.mkdirSync(logDir, { recursive: true });
-        }
-        
-        const logFile = path.join(logDir, `error_fix_${taskId}_${Date.now()}.log`);
-        
-        const options: AgentRunOptions = {
-            id: `error_${this.sessionId}_${taskId}`,
-            prompt,
-            cwd: workspaceRoot,
-            model: role?.defaultModel || 'sonnet-4.5',
-            logFile,
-            timeoutMs: role?.timeoutMs || 600000,
-            onProgress: (msg) => this.log(`  ${msg}`)
-        };
-        
-        const result = await this.agentRunner.run(options);
-        
-        return {
-            success: result.success,
-            output: result.output
-        };
-    }
-    
-    private parseAnalysisResult(output: string): {
-        rootCause: string;
-        affectedFiles: string[];
-        suggestedFix: string;
-        relatedTaskId?: string;
-    } {
-        // Parse root cause
-        const rootCauseMatch = output.match(/####?\s*Root\s*Cause[\s\S]*?(?=####|$)/i);
-        const rootCause = rootCauseMatch 
-            ? rootCauseMatch[0].replace(/####?\s*Root\s*Cause\s*/i, '').trim()
-            : 'Unknown';
-        
-        // Parse affected files
-        const filesMatch = output.match(/####?\s*Affected\s*Files[\s\S]*?(?=####|$)/i);
-        const affectedFiles: string[] = [];
-        if (filesMatch) {
-            const fileLines = filesMatch[0].match(/^-\s+.+$/gm);
-            if (fileLines) {
-                affectedFiles.push(...fileLines.map(l => l.replace(/^-\s+/, '').trim()));
-            }
-        }
-        
-        // Parse suggested fix
-        const fixMatch = output.match(/####?\s*Suggested\s*Fix[\s\S]*?(?=####|$)/i);
-        const suggestedFix = fixMatch 
-            ? fixMatch[0].replace(/####?\s*Suggested\s*Fix\s*/i, '').trim()
-            : 'Review and fix manually';
-        
-        // Parse related task
-        const taskMatch = output.match(/####?\s*Related\s*Task[\s\S]*?(?=####|$)/i);
-        let relatedTaskId: string | undefined;
-        if (taskMatch) {
-            const taskText = taskMatch[0].replace(/####?\s*Related\s*Task\s*/i, '').trim();
-            if (taskText && !taskText.toLowerCase().includes('unknown')) {
-                // Extract task ID (T1, T2, etc.)
-                const idMatch = taskText.match(/T\d+/i);
-                relatedTaskId = idMatch ? idMatch[0] : undefined;
-            }
-        }
-        
-        return { rootCause, affectedFiles, suggestedFix, relatedTaskId };
-    }
 }
-

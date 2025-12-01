@@ -189,6 +189,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 case 'openRoleSettings':
                     vscode.commands.executeCommand('apc.openRoleSettings');
                     break;
+                case 'openWorkflowSettings':
+                    vscode.commands.executeCommand('apc.openWorkflowSettings');
+                    break;
             }
         });
 

@@ -8,9 +8,9 @@
 
 import WebSocket, { WebSocketServer } from 'ws';
 import * as http from 'http';
-import { ApcRequest, ApcResponse, ApcEvent, ApcMessage, isApcResponse } from '../client/Protocol';
+import { ApcRequest, ApcResponse, ApcEvent, ApcMessage } from '../client/Protocol';
 import { ApiHandler, ApiServices } from './ApiHandler';
-import { EventBroadcaster, getBroadcaster } from './EventBroadcaster';
+import { EventBroadcaster } from './EventBroadcaster';
 import { ServiceLocator } from '../services/ServiceLocator';
 import {
     CoreConfig,
@@ -200,7 +200,7 @@ export class ApcDaemon {
         });
         
         // Close all client connections
-        for (const [clientId, client] of this.clients) {
+        for (const [_clientId, client] of this.clients) {
             try {
                 client.ws.close(1000, reason);
             } catch {
@@ -248,7 +248,7 @@ export class ApcDaemon {
         connectedClients: number;
         clientTypes: Record<string, number>;
         apiStats?: { requestCount: number; uptime: number };
-        eventStats?: any;
+        eventStats?: ReturnType<EventBroadcaster['getStats']>;
     } {
         const clientTypes: Record<string, number> = {};
         for (const client of this.clients.values()) {
@@ -355,7 +355,7 @@ export class ApcDaemon {
         
         // Handle special commands
         if (request.cmd === 'subscribe') {
-            this.handleSubscribe(client, request.params?.sessionId);
+            this.handleSubscribe(client, request.params?.sessionId as string | undefined);
             this.sendResponse(client, {
                 id: request.id,
                 success: true,
@@ -365,7 +365,7 @@ export class ApcDaemon {
         }
         
         if (request.cmd === 'unsubscribe') {
-            this.handleUnsubscribe(client, request.params?.sessionId);
+            this.handleUnsubscribe(client, request.params?.sessionId as string | undefined);
             this.sendResponse(client, {
                 id: request.id,
                 success: true,
@@ -425,7 +425,9 @@ export class ApcDaemon {
      * Subscribe client to session events
      */
     private handleSubscribe(client: ConnectedClient, sessionId?: string): void {
-        if (!sessionId) return;
+        if (!sessionId) {
+            return;
+        }
         
         client.subscribedSessions.add(sessionId);
         this.broadcaster.subscribeToSession(client.id, sessionId);
@@ -436,7 +438,9 @@ export class ApcDaemon {
      * Unsubscribe client from session events
      */
     private handleUnsubscribe(client: ConnectedClient, sessionId?: string): void {
-        if (!sessionId) return;
+        if (!sessionId) {
+            return;
+        }
         
         client.subscribedSessions.delete(sessionId);
         this.broadcaster.unsubscribeFromSession(client.id, sessionId);
@@ -524,8 +528,12 @@ export class ApcDaemon {
             }
         }
         
-        if (userAgent.includes('vscode')) return 'vscode';
-        if (userAgent.includes('tui')) return 'tui';
+        if (userAgent.includes('vscode')) {
+            return 'vscode';
+        }
+        if (userAgent.includes('tui')) {
+            return 'tui';
+        }
         
         return 'unknown';
     }
@@ -540,7 +548,7 @@ export class ApcDaemon {
     /**
      * Log message
      */
-    private log(level: 'debug' | 'info' | 'warn' | 'error', ...args: any[]): void {
+    private log(level: 'debug' | 'info' | 'warn' | 'error', ...args: unknown[]): void {
         const logLevels = { debug: 0, info: 1, warn: 2, error: 3 };
         const configLevel = logLevels[this.config.logLevel] || 1;
         

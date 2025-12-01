@@ -47,6 +47,7 @@ export type CoordinatorEventPayload =
 export interface ExecutionStartedPayload {
     type: 'execution_started';
     planPath: string;
+    planContent?: string;    // Raw plan markdown for coordinator to read
     taskCount: number;
 }
 
@@ -205,59 +206,12 @@ export interface CoordinatorInput {
 // ============================================================================
 
 /**
- * Dispatch instruction from coordinator
- */
-export interface DispatchInstruction {
-    taskId: string;
-    workflowType: WorkflowType;
-    priority: number;
-    preferredAgent?: string;
-    context?: string;  // Additional context for the workflow
-}
-
-/**
- * Question to ask user
- */
-export interface UserQuestion {
-    sessionId: string;
-    questionId: string;
-    question: string;
-    context: string;
-    relatedTaskId?: string;
-    options?: string[];  // Optional multiple choice
-    blocking: boolean;   // If true, pause related work until answered
-}
-
-/**
- * Error task creation instruction
- */
-export interface ErrorTaskInstruction {
-    errorId: string;
-    errorMessage: string;
-    file?: string;
-    affectedTaskIds: string[];
-    priority: number;
-}
-
-/**
- * Complete decision output from AI coordinator
+ * Decision output from AI coordinator
+ * 
+ * NOTE: The AI executes commands directly via run_terminal_cmd.
+ * This interface is mostly for logging/history tracking.
  */
 export interface CoordinatorDecision {
-    /** Workflows to dispatch */
-    dispatch: DispatchInstruction[];
-    
-    /** Question to ask user (null if none needed) */
-    askUser: UserQuestion | null;
-    
-    /** Task IDs to pause */
-    pauseTasks: string[];
-    
-    /** Task IDs to resume */
-    resumeTasks: string[];
-    
-    /** Error tasks to create */
-    createErrorTasks: ErrorTaskInstruction[];
-    
     /** AI's reasoning (logged for history/debugging) */
     reasoning: string;
     
