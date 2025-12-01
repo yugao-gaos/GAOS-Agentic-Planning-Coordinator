@@ -157,6 +157,10 @@ export const agentStyles = `
     background: rgba(241, 76, 76, 0.2);
 }
 
+.agent-stop-btn:active {
+    background: rgba(241, 76, 76, 0.3);
+}
+
 .agent-stop-btn svg {
     width: 10px;
     height: 10px;

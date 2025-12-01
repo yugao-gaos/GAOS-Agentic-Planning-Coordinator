@@ -334,6 +334,10 @@ export const sessionStyles = `
     background: var(--vscode-button-secondaryHoverBackground);
 }
 
+.sub-item-btn:active {
+    opacity: 0.8;
+}
+
 .sub-item-btn.primary {
     background: var(--vscode-button-background);
     color: var(--vscode-button-foreground);
@@ -344,6 +348,10 @@ export const sessionStyles = `
     background: var(--vscode-button-hoverBackground);
 }
 
+.sub-item-btn.primary:active {
+    opacity: 0.8;
+}
+
 .sub-item-btn.danger {
     color: #f14c4c;
     border-color: rgba(241, 76, 76, 0.3);
@@ -351,6 +359,10 @@ export const sessionStyles = `
 
 .sub-item-btn.danger:hover {
     background: rgba(241, 76, 76, 0.2);
+}
+
+.sub-item-btn.danger:active {
+    background: rgba(241, 76, 76, 0.3);
 }
 
 /* Spin animation for session activity */
