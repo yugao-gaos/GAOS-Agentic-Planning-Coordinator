@@ -460,6 +460,12 @@ export class ApiHandler {
                     params.prompt as string,
                     params.docs as string[] | undefined
                 );
+                // Broadcast session created so UI refreshes
+                this.broadcaster.broadcast('session.created', { 
+                    sessionId: result.sessionId, 
+                    requirement: params.prompt as string,
+                    createdAt: new Date().toISOString()
+                });
                 return {
                     data: result,
                     message: `Planning session ${result.sessionId} created`

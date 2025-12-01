@@ -189,6 +189,10 @@ export async function activate(context: vscode.ExtensionContext) {
         sidebarProvider.setStateProxy(daemonStateProxy);
         
         // Subscribe to events for UI updates
+        vsCodeClient.subscribe('session.created', () => {
+            sidebarProvider?.refresh();
+        });
+        
         vsCodeClient.subscribe('session.updated', () => {
             sidebarProvider?.refresh();
         });
