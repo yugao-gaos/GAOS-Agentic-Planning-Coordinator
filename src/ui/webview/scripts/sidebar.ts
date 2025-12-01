@@ -128,9 +128,15 @@ export function getSidebarScript(): string {
                             vscode.postMessage({ type: 'openPlan', planPath });
                         }
                     } else if (action === 'openProgressLog') {
-                        const progressPath = el.dataset.progressPath;
+                        // Check for progressPath on element first, then fall back to session's progress log
+                        const progressPath = el.dataset.progressPath || item.querySelector('.session-body')?.dataset.progressLog;
                         if (progressPath) {
                             vscode.postMessage({ type: 'openProgressLog', progressLogPath: progressPath });
+                        }
+                    } else if (action === 'showWorkflowAgent') {
+                        const agentName = el.dataset.agentName;
+                        if (agentName) {
+                            vscode.postMessage({ type: 'showAgentTerminal', agentName });
                         }
                     } else if (action === 'retryTask') {
                         const taskId = el.dataset.taskId;
