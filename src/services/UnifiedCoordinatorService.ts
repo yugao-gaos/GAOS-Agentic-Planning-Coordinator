@@ -153,6 +153,9 @@ export class UnifiedCoordinatorService {
     private readonly _onSessionStateChanged = new TypedEventEmitter<string>();
     readonly onSessionStateChanged = this._onSessionStateChanged.event;
     
+    private readonly _onAgentAllocated = new TypedEventEmitter<{ agentName: string; sessionId: string; roleId: string; workflowId: string }>();
+    readonly onAgentAllocated = this._onAgentAllocated.event;
+    
     // AI Coordinator Agent (handles debouncing, evaluation, and history)
     private coordinatorAgent: CoordinatorAgent;
     private coordinatorContext: CoordinatorContext;
@@ -661,6 +664,14 @@ export class UnifiedCoordinatorService {
                 // Map the string roleId to the AgentRole type
                 const roleId = this.mapRoleIdToAgentRole(request.roleId);
                 taskManager.registerAgent(agentName, sessionId, '', roleId);
+                
+                // Fire allocation event (for terminal creation etc.)
+                this._onAgentAllocated.fire({
+                    agentName,
+                    sessionId,
+                    roleId: request.roleId,
+                    workflowId: request.workflowId
+                });
                 
                 // Fulfill the request
                 request.callback(agentName);

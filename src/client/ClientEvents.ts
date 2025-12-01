@@ -139,6 +139,17 @@ export interface AgentAssignedEventData {
 }
 
 /**
+ * Agent allocated event data (for terminal creation)
+ */
+export interface AgentAllocatedEventData {
+    agentName: string;
+    sessionId: string;
+    roleId: string;
+    workflowId: string;
+    logFile?: string;
+}
+
+/**
  * Agent released event data
  */
 export interface AgentReleasedEventData {
@@ -373,6 +384,7 @@ export interface ApcEventMap {
     
     // Agent events
     'agent.assigned': AgentAssignedEventData;
+    'agent.allocated': AgentAllocatedEventData;
     'agent.released': AgentReleasedEventData;
     'agent.progress': AgentProgressEventData;
     'agent.completed': AgentReleasedEventData;

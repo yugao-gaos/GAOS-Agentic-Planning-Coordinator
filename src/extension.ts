@@ -197,6 +197,19 @@ export async function activate(context: vscode.ExtensionContext) {
             sidebarProvider?.refresh();
         });
         
+        // Create agent terminal when an agent is allocated
+        vsCodeClient.subscribe('agent.allocated', (data: unknown) => {
+            const allocData = data as { agentName: string; sessionId: string; roleId: string; logFile?: string };
+            if (allocData.agentName && allocData.sessionId) {
+                terminalManager.createAgentTerminal(
+                    allocData.agentName,
+                    allocData.sessionId,
+                    allocData.logFile || '',
+                    workspaceRoot
+                );
+            }
+        });
+        
         vsCodeClient.subscribe('pool.changed', () => {
             sidebarProvider?.refresh();
         });
@@ -458,7 +471,13 @@ Let's get started!`;
                 }
             }
             if (agentName) {
-                terminalManager.showAgentTerminal(agentName);
+                const shown = terminalManager.showAgentTerminal(agentName);
+                if (!shown) {
+                    // Agent has no terminal yet - show informative message
+                    vscode.window.showInformationMessage(
+                        `Agent "${agentName}" has no terminal output yet. Terminal will open when the agent starts working.`
+                    );
+                }
             }
         }),
 
