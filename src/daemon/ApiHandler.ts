@@ -86,6 +86,7 @@ export interface ICoordinatorApi {
     resumeSession(sessionId: string): Promise<void>;
     cancelSession(sessionId: string): Promise<void>;
     startExecution(sessionId: string): Promise<string[]>;
+    getFailedTasks(sessionId: string): Array<{ taskId: string; description: string; attempts: number; lastError: string; canRetry: boolean }>;
     
     // Agent CLI callback support
     signalAgentCompletion(signal: AgentCompletionSignal): boolean;
@@ -269,9 +270,29 @@ export class ApiHandler {
                 await this.services.coordinator.resumeSession(params.id);
                 return { message: `Session ${params.id} resumed` };
             
+            case 'get':
+                const session = this.services.stateManager.getPlanningSession(params.id);
+                return { data: { session } };
+            
+            case 'state':
+                return { data: { state: this.sessionState(params.id) } };
+            
+            case 'failed_tasks':
+                const failedTasks = this.services.coordinator.getFailedTasks(params.id);
+                return { data: { failedTasks } };
+            
             default:
                 throw new Error(`Unknown session action: ${action}`);
         }
+    }
+    
+    private sessionState(id: string): { isRevising: boolean; activeWorkflows: any[] } | null {
+        const state = this.services.coordinator.getSessionState(id);
+        if (!state) return null;
+        return {
+            isRevising: state.isRevising,
+            activeWorkflows: Array.from(state.activeWorkflows.values())
+        };
     }
     
     private sessionList(): SessionListResponse {
@@ -503,6 +524,10 @@ export class ApiHandler {
                     message: `Pool resized to ${params.size}`
                 };
             
+            case 'role':
+                const role = this.services.agentPoolService.getRole(params.id);
+                return { data: { role } };
+            
             default:
                 throw new Error(`Unknown pool action: ${action}`);
         }
@@ -705,8 +730,12 @@ export class ApiHandler {
     // ========================================================================
     
     private async handleUnity(action: string, params: Record<string, any>): Promise<{ data?: any; message?: string }> {
+        // For status requests, return null gracefully when Unity manager isn't available
         if (!this.services.unityManager) {
-            throw new Error('Unity manager not available');
+            if (action === 'status') {
+                return { data: null };
+            }
+            throw new Error('Unity manager not available - Unity features require Unity MCP connection');
         }
         
         switch (action) {
