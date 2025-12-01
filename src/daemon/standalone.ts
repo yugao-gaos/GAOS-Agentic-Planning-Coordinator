@@ -161,7 +161,8 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
             },
             revisePlan: (id: string, feedback: string) => planningService.revisePlan(id, feedback),
             approvePlan: (id: string, autoStart?: boolean) => planningService.approvePlan(id, autoStart),
-            cancelPlan: (id: string) => planningService.cancelPlan(id)
+            cancelPlan: (id: string) => planningService.cancelPlan(id),
+            restartPlanning: (id: string) => planningService.restartPlanning(id)
         },
         // Optional services for full API support
         taskManager: (() => {

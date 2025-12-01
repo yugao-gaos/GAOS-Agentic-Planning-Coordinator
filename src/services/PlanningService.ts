@@ -790,18 +790,16 @@ export class PlanningService extends EventEmitter {
                 await this.coordinator.cancelSession(sessionId);
             }
 
-            // Use 'stopped' for both planning and execution - both can be resumed
-            // 'cancelled' is reserved for explicit terminal cancellation via cancelPlan
-            session.status = 'stopped';
+            // Distinct states for planning vs execution stops
+            // - cancelled: stopped during planning (can restart fresh)
+            // - stopped: stopped during execution (can resume where left off)
             if (wasDuringPlanning) {
-                this.writeProgress(sessionId, 'STOP', `✅ Session stopped during planning (can resume)`);
+                session.status = 'cancelled';
+                this.writeProgress(sessionId, 'STOP', `✅ Planning cancelled (use Restart to plan again)`);
             } else {
-                this.writeProgress(sessionId, 'STOP', `✅ Session stopped (can resume execution)`);
+                session.status = 'stopped';
+                this.writeProgress(sessionId, 'STOP', `✅ Execution stopped (can resume)`);
             }
-            
-            // Store previous status in metadata for resume logic
-            session.metadata = session.metadata || {};
-            session.metadata.stoppedDuring = wasDuringPlanning ? 'planning' : 'execution';
             
             session.updatedAt = new Date().toISOString();
             this.stateManager.savePlanningSession(session);
@@ -837,7 +835,9 @@ export class PlanningService extends EventEmitter {
     }
 
     /**
-     * Resume a stopped or paused planning session
+     * Resume a stopped or paused execution session
+     * Note: Only works for execution phase (stopped/paused states)
+     * For cancelled planning sessions, use restartPlanning instead
      */
     async resumeSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
         try {
@@ -851,48 +851,61 @@ export class PlanningService extends EventEmitter {
             }
 
             if (session.status !== 'stopped') {
-                return { success: false, error: `Session ${sessionId} is not in a resumable state (current: ${session.status})` };
+                return { success: false, error: `Session ${sessionId} is not in a resumable state (current: ${session.status}). Use restartPlanning for cancelled sessions.` };
             }
 
-            // Check what phase we stopped in
-            const stoppedDuring = session.metadata?.stoppedDuring;
-            
-            if (stoppedDuring === 'planning') {
-                // Resume planning by restarting the planning workflow
-                this.writeProgress(sessionId, 'RESUME', '='.repeat(60));
-                this.writeProgress(sessionId, 'RESUME', `🔄 RESUMING PLANNING: ${sessionId}`);
-                this.writeProgress(sessionId, 'RESUME', '='.repeat(60));
-                
-                // Clear the stopped metadata
-                delete session.metadata?.stoppedDuring;
-                
-                // Restart planning workflow
-                const input = {
-                    requirement: session.requirement,
-                    docs: [] // TODO: could store original docs in metadata if needed
-                };
-                
-                const workflowId = await this.coordinator.dispatchWorkflow(
-                    sessionId,
-                    'planning_new',
-                    input,
-                    { priority: 5, blocking: true }
-                );
-                
-                session.status = 'debating';
-                session.updatedAt = new Date().toISOString();
-                this.stateManager.savePlanningSession(session);
-                this.notifyChange();
-                
-                this.writeProgress(sessionId, 'RESUME', `✅ Planning resumed (workflow: ${workflowId})`);
-                return { success: true };
-            }
-
-            // Restart execution for stopped session (stopped during execution)
+            // Restart execution for stopped session
             return await this.startExecution(sessionId);
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
             return { success: false, error: `Failed to resume session: ${errorMessage}` };
+        }
+    }
+
+    /**
+     * Restart planning for a cancelled session
+     * This re-runs the planning workflow from scratch
+     */
+    async restartPlanning(sessionId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            const session = this.stateManager.getPlanningSession(sessionId);
+            if (!session) {
+                return { success: false, error: `Session ${sessionId} not found` };
+            }
+
+            if (session.status !== 'cancelled') {
+                return { success: false, error: `Session ${sessionId} is not cancelled (current: ${session.status}). Only cancelled sessions can restart planning.` };
+            }
+
+            this.writeProgress(sessionId, 'RESTART', '='.repeat(60));
+            this.writeProgress(sessionId, 'RESTART', `🔄 RESTARTING PLANNING: ${sessionId}`);
+            this.writeProgress(sessionId, 'RESTART', `   Original requirement: ${session.requirement.substring(0, 50)}...`);
+            this.writeProgress(sessionId, 'RESTART', '='.repeat(60));
+
+            // Dispatch new planning workflow
+            const input = {
+                requirement: session.requirement,
+                docs: [] // Original docs not stored - starts fresh
+            };
+            
+            const workflowId = await this.coordinator.dispatchWorkflow(
+                sessionId,
+                'planning_new',
+                input,
+                { priority: 5, blocking: true }
+            );
+            
+            session.status = 'debating';
+            session.updatedAt = new Date().toISOString();
+            this.stateManager.savePlanningSession(session);
+            this.notifyChange();
+            
+            this.writeProgress(sessionId, 'RESTART', `✅ Planning restarted (workflow: ${workflowId})`);
+            return { success: true };
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            this.writeProgress(sessionId, 'ERROR', `❌ Failed to restart planning: ${errorMessage}`);
+            return { success: false, error: `Failed to restart planning: ${errorMessage}` };
         }
     }
 

@@ -643,6 +643,23 @@ This will trigger the multi-agent debate to revise the plan.`;
             }
         }),
         
+        // Restart planning for cancelled sessions
+        vscode.commands.registerCommand('agenticPlanning.restartPlanning', async (item?: { session?: { id: string } }) => {
+            const sessionId = item?.session?.id;
+            if (!sessionId) {
+                vscode.window.showWarningMessage('No session selected');
+                return;
+            }
+            
+            const result = await vsCodeClient.restartPlanning(sessionId);
+            if (result.success) {
+                vscode.window.showInformationMessage(`Planning restarted for ${sessionId}`);
+                sidebarProvider.refresh();
+            } else {
+                vscode.window.showErrorMessage(`Failed to restart planning: ${result.error}`);
+            }
+        }),
+        
         vscode.commands.registerCommand('agenticPlanning.refreshAgentPool', async () => {
             // Sync pool size with settings via daemon
             const configSize = vscode.workspace.getConfiguration('agenticPlanning').get<number>('agentPoolSize', 5);

@@ -162,6 +162,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 case 'stopRevision':
                     vscode.commands.executeCommand('agenticPlanning.cancelPlan', { session: { id: data.sessionId } });
                     break;
+                case 'restartPlanning':
+                    vscode.commands.executeCommand('agenticPlanning.restartPlanning', { session: { id: data.sessionId } });
+                    break;
                 case 'removeSession':
                     vscode.commands.executeCommand('agenticPlanning.removePlanningSession', { session: { id: data.sessionId } });
                     break;

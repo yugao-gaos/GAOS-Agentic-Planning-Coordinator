@@ -174,6 +174,7 @@ export interface IPlanningApi {
     revisePlan(id: string, feedback: string): Promise<any>;
     approvePlan(id: string, autoStart?: boolean): Promise<void>;
     cancelPlan(id: string): Promise<void>;
+    restartPlanning(id: string): Promise<{ success: boolean; error?: string }>;
 }
 
 /**
@@ -520,6 +521,23 @@ export class ApiHandler {
                     updatedAt: new Date().toISOString()
                 });
                 return { message: `Plan ${cancelId} cancelled` };
+            }
+            
+            case 'restart': {
+                const restartId = params.id as string;
+                const result = await this.services.planningService.restartPlanning(restartId);
+                if (!result.success) {
+                    throw new Error(result.error || 'Failed to restart planning');
+                }
+                // Broadcast session update so UI refreshes
+                this.broadcaster.broadcast('session.updated', { 
+                    sessionId: restartId, 
+                    status: 'debating',
+                    previousStatus: 'cancelled',
+                    changes: ['planning_restarted'],
+                    updatedAt: new Date().toISOString()
+                });
+                return { message: `Planning restarted for ${restartId}` };
             }
             
             default:

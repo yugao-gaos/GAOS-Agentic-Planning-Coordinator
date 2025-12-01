@@ -361,6 +361,18 @@ export class VsCodeClient extends BaseApcClient {
     }
     
     /**
+     * Restart planning for a cancelled session
+     */
+    async restartPlanning(sessionId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('plan.restart', { id: sessionId });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
      * Get plan status
      */
     async getPlanStatus(sessionId: string): Promise<any> {
