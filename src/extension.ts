@@ -253,46 +253,45 @@ export async function activate(context: vscode.ExtensionContext) {
             );
         }
         
-        // Create DaemonStateProxy
+        // Create DaemonStateProxy - always uses daemon API for state
         const unityFeaturesEnabled = vscode.workspace.getConfiguration('agenticPlanning').get<boolean>('enableUnityFeatures', true);
         daemonStateProxy = new DaemonStateProxy({
-            isExternal: daemonResult.isExternal,
-            vsCodeClient: daemonResult.isExternal ? vsCodeClient : undefined,
-            stateManager: daemonResult.isExternal ? undefined : stateManager,
-            agentPoolService: daemonResult.isExternal ? undefined : agentPoolService,
+            vsCodeClient,
             unityEnabled: unityFeaturesEnabled
         });
-        console.log(`Agentic Planning: DaemonStateProxy created (isExternal: ${daemonResult.isExternal})`);
+        console.log('[APC] DaemonStateProxy created (daemon-only mode)');
         
         // Pass proxy to providers
         sidebarProvider.setStateProxy(daemonStateProxy);
         
         // Subscribe to events for UI updates
         vsCodeClient.subscribe('session.updated', () => {
-            // Refresh state from files when daemon reports changes
-            daemonStateProxy?.reloadFromFiles();
             planningSessionsProvider?.refresh();
             sidebarProvider?.refresh();
         });
         
         vsCodeClient.subscribe('pool.changed', () => {
-            daemonStateProxy?.reloadFromFiles();
             agentPoolProvider?.refresh();
+            sidebarProvider?.refresh();
+        });
+        
+        // Subscribe to disconnection events to update UI
+        vsCodeClient.subscribe('disconnected', () => {
+            console.log('[APC] Daemon disconnected, refreshing UI');
             sidebarProvider?.refresh();
         });
         
     } catch (daemonError) {
         console.error('Agentic Planning: Failed to connect to daemon:', daemonError);
         vscode.window.showWarningMessage(
-            'Could not connect to APC daemon. Some features may not work. Try running: apc system run --headless'
+            'Could not connect to APC daemon. Run "apc system run --headless" or restart Cursor.'
         );
         
-        // Create local-only proxy as fallback
+        // Create proxy with unconnected client - UI will show "daemon missing"
         const unityFeaturesEnabled = vscode.workspace.getConfiguration('agenticPlanning').get<boolean>('enableUnityFeatures', true);
+        vsCodeClient = new VsCodeClient({ clientId: 'vscode-extension' });
         daemonStateProxy = new DaemonStateProxy({
-            isExternal: false,
-            stateManager,
-            agentPoolService,
+            vsCodeClient,
             unityEnabled: unityFeaturesEnabled
         });
         sidebarProvider.setStateProxy(daemonStateProxy);

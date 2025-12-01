@@ -228,14 +228,33 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     }
 
     private async _buildStateAsync(): Promise<SidebarState> {
-        // System Status
+        // Check daemon connection first - this is critical for all operations
+        if (this.stateProxy && !this.stateProxy.isDaemonConnected()) {
+            return {
+                systemStatus: 'daemon_missing',
+                missingCount: 0,
+                sessions: [],
+                agents: [],
+                unity: {
+                    connected: false,
+                    isPlaying: false,
+                    isCompiling: false,
+                    hasErrors: false,
+                    errorCount: 0,
+                    queueLength: 0
+                },
+                unityEnabled: this.unityEnabled
+            };
+        }
+
+        // System Status - check dependencies
         const statuses = this.dependencyService.getCachedStatus();
         const platform = process.platform;
         const relevantStatuses = statuses.filter(s => s.platform === platform || s.platform === 'all');
         const requiredStatuses = relevantStatuses.filter(s => s.required);
         const missingDeps = requiredStatuses.filter(s => !s.installed);
 
-        let systemStatus: 'checking' | 'ready' | 'missing' = 'checking';
+        let systemStatus: 'checking' | 'ready' | 'missing' | 'daemon_missing' = 'checking';
         if (relevantStatuses.length > 0) {
             systemStatus = missingDeps.length === 0 ? 'ready' : 'missing';
         }
@@ -342,7 +361,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             }
             
             // Get progress log path
-            const progressLogPath = this.stateProxy?.getProgressLogPath(s.id) || this.stateManager?.getProgressLogPath(s.id);
+            const progressLogPath = this.stateProxy 
+                ? await this.stateProxy.getProgressLogPath(s.id)
+                : this.stateManager?.getProgressLogPath(s.id);
             
             // Get failed tasks from proxy or coordinator
             let failedTasks: FailedTaskInfo[] = [];
@@ -371,7 +392,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 if (agent.coordinatorId === s.id || agent.sessionId === s.id) {
                     let roleColor: string | undefined;
                     if (agent.roleId) {
-                        const role = this.stateProxy?.getRole(agent.roleId) || this.agentPoolService?.getRole(agent.roleId);
+                        const role = this.stateProxy 
+                            ? await this.stateProxy.getRole(agent.roleId) 
+                            : this.agentPoolService?.getRole(agent.roleId);
                         roleColor = role?.color;
                     }
                     
@@ -444,7 +467,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             // Get role color if available
             let roleColor: string | undefined;
             if (agent.roleId) {
-                const role = this.stateProxy?.getRole(agent.roleId) || this.agentPoolService?.getRole(agent.roleId);
+                const role = this.stateProxy 
+                    ? await this.stateProxy.getRole(agent.roleId) 
+                    : this.agentPoolService?.getRole(agent.roleId);
                 roleColor = role?.color;
             }
             

@@ -4,7 +4,7 @@
  */
 
 export interface SidebarState {
-    systemStatus: 'checking' | 'ready' | 'missing';
+    systemStatus: 'checking' | 'ready' | 'missing' | 'daemon_missing';
     missingCount: number;
     sessions: SessionInfo[];
     agents: AgentInfo[];

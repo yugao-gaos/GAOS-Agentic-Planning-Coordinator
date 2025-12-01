@@ -182,6 +182,9 @@ export function getSidebarScript(): string {
             if (state.systemStatus === 'ready') {
                 statusText.textContent = 'Ready';
                 statusInfo.style.cursor = 'default';
+            } else if (state.systemStatus === 'daemon_missing') {
+                statusText.textContent = 'Daemon Missing';
+                statusInfo.style.cursor = 'pointer';
             } else if (state.systemStatus === 'missing') {
                 statusText.textContent = state.missingCount + ' Missing';
                 statusInfo.style.cursor = 'pointer';

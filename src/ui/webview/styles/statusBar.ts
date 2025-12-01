@@ -49,6 +49,11 @@ export const statusBarStyles = `
     background: var(--vscode-list-warningForeground, #cca700);
 }
 
+.status-dot.daemon_missing {
+    background: var(--vscode-testing-iconFailed, #f14c4c);
+    animation: pulse 2s infinite;
+}
+
 .status-dot.checking {
     background: var(--vscode-foreground);
     animation: pulse 1s infinite;
