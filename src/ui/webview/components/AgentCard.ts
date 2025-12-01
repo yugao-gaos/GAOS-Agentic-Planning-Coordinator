@@ -44,6 +44,7 @@ function renderBusyAgent(agent: AgentInfo): string {
     
     return `
         <div class="agent-card busy" data-agent="${agent.name}" 
+             title="Click to view terminal output"
              style="--role-color: ${roleColor}; --role-color-bg: rgba(${roleColorRgb}, 0.2); --role-color-glow: rgba(${roleColorRgb}, 0.3);">
             <div class="agent-header">
                 <div class="agent-icon">${initial}</div>

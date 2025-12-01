@@ -168,6 +168,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 case 'releaseAgent':
                     vscode.commands.executeCommand('agenticPlanning.releaseAgent', { label: data.agentName });
                     break;
+                case 'showAgentTerminal':
+                    vscode.commands.executeCommand('agenticPlanning.showAgentTerminal', data.agentName);
+                    break;
                 case 'openPlan':
                     if (data.planPath) {
                         const uri = vscode.Uri.file(data.planPath);

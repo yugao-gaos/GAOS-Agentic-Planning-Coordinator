@@ -170,6 +170,17 @@ export function getSidebarScript(): string {
             const grid = document.getElementById('agentGrid');
             if (!grid) return;
             
+            // Click on busy agent card to open terminal
+            grid.querySelectorAll('.agent-card.busy').forEach(card => {
+                card.style.cursor = 'pointer';
+                card.onclick = (e) => {
+                    // Don't open terminal if clicking stop button
+                    if (e.target.closest('.agent-stop-btn')) return;
+                    vscode.postMessage({ type: 'showAgentTerminal', agentName: card.dataset.agent });
+                };
+            });
+            
+            // Stop button handler
             grid.querySelectorAll('.agent-stop-btn').forEach(btn => {
                 btn.onclick = (e) => {
                     e.stopPropagation();
