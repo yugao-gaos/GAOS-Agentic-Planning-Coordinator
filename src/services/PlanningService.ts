@@ -2,7 +2,7 @@ import { EventEmitter } from 'events';
 import * as path from 'path';
 import * as fs from 'fs';
 import { StateManager } from './StateManager';
-import { PlanningSession, PlanningStatus, ExecutionState } from '../types';
+import { PlanningSession, PlanStatus, ExecutionState } from '../types';
 import { UnifiedCoordinatorService } from './UnifiedCoordinatorService';
 import { OutputChannelManager } from './OutputChannelManager';
 import { EventBroadcaster } from '../daemon/EventBroadcaster';
@@ -177,7 +177,7 @@ export class PlanningService extends EventEmitter {
      */
     async startPlanning(requirement: string, docs?: string[]): Promise<{
         sessionId: string;
-        status: PlanningStatus;
+        status: PlanStatus;
         debateSummary?: {
             phases: string[];
             concerns: string[];
@@ -192,7 +192,7 @@ export class PlanningService extends EventEmitter {
         
         const session: PlanningSession = {
             id: sessionId,
-            status: 'debating',
+            status: 'planning',
             requirement: requirement,
             planHistory: [],
             revisionHistory: [{
@@ -225,7 +225,7 @@ export class PlanningService extends EventEmitter {
         );
         
         // Update session
-        session.status = 'debating';
+        session.status = 'planning';
         session.updatedAt = new Date().toISOString();
         this.stateManager.savePlanningSession(session);
         this.notifyChange();
@@ -235,7 +235,8 @@ export class PlanningService extends EventEmitter {
             if (event.sessionId === sessionId) {
                 const updatedSession = this.stateManager.getPlanningSession(sessionId);
                 if (updatedSession) {
-                    updatedSession.status = event.result.success ? 'reviewing' : 'stopped';
+                    // On success -> reviewing, on failure -> no_plan (planning failed)
+                    updatedSession.status = event.result.success ? 'reviewing' : 'no_plan';
                     
                     if (event.result.success && event.result.output?.planPath) {
                         updatedSession.currentPlanPath = event.result.output.planPath;
@@ -299,7 +300,7 @@ export class PlanningService extends EventEmitter {
      */
     async revisePlan(sessionId: string, feedback: string): Promise<{ 
         sessionId: string; 
-        status: PlanningStatus;
+        status: PlanStatus;
         planPath?: string;
         version?: number;
     }> {
@@ -538,6 +539,8 @@ export class PlanningService extends EventEmitter {
     
     /**
      * Start execution for an approved plan
+     * Note: Plan status stays 'approved'. This triggers the Coordinator AI Agent
+     * which decides what tasks/workflows to dispatch. Workflow states are tracked separately.
      */
     async startExecution(sessionId: string, options?: {
         mode?: 'auto' | 'interactive';
@@ -549,8 +552,9 @@ export class PlanningService extends EventEmitter {
                 return { success: false, error: `Session ${sessionId} not found` };
             }
             
-            if (session.status !== 'approved' && session.status !== 'paused' && session.status !== 'stopped') {
-                return { success: false, error: `Session must be 'approved', 'paused', or 'stopped' to start execution (current: ${session.status})` };
+            // Plan must be approved to start execution
+            if (session.status !== 'approved') {
+                return { success: false, error: `Session must be 'approved' to start execution (current: ${session.status})` };
             }
             
             if (!session.currentPlanPath) {
@@ -560,24 +564,14 @@ export class PlanningService extends EventEmitter {
             // Start execution via coordinator (dispatches task workflows)
             const workflowIds = await this.coordinator.startExecution(sessionId);
             
-            // Create execution state on the session
+            // Create simplified execution state (occupancy tracked in global TaskManager)
             const executionState: ExecutionState = {
-                mode: options?.mode || 'auto',
                 startedAt: new Date().toISOString(),
                 lastActivityAt: new Date().toISOString(),
-                progress: { completed: 0, total: workflowIds.length, percentage: 0 },
-                taskOccupancy: {},
-                activeWorkflowIds: workflowIds,
-                completedWorkflowIds: [],
-                failedTasks: {},
-                coordinatorHistory: [],
-                pendingQuestions: [],
-                isRevising: false,
-                pausedForRevision: []
+                progress: { completed: 0, total: workflowIds.length, percentage: 0 }
             };
             
-            // Update session
-            session.status = 'executing';
+            // Update session - status stays 'approved', only set execution state
             session.execution = executionState;
             session.updatedAt = new Date().toISOString();
             this.stateManager.savePlanningSession(session);
@@ -636,6 +630,7 @@ export class PlanningService extends EventEmitter {
     
     /**
      * Pause execution for a session
+     * Note: Plan status stays 'approved'. Workflow pause state is tracked by workflows.
      */
     async pauseExecution(sessionId: string): Promise<{ success: boolean; error?: string }> {
         try {
@@ -644,13 +639,15 @@ export class PlanningService extends EventEmitter {
                 return { success: false, error: `Session ${sessionId} not found` };
             }
             
-            if (session.status !== 'executing') {
-                return { success: false, error: `Session is not executing (current: ${session.status})` };
+            // Check if there are active workflows to pause
+            const state = this.coordinator.getSessionState(sessionId);
+            if (!state || state.activeWorkflows.size === 0) {
+                return { success: false, error: `No active workflows to pause` };
             }
             
             await this.coordinator.pauseSession(sessionId);
             
-            session.status = 'paused';
+            // Update execution timestamp, but NOT session status
             session.updatedAt = new Date().toISOString();
             if (session.execution) {
                 session.execution.lastActivityAt = new Date().toISOString();
@@ -658,7 +655,7 @@ export class PlanningService extends EventEmitter {
             this.stateManager.savePlanningSession(session);
             this.notifyChange();
             
-            this.writeProgress(sessionId, 'EXECUTION', '⏸️ EXECUTION PAUSED');
+            this.writeProgress(sessionId, 'EXECUTION', '⏸️ WORKFLOWS PAUSED');
             
             return { success: true };
         } catch (error) {
@@ -668,7 +665,8 @@ export class PlanningService extends EventEmitter {
     }
     
     /**
-     * Resume a paused execution
+     * Resume paused workflows
+     * Note: Plan status stays 'approved'. Workflow resume is handled by coordinator.
      */
     async resumeExecution(sessionId: string): Promise<{ success: boolean; error?: string }> {
         try {
@@ -677,13 +675,15 @@ export class PlanningService extends EventEmitter {
                 return { success: false, error: `Session ${sessionId} not found` };
             }
             
-            if (session.status !== 'paused') {
-                return { success: false, error: `Session is not paused (current: ${session.status})` };
+            // Check if there are paused workflows to resume
+            const hasPausedWorkflows = this.coordinator.hasPausedWorkflows(sessionId);
+            if (!hasPausedWorkflows) {
+                return { success: false, error: `No paused workflows to resume` };
             }
             
             await this.coordinator.resumeSession(sessionId);
             
-            session.status = 'executing';
+            // Update execution timestamp, but NOT session status
             session.updatedAt = new Date().toISOString();
             if (session.execution) {
                 session.execution.lastActivityAt = new Date().toISOString();
@@ -691,7 +691,7 @@ export class PlanningService extends EventEmitter {
             this.stateManager.savePlanningSession(session);
             this.notifyChange();
             
-            this.writeProgress(sessionId, 'EXECUTION', '▶️ EXECUTION RESUMED');
+            this.writeProgress(sessionId, 'EXECUTION', '▶️ WORKFLOWS RESUMED');
             
             return { success: true };
         } catch (error) {
@@ -701,7 +701,8 @@ export class PlanningService extends EventEmitter {
     }
     
     /**
-     * Stop execution completely
+     * Stop execution completely (cancel all workflows)
+     * Note: Plan status stays 'approved'. Workflows are cancelled.
      */
     async stopExecution(sessionId: string): Promise<{ success: boolean; error?: string }> {
         try {
@@ -710,18 +711,20 @@ export class PlanningService extends EventEmitter {
                 return { success: false, error: `Session ${sessionId} not found` };
             }
             
-            if (session.status !== 'executing' && session.status !== 'paused') {
-                return { success: false, error: `Session is not executing (current: ${session.status})` };
+            // Check if there are workflows to cancel
+            const state = this.coordinator.getSessionState(sessionId);
+            if (!state || state.activeWorkflows.size === 0) {
+                return { success: false, error: `No workflows to stop` };
             }
             
             await this.coordinator.cancelSession(sessionId);
             
-            session.status = 'stopped';
+            // Update timestamp, but NOT session status (stays 'approved')
             session.updatedAt = new Date().toISOString();
             this.stateManager.savePlanningSession(session);
             this.notifyChange();
             
-            this.writeProgress(sessionId, 'EXECUTION', '⏹️ EXECUTION STOPPED');
+            this.writeProgress(sessionId, 'EXECUTION', '⏹️ WORKFLOWS STOPPED');
             
             return { success: true };
         } catch (error) {
@@ -740,6 +743,7 @@ export class PlanningService extends EventEmitter {
 
     /**
      * Cancel a planning session
+     * Cancels any running workflows. If no plan exists, sets status to 'no_plan'.
      */
     async cancelPlan(sessionId: string): Promise<void> {
         const session = this.stateManager.getPlanningSession(sessionId);
@@ -747,7 +751,21 @@ export class PlanningService extends EventEmitter {
             throw new Error(`Planning session ${sessionId} not found`);
         }
 
-        session.status = 'cancelled';
+        // Cancel any running workflows
+        const state = this.coordinator.getSessionState(sessionId);
+        if (state && state.activeWorkflows.size > 0) {
+            await this.coordinator.cancelSession(sessionId);
+        }
+
+        // If we're in planning phase and no plan exists, go to 'no_plan'
+        // Otherwise, go back to 'reviewing' if plan exists, or stay 'approved'
+        if (session.status === 'planning' && !session.currentPlanPath) {
+            session.status = 'no_plan';
+        } else if (session.status === 'revising' && session.currentPlanPath) {
+            session.status = 'reviewing';
+        }
+        // For approved/completed, status stays the same
+        
         session.updatedAt = new Date().toISOString();
         this.stateManager.savePlanningSession(session);
         this.notifyChange();
@@ -768,7 +786,10 @@ export class PlanningService extends EventEmitter {
     }
 
     /**
-     * Stop a running planning session
+     * Stop a running planning session (cancel all workflows)
+     * Note: Plan status is NOT changed. Workflows are cancelled.
+     * - If in planning phase: status goes back to 'no_plan' or 'reviewing' depending on plan existence
+     * - If in execution phase: status stays 'approved', workflows are cancelled
      */
     async stopSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
         try {
@@ -778,30 +799,36 @@ export class PlanningService extends EventEmitter {
             }
 
             const previousStatus = session.status;
-            const wasDuringPlanning = ['debating', 'revising', 'reviewing'].includes(previousStatus);
+            const wasDuringPlanning = ['planning', 'revising'].includes(previousStatus);
 
             this.writeProgress(sessionId, 'STOP', '='.repeat(60));
             this.writeProgress(sessionId, 'STOP', `⏹️ STOPPING SESSION: ${sessionId}`);
             this.writeProgress(sessionId, 'STOP', `   Previous status: ${previousStatus}`);
             this.writeProgress(sessionId, 'STOP', '='.repeat(60));
 
-            // Cancel coordinator workflows if executing
-            if (session.status === 'executing' || session.status === 'paused') {
+            // Cancel coordinator workflows
+            const state = this.coordinator.getSessionState(sessionId);
+            if (state && state.activeWorkflows.size > 0) {
                 await this.coordinator.cancelSession(sessionId);
             }
 
-            // Distinct states for planning vs execution stops
-            // - cancelled: stopped during planning (can restart fresh)
-            // - stopped: stopped during execution (can resume where left off)
+            // Update status based on phase:
+            // - During planning: go back to 'no_plan' or 'reviewing'
+            // - During execution (approved): stay 'approved', workflows are cancelled
             if (wasDuringPlanning) {
-                session.status = 'cancelled';
-                // Store whether it was initial planning or revision for proper restart
+                if (session.currentPlanPath) {
+                    session.status = 'reviewing';
+                    this.writeProgress(sessionId, 'STOP', `✅ Planning stopped. Plan ready for review.`);
+                } else {
+                    session.status = 'no_plan';
+                    this.writeProgress(sessionId, 'STOP', `✅ Planning cancelled. Start new planning to continue.`);
+                }
+                // Store for restart context
                 session.metadata = session.metadata || {};
-                session.metadata.cancelledDuring = previousStatus === 'revising' ? 'revision' : 'initial';
-                this.writeProgress(sessionId, 'STOP', `✅ Planning cancelled (use Restart to ${previousStatus === 'revising' ? 'resume revision' : 'plan again'})`);
+                session.metadata.stoppedDuring = previousStatus === 'revising' ? 'revision' : 'initial';
             } else {
-                session.status = 'stopped';
-                this.writeProgress(sessionId, 'STOP', `✅ Execution stopped (can resume)`);
+                // Execution phase - status stays as is (approved or completed)
+                this.writeProgress(sessionId, 'STOP', `✅ Workflows stopped. Plan still ${session.status}.`);
             }
             
             session.updatedAt = new Date().toISOString();
@@ -817,7 +844,7 @@ export class PlanningService extends EventEmitter {
     }
 
     /**
-     * Pause a running planning session
+     * Pause a running session (pause all active workflows)
      */
     async pauseSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
         try {
@@ -826,10 +853,7 @@ export class PlanningService extends EventEmitter {
                 return { success: false, error: `Session ${sessionId} not found` };
             }
 
-            if (session.status !== 'executing') {
-                return { success: false, error: `Session ${sessionId} is not executing (current: ${session.status})` };
-            }
-
+            // Delegate to pauseExecution which checks for active workflows
             return await this.pauseExecution(sessionId);
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
@@ -838,9 +862,8 @@ export class PlanningService extends EventEmitter {
     }
 
     /**
-     * Resume a stopped or paused execution session
-     * Note: Only works for execution phase (stopped/paused states)
-     * For cancelled planning sessions, use restartPlanning instead
+     * Resume paused workflows
+     * Note: Resumes paused workflows. For restarting execution, use startExecution.
      */
     async resumeSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
         try {
@@ -849,16 +872,8 @@ export class PlanningService extends EventEmitter {
                 return { success: false, error: `Session ${sessionId} not found` };
             }
 
-            if (session.status === 'paused') {
-                return await this.resumeExecution(sessionId);
-            }
-
-            if (session.status !== 'stopped') {
-                return { success: false, error: `Session ${sessionId} is not in a resumable state (current: ${session.status}). Use restartPlanning for cancelled sessions.` };
-            }
-
-            // Restart execution for stopped session
-            return await this.startExecution(sessionId);
+            // Delegate to resumeExecution which checks for paused workflows
+            return await this.resumeExecution(sessionId);
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
             return { success: false, error: `Failed to resume session: ${errorMessage}` };
@@ -866,9 +881,9 @@ export class PlanningService extends EventEmitter {
     }
 
     /**
-     * Restart planning for a cancelled session
-     * - If cancelled during initial planning: re-runs planning_new workflow
-     * - If cancelled during revision: re-runs planning_revision with the last feedback
+     * Restart planning for a session
+     * - If 'no_plan' or stopped during initial planning: re-runs planning_new workflow
+     * - If stopped during revision: re-runs planning_revision with the last feedback
      */
     async restartPlanning(sessionId: string): Promise<{ success: boolean; error?: string }> {
         try {
@@ -877,16 +892,17 @@ export class PlanningService extends EventEmitter {
                 return { success: false, error: `Session ${sessionId} not found` };
             }
 
-            if (session.status !== 'cancelled') {
-                return { success: false, error: `Session ${sessionId} is not cancelled (current: ${session.status}). Only cancelled sessions can restart planning.` };
+            // Only allow restart from 'no_plan' or 'reviewing' states
+            if (session.status !== 'no_plan' && session.status !== 'reviewing') {
+                return { success: false, error: `Session ${sessionId} cannot restart planning (current: ${session.status}). Must be 'no_plan' or 'reviewing'.` };
             }
 
-            // Check if this was a revision cancellation
-            const wasRevision = session.metadata?.cancelledDuring === 'revision';
+            // Check if this was stopped during a revision
+            const wasRevision = session.metadata?.stoppedDuring === 'revision';
             const lastRevision = session.revisionHistory?.[session.revisionHistory.length - 1];
             
             this.writeProgress(sessionId, 'RESTART', '='.repeat(60));
-            if (wasRevision && lastRevision) {
+            if (wasRevision && lastRevision && session.currentPlanPath) {
                 this.writeProgress(sessionId, 'RESTART', `🔄 RESTARTING REVISION: ${sessionId}`);
                 this.writeProgress(sessionId, 'RESTART', `   Last feedback: ${lastRevision.feedback.substring(0, 50)}...`);
             } else {
@@ -897,10 +913,12 @@ export class PlanningService extends EventEmitter {
 
             let workflowId: string;
             
-            if (wasRevision && lastRevision) {
+            if (wasRevision && lastRevision && session.currentPlanPath) {
                 // Restart revision workflow with the last feedback
-                const input = {
-                    feedback: lastRevision.feedback
+                const input: PlanningWorkflowInput = {
+                    requirement: session.requirement,
+                    userFeedback: lastRevision.feedback,
+                    existingPlanPath: session.currentPlanPath
                 };
                 
                 workflowId = await this.coordinator.dispatchWorkflow(
@@ -914,7 +932,7 @@ export class PlanningService extends EventEmitter {
                 this.writeProgress(sessionId, 'RESTART', `✅ Revision restarted (workflow: ${workflowId})`);
             } else {
                 // Restart initial planning workflow
-                const input = {
+                const input: PlanningWorkflowInput = {
                     requirement: session.requirement,
                     docs: [] // Original docs not stored - starts fresh
                 };
@@ -926,13 +944,13 @@ export class PlanningService extends EventEmitter {
                     { priority: 5, blocking: true }
                 );
                 
-                session.status = 'debating';
+                session.status = 'planning';
                 this.writeProgress(sessionId, 'RESTART', `✅ Planning restarted (workflow: ${workflowId})`);
             }
             
-            // Clear the cancellation metadata
+            // Clear the stopped metadata
             if (session.metadata) {
-                delete session.metadata.cancelledDuring;
+                delete session.metadata.stoppedDuring;
             }
             
             session.updatedAt = new Date().toISOString();
@@ -958,7 +976,8 @@ export class PlanningService extends EventEmitter {
             }
 
             // Cancel any running workflows
-            if (session.status === 'executing' || session.status === 'paused') {
+            const state = this.coordinator.getSessionState(sessionId);
+            if (state && state.activeWorkflows.size > 0) {
                 await this.coordinator.cancelSession(sessionId);
             }
 

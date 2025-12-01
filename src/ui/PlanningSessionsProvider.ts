@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { StateManager } from '../services/StateManager';
 import { TaskManager } from '../services/TaskManager';
-import { PlanningSession, PlanningStatus, ExecutionState } from '../types';
+import { PlanningSession, PlanStatus, ExecutionState } from '../types';
 import { ServiceLocator } from '../services/ServiceLocator';
 
 /**
@@ -76,22 +76,17 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
         
         // === Status categorization ===
         // Planning statuses (plan creation phase)
-        const isPlanningOngoing = ['debating', 'revising'].includes(session.status);
+        const isPlanningOngoing = ['planning', 'revising'].includes(session.status);
         const isPlanningComplete = session.status === 'reviewing'; // Plan exists, awaiting approval
         const isPlanApproved = session.status === 'approved';
-        
-        // Execution statuses (plan execution phase)
-        const isExecuting = session.status === 'executing';
-        const isExecutionPaused = session.status === 'paused';
         const isExecutionComplete = session.status === 'completed';
         
-        // Stopped can mean planning stopped OR execution stopped
-        // If session.execution exists, it means execution was started (so it's execution stopped)
-        const isExecutionStopped = session.status === 'stopped' && !!session.execution;
-        const isPlanningStoppedOrCancelled = ['stopped', 'cancelled'].includes(session.status) && !session.execution;
+        // In execution phase = approved with execution state, or completed
+        // (workflow states are tracked separately - this just tracks if execution was ever started)
+        const isInExecutionPhase = (isPlanApproved && !!session.execution) || isExecutionComplete;
         
-        // In execution phase = currently executing, paused, completed, OR execution was stopped
-        const isInExecutionPhase = isExecuting || isExecutionPaused || isExecutionComplete || isExecutionStopped;
+        // No plan yet - either never created or planning failed
+        const hasNoPlan = session.status === 'no_plan';
         
         // Does a plan file exist? (for showing Revise/Approve on stopped sessions)
         const hasPlanFile = !!session.currentPlanPath;
@@ -112,7 +107,7 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
                     isPlanningOngoing, 
                     isApproved,
                     hasPlanFile,
-                    isPlanningStoppedOrCancelled,
+                    isPlanningStoppedOrCancelled: false,  // No longer tracked at session level
                     isInExecutionPhase
                 }
             ));
@@ -140,9 +135,7 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
 
         // ====== EXECUTION STATUS ======
         // Show execution controls when plan is approved OR in execution phase
-        // Note: Global coordinator - no per-session coordinator lookup needed
-        // Reviewing status comes from session.status directly
-        const isReviewing = session.status === 'reviewing';
+        // Note: Workflow states (running/paused) are shown on individual workflows, not here
         
         if (isPlanApproved || isInExecutionPhase) {
             let executionLabel: string;
@@ -155,34 +148,14 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
                     : 'Complete';
                 executionLabel = `✅ Execution: ${progressText}`;
                 executionContextValue = 'executionItem_completed';
-            } else if (isReviewing) {
-                const progress = session.execution?.progress;
-                const progressText = progress 
-                    ? `${progress.completed}/${progress.total} (100%)`
-                    : 'Reviewing';
-                executionLabel = `📋 Execution: ${progressText} - Reviewing...`;
-                executionContextValue = 'executionItem_reviewing';
-            } else if (isExecutionStopped) {
-                const progress = session.execution?.progress;
-                const progressText = progress 
-                    ? `${progress.completed}/${progress.total} (${progress.percentage.toFixed(0)}%)`
-                    : 'Stopped';
-                executionLabel = `⏹️ Execution: ${progressText} - Stopped`;
-                executionContextValue = 'executionItem_stopped';
-            } else if (isExecutionPaused) {
-                const progress = session.execution?.progress;
-                const progressText = progress 
-                    ? `${progress.completed}/${progress.total} (${progress.percentage.toFixed(0)}%)`
-                    : 'Paused';
-                executionLabel = `⏸️ Execution: ${progressText} - Paused`;
-                executionContextValue = 'executionItem_paused';
-            } else if (isExecuting) {
-                const progress = session.execution?.progress;
+            } else if (session.execution) {
+                // Execution started - show progress
+                const progress = session.execution.progress;
                 const progressText = progress?.total 
                     ? `${progress.completed}/${progress.total} (${progress.percentage.toFixed(0)}%)`
-                    : 'Starting...';
+                    : 'In progress...';
                 executionLabel = `🔄 Execution: ${progressText}`;
-                executionContextValue = 'executionItem_running';
+                executionContextValue = 'executionItem';
             } else {
                 // Approved but not yet started
                 executionLabel = `▶️ Execution: Ready to start`;
@@ -315,26 +288,21 @@ export class PlanningSessionItem extends vscode.TreeItem {
                     // Plan item shows approval status + context-aware buttons
                     const approved = planItemState?.isApproved ?? false;
                     const isPlanningOngoing = planItemState?.isPlanningOngoing ?? false;
-                    const isCancelled = session.status === 'cancelled';
-                    const isStopped = session.status === 'stopped' && !session.execution;
+                    const hasNoPlan = session.status === 'no_plan';
                     
                     if (approved) {
                         this.iconPath = new vscode.ThemeIcon('pass', new vscode.ThemeColor('charts.green'));
                         this.description = '✓ approved';
-                    } else if (isCancelled) {
-                        // Cancelled during planning - incomplete plan
-                        this.iconPath = new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('charts.red'));
-                        this.description = '⛔ cancelled (incomplete)';
-                    } else if (isStopped) {
-                        // Stopped but has plan file - may need review
-                        this.iconPath = new vscode.ThemeIcon('debug-pause', new vscode.ThemeColor('charts.orange'));
-                        this.description = '⏸️ stopped';
+                    } else if (hasNoPlan) {
+                        // No plan created yet
+                        this.iconPath = new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('charts.gray'));
+                        this.description = '⏳ no plan yet';
                     } else if (isPlanningOngoing) {
                         // Planning still in progress
                         this.iconPath = new vscode.ThemeIcon('loading~spin', new vscode.ThemeColor('charts.yellow'));
                         this.description = '⏳ planning...';
                     } else {
-                        // Planning complete, awaiting approval
+                        // Planning complete, awaiting approval (reviewing status)
                         this.iconPath = new vscode.ThemeIcon('checklist', new vscode.ThemeColor('charts.blue'));
                         this.description = '📋 ready for approval';
                     }
@@ -442,29 +410,22 @@ export class PlanningSessionItem extends vscode.TreeItem {
         switch (detailType) {
             case 'plan':
                 // Use passed state or derive from session
-                const isPlanningOngoing = planItemState?.isPlanningOngoing ?? ['debating', 'revising'].includes(status);
+                const isPlanningOngoing = planItemState?.isPlanningOngoing ?? ['planning', 'revising'].includes(status);
                 const isApproved = planItemState?.isApproved ?? (status === 'approved');
                 const hasPlanFile = planItemState?.hasPlanFile ?? !!session.currentPlanPath;
-                const isInExecutionPhase = planItemState?.isInExecutionPhase ?? ['executing', 'paused', 'completed'].includes(status);
+                const isInExecutionPhase = planItemState?.isInExecutionPhase ?? ((status === 'approved' && !!session.execution) || status === 'completed');
                 const isReviewing = status === 'reviewing';
-                const isCancelled = status === 'cancelled';
-                const isStopped = status === 'stopped' && !session.execution;
+                const hasNoPlan = status === 'no_plan';
                 
                 if (isPlanningOngoing) {
-                    // Planning actively in progress (debating/revising) - only stop button
+                    // Planning actively in progress (planning/revising) - only stop button
                     return 'planItem_planning';
                 } else if (isInExecutionPhase) {
                     // In execution phase - plan is locked, only allow revision
                     return 'planItem_executing';
-                } else if (isCancelled) {
-                    // Cancelled during planning - plan is incomplete, show Resume/Delete only
-                    return 'planItem_cancelled';
-                } else if (isStopped && hasPlanFile) {
-                    // Stopped with plan file - show Revise + Approve
-                    return 'planItem_pending';
-                } else if (isStopped && !hasPlanFile) {
-                    // Stopped before plan was created - show Resume
-                    return 'planItem_stopped';
+                } else if (hasNoPlan) {
+                    // No plan yet - show restart option
+                    return 'planItem_no_plan';
                 } else if (isReviewing) {
                     // Plan complete, ready for approval - show Revise + Approve
                     return 'planItem_pending';
@@ -477,12 +438,7 @@ export class PlanningSessionItem extends vscode.TreeItem {
                 }
                 
             case 'execution':
-                // Execution item shows pause/resume/stop
-                if (status === 'executing') {
-                    return 'executionItem_running';
-                } else if (status === 'paused') {
-                    return 'executionItem_paused';
-                }
+                // Execution context - workflow controls are shown on individual workflows now
                 return 'executionItem';
                 
             case 'engineer':
@@ -497,9 +453,11 @@ export class PlanningSessionItem extends vscode.TreeItem {
         }
     }
 
-    private getStatusIcon(status: PlanningStatus): vscode.ThemeIcon {
+    private getStatusIcon(status: PlanStatus): vscode.ThemeIcon {
         switch (status) {
-            case 'debating':
+            case 'no_plan':
+                return new vscode.ThemeIcon('circle-outline', new vscode.ThemeColor('charts.gray'));
+            case 'planning':
                 return new vscode.ThemeIcon('comment-discussion', new vscode.ThemeColor('charts.yellow'));
             case 'reviewing':
                 return new vscode.ThemeIcon('eye', new vscode.ThemeColor('charts.blue'));
@@ -507,15 +465,6 @@ export class PlanningSessionItem extends vscode.TreeItem {
                 return new vscode.ThemeIcon('edit', new vscode.ThemeColor('charts.orange'));
             case 'approved':
                 return new vscode.ThemeIcon('check', new vscode.ThemeColor('charts.green'));
-            case 'cancelled':
-                return new vscode.ThemeIcon('x', new vscode.ThemeColor('charts.red'));
-            case 'stopped':
-                return new vscode.ThemeIcon('debug-pause', new vscode.ThemeColor('charts.purple'));
-            // Execution statuses
-            case 'executing':
-                return new vscode.ThemeIcon('sync~spin', new vscode.ThemeColor('charts.green'));
-            case 'paused':
-                return new vscode.ThemeIcon('debug-pause', new vscode.ThemeColor('charts.orange'));
             case 'completed':
                 return new vscode.ThemeIcon('pass-filled', new vscode.ThemeColor('charts.green'));
             default:
@@ -533,7 +482,6 @@ export class PlanningSessionItem extends vscode.TreeItem {
         
         if (session.execution) {
             tooltip += `\n\n**Execution:**\n`;
-            tooltip += `Mode: ${session.execution.mode}\n`;
             tooltip += `Progress: ${session.execution.progress.percentage.toFixed(0)}%`;
         }
         

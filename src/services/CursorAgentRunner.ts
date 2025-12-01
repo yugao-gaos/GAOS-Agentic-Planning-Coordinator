@@ -293,12 +293,16 @@ export class CursorAgentRunner implements IAgentBackend {
             }
 
             // Format 2: type="assistant" with message.content[0].text
+            // NOTE: With --stream-partial-output, assistant messages contain CUMULATIVE text
+            // (each message includes all previous text). Do NOT collect here to avoid duplication.
+            // Only use for progress display. Final output comes from type="result".
             else if (msgType === 'assistant' && parsed?.message?.content) {
                 for (const item of parsed.message.content) {
                     if (item?.type === 'text' && item?.text) {
-                        collectedOutput(item.text);
+                        // Don't collect partial outputs - they accumulate and cause duplication
+                        // collectedOutput is only called for type="result" (final output)
                         onOutput?.(item.text, 'text');
-                        // Write text content to log (main output)
+                        // Write text content to log for debugging (but not to collectedOutput)
                         if (logFile) {
                             this.appendToLog(logFile, item.text);
                         }
@@ -348,6 +352,8 @@ export class CursorAgentRunner implements IAgentBackend {
             }
 
             // Format 5: type="result" - final result
+            // This is the ONLY place we call collectedOutput to avoid duplication
+            // from streaming partial outputs in assistant messages
             else if (msgType === 'result') {
                 if (parsed?.result) {
                     collectedOutput(parsed.result);

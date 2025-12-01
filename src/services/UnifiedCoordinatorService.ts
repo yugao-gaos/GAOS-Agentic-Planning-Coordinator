@@ -310,6 +310,37 @@ export class UnifiedCoordinatorService {
         return summaries;
     }
     
+    /**
+     * Check if a session has any paused workflows
+     */
+    hasPausedWorkflows(sessionId: string): boolean {
+        const state = this.sessions.get(sessionId);
+        if (!state) return false;
+        
+        for (const workflow of state.workflows.values()) {
+            if (workflow.getStatus() === 'paused') {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * Check if a session has any active (running/pending) workflows
+     */
+    hasActiveWorkflows(sessionId: string): boolean {
+        const state = this.sessions.get(sessionId);
+        if (!state) return false;
+        
+        for (const workflow of state.workflows.values()) {
+            const status = workflow.getStatus();
+            if (status === 'running' || status === 'pending' || status === 'blocked') {
+                return true;
+            }
+        }
+        return false;
+    }
+    
     // =========================================================================
     // WORKFLOW DISPATCH
     // =========================================================================
@@ -439,8 +470,7 @@ export class UnifiedCoordinatorService {
         // Register session with global TaskManager (no task initialization - coordinator does that)
         taskManager.registerSession(sessionId, session.currentPlanPath);
         
-        // Update session status
-        session.status = 'executing';
+        // Update session timestamp (status stays 'approved' - workflow states are tracked separately)
         session.updatedAt = new Date().toISOString();
         this.stateManager.savePlanningSession(session);
         
@@ -477,6 +507,7 @@ export class UnifiedCoordinatorService {
     
     /**
      * Pause all workflows in a session
+     * Note: Session status is NOT changed. Workflow pause state is tracked by workflows.
      */
     async pauseSession(sessionId: string): Promise<void> {
         const state = this.sessions.get(sessionId);
@@ -490,10 +521,9 @@ export class UnifiedCoordinatorService {
             }
         }
         
-        // Update planning session status
+        // Update timestamp only (status stays unchanged - workflow states tracked separately)
         const session = this.stateManager.getPlanningSession(sessionId);
         if (session) {
-            session.status = 'paused';
             session.updatedAt = new Date().toISOString();
             this.stateManager.savePlanningSession(session);
         }
@@ -503,6 +533,7 @@ export class UnifiedCoordinatorService {
     
     /**
      * Resume all paused workflows in a session
+     * Note: Session status is NOT changed. Workflow resume is handled by individual workflows.
      */
     async resumeSession(sessionId: string): Promise<void> {
         const state = this.sessions.get(sessionId);
@@ -516,10 +547,9 @@ export class UnifiedCoordinatorService {
             }
         }
         
-        // Update planning session status
+        // Update timestamp only (status stays unchanged - workflow states tracked separately)
         const session = this.stateManager.getPlanningSession(sessionId);
         if (session) {
-            session.status = 'executing';
             session.updatedAt = new Date().toISOString();
             this.stateManager.savePlanningSession(session);
         }
@@ -529,6 +559,7 @@ export class UnifiedCoordinatorService {
     
     /**
      * Cancel all workflows in a session
+     * Note: Session status is NOT changed. Workflows are cancelled individually.
      */
     async cancelSession(sessionId: string): Promise<void> {
         const state = this.sessions.get(sessionId);
@@ -543,10 +574,9 @@ export class UnifiedCoordinatorService {
             }
         }
         
-        // Update planning session status
+        // Update timestamp only (status stays unchanged - workflows cancelled individually)
         const session = this.stateManager.getPlanningSession(sessionId);
         if (session) {
-            session.status = 'stopped';
             session.updatedAt = new Date().toISOString();
             this.stateManager.savePlanningSession(session);
         }
@@ -1146,11 +1176,11 @@ export class UnifiedCoordinatorService {
         if (!state) return;
         
         // Don't auto-complete sessions that are still in planning/review states
-        // These require explicit user approval before execution can start
+        // Only 'approved' sessions (execution started) can become 'completed'
         const session = this.stateManager.getPlanningSession(sessionId);
         if (!session) return;
         
-        const planningStates = ['debating', 'reviewing', 'revising', 'approved'];
+        const planningStates: string[] = ['no_plan', 'planning', 'reviewing', 'revising'];
         if (planningStates.includes(session.status)) {
             // Session is still in planning phase - don't auto-complete
             // The session needs to go through approval -> execution flow
@@ -1178,11 +1208,11 @@ export class UnifiedCoordinatorService {
         );
         
         // Only mark complete if:
-        // 1. Session is in executing state (not planning)
+        // 1. Session is approved (execution was started)
         // 2. All workflows are done
         // 3. All tasks are done (and there were tasks to begin with)
         const isSessionComplete = (
-            session.status === 'executing' &&
+            session.status === 'approved' &&
             allWorkflowsComplete && 
             allTasksComplete && 
             taskProgress.total > 0
@@ -1367,8 +1397,7 @@ export class UnifiedCoordinatorService {
         }
         
         if (recoveredCount > 0) {
-            // Update session status
-            session.status = 'paused';
+            // Update timestamp only - workflows are recovered in paused state
             session.updatedAt = new Date().toISOString();
             this.stateManager.savePlanningSession(session);
             
@@ -1429,8 +1458,9 @@ export class UnifiedCoordinatorService {
         
         const sessions = this.stateManager.getAllPlanningSessions();
         for (const session of sessions) {
-            // Only try to recover sessions that were in active states
-            if (session.status === 'executing' || session.status === 'paused') {
+            // Only try to recover sessions that were in approved state (execution was active)
+            // Check if there are saved workflow states to recover
+            if (session.status === 'approved' && session.execution) {
                 const recovered = await this.recoverSession(session.id);
                 totalRecovered += recovered;
             }

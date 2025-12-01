@@ -166,13 +166,20 @@ export class TerminalManager implements ITerminalManager {
     }
 
     /**
-     * Show an agent's terminal (create if needed)
+     * Show an agent's terminal (create if needed) and start tailing log
      */
     showAgentTerminal(agentName: string): boolean {
         const agentTerminal = this.agentTerminals.get(agentName);
         
         if (agentTerminal && this.isTerminalAlive(agentTerminal.terminal)) {
             agentTerminal.terminal.show();
+            // Ensure tailing is started if we have a log file
+            if (agentTerminal.logFile) {
+                // Check if tail is already running by sending a harmless command
+                // Actually, just restart tail to ensure it's running
+                agentTerminal.terminal.sendText(`echo "📄 Streaming from: ${agentTerminal.logFile}"`);
+                agentTerminal.terminal.sendText(`touch "${agentTerminal.logFile}" && tail -f "${agentTerminal.logFile}"`);
+            }
             return true;
         }
 
@@ -194,7 +201,7 @@ export class TerminalManager implements ITerminalManager {
             // Only tail if log file path exists
             if (agentTerminal.logFile) {
                 terminal.sendText(`echo "📄 Reconnecting to log file..."`);
-            terminal.sendText(`tail -f "${agentTerminal.logFile}"`);
+                terminal.sendText(`touch "${agentTerminal.logFile}" && tail -f "${agentTerminal.logFile}"`);
             }
             return true;
         }

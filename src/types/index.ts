@@ -993,7 +993,7 @@ export interface AgentStatus {
 
 export interface PlanningSession {
     id: string;
-    status: PlanningStatus;
+    status: PlanStatus;
     requirement: string;
     currentPlanPath?: string;
     planHistory: PlanVersion[];
@@ -1003,45 +1003,28 @@ export interface PlanningSession {
     updatedAt: string;
     metadata?: Record<string, any>;  // Optional metadata for pause/resume state
     
-    // === Execution State (embedded coordinator) ===
+    // === Execution State (simplified - occupancy tracked in global TaskManager) ===
     execution?: ExecutionState;
 }
 
 /**
- * Planning-only statuses (for the plan creation phase)
- * - debating: AI analysts creating plan
- * - reviewing: Plan complete, user reviewing for approval
- * - revising: Agents revising based on feedback
- * - approved: Plan approved, ready to execute
- * - stopped: Planning stopped by user (can resume)
- * - cancelled: Planning cancelled, cannot resume
- */
-export type PlanningOnlyStatus = 
-    | 'debating' 
-    | 'reviewing' 
-    | 'approved' 
-    | 'revising' 
-    | 'stopped'
-    | 'cancelled';
-
-/**
- * Execution-only statuses (for the execution phase)
- * - executing: Agents actively working
- * - paused: Execution paused (can resume)
+ * Plan lifecycle status - tracks the plan document state only
+ * Workflow states (running, paused, failed) are shown on individual workflows, not here.
+ * 
+ * - no_plan: No plan exists yet
+ * - planning: planning_new workflow is active (creating plan)
+ * - revising: planning_revision workflow is active
+ * - reviewing: Plan ready for user review/approval
+ * - approved: Plan approved, execution can proceed
  * - completed: All tasks done
- * - failed: Execution failed
  */
-export type ExecutionOnlyStatus =
-    | 'executing'
-    | 'paused'
-    | 'completed'
-    | 'failed';
-
-/**
- * Combined status for PlanningSession
- * The session tracks both planning phase and execution phase
- */
-export type PlanningStatus = PlanningOnlyStatus | ExecutionOnlyStatus;
+export type PlanStatus = 
+    | 'no_plan'
+    | 'planning'
+    | 'revising'
+    | 'reviewing'
+    | 'approved'
+    | 'completed';
 
 /**
  * Task occupancy entry - tracks which workflow owns which task
@@ -1065,51 +1048,18 @@ export interface PendingQuestion {
 }
 
 /**
- * Execution state embedded in PlanningSession
- * Contains all runtime state for executing a plan (replaces old CoordinatorState)
+ * Execution state embedded in PlanningSession (simplified)
+ * 
+ * Task occupancy is tracked globally in TaskManager (not duplicated here).
+ * Workflow state is tracked by the coordinator and individual workflows.
+ * This only contains minimal metadata for UI display.
  */
 export interface ExecutionState {
-    mode: 'auto' | 'interactive';
     startedAt: string;
     lastActivityAt: string;
     
-    /** Task progress snapshot */
+    /** Task progress snapshot for UI display */
     progress: TaskProgress;
-    
-    // === Task Occupancy Tracking ===
-    
-    /** Map taskId → occupancy entry (which workflow owns it) */
-    taskOccupancy: Record<string, TaskOccupancyEntry>;
-    
-    /** Workflow IDs currently active */
-    activeWorkflowIds: string[];
-    
-    /** Workflow IDs that have completed */
-    completedWorkflowIds: string[];
-    
-    // === Failed Task Tracking ===
-    
-    /** Failed tasks that need attention */
-    failedTasks: Record<string, import('./workflow').FailedTask>;
-    
-    // === AI Coordinator State ===
-    
-    /** History of coordinator decisions for continuity across evaluations */
-    coordinatorHistory: import('./coordinator').CoordinatorHistoryEntry[];
-    
-    /** Pending questions awaiting user response */
-    pendingQuestions: PendingQuestion[];
-    
-    // === Revision State ===
-    
-    /** Current revision state (if revising) */
-    revisionState?: import('./workflow').RevisionState;
-    
-    /** Whether currently in revision mode */
-    isRevising: boolean;
-    
-    /** Workflow IDs paused for revision */
-    pausedForRevision: string[];
 }
 
 export interface PlanVersion {
@@ -1143,7 +1093,7 @@ export interface PlanInfo {
     title: string;
     path: string;
     sessionId?: string;
-    status: PlanningStatus;
+    status: PlanStatus;
 }
 
 export interface PlanTask {
@@ -1236,7 +1186,7 @@ export interface CliResponse {
 export interface PlanStartResponse extends CliResponse {
     data: {
         sessionId: string;
-        status: PlanningStatus;
+        status: PlanStatus;
         analysts?: string[];
     };
 }

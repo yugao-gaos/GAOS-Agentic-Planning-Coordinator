@@ -623,7 +623,8 @@ export class StateManager {
                 this.extensionState.activePlanningSessions = Array.from(this.planningSessions.keys())
                     .filter(id => {
                         const session = this.planningSessions.get(id);
-                        return session && ['debating', 'reviewing', 'revising', 'executing'].includes(session.status);
+                        // Active sessions are those in planning or approved (execution active) states
+                        return session && ['planning', 'reviewing', 'revising', 'approved'].includes(session.status);
                     });
                 atomicWriteFileSync(extensionStatePath, JSON.stringify(this.extensionState, null, 2));
 
@@ -688,9 +689,13 @@ export class StateManager {
     /**
      * Get sessions that are currently executing
      */
+    /**
+     * Get sessions that are approved and have active execution
+     * (sessions where task workflows may be running)
+     */
     getExecutingSessions(): PlanningSession[] {
         return Array.from(this.planningSessions.values())
-            .filter(s => s.status === 'executing' && s.execution);
+            .filter(s => s.status === 'approved' && s.execution);
     }
 
     // ========================================================================

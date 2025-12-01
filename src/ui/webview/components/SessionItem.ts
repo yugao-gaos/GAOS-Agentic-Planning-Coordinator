@@ -43,7 +43,7 @@ function getPlanButtons(status: string): string {
         `;
     }
     // Planning in progress - show stop button
-    if (status === 'debating') {
+    if (status === 'planning') {
         return `<button class="sub-item-btn danger" data-action="stopExecution">Stop</button>`;
     }
     if (status === 'revising') {
@@ -57,64 +57,43 @@ function getPlanButtons(status: string): string {
 
 /**
  * Get execution status and buttons based on session status.
+ * Note: Workflow states (running/paused) are now shown on individual workflows, not here.
  */
-function getExecutionInfo(status: string): { buttons: string; status: string; badgeClass: string } {
+function getExecutionInfo(status: string, hasExecution: boolean): { buttons: string; status: string; badgeClass: string } {
     switch (status) {
-        case 'executing':
-            return {
-                buttons: `
-                    <button class="sub-item-btn" data-action="pauseExecution">Pause</button>
-                    <button class="sub-item-btn danger" data-action="stopExecution">Stop</button>
-                `,
-                status: 'Running',
-                badgeClass: 'running'
-            };
-        case 'paused':
-            return {
-                buttons: `
-                    <button class="sub-item-btn primary" data-action="resumeExecution">Resume</button>
-                    <button class="sub-item-btn danger" data-action="stopExecution">Stop</button>
-                `,
-                status: 'Paused',
-                badgeClass: 'paused'
-            };
         case 'approved':
+            if (hasExecution) {
+                // Execution started - controls are on individual workflows
+                return {
+                    buttons: '',
+                    status: '',  // No status badge needed - workflows show their status
+                    badgeClass: ''
+                };
+            }
+            // Ready to start
             return {
                 buttons: `<button class="sub-item-btn primary" data-action="startExecution">Start</button>`,
-                status: 'Ready',
-                badgeClass: 'approved'
+                status: '',  // No badge - plan status already shows "APPROVED"
+                badgeClass: ''
             };
         case 'completed':
             return {
                 buttons: '',
-                status: 'Completed',
-                badgeClass: 'completed'
+                status: '',  // No badge - plan status already shows "COMPLETED"
+                badgeClass: ''
             };
-        case 'failed':
+        case 'no_plan':
             return {
                 buttons: '',
-                status: 'Failed',
-                badgeClass: 'draft'
-            };
-        case 'stopped':
-            // Stopped during execution - can resume
-            return {
-                buttons: `<button class="sub-item-btn primary" data-action="resumeExecution">Resume</button>`,
-                status: 'Stopped',
-                badgeClass: 'draft'
-            };
-        case 'cancelled':
-            // Cancelled during planning - can restart (will resume revision if cancelled during revision)
-            return {
-                buttons: `<button class="sub-item-btn" data-action="restartPlanning">Restart</button>`,
-                status: 'Cancelled',
-                badgeClass: 'draft'
+                status: '',
+                badgeClass: ''
             };
         default:
+            // Planning phase (planning, revising, reviewing) - no execution controls
             return {
                 buttons: '',
-                status: 'Pending Plan Approval',
-                badgeClass: 'pending'
+                status: '',
+                badgeClass: ''
             };
     }
 }
@@ -273,13 +252,14 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
         : session.requirement;
     
     const planButtons = getPlanButtons(session.status);
-    const execInfo = getExecutionInfo(session.status);
+    const hasExecution = !!(session.executionStatus || (session.activeWorkflows && session.activeWorkflows.length > 0));
+    const execInfo = getExecutionInfo(session.status, hasExecution);
     const planBadgeClass = getPlanBadgeClass(session.planStatus);
     
     // Determine if session is active (has running workflows)
     const hasRunningWorkflow = session.activeWorkflows?.some(w => w.status === 'running') || false;
     const isRevising = session.status === 'revising' || session.isRevising;
-    const activityClass = isRevising ? 'revising' : (hasRunningWorkflow || session.status === 'executing' ? 'active' : '');
+    const activityClass = isRevising ? 'revising' : (hasRunningWorkflow ? 'active' : '');
     
     return `
         <div class="session-item ${isExpanded ? 'expanded' : ''} ${activityClass}" 
@@ -332,7 +312,7 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                     </div>
                     <div class="sub-item-icon">${ICONS.workflow}</div>
                     <span class="sub-item-label">Execution</span>
-                    <span class="sub-item-badge ${execInfo.badgeClass}">${execInfo.status}</span>
+                    ${execInfo.status ? `<span class="sub-item-badge ${execInfo.badgeClass}">${execInfo.status}</span>` : ''}
                     <div class="sub-item-spacer"></div>
                     ${getExecutionProgressText(session) ? `<span class="execution-progress-text">${getExecutionProgressText(session)}</span>` : ''}
                     <div class="sub-item-actions">${execInfo.buttons}</div>
