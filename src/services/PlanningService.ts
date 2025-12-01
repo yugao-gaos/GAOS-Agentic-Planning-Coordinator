@@ -790,13 +790,18 @@ export class PlanningService extends EventEmitter {
                 await this.coordinator.cancelSession(sessionId);
             }
 
+            // Use 'stopped' for both planning and execution - both can be resumed
+            // 'cancelled' is reserved for explicit terminal cancellation via cancelPlan
+            session.status = 'stopped';
             if (wasDuringPlanning) {
-                session.status = 'cancelled';
-                this.writeProgress(sessionId, 'STOP', `✅ Session cancelled (stopped during planning)`);
+                this.writeProgress(sessionId, 'STOP', `✅ Session stopped during planning (can resume)`);
             } else {
-                session.status = 'stopped';
                 this.writeProgress(sessionId, 'STOP', `✅ Session stopped (can resume execution)`);
             }
+            
+            // Store previous status in metadata for resume logic
+            session.metadata = session.metadata || {};
+            session.metadata.stoppedDuring = wasDuringPlanning ? 'planning' : 'execution';
             
             session.updatedAt = new Date().toISOString();
             this.stateManager.savePlanningSession(session);
@@ -849,7 +854,41 @@ export class PlanningService extends EventEmitter {
                 return { success: false, error: `Session ${sessionId} is not in a resumable state (current: ${session.status})` };
             }
 
-            // Restart execution for stopped session
+            // Check what phase we stopped in
+            const stoppedDuring = session.metadata?.stoppedDuring;
+            
+            if (stoppedDuring === 'planning') {
+                // Resume planning by restarting the planning workflow
+                this.writeProgress(sessionId, 'RESUME', '='.repeat(60));
+                this.writeProgress(sessionId, 'RESUME', `🔄 RESUMING PLANNING: ${sessionId}`);
+                this.writeProgress(sessionId, 'RESUME', '='.repeat(60));
+                
+                // Clear the stopped metadata
+                delete session.metadata?.stoppedDuring;
+                
+                // Restart planning workflow
+                const input = {
+                    requirement: session.requirement,
+                    docs: [] // TODO: could store original docs in metadata if needed
+                };
+                
+                const workflowId = await this.coordinator.dispatchWorkflow(
+                    sessionId,
+                    'planning_new',
+                    input,
+                    { priority: 5, blocking: true }
+                );
+                
+                session.status = 'debating';
+                session.updatedAt = new Date().toISOString();
+                this.stateManager.savePlanningSession(session);
+                this.notifyChange();
+                
+                this.writeProgress(sessionId, 'RESUME', `✅ Planning resumed (workflow: ${workflowId})`);
+                return { success: true };
+            }
+
+            // Restart execution for stopped session (stopped during execution)
             return await this.startExecution(sessionId);
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : String(error);
