@@ -355,21 +355,23 @@ export class ApcDaemon {
         
         // Handle special commands
         if (request.cmd === 'subscribe') {
-            this.handleSubscribe(client, request.params?.sessionId as string | undefined);
+            const sessionId = request.params?.sessionId as string | undefined;
+            this.handleSubscribe(client, sessionId);
             this.sendResponse(client, {
                 id: request.id,
                 success: true,
-                message: `Subscribed to session ${request.params?.sessionId}`
+                message: `Subscribed to session ${sessionId}`
             });
             return;
         }
         
         if (request.cmd === 'unsubscribe') {
-            this.handleUnsubscribe(client, request.params?.sessionId as string | undefined);
+            const sessionId = request.params?.sessionId as string | undefined;
+            this.handleUnsubscribe(client, sessionId);
             this.sendResponse(client, {
                 id: request.id,
                 success: true,
-                message: `Unsubscribed from session ${request.params?.sessionId}`
+                message: `Unsubscribed from session ${sessionId}`
             });
             return;
         }
