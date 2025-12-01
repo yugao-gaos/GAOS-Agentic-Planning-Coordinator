@@ -1,9 +1,9 @@
-import * as vscode from 'vscode';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { TypedEventEmitter } from './TypedEventEmitter';
 
 const execAsync = promisify(exec);
 
@@ -37,25 +37,65 @@ export interface WorkspaceCheck {
     created?: boolean;  // If we created something that was missing
 }
 
+/**
+ * DependencyService - Checks system dependencies for APC
+ * 
+ * Obtain via ServiceLocator:
+ *   const deps = ServiceLocator.resolve(DependencyService);
+ */
 export class DependencyService {
-    private static instance: DependencyService;
     private cachedStatus: DependencyStatus[] = [];
-    private _onStatusChanged = new vscode.EventEmitter<void>();
+    private _onStatusChanged = new TypedEventEmitter<void>();
     readonly onStatusChanged = this._onStatusChanged.event;
     private workspaceRoot: string = '';
+    
+    /** Whether Unity features are enabled (affects which dependencies are checked) */
+    private unityEnabled: boolean = true;
+    
+    // Optional VS Code integration (set by VS Code client)
+    private vscodeIntegration: {
+        openExternal?: (url: string) => Promise<void>;
+        copyToClipboard?: (text: string) => Promise<void>;
+        showMessage?: (message: string) => void;
+        getWorkspaceFolders?: () => string[];
+        getCommands?: () => Promise<string[]>;
+    } = {};
 
-    static getInstance(): DependencyService {
-        if (!DependencyService.instance) {
-            DependencyService.instance = new DependencyService();
-        }
-        return DependencyService.instance;
-    }
+    constructor() {}
 
     /**
      * Set the workspace root for workspace-level checks
      */
     setWorkspaceRoot(root: string): void {
         this.workspaceRoot = root;
+    }
+    
+    /**
+     * Set whether Unity features are enabled
+     * When disabled, Unity MCP and temp scene checks are skipped
+     */
+    setUnityEnabled(enabled: boolean): void {
+        this.unityEnabled = enabled;
+    }
+    
+    /**
+     * Check if Unity features are enabled
+     */
+    isUnityEnabled(): boolean {
+        return this.unityEnabled;
+    }
+    
+    /**
+     * Set VS Code integration callbacks (called by VS Code extension)
+     */
+    setVsCodeIntegration(integration: {
+        openExternal?: (url: string) => Promise<void>;
+        copyToClipboard?: (text: string) => Promise<void>;
+        showMessage?: (message: string) => void;
+        getWorkspaceFolders?: () => string[];
+        getCommands?: () => Promise<string[]>;
+    }): void {
+        this.vscodeIntegration = integration;
     }
 
     async checkAllDependencies(): Promise<DependencyStatus[]> {
@@ -77,9 +117,11 @@ export class DependencyService {
         dependencies.push(await this.checkCursorCli());
         dependencies.push(await this.checkApcCli());
         
-        // Unity-specific dependencies (workspace-level)
-        dependencies.push(await this.checkUnityMcp());
-        dependencies.push(await this.checkUnityTempScene());
+        // Unity-specific dependencies (workspace-level) - only check when Unity features are enabled
+        if (this.unityEnabled) {
+            dependencies.push(await this.checkUnityMcp());
+            dependencies.push(await this.checkUnityTempScene());
+        }
 
         this.cachedStatus = dependencies;
         this._onStatusChanged.fire();
@@ -93,8 +135,9 @@ export class DependencyService {
         try {
             // Try to call a simple MCP command to see if Unity MCP is available
             // This works for both workspace-specific and globally installed MCP servers
-            const workspaceFolders = vscode.workspace.workspaceFolders;
-            if (!workspaceFolders) {
+            const workspaceFolders = this.vscodeIntegration.getWorkspaceFolders?.() || 
+                (this.workspaceRoot ? [this.workspaceRoot] : null);
+            if (!workspaceFolders || workspaceFolders.length === 0) {
                 return {
                     name: 'Unity MCP',
                     installed: false,
@@ -104,33 +147,35 @@ export class DependencyService {
                 };
             }
             
-            // Method 1: Try to execute a Unity MCP command
-            // If Unity MCP is installed (globally or workspace-specific), this command will exist
-            try {
-                const commands = await vscode.commands.getCommands();
-                const unityMcpCommands = commands.filter(cmd => 
-                    cmd.includes('unityMCP') || 
-                    cmd.includes('mcp_unityMCP')
-                );
-                
-                if (unityMcpCommands.length > 0) {
-                    // Unity MCP commands are registered, so it's installed
-                    return {
-                        name: 'Unity MCP',
-                        installed: true,
-                        required: true,
-                        description: `Unity MCP server available (${unityMcpCommands.length} commands)`,
-                        platform: 'all'
-                    };
+            // Method 1: Try to query commands if VS Code integration available
+            if (this.vscodeIntegration.getCommands) {
+                try {
+                    const commands = await this.vscodeIntegration.getCommands();
+                    const unityMcpCommands = commands.filter(cmd => 
+                        cmd.includes('unityMCP') || 
+                        cmd.includes('mcp_unityMCP')
+                    );
+                    
+                    if (unityMcpCommands.length > 0) {
+                        // Unity MCP commands are registered, so it's installed
+                        return {
+                            name: 'Unity MCP',
+                            installed: true,
+                            required: true,
+                            description: `Unity MCP server available (${unityMcpCommands.length} commands)`,
+                            platform: 'all'
+                        };
+                    }
+                } catch (e) {
+                    // Command query failed, fall through to file check
                 }
-            } catch (e) {
-                // Command query failed, fall through to file check
             }
             
             // Method 2: Check if MCP config exists in the workspace (fallback)
+            const workspaceRootPath = workspaceFolders[0];
             const mcpConfigPaths = [
-                path.join(workspaceFolders[0].uri.fsPath, '.cursor', 'mcp.json'),
-                path.join(workspaceFolders[0].uri.fsPath, 'mcp.json')
+                path.join(workspaceRootPath, '.cursor', 'mcp.json'),
+                path.join(workspaceRootPath, 'mcp.json')
             ];
             
             let mcpConfigExists = false;
@@ -507,15 +552,23 @@ export class DependencyService {
     }
 
     async openInstallUrl(dep: DependencyStatus): Promise<void> {
-        if (dep.installUrl) {
-            await vscode.env.openExternal(vscode.Uri.parse(dep.installUrl));
+        if (dep.installUrl && this.vscodeIntegration.openExternal) {
+            await this.vscodeIntegration.openExternal(dep.installUrl);
+        } else if (dep.installUrl) {
+            console.log(`Open URL to install: ${dep.installUrl}`);
         }
     }
 
     async copyInstallCommand(dep: DependencyStatus): Promise<void> {
         if (dep.installCommand) {
-            await vscode.env.clipboard.writeText(dep.installCommand);
-            vscode.window.showInformationMessage(`Install command copied: ${dep.installCommand}`);
+            if (this.vscodeIntegration.copyToClipboard) {
+                await this.vscodeIntegration.copyToClipboard(dep.installCommand);
+                if (this.vscodeIntegration.showMessage) {
+                    this.vscodeIntegration.showMessage(`Install command copied: ${dep.installCommand}`);
+                }
+            } else {
+                console.log(`Install command: ${dep.installCommand}`);
+            }
         }
     }
     

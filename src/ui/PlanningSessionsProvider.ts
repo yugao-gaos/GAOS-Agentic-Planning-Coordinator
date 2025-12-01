@@ -2,7 +2,47 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import { StateManager } from '../services/StateManager';
-import { PlanningSession, PlanningStatus, ExecutionState, EngineerExecutionState } from '../types';
+import { TaskManager } from '../services/TaskManager';
+import { PlanningSession, PlanningStatus, ExecutionState } from '../types';
+import { ServiceLocator } from '../services/ServiceLocator';
+
+/**
+ * Async file existence check (replaces fs.existsSync)
+ */
+async function fileExists(filePath: string): Promise<boolean> {
+    try {
+        await fs.promises.access(filePath);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Sync file existence check (for constructor use where async isn't possible)
+ * Falls back to sync check but logs a warning if it blocks
+ */
+function fileExistsSync(filePath: string): boolean {
+    try {
+        fs.accessSync(filePath);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Agent display state for UI (subset of TaskManager's AgentAssignment)
+ */
+interface AgentDisplayState {
+    name: string;
+    status: 'idle' | 'working' | 'starting' | 'paused' | 'completed' | 'error';
+    sessionId: string;
+    currentTask?: string;
+    logFile: string;
+    startTime: string;
+    lastActivity?: string;
+}
 
 export class PlanningSessionsProvider implements vscode.TreeDataProvider<PlanningSessionItem> {
     private _onDidChangeTreeData: vscode.EventEmitter<PlanningSessionItem | undefined | null | void> = 
@@ -31,7 +71,7 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
         return sessions.map(session => new PlanningSessionItem(session));
     }
 
-    private getSessionDetails(session: PlanningSession): PlanningSessionItem[] {
+    private async getSessionDetails(session: PlanningSession): Promise<PlanningSessionItem[]> {
         const details: PlanningSessionItem[] = [];
         
         // === Status categorization ===
@@ -80,7 +120,7 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
 
         // Progress log (in plan folder: _AiDevLog/Plans/{sessionId}/progress.log)
         const progressLogPath = this.stateManager.getProgressLogPath(session.id);
-        if (fs.existsSync(progressLogPath)) {
+        if (await fileExists(progressLogPath)) {
             details.push(new PlanningSessionItem(
                 session,
                 'progress',
@@ -100,11 +140,9 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
 
         // ====== EXECUTION STATUS ======
         // Show execution controls when plan is approved OR in execution phase
-        // Check for reviewing status from coordinator
-        const coordinator = session.execution?.coordinatorId 
-            ? this.stateManager.getCoordinator(session.execution.coordinatorId) 
-            : null;
-        const isReviewing = coordinator?.status === 'reviewing';
+        // Note: Global coordinator - no per-session coordinator lookup needed
+        // Reviewing status comes from session.status directly
+        const isReviewing = session.status === 'reviewing';
         
         if (isPlanApproved || isInExecutionPhase) {
             let executionLabel: string;
@@ -162,46 +200,54 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
                 executionContextValue
             ));
             
-            // Engineers working on this session (only if in execution phase)
+            // Agents working on this session (only if in execution phase)
             if (session.execution && isInExecutionPhase) {
-                const engineers = session.execution.engineers;
-                if (Object.keys(engineers).length > 0) {
+                // Get agents from TaskManager (single source of truth)
+                const taskManager = ServiceLocator.resolve(TaskManager);
+                const sessionAgents = taskManager.getAgentAssignmentsForUI()
+                    .filter(a => a.sessionId === session.id);
+                
+                if (sessionAgents.length > 0) {
                     details.push(new PlanningSessionItem(
                         session,
                         'engineers_header',
-                        `👷 Engineers (${Object.keys(engineers).length})`,
+                        `👷 Agents (${sessionAgents.length})`,
                         this.stateManager
                     ));
                     
-                    // Individual engineer status - clicking opens their log
-                    for (const [name, engState] of Object.entries(engineers)) {
-                        const statusIcon = this.getEngineerStatusIcon(engState.status);
-                        const taskText = engState.currentTask 
-                            ? `: ${engState.currentTask.substring(0, 25)}...`
+                    // Individual agent status - clicking opens their log
+                    for (const agent of sessionAgents) {
+                        // Map TaskManager status to display status
+                        const displayStatus = agent.status === 'error_fixing' ? 'working' 
+                            : agent.status === 'waiting' ? 'idle' 
+                            : agent.status;
+                        const statusIcon = this.getEngineerStatusIcon(displayStatus);
+                        const taskText = agent.currentTaskId 
+                            ? `: ${agent.currentTaskId.substring(0, 25)}...`
                             : '';
                         
                         details.push(new PlanningSessionItem(
                             session,
                             'engineer',
-                            `  ${statusIcon} ${name}${taskText}`,
+                            `  ${statusIcon} ${agent.name}${taskText}`,
                             this.stateManager,
-                            engState.logFile,
-                            engState
+                            agent.logFile,
+                            { 
+                                name: agent.name,
+                                status: displayStatus as 'idle' | 'working', 
+                                sessionId: agent.sessionId,
+                                currentTask: agent.currentTaskId, 
+                                logFile: agent.logFile,
+                                startTime: agent.assignedAt,
+                                lastActivity: agent.lastActivityAt
+                            }
                         ));
                     }
                 }
             }
             
-            // Show execution summary when completed
-            if (isExecutionComplete && coordinator?.executionSummaryPath) {
-                details.push(new PlanningSessionItem(
-                    session,
-                    'execution_summary',
-                    `📄 Execution Summary`,
-                    this.stateManager,
-                    coordinator.executionSummaryPath
-                ));
-            }
+            // Show execution summary when completed (if available)
+            // Note: Execution summary path would need to be stored on the session if desired
         }
 
         return details;
@@ -235,7 +281,7 @@ export class PlanningSessionItem extends vscode.TreeItem {
         label?: string,
         stateManager?: StateManager,
         extraPath?: string,
-        public readonly engineerState?: EngineerExecutionState,
+        public readonly engineerState?: AgentDisplayState,
         planItemState?: PlanItemState,
         customContextValue?: string  // For explicit context value override
     ) {
@@ -324,7 +370,7 @@ export class PlanningSessionItem extends vscode.TreeItem {
                     // Execution item with pause/resume/stop buttons
                     this.iconPath = new vscode.ThemeIcon('graph', new vscode.ThemeColor('charts.blue'));
                     if (session.execution) {
-                        this.tooltip = `Coordinator: ${session.execution.coordinatorId}\n${session.execution.progress.completed} of ${session.execution.progress.total} tasks complete`;
+                        this.tooltip = `Session: ${session.id}\n${session.execution.progress.completed} of ${session.execution.progress.total} tasks complete`;
                     }
                     break;
                     
@@ -335,7 +381,7 @@ export class PlanningSessionItem extends vscode.TreeItem {
                 case 'engineer':
                     // Engineer item - clicking opens their log file
                     this.iconPath = new vscode.ThemeIcon('account');
-                    if (extraPath && fs.existsSync(extraPath)) {
+                    if (extraPath && fileExistsSync(extraPath)) {
                         this.command = {
                             command: 'vscode.open',
                             title: 'Open Engineer Log',
@@ -352,7 +398,7 @@ export class PlanningSessionItem extends vscode.TreeItem {
                 case 'execution_summary':
                     // Execution summary - clicking opens the summary file
                     this.iconPath = new vscode.ThemeIcon('file-text', new vscode.ThemeColor('charts.green'));
-                    if (extraPath && fs.existsSync(extraPath)) {
+                    if (extraPath && fileExistsSync(extraPath)) {
                         this.command = {
                             command: 'vscode.open',
                             title: 'Open Execution Summary',
@@ -487,7 +533,7 @@ export class PlanningSessionItem extends vscode.TreeItem {
         
         if (session.execution) {
             tooltip += `\n\n**Execution:**\n`;
-            tooltip += `Coordinator: ${session.execution.coordinatorId}\n`;
+            tooltip += `Mode: ${session.execution.mode}\n`;
             tooltip += `Progress: ${session.execution.progress.percentage.toFixed(0)}%`;
         }
         

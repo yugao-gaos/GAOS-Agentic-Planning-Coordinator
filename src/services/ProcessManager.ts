@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { OutputChannelManager } from './OutputChannelManager';
+import { ServiceLocator } from './ServiceLocator';
 
 /**
  * Process state for pause/resume
@@ -41,9 +42,11 @@ interface ManagedProcess {
  * - State-based pause/resume (saves state, kills, restarts)
  * - Graceful shutdown with timeout
  * - Output capture for debugging
+ * 
+ * Obtain via ServiceLocator:
+ *   const manager = ServiceLocator.resolve(ProcessManager);
  */
 export class ProcessManager {
-    private static instance: ProcessManager;
     private processes: Map<string, ManagedProcess> = new Map();
     private pausedStates: Map<string, ProcessState> = new Map();
     private outputManager: OutputChannelManager;
@@ -60,8 +63,8 @@ export class ProcessManager {
     private onTimeoutCallbacks: Map<string, (id: string, state: ProcessState) => void> = new Map();
     private callbackIdCounter: number = 0;
 
-    private constructor() {
-        this.outputManager = OutputChannelManager.getInstance();
+    constructor() {
+        this.outputManager = ServiceLocator.resolve(OutputChannelManager);
     }
 
     /**
@@ -105,13 +108,6 @@ export class ProcessManager {
         this.onStuckCallbacks.clear();
         this.onTimeoutCallbacks.clear();
         this.log('Cleared all process manager callbacks');
-    }
-
-    static getInstance(): ProcessManager {
-        if (!ProcessManager.instance) {
-            ProcessManager.instance = new ProcessManager();
-        }
-        return ProcessManager.instance;
     }
 
     /**
@@ -672,42 +668,78 @@ export class ProcessManager {
     }
 
     /**
-     * Kill process and its children
+     * Kill a process group by PID
+     * 
+     * This reliably kills a process and all its children:
+     * - On Unix: Uses negative PID to kill the process group
+     * - On Windows: Uses taskkill /T to kill the process tree
+     * 
+     * @param pid Process ID to kill
+     * @param force If true, use SIGKILL (immediate), otherwise SIGTERM (graceful)
+     * @returns true if kill was attempted, false if PID invalid
      */
-    private killProcess(proc: ChildProcess, force: boolean): void {
+    killProcessGroup(pid: number, force: boolean = true): boolean {
+        if (!pid || pid <= 0) {
+            return false;
+        }
+        
         try {
-            if (proc.killed) return;
-
             const signal = force ? 'SIGKILL' : 'SIGTERM';
-
+            
             if (process.platform === 'win32') {
                 // Windows: Use taskkill to kill process tree
-                if (proc.pid) {
-                    const { execSync } = require('child_process');
-                    try {
-                        execSync(`taskkill /PID ${proc.pid} /T /F`, { stdio: 'ignore' });
-                    } catch (e) {
-                        // Process might already be dead
-                    }
+                const { execSync } = require('child_process');
+                try {
+                    execSync(`taskkill /PID ${pid} /T /F`, { 
+                        stdio: 'ignore',
+                        timeout: 5000,
+                        windowsHide: true
+                    });
+                    this.log(`Killed process group ${pid} (Windows)`);
+                    return true;
+                } catch (e) {
+                    // Process might already be dead
+                    return false;
                 }
             } else {
-                // Unix: Kill process group
-                if (proc.pid) {
+                // Unix: Kill process group with negative PID
+                try {
+                    process.kill(-pid, signal);
+                    this.log(`Killed process group ${pid} (Unix, ${signal})`);
+                    return true;
+                } catch (e) {
+                    // Try killing just the process if group kill fails
                     try {
-                        // Negative PID kills the process group
-                        process.kill(-proc.pid, signal);
-                    } catch (e) {
-                        // Try killing just the process
-                        try {
-                            proc.kill(signal);
-                        } catch (e2) {
-                            // Process already dead
-                        }
+                        process.kill(pid, signal);
+                        this.log(`Killed process ${pid} (Unix, fallback)`);
+                        return true;
+                    } catch (e2) {
+                        // Process already dead
+                        return false;
                     }
                 }
             }
         } catch (error) {
-            this.log(`Error killing process: ${error}`);
+            this.log(`Error killing process group ${pid}: ${error}`);
+            return false;
+        }
+    }
+
+    /**
+     * Kill process and its children (internal helper)
+     */
+    private killProcess(proc: ChildProcess, force: boolean): void {
+        if (proc.killed) return;
+        
+        if (proc.pid) {
+            this.killProcessGroup(proc.pid, force);
+        } else {
+            // No PID, try direct kill
+            try {
+                proc.kill(force ? 'SIGKILL' : 'SIGTERM');
+            } catch (e) {
+                // Process already dead
+            }
         }
     }
 

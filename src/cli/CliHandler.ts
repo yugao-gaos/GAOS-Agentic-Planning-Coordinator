@@ -1,12 +1,15 @@
 import * as vscode from 'vscode';
 import { StateManager } from '../services/StateManager';
-import { EngineerPoolService } from '../services/EngineerPoolService';
-import { CoordinatorService } from '../services/CoordinatorService';
+import { AgentPoolService } from '../services/AgentPoolService';
+import { UnifiedCoordinatorService } from '../services/UnifiedCoordinatorService';
 import { PlanningService } from '../services/PlanningService';
 import { TerminalManager } from '../services/TerminalManager';
 import { UnityControlManager } from '../services/UnityControlManager';
 import { CliResponse, StatusResponse, PoolStatusResponse } from '../types';
 import { UnityTaskType, TaskRequester, PipelineOperation, PipelineTaskContext } from '../types/unity';
+import { WorkflowType, WorkflowSummary, AgentCompletionSignal, AgentStage, AgentStageResult, AgentCompletionPayload } from '../types/workflow';
+import { TaskManager } from '../services/TaskManager';
+import { ServiceLocator } from '../services/ServiceLocator';
 
 /**
  * CLI Handler for AI Agent interaction
@@ -19,21 +22,21 @@ import { UnityTaskType, TaskRequester, PipelineOperation, PipelineTaskContext } 
  */
 export class CliHandler {
     private stateManager: StateManager;
-    private engineerPoolService: EngineerPoolService;
-    private coordinatorService: CoordinatorService;
+    private agentPoolService: AgentPoolService;
+    private coordinator: UnifiedCoordinatorService;
     private planningService: PlanningService;
     private terminalManager: TerminalManager;
 
     constructor(
         stateManager: StateManager,
-        engineerPoolService: EngineerPoolService,
-        coordinatorService: CoordinatorService,
+        agentPoolService: AgentPoolService,
+        coordinator: UnifiedCoordinatorService,
         planningService: PlanningService,
         terminalManager: TerminalManager
     ) {
         this.stateManager = stateManager;
-        this.engineerPoolService = engineerPoolService;
-        this.coordinatorService = coordinatorService;
+        this.agentPoolService = agentPoolService;
+        this.coordinator = coordinator;
         this.planningService = planningService;
         this.terminalManager = terminalManager;
     }
@@ -57,21 +60,24 @@ export class CliHandler {
             case 'plan':
                 return this.handlePlan(subArgs);
             
+            case 'session':
+                return this.handleSession(subArgs);
+            
+            case 'workflow':
+                return this.handleWorkflow(subArgs);
+            
             case 'exec':
             case 'execute':
                 return this.handleExecution(subArgs);
             
-            case 'coordinator':
-                return this.handleCoordinator(subArgs);
-            
             case 'pool':
                 return this.handlePool(subArgs);
             
+            case 'agent':
+                return this.handleAgent(subArgs);
+            
             case 'task':
                 return this.handleTask(subArgs);
-            
-            case 'engineer':
-                return this.handleEngineer(subArgs);
             
             case 'unity':
                 return this.handleUnity(subArgs);
@@ -93,28 +99,236 @@ export class CliHandler {
 
     private async handleStatus(): Promise<StatusResponse> {
         const sessions = this.stateManager.getAllPlanningSessions();
-        const coordinators = this.stateManager.getAllCoordinators();
-        const poolStatus = this.engineerPoolService.getPoolStatus();
+        const poolStatus = this.agentPoolService.getPoolStatus();
 
         const activeSessions = sessions.filter(s => 
-            ['debating', 'reviewing', 'revising'].includes(s.status)
-        ).length;
-
-        const activeCoordinators = coordinators.filter(c => 
-            ['initializing', 'running', 'paused'].includes(c.status)
+            ['debating', 'reviewing', 'revising', 'executing'].includes(s.status)
         ).length;
 
         return {
             success: true,
             data: {
                 activePlanningSessions: activeSessions,
-                activeCoordinators: activeCoordinators,
-                engineerPool: {
+                agentPool: {
                     total: poolStatus.total,
                     available: poolStatus.available.length,
                     busy: poolStatus.busy.length
                 }
             }
+        };
+    }
+
+    // ========================================================================
+    // Session Commands - Workflow-based session management
+    // ========================================================================
+
+    private async handleSession(args: string[]): Promise<CliResponse> {
+        if (args.length === 0) {
+            return { success: false, error: 'Missing session subcommand. Use: list, status, pause, resume' };
+        }
+
+        const subCommand = args[0];
+        const params = this.parseArgs(args.slice(1));
+
+        switch (subCommand) {
+            case 'list':
+                return this.sessionList();
+            
+            case 'status':
+                return this.sessionStatus(params);
+            
+            case 'pause':
+                return this.sessionPause(params);
+            
+            case 'resume':
+                return this.sessionResume(params);
+            
+            default:
+                return { success: false, error: `Unknown session subcommand: ${subCommand}` };
+        }
+    }
+
+    private async sessionList(): Promise<CliResponse> {
+        const sessions = this.stateManager.getAllPlanningSessions();
+        
+        return {
+            success: true,
+            data: sessions.map(s => {
+                const workflows = this.coordinator.getWorkflowSummaries(s.id);
+                return {
+                    id: s.id,
+                    status: s.status,
+                    requirement: s.requirement.substring(0, 50) + (s.requirement.length > 50 ? '...' : ''),
+                    activeWorkflows: workflows.filter(w => w.status === 'running').length,
+                    totalWorkflows: workflows.length
+                };
+            })
+        };
+    }
+
+    private async sessionStatus(params: Record<string, string>): Promise<CliResponse> {
+        const id = params['id'];
+        if (!id) {
+            return { success: false, error: 'Missing --id parameter' };
+        }
+
+        const state = this.coordinator.getSessionState(id);
+        if (!state) {
+            return { success: false, error: `Session ${id} not found` };
+        }
+
+        const workflows = this.coordinator.getWorkflowSummaries(id);
+
+        return {
+            success: true,
+            data: {
+                sessionId: id,
+                isRevising: state.isRevising,
+                workflows: workflows,
+                pendingWorkflows: state.pendingWorkflows.length,
+                completedWorkflows: state.completedWorkflows.length
+            }
+        };
+    }
+
+    private async sessionPause(params: Record<string, string>): Promise<CliResponse> {
+        const id = params['id'];
+        if (!id) {
+            return { success: false, error: 'Missing --id parameter' };
+        }
+
+        await this.coordinator.pauseSession(id);
+        return {
+            success: true,
+            message: `Session ${id} paused`
+        };
+    }
+
+    private async sessionResume(params: Record<string, string>): Promise<CliResponse> {
+        const id = params['id'];
+        if (!id) {
+            return { success: false, error: 'Missing --id parameter' };
+        }
+
+        await this.coordinator.resumeSession(id);
+        return {
+            success: true,
+            message: `Session ${id} resumed`
+        };
+    }
+
+    // ========================================================================
+    // Workflow Commands - Direct workflow management
+    // ========================================================================
+
+    private async handleWorkflow(args: string[]): Promise<CliResponse> {
+        if (args.length === 0) {
+            return { success: false, error: 'Missing workflow subcommand. Use: dispatch, status, cancel, list' };
+        }
+
+        const subCommand = args[0];
+        const params = this.parseArgs(args.slice(1));
+
+        switch (subCommand) {
+            case 'dispatch':
+                return this.workflowDispatch(args.slice(1));
+            
+            case 'status':
+                return this.workflowStatus(params);
+            
+            case 'cancel':
+                return this.workflowCancel(params);
+            
+            case 'list':
+                return this.workflowList(params);
+            
+            default:
+                return { success: false, error: `Unknown workflow subcommand: ${subCommand}` };
+        }
+    }
+
+    /**
+     * Dispatch a workflow
+     * Usage: apc workflow dispatch <sessionId> <type> [--input JSON]
+     */
+    private async workflowDispatch(args: string[]): Promise<CliResponse> {
+        if (args.length < 2) {
+            return { 
+                success: false, 
+                error: 'Usage: apc workflow dispatch <sessionId> <type> [--input JSON]' 
+            };
+        }
+
+        const sessionId = args[0];
+        const type = args[1] as WorkflowType;
+        const params = this.parseArgs(args.slice(2));
+        
+        // Parse input JSON
+        let input: Record<string, any> = {};
+        if (params['input']) {
+            try {
+                input = JSON.parse(params['input']);
+            } catch (e) {
+                return { success: false, error: 'Invalid --input JSON' };
+            }
+        }
+
+        const workflowId = await this.coordinator.dispatchWorkflow(sessionId, type, input);
+
+        return {
+            success: true,
+            message: `Workflow ${type} dispatched`,
+            data: { workflowId, sessionId, type }
+        };
+    }
+
+    private async workflowStatus(params: Record<string, string>): Promise<CliResponse> {
+        const sessionId = params['session'];
+        const workflowId = params['id'];
+        
+        if (!sessionId || !workflowId) {
+            return { success: false, error: 'Missing --session and --id parameters' };
+        }
+
+        const progress = this.coordinator.getWorkflowStatus(sessionId, workflowId);
+        if (!progress) {
+            return { success: false, error: `Workflow ${workflowId} not found` };
+        }
+
+        return {
+            success: true,
+            data: progress
+        };
+    }
+
+    private async workflowCancel(params: Record<string, string>): Promise<CliResponse> {
+        const sessionId = params['session'];
+        const workflowId = params['id'];
+        
+        if (!sessionId || !workflowId) {
+            return { success: false, error: 'Missing --session and --id parameters' };
+        }
+
+        await this.coordinator.cancelWorkflow(sessionId, workflowId);
+
+        return {
+            success: true,
+            message: `Workflow ${workflowId} cancelled`
+        };
+    }
+
+    private async workflowList(params: Record<string, string>): Promise<CliResponse> {
+        const sessionId = params['session'];
+        
+        if (!sessionId) {
+            return { success: false, error: 'Missing --session parameter' };
+        }
+
+        const workflows = this.coordinator.getWorkflowSummaries(sessionId);
+
+        return {
+            success: true,
+            data: workflows
         };
     }
 
@@ -186,7 +400,7 @@ export class CliHandler {
                 sessionId: result.sessionId,
                 status: result.status,
                 planPath: result.planPath,
-                recommendedEngineers: result.recommendedEngineers,
+                recommendedAgents: result.recommendedAgents,
                 debateSummary: result.debateSummary
             }
         };
@@ -293,23 +507,20 @@ export class CliHandler {
             return { success: false, error: 'Missing --session or --id parameter (e.g., ps_001)' };
         }
 
-        const mode = params['mode'] as 'auto' | 'interactive' || 'auto';
-        const engineerCount = params['engineers'] ? parseInt(params['engineers']) : undefined;
+        try {
+            const workflowIds = await this.coordinator.startExecution(sessionId);
 
-        const result = await this.planningService.startExecution(sessionId, {
-            mode,
-            engineerCount
-        });
-
-        if (!result.success) {
-            return { success: false, error: result.error };
+            return {
+                success: true,
+                message: `Execution started for ${sessionId} with ${workflowIds.length} task workflows`,
+                data: { sessionId, workflowIds }
+            };
+        } catch (error) {
+            return { 
+                success: false, 
+                error: error instanceof Error ? error.message : String(error)
+            };
         }
-
-        return {
-            success: true,
-            message: `Execution started for ${sessionId} with ${result.engineerCount} engineers`,
-            data: result
-        };
     }
 
     private async execPause(params: Record<string, string>): Promise<CliResponse> {
@@ -318,10 +529,7 @@ export class CliHandler {
             return { success: false, error: 'Missing --session or --id parameter' };
         }
 
-        const result = await this.planningService.pauseExecution(sessionId);
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
+        await this.coordinator.pauseSession(sessionId);
 
         return {
             success: true,
@@ -335,10 +543,7 @@ export class CliHandler {
             return { success: false, error: 'Missing --session or --id parameter' };
         }
 
-        const result = await this.planningService.resumeExecution(sessionId);
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
+        await this.coordinator.resumeSession(sessionId);
 
         return {
             success: true,
@@ -352,10 +557,7 @@ export class CliHandler {
             return { success: false, error: 'Missing --session or --id parameter' };
         }
 
-        const result = await this.planningService.stopExecution(sessionId);
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
+        await this.coordinator.cancelSession(sessionId);
 
         return {
             success: true,
@@ -369,157 +571,22 @@ export class CliHandler {
             return { success: false, error: 'Missing --session or --id parameter' };
         }
 
-        const session = this.planningService.getPlanningStatus(sessionId);
-        if (!session) {
-            return { success: false, error: `Planning session ${sessionId} not found` };
+        const state = this.coordinator.getSessionState(sessionId);
+        if (!state) {
+            return { success: false, error: `Session ${sessionId} not found` };
         }
+
+        const workflows = this.coordinator.getWorkflowSummaries(sessionId);
 
         return {
             success: true,
             data: {
-                sessionId: session.id,
-                status: session.status,
-                execution: session.execution,
-                progress: session.execution?.progress
+                sessionId,
+                isRevising: state.isRevising,
+                workflows: workflows,
+                activeWorkflows: workflows.filter(w => w.status === 'running').length,
+                completedWorkflows: state.completedWorkflows.length
             }
-        };
-    }
-
-    // ========================================================================
-    // Coordinator Commands
-    // ========================================================================
-
-    private async handleCoordinator(args: string[]): Promise<CliResponse> {
-        if (args.length === 0) {
-            return { success: false, error: 'Missing coordinator subcommand. Use: list, start, status, pause, resume, stop' };
-        }
-
-        const subCommand = args[0];
-        const params = this.parseArgs(args.slice(1));
-
-        switch (subCommand) {
-            case 'list':
-                return this.coordinatorList();
-            
-            case 'start':
-                return this.coordinatorStart(params);
-            
-            case 'status':
-                return this.coordinatorStatus(params);
-            
-            case 'pause':
-                return this.coordinatorPause(params);
-            
-            case 'resume':
-                return this.coordinatorResume(params);
-            
-            case 'stop':
-                return this.coordinatorStop(params);
-            
-            default:
-                return { success: false, error: `Unknown coordinator subcommand: ${subCommand}` };
-        }
-    }
-
-    private async coordinatorList(): Promise<CliResponse> {
-        const coordinators = this.stateManager.getAllCoordinators();
-        return {
-            success: true,
-            data: coordinators.map(c => ({
-                id: c.id,
-                status: c.status,
-                plan: c.planPath,
-                engineers: Object.keys(c.engineerSessions).length,
-                progress: c.progress
-            }))
-        };
-    }
-
-    private async coordinatorStart(params: Record<string, string>): Promise<CliResponse> {
-        const planPath = params['plan'];
-        const planSessionId = params['plan-session'];
-        const mode = params['mode'] as 'auto' | 'interactive' || 'auto';
-        const engineerCount = params['engineers'] ? parseInt(params['engineers']) : undefined;
-
-        if (!planPath && !planSessionId) {
-            return { success: false, error: 'Missing --plan or --plan-session parameter' };
-        }
-
-        let resolvedPlanPath = planPath;
-        if (planSessionId && !planPath) {
-            const session = this.stateManager.getPlanningSession(planSessionId);
-            if (!session || !session.currentPlanPath) {
-                return { success: false, error: `Planning session ${planSessionId} not found or has no plan` };
-            }
-            resolvedPlanPath = session.currentPlanPath;
-        }
-
-        const result = await this.coordinatorService.startCoordinator(resolvedPlanPath!, {
-            mode,
-            engineerCount,
-            planSessionId
-        });
-
-        return {
-            success: true,
-            message: `Coordinator ${result.coordinatorId} started`,
-            data: result
-        };
-    }
-
-    private async coordinatorStatus(params: Record<string, string>): Promise<CliResponse> {
-        const id = params['id'];
-        if (!id) {
-            return { success: false, error: 'Missing --id parameter' };
-        }
-
-        const coordinator = this.coordinatorService.getCoordinatorStatus(id);
-        if (!coordinator) {
-            return { success: false, error: `Coordinator ${id} not found` };
-        }
-
-        return {
-            success: true,
-            data: coordinator
-        };
-    }
-
-    private async coordinatorPause(params: Record<string, string>): Promise<CliResponse> {
-        const id = params['id'];
-        if (!id) {
-            return { success: false, error: 'Missing --id parameter' };
-        }
-
-        await this.coordinatorService.pauseCoordinator(id);
-        return {
-            success: true,
-            message: `Coordinator ${id} paused`
-        };
-    }
-
-    private async coordinatorResume(params: Record<string, string>): Promise<CliResponse> {
-        const id = params['id'];
-        if (!id) {
-            return { success: false, error: 'Missing --id parameter' };
-        }
-
-        await this.coordinatorService.resumeCoordinator(id);
-        return {
-            success: true,
-            message: `Coordinator ${id} resumed`
-        };
-    }
-
-    private async coordinatorStop(params: Record<string, string>): Promise<CliResponse> {
-        const id = params['id'];
-        if (!id) {
-            return { success: false, error: 'Missing --id parameter' };
-        }
-
-        await this.coordinatorService.stopCoordinator(id);
-        return {
-            success: true,
-            message: `Coordinator ${id} stopped`
         };
     }
 
@@ -545,8 +612,8 @@ export class CliHandler {
     }
 
     private async poolStatus(): Promise<PoolStatusResponse> {
-        const status = this.engineerPoolService.getPoolStatus();
-        const busyEngineers = this.engineerPoolService.getBusyEngineers();
+        const status = this.agentPoolService.getPoolStatus();
+        const busyEngineers = this.agentPoolService.getBusyAgents();
 
         return {
             success: true,
@@ -569,7 +636,7 @@ export class CliHandler {
             return { success: false, error: 'Size must be between 1 and 20' };
         }
 
-        const result = this.engineerPoolService.resizePool(newSize);
+        const result = this.agentPoolService.resizePool(newSize);
         return {
             success: true,
             message: `Pool resized to ${newSize}`,
@@ -578,607 +645,42 @@ export class CliHandler {
     }
 
     // ========================================================================
-    // Task Commands - For Coordinator to interact with TaskManager
+    // Agent Commands - For workflow agent management
     // ========================================================================
 
-    private async handleTask(args: string[]): Promise<CliResponse> {
+    private async handleAgent(args: string[]): Promise<CliResponse> {
         if (args.length === 0) {
-            return { success: false, error: 'Missing task subcommand. Use: create, start, complete, fail, reset, list, ready, progress, status, defer, undefer' };
+            return { success: false, error: 'Missing agent subcommand. Use: pool, roles, release' };
         }
 
         const subCommand = args[0];
         const subArgs = args.slice(1);
 
         switch (subCommand) {
-            case 'create':
-                return this.taskCreate(subArgs);
+            case 'pool':
+                return this.agentPool();
             
-            case 'start':
-                return this.taskStart(subArgs);
-            
-            case 'complete':
-                return this.taskComplete(subArgs);
-            
-            case 'fail':
-                return this.taskFail(subArgs);
-            
-            case 'reset':
-                return this.taskReset(subArgs);
-            
-            case 'list':
-                return this.taskList(subArgs);
-            
-            case 'ready':
-                return this.taskReady(subArgs);
-            
-            case 'progress':
-                return this.taskProgress(subArgs);
-            
-            case 'assign':
-                return this.taskAssign(subArgs);
-            
-            case 'status':
-                return this.taskSetStatus(subArgs);
-            
-            case 'defer':
-                return this.taskDefer(subArgs);
-            
-            case 'undefer':
-                return this.taskUndefer(subArgs);
-            
-            default:
-                return { success: false, error: `Unknown task subcommand: ${subCommand}` };
-        }
-    }
-
-    /**
-     * Create a task in TaskManager
-     * Usage: apc task create <coordinator_id> "<description>" --id T1 --deps T2 T3 --engineer Alex
-     */
-    private async taskCreate(args: string[]): Promise<CliResponse> {
-        if (args.length < 2) {
-            return { success: false, error: 'Usage: apc task create <coordinator_id> "<description>" --id T1 [--deps T2 T3] [--engineer Alex]' };
-        }
-
-        const coordinatorId = args[0];
-        const description = args[1];
-        const params = this.parseArgsWithMultiValue(args.slice(2));
-
-        const taskId = params['id'];
-        if (!taskId) {
-            return { success: false, error: 'Missing --id parameter' };
-        }
-
-        const dependencies = params['deps'] ? params['deps'].split(',').map(d => d.trim()) : [];
-        const engineer = params['engineer'];
-
-        const result = await this.coordinatorService.createTask(coordinatorId, {
-            id: taskId,
-            description,
-            dependencies,
-            engineer
-        });
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            message: `Task ${taskId} created`,
-            data: { taskId, description, dependencies, engineer }
-        };
-    }
-
-    /**
-     * Start a task (assign to engineer and mark in_progress)
-     * Usage: apc task start <coordinator_id> <task_id> --engineer Alex
-     */
-    private async taskStart(args: string[]): Promise<CliResponse> {
-        if (args.length < 2) {
-            return { success: false, error: 'Usage: apc task start <coordinator_id> <task_id> --engineer Alex' };
-        }
-
-        const coordinatorId = args[0];
-        const taskId = args[1];
-        const params = this.parseArgs(args.slice(2));
-        const engineer = params['engineer'];
-
-        if (!engineer) {
-            return { success: false, error: 'Missing --engineer parameter' };
-        }
-
-        const result = await this.coordinatorService.startTask(coordinatorId, taskId, engineer);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            message: `Task ${taskId} started by ${engineer}`,
-            data: { taskId, engineer }
-        };
-    }
-
-    /**
-     * Complete a task
-     * Usage: apc task complete <coordinator_id> <task_id> [--files "path1.cs" "path2.cs"]
-     */
-    private async taskComplete(args: string[]): Promise<CliResponse> {
-        if (args.length < 2) {
-            return { success: false, error: 'Usage: apc task complete <coordinator_id> <task_id> [--files "path1.cs,path2.cs"]' };
-        }
-
-        const coordinatorId = args[0];
-        const taskId = args[1];
-        const params = this.parseArgsWithMultiValue(args.slice(2));
-        const files = params['files'] ? params['files'].split(',').map(f => f.trim()) : [];
-
-        const result = await this.coordinatorService.completeTask(coordinatorId, taskId, files);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            message: `Task ${taskId} completed`,
-            data: { taskId, filesModified: files }
-        };
-    }
-
-    /**
-     * Fail a task
-     * Usage: apc task fail <coordinator_id> <task_id> --reason "error message"
-     */
-    private async taskFail(args: string[]): Promise<CliResponse> {
-        if (args.length < 2) {
-            return { success: false, error: 'Usage: apc task fail <coordinator_id> <task_id> --reason "error message"' };
-        }
-
-        const coordinatorId = args[0];
-        const taskId = args[1];
-        const params = this.parseArgs(args.slice(2));
-        const reason = params['reason'] || 'Unknown error';
-
-        const result = await this.coordinatorService.failTask(coordinatorId, taskId, reason);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            message: `Task ${taskId} marked as failed`,
-            data: { taskId, reason }
-        };
-    }
-
-    /**
-     * Reset a task to ready state (for retry)
-     * Usage: apc task reset <coordinator_id> <task_id>
-     */
-    private async taskReset(args: string[]): Promise<CliResponse> {
-        if (args.length < 2) {
-            return { success: false, error: 'Usage: apc task reset <coordinator_id> <task_id>' };
-        }
-
-        const coordinatorId = args[0];
-        const taskId = args[1];
-
-        const result = await this.coordinatorService.resetTask(coordinatorId, taskId);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            message: `Task ${taskId} reset to ready`,
-            data: { taskId }
-        };
-    }
-
-    /**
-     * List all tasks
-     * Usage: apc task list <coordinator_id> [--status ready|pending|completed|in_progress]
-     */
-    private async taskList(args: string[]): Promise<CliResponse> {
-        if (args.length < 1) {
-            return { success: false, error: 'Usage: apc task list <coordinator_id> [--status ready|pending|completed]' };
-        }
-
-        const coordinatorId = args[0];
-        const params = this.parseArgs(args.slice(1));
-        const statusFilter = params['status'];
-
-        const result = await this.coordinatorService.listTasks(coordinatorId, statusFilter);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            data: result.tasks
-        };
-    }
-
-    /**
-     * Get ready tasks (dependencies satisfied)
-     * Usage: apc task ready <coordinator_id>
-     */
-    private async taskReady(args: string[]): Promise<CliResponse> {
-        if (args.length < 1) {
-            return { success: false, error: 'Usage: apc task ready <coordinator_id>' };
-        }
-
-        const coordinatorId = args[0];
-
-        const result = await this.coordinatorService.getReadyTasks(coordinatorId);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            data: result.tasks,
-            message: `${result.tasks?.length || 0} ready tasks`
-        };
-    }
-
-    /**
-     * Get task progress
-     * Usage: apc task progress <coordinator_id>
-     */
-    private async taskProgress(args: string[]): Promise<CliResponse> {
-        if (args.length < 1) {
-            return { success: false, error: 'Usage: apc task progress <coordinator_id>' };
-        }
-
-        const coordinatorId = args[0];
-
-        const result = await this.coordinatorService.getTaskProgress(coordinatorId);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            data: result.progress
-        };
-    }
-
-    /**
-     * Assign task to engineer (without starting)
-     * Usage: apc task assign <coordinator_id> <task_id> --engineer Betty
-     */
-    private async taskAssign(args: string[]): Promise<CliResponse> {
-        if (args.length < 2) {
-            return { success: false, error: 'Usage: apc task assign <coordinator_id> <task_id> --engineer Betty' };
-        }
-
-        const coordinatorId = args[0];
-        const taskId = args[1];
-        const params = this.parseArgs(args.slice(2));
-        const engineer = params['engineer'];
-
-        if (!engineer) {
-            return { success: false, error: 'Missing --engineer parameter' };
-        }
-
-        const result = await this.coordinatorService.assignTask(coordinatorId, taskId, engineer);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            message: `Task ${taskId} assigned to ${engineer}`,
-            data: { taskId, engineer }
-        };
-    }
-
-    /**
-     * Set task status/stage directly
-     * Usage: apc task status <coordinator_id> <task_id> <stage> [--reason "why"]
-     * 
-     * Valid stages: test_passed, test_failed, compile_failed, completed, failed, etc.
-     * 
-     * Used by coordinator after pipeline results to update task status.
-     */
-    private async taskSetStatus(args: string[]): Promise<CliResponse> {
-        if (args.length < 3) {
-            return { success: false, error: 'Usage: apc task status <coordinator_id> <task_id> <stage> [--reason "why"]' };
-        }
-
-        const coordinatorId = args[0];
-        const taskId = args[1];
-        const stage = args[2];
-        const params = this.parseArgs(args.slice(3));
-        const reason = params['reason'];
-
-        const result = await this.coordinatorService.updateTaskStage(coordinatorId, taskId, stage, reason);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            message: `Task ${taskId} status set to ${stage}`,
-            data: { taskId, stage, reason }
-        };
-    }
-
-    /**
-     * Defer a task (due to overlap with ongoing work)
-     * Usage: apc task defer <coordinator_id> <task_id> --reason "Waiting for T7"
-     * 
-     * Used when an error's fix would conflict with ongoing work.
-     * The task will be un-deferred when the blocking work completes.
-     */
-    private async taskDefer(args: string[]): Promise<CliResponse> {
-        if (args.length < 2) {
-            return { success: false, error: 'Usage: apc task defer <coordinator_id> <task_id> --reason "why" [--blocked-by <task_id>]' };
-        }
-
-        const coordinatorId = args[0];
-        const taskId = args[1];
-        const params = this.parseArgs(args.slice(2));
-        const reason = params['reason'] || 'Overlap with ongoing work';
-        const blockedBy = params['blocked-by'];
-
-        const result = await this.coordinatorService.deferTask(coordinatorId, taskId, reason, blockedBy);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            message: `Task ${taskId} deferred: ${reason}`,
-            data: { taskId, reason, blockedBy }
-        };
-    }
-
-    /**
-     * Un-defer a task (blocker completed)
-     * Usage: apc task undefer <coordinator_id> <task_id>
-     * 
-     * Called when a blocking task completes and the deferred task can proceed.
-     */
-    private async taskUndefer(args: string[]): Promise<CliResponse> {
-        if (args.length < 2) {
-            return { success: false, error: 'Usage: apc task undefer <coordinator_id> <task_id>' };
-        }
-
-        const coordinatorId = args[0];
-        const taskId = args[1];
-
-        const result = await this.coordinatorService.undeferTask(coordinatorId, taskId);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            message: `Task ${taskId} un-deferred and ready for work`,
-            data: { taskId, newStage: result.newStage }
-        };
-    }
-
-    // ========================================================================
-    // Engineer Commands - For Coordinator to monitor engineer status
-    // ========================================================================
-
-    private async handleEngineer(args: string[]): Promise<CliResponse> {
-        if (args.length === 0) {
-            return { success: false, error: 'Missing engineer subcommand. Use: list, status, log, request, release, complete, pool' };
-        }
-
-        const subCommand = args[0];
-        const subArgs = args.slice(1);
-
-        switch (subCommand) {
-            case 'list':
-                return this.engineerList(subArgs);
-            
-            case 'status':
-                return this.engineerStatus(subArgs);
-            
-            case 'log':
-                return this.engineerLog(subArgs);
-            
-            case 'request':
-                return this.engineerRequest(subArgs);
+            case 'roles':
+                return this.agentRoles();
             
             case 'release':
-                return this.engineerRelease(subArgs);
+                return this.agentRelease(subArgs);
             
             case 'complete':
-                return this.engineerComplete(subArgs);
-            
-            case 'pool':
-                return this.engineerPool();
+                return this.agentComplete(subArgs);
             
             default:
-                return { success: false, error: `Unknown engineer subcommand: ${subCommand}` };
+                return { success: false, error: `Unknown agent subcommand: ${subCommand}. Use: pool, roles, release, complete` };
         }
     }
 
     /**
-     * List all engineers and their status
-     * Usage: apc engineer list <coordinator_id>
+     * Show available agents in the pool
+     * Usage: apc agent pool
      */
-    private async engineerList(args: string[]): Promise<CliResponse> {
-        if (args.length < 1) {
-            return { success: false, error: 'Usage: apc engineer list <coordinator_id>' };
-        }
-
-        const coordinatorId = args[0];
-        const result = await this.coordinatorService.listEngineers(coordinatorId);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            data: result.engineers
-        };
-    }
-
-    /**
-     * Get detailed status of one engineer
-     * Usage: apc engineer status <coordinator_id> <engineer_name>
-     */
-    private async engineerStatus(args: string[]): Promise<CliResponse> {
-        if (args.length < 2) {
-            return { success: false, error: 'Usage: apc engineer status <coordinator_id> <engineer_name>' };
-        }
-
-        const coordinatorId = args[0];
-        const engineerName = args[1];
-        const result = await this.coordinatorService.getEngineerStatus(coordinatorId, engineerName);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            data: result.status
-        };
-    }
-
-    /**
-     * Get recent log output from an engineer
-     * Usage: apc engineer log <coordinator_id> <engineer_name> [--lines 50]
-     */
-    private async engineerLog(args: string[]): Promise<CliResponse> {
-        if (args.length < 2) {
-            return { success: false, error: 'Usage: apc engineer log <coordinator_id> <engineer_name> [--lines 50]' };
-        }
-
-        const coordinatorId = args[0];
-        const engineerName = args[1];
-        const params = this.parseArgs(args.slice(2));
-        const lines = params['lines'] ? parseInt(params['lines'], 10) : 50;
-
-        const result = await this.coordinatorService.getEngineerLog(coordinatorId, engineerName, lines);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            data: { log: result.log }
-        };
-    }
-
-    /**
-     * Request additional engineers from the pool for a coordinator
-     * Usage: apc engineer request <coordinator_id> [count]
-     * 
-     * This allows a coordinator to dynamically scale up when:
-     * - All assigned engineers are busy
-     * - There are ready tasks waiting
-     * - There are available engineers in the pool
-     */
-    private async engineerRequest(args: string[]): Promise<CliResponse> {
-        if (args.length < 1) {
-            return { success: false, error: 'Usage: apc engineer request <coordinator_id> [count]' };
-        }
-
-        const coordinatorId = args[0];
-        const requestedCount = args.length > 1 ? parseInt(args[1], 10) : 1;
-
-        // Check coordinator exists
-        const coordinator = this.stateManager.getCoordinator(coordinatorId);
-        if (!coordinator) {
-            return { success: false, error: `Coordinator not found: ${coordinatorId}` };
-        }
-
-        // Check pool availability
-        const available = this.engineerPoolService.getAvailableEngineers();
-        if (available.length === 0) {
-            return { 
-                success: false, 
-                error: 'No engineers available in pool. All engineers are currently assigned to coordinators.',
-                data: { availableInPool: 0 }
-            };
-        }
-
-        // Allocate engineers
-        const toAllocate = Math.min(requestedCount, available.length);
-        const allocated = this.engineerPoolService.allocateEngineers(coordinatorId, toAllocate);
-
-        if (allocated.length === 0) {
-            return { success: false, error: 'Failed to allocate engineers' };
-        }
-
-        // Register new engineers with the coordinator's TaskManager
-        const result = await this.coordinatorService.addEngineersToCoordinator(coordinatorId, allocated);
-
-        if (!result.success) {
-            // Rollback - release the engineers back
-            this.engineerPoolService.releaseEngineers(allocated);
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            message: `Allocated ${allocated.length} additional engineer(s) to coordinator`,
-            data: {
-                allocated: allocated,
-                remainingInPool: available.length - allocated.length
-            }
-        };
-    }
-
-    /**
-     * Release an idle engineer back to the pool
-     * Usage: apc engineer release <coordinator_id> <engineer_name>
-     * 
-     * This allows a coordinator to give back engineers when:
-     * - No ready tasks to dispatch
-     * - Want to free up resources for other coordinators
-     */
-    private async engineerRelease(args: string[]): Promise<CliResponse> {
-        if (args.length < 2) {
-            return { success: false, error: 'Usage: apc engineer release <coordinator_id> <engineer_name>' };
-        }
-
-        const coordinatorId = args[0];
-        const engineerName = args[1];
-
-        const result = await this.coordinatorService.releaseEngineer(coordinatorId, engineerName);
-
-        if (!result.success) {
-            return { success: false, error: result.error };
-        }
-
-        return {
-            success: true,
-            message: `Released ${engineerName} back to pool`,
-            data: { released: engineerName }
-        };
-    }
-
-    /**
-     * Show available engineers in the pool (not assigned to any coordinator)
-     * Usage: apc engineer pool
-     */
-    private async engineerPool(): Promise<CliResponse> {
-        const available = this.engineerPoolService.getAvailableEngineers();
-        const busy = this.engineerPoolService.getBusyEngineers();
+    private async agentPool(): Promise<CliResponse> {
+        const available = this.agentPoolService.getAvailableAgents();
+        const busy = this.agentPoolService.getBusyAgents();
 
         return {
             success: true,
@@ -1188,7 +690,8 @@ export class CliHandler {
                 busyCount: busy.length,
                 busy: busy.map(e => ({
                     name: e.name,
-                    coordinator: e.coordinatorId,
+                    coordinatorId: e.coordinatorId,
+                    roleId: e.roleId,
                     task: e.task || 'unknown'
                 }))
             }
@@ -1196,111 +699,270 @@ export class CliHandler {
     }
 
     /**
-     * Engineer completes a task stage and queues Unity pipeline
-     * 
-     * Usage: apc engineer complete <coordinator_id> --engineer <name> --task <task_id> --stage <stage> --unity "prep,test_editmode" --files "a.cs,b.cs"
-     * 
-     * This is called by engineers when they finish implementation:
-     * 1. Engineer process STOPS (no longer running)
-     * 2. Engineer status becomes 'available' (ready for redeployment)
-     * 3. Task is marked 'awaiting_unity' 
-     * 4. Unity pipeline is queued (prep → test_editmode → test_playmode → etc.)
-     * 5. When pipeline completes, COORDINATOR is notified (not engineer)
-     * 6. Coordinator decides how to dispatch fixes or continue
+     * Release an agent back to the pool
+     * Usage: apc agent release <agent_name>
      */
-    private async engineerComplete(args: string[]): Promise<CliResponse> {
+    private async agentRelease(args: string[]): Promise<CliResponse> {
         if (args.length < 1) {
-            return { 
-                success: false, 
-                error: 'Usage: apc engineer complete <coordinator_id> --engineer <name> --task <task_id> --stage <stage> [--unity "prep,test_editmode"] [--files "a.cs,b.cs"]' 
-            };
+            return { success: false, error: 'Usage: apc agent release <agent_name>' };
         }
 
-        const coordinatorId = args[0];
-        const params = this.parseArgsWithMultiValue(args.slice(1));
+        const agentName = args[0];
+        this.agentPoolService.releaseAgents([agentName]);
 
-        const engineerName = params['engineer'];
-        const taskId = params['task'];
-        const stage = params['stage'];
-        const unityOps = params['unity'];
-        const files = params['files'] ? params['files'].split(',').map(f => f.trim()) : [];
+        return {
+            success: true,
+            message: `Released ${agentName} back to pool`,
+            data: { released: agentName }
+        };
+    }
 
-        if (!engineerName || !taskId || !stage) {
-            return { 
-                success: false, 
-                error: 'Missing required parameters: --engineer, --task, --stage' 
-            };
-        }
-
-        // Update task to awaiting_unity status
-        const taskResult = await this.coordinatorService.updateTaskStage(coordinatorId, taskId, 'awaiting_unity', stage);
-        if (!taskResult.success) {
-            return { success: false, error: taskResult.error };
-        }
-
-        // Mark engineer as available (they stopped working)
-        const engineerResult = await this.coordinatorService.markEngineerAvailable(coordinatorId, engineerName, taskId, files);
-        if (!engineerResult.success) {
-            return { success: false, error: engineerResult.error };
-        }
-
-        // Queue Unity pipeline if requested
-        let pipelineId: string | undefined;
-        if (unityOps) {
-            const operations = unityOps.split(',').map(op => op.trim() as PipelineOperation);
-            
-            // Validate operations
-            const validOps: PipelineOperation[] = ['prep', 'test_editmode', 'test_playmode', 'test_player_playmode'];
-            for (const op of operations) {
-                if (!validOps.includes(op)) {
-                    return { 
-                        success: false, 
-                        error: `Invalid operation: ${op}. Valid operations: ${validOps.join(', ')}` 
-                    };
-                }
+    /**
+     * List all available agent roles
+     * Usage: apc agent roles
+     */
+    private async agentRoles(): Promise<CliResponse> {
+        const roles = this.agentPoolService.getAllRoles();
+        
+        return {
+            success: true,
+            data: {
+                roles: roles.map(r => ({
+                    id: r.id,
+                    name: r.name,
+                    description: r.description,
+                    isBuiltIn: r.isBuiltIn,
+                    defaultModel: r.defaultModel,
+                    timeoutMs: r.timeoutMs
+                }))
             }
+        };
+    }
 
-            // Build task context
-            const taskContext: PipelineTaskContext = {
-                taskId,
-                stage,
-                engineerName,
-                filesModified: files
+    /**
+     * Signal agent completion from CLI callback
+     * 
+     * This is the primary way agents report completion/results to the workflow system.
+     * Replaces fragile output parsing with explicit structured callbacks.
+     * 
+     * Usage: apc agent complete --session <s> --workflow <w> --stage <stage> --result <r> [--data '<json>']
+     * 
+     * Stages: context, implementation, review, analysis, error_analysis, delta_context, finalize
+     * Results: success, failed, approved, changes_requested, pass, critical, minor, complete
+     * 
+     * Examples:
+     *   apc agent complete --session ps_001 --workflow wf_abc --stage implementation --result success --data '{"files":["a.cs"]}'
+     *   apc agent complete --session ps_001 --workflow wf_abc --stage review --result approved
+     *   apc agent complete --session ps_001 --workflow wf_abc --stage review --result changes_requested --data '{"feedback":"Fix line 42"}'
+     */
+    private async agentComplete(args: string[]): Promise<CliResponse> {
+        const params = this.parseArgs(args);
+        
+        const sessionId = params['session'];
+        const workflowId = params['workflow'];
+        const stage = params['stage'] as AgentStage;
+        const result = params['result'] as AgentStageResult;
+        const dataJson = params['data'];
+        
+        // Validate required parameters
+        if (!sessionId) {
+            return { success: false, error: 'Missing --session parameter' };
+        }
+        if (!workflowId) {
+            return { success: false, error: 'Missing --workflow parameter' };
+        }
+        if (!stage) {
+            return { success: false, error: 'Missing --stage parameter (context, implementation, review, analysis, error_analysis, delta_context, finalize)' };
+        }
+        if (!result) {
+            return { success: false, error: 'Missing --result parameter (success, failed, approved, changes_requested, pass, critical, minor, complete)' };
+        }
+        
+        // Parse data payload if provided
+        let payload: AgentCompletionPayload | undefined;
+        if (dataJson) {
+            try {
+                payload = JSON.parse(dataJson);
+            } catch (e) {
+                return { success: false, error: `Invalid --data JSON: ${e instanceof Error ? e.message : String(e)}` };
+            }
+        }
+        
+        // Build the completion signal
+        const signal: AgentCompletionSignal = {
+            sessionId,
+            workflowId,
+            stage,
+            result,
+            payload
+        };
+        
+        // Send to coordinator
+        const delivered = this.coordinator.signalAgentCompletion(signal);
+        
+        if (delivered) {
+            return {
+                success: true,
+                message: `Completion signaled: ${stage} → ${result}`,
+                data: { sessionId, workflowId, stage, result, delivered: true }
             };
+        } else {
+            // Signal was not delivered - no workflow waiting
+            // This is not necessarily an error (workflow may have timed out or been cancelled)
+            return {
+                success: true,
+                message: `Signal sent but no workflow waiting (may have timed out)`,
+                data: { sessionId, workflowId, stage, result, delivered: false }
+            };
+        }
+    }
 
-            // Queue the pipeline
-            const unityManager = UnityControlManager.getInstance();
-            pipelineId = unityManager.queuePipeline(
-                coordinatorId,
-                operations,
-                [taskContext],
-                true  // mergeEnabled
-            );
+    // ========================================================================
+    // Task Commands - Direct task management
+    // ========================================================================
+
+    private async handleTask(args: string[]): Promise<CliResponse> {
+        if (args.length === 0) {
+            return { success: false, error: 'Missing task subcommand. Use: fail, progress, status' };
+        }
+
+        const subCommand = args[0];
+        const params = this.parseArgs(args.slice(1));
+
+        switch (subCommand) {
+            case 'fail':
+                return this.taskFail(params);
+            
+            case 'progress':
+                return this.taskProgress(params);
+            
+            case 'status':
+                return this.taskStatus(params);
+            
+            default:
+                return { success: false, error: `Unknown task subcommand: ${subCommand}. Use: fail, progress, status` };
+        }
+    }
+
+    /**
+     * Mark a task as failed
+     * Usage: apc task fail --session <id> --task <task_id> --reason "error message"
+     */
+    private async taskFail(params: Record<string, string>): Promise<CliResponse> {
+        const sessionId = params['session'];
+        const taskId = params['task'];
+        const reason = params['reason'];
+
+        if (!sessionId) {
+            return { success: false, error: 'Missing --session parameter' };
+        }
+        if (!taskId) {
+            return { success: false, error: 'Missing --task parameter' };
+        }
+        if (!reason) {
+            return { success: false, error: 'Missing --reason parameter' };
+        }
+
+        const taskManager = ServiceLocator.resolve(TaskManager);
+        const globalTaskId = `${sessionId}_${taskId}`;
+        
+        taskManager.markTaskFailed(globalTaskId, reason);
+
+        return {
+            success: true,
+            message: `Task ${taskId} marked as failed`,
+            data: { sessionId, taskId, reason }
+        };
+    }
+
+    /**
+     * Get task progress for a session
+     * Usage: apc task progress --session <id>
+     */
+    private async taskProgress(params: Record<string, string>): Promise<CliResponse> {
+        const sessionId = params['session'];
+
+        if (!sessionId) {
+            return { success: false, error: 'Missing --session parameter' };
+        }
+
+        const taskManager = ServiceLocator.resolve(TaskManager);
+        const progress = taskManager.getProgressForSession(sessionId);
+        const tasks = taskManager.getTasksForSession(sessionId);
+
+        return {
+            success: true,
+            data: {
+                sessionId,
+                progress,
+                tasks: tasks.map(t => ({
+                    id: t.id.replace(`${sessionId}_`, ''),
+                    description: t.description,
+                    status: t.status,
+                    stage: t.stage,
+                    dependencies: t.dependencies,
+                    actualAgent: t.actualAgent
+                }))
+            }
+        };
+    }
+
+    /**
+     * Get status of a specific task
+     * Usage: apc task status --session <id> --task <task_id>
+     */
+    private async taskStatus(params: Record<string, string>): Promise<CliResponse> {
+        const sessionId = params['session'];
+        const taskId = params['task'];
+
+        if (!sessionId) {
+            return { success: false, error: 'Missing --session parameter' };
+        }
+        if (!taskId) {
+            return { success: false, error: 'Missing --task parameter' };
+        }
+
+        const taskManager = ServiceLocator.resolve(TaskManager);
+        const globalTaskId = `${sessionId}_${taskId}`;
+        const task = taskManager.getTask(globalTaskId);
+
+        if (!task) {
+            return { success: false, error: `Task ${taskId} not found in session ${sessionId}` };
         }
 
         return {
             success: true,
-            message: `Engineer ${engineerName} completed ${taskId} stage ${stage}${pipelineId ? `. Unity pipeline queued: ${pipelineId}` : ''}`,
             data: {
-                coordinatorId,
-                engineerName,
-                taskId,
-                stage,
-                files,
-                pipelineId,
-                unityOperations: unityOps ? unityOps.split(',') : [],
-                hint: pipelineId 
-                    ? 'Engineer process should EXIT now. Coordinator will handle Unity results.' 
-                    : 'No Unity operations queued. Task marked as awaiting review.'
+                id: taskId,
+                globalId: globalTaskId,
+                description: task.description,
+                status: task.status,
+                stage: task.stage,
+                dependencies: task.dependencies,
+                actualAgent: task.actualAgent,
+                filesModified: task.filesModified,
+                startedAt: task.startedAt,
+                completedAt: task.completedAt
             }
         };
     }
 
     // ========================================================================
-    // Unity Commands - Engineers interact with UnityControlManager via CLI
+    // Unity Commands - Agents interact with UnityControlManager via CLI
     // ========================================================================
 
     private async handleUnity(args: string[]): Promise<CliResponse> {
+        // Check if Unity features are enabled
+        const config = vscode.workspace.getConfiguration('agenticPlanning');
+        const unityEnabled = config.get<boolean>('enableUnityFeatures', true);
+        
+        if (!unityEnabled) {
+            return { 
+                success: false, 
+                error: 'Unity features are disabled. Enable via: agenticPlanning.enableUnityFeatures setting.' 
+            };
+        }
+        
         if (args.length === 0) {
             return { success: false, error: 'Missing unity subcommand. Use: compile, test, status, wait, console' };
         }
@@ -1348,7 +1010,7 @@ export class CliHandler {
             timestamp: Date.now()
         };
 
-        const unityManager = UnityControlManager.getInstance();
+        const unityManager = ServiceLocator.resolve(UnityControlManager);
         unityManager.receiveStatusNotification(status);
 
         return {
@@ -1360,24 +1022,24 @@ export class CliHandler {
 
     /**
      * Queue compilation/prep_editor task
-     * Usage: apc unity compile --coordinator coord_001 --engineer Alex
+     * Usage: apc unity compile --coordinator coord_001 --agent Alex
      */
     private async unityCompile(args: string[]): Promise<CliResponse> {
         const params = this.parseArgs(args);
         const coordinatorId = params['coordinator'] || params['coord'];
-        const engineerName = params['engineer'];
+        const agentName = params['agent'] || params['engineer'];
 
-        if (!coordinatorId || !engineerName) {
+        if (!coordinatorId || !agentName) {
             return { 
                 success: false, 
-                error: 'Usage: apc unity compile --coordinator <id> --engineer <name>' 
+                error: 'Usage: apc unity compile --coordinator <id> --agent <name>' 
             };
         }
 
-        const unityManager = UnityControlManager.getInstance();
+        const unityManager = ServiceLocator.resolve(UnityControlManager);
         const requester: TaskRequester = {
             coordinatorId,
-            engineerName
+            agentName
         };
 
         const taskId = unityManager.queueTask('prep_editor', requester);
@@ -1388,7 +1050,7 @@ export class CliHandler {
             data: { 
                 taskId,
                 type: 'prep_editor',
-                requestedBy: { coordinatorId, engineerName },
+                requestedBy: { coordinatorId, agentName },
                 hint: `Use 'apc unity wait --task ${taskId}' to wait for completion`
             }
         };
@@ -1396,26 +1058,26 @@ export class CliHandler {
 
     /**
      * Queue Unity test task
-     * Usage: apc unity test editmode --coordinator coord_001 --engineer Alex [--filter "TestName"]
-     *        apc unity test playmode --coordinator coord_001 --engineer Alex [--scene "Assets/Scenes/Test.unity"]
+     * Usage: apc unity test editmode --coordinator coord_001 --agent Alex [--filter "TestName"]
+     *        apc unity test playmode --coordinator coord_001 --agent Alex [--scene "Assets/Scenes/Test.unity"]
      */
     private async unityTest(args: string[]): Promise<CliResponse> {
         if (args.length === 0) {
             return { 
                 success: false, 
-                error: 'Usage: apc unity test <editmode|playmode> --coordinator <id> --engineer <name> [--filter "TestName"]' 
+                error: 'Usage: apc unity test <editmode|playmode> --coordinator <id> --agent <name> [--filter "TestName"]' 
             };
         }
 
         const mode = args[0].toLowerCase();
         const params = this.parseArgs(args.slice(1));
         const coordinatorId = params['coordinator'] || params['coord'];
-        const engineerName = params['engineer'];
+        const agentName = params['agent'] || params['engineer'];
 
-        if (!coordinatorId || !engineerName) {
+        if (!coordinatorId || !agentName) {
             return { 
                 success: false, 
-                error: 'Missing --coordinator and --engineer parameters' 
+                error: 'Missing --coordinator and --agent parameters' 
             };
         }
 
@@ -1428,10 +1090,10 @@ export class CliHandler {
             return { success: false, error: `Unknown test mode: ${mode}. Use 'editmode' or 'playmode'` };
         }
 
-        const unityManager = UnityControlManager.getInstance();
+        const unityManager = ServiceLocator.resolve(UnityControlManager);
         const requester: TaskRequester = {
             coordinatorId,
-            engineerName
+            agentName
         };
 
         // Parse optional filters
@@ -1450,7 +1112,7 @@ export class CliHandler {
             data: { 
                 taskId,
                 type: taskType,
-                requestedBy: { coordinatorId, engineerName },
+                requestedBy: { coordinatorId, agentName },
                 filter: testFilter,
                 hint: `Use 'apc unity wait --task ${taskId}' to wait for completion`
             }
@@ -1462,7 +1124,7 @@ export class CliHandler {
      * Usage: apc unity status
      */
     private async unityStatus(): Promise<CliResponse> {
-        const unityManager = UnityControlManager.getInstance();
+        const unityManager = ServiceLocator.resolve(UnityControlManager);
         const state = unityManager.getState();
 
         return {
@@ -1494,7 +1156,7 @@ export class CliHandler {
             return { success: false, error: 'Usage: apc unity wait --task <taskId> [--timeout 120]' };
         }
 
-        const unityManager = UnityControlManager.getInstance();
+        const unityManager = ServiceLocator.resolve(UnityControlManager);
 
         // Poll for task completion
         const startTime = Date.now();
@@ -1571,7 +1233,7 @@ export class CliHandler {
 
         // This will be handled by UnityControlManager using runCursorAgentCommand
         // For now, return a message explaining the workflow
-        const unityManager = UnityControlManager.getInstance();
+        const unityManager = ServiceLocator.resolve(UnityControlManager);
         
         // Queue a console read - this is handled internally
         // The UnityControlManager will use runCursorAgentCommand to call MCP
@@ -1613,92 +1275,92 @@ export class CliHandler {
 
     private showHelp(): CliResponse {
         const help = `
-Agentic Planning Coordinator CLI
+Agentic Planning Coordinator CLI (Workflow-based)
 
 Usage: apc <command> [subcommand] [options]
 
 Commands:
   status                          Show overall status
   
+  === Session Management ===
+  session list                    List all sessions with workflow info
+  session status --id <id>        Get session status with active workflows
+  session pause --id <id>         Pause all workflows in session
+  session resume --id <id>        Resume paused session
+  
+  === Workflow Management ===
+  workflow dispatch <sessionId> <type> [--input JSON]
+                                  Dispatch a new workflow
+                                  Types: planning_new, planning_revision,
+                                         task_implementation, error_resolution
+  workflow status --session <id> --id <workflowId>
+                                  Get workflow progress
+  workflow cancel --session <id> --id <workflowId>
+                                  Cancel a workflow
+  workflow list --session <id>    List all workflows in a session
+  
+  === Planning ===
   plan list                       List all planning sessions
-  plan new "<prompt>" [--docs]    Start new planning session
-  plan status <id>                Get planning session status
-  plan revise <id> "<feedback>"   Revise a plan
-  plan approve <id>               Approve a plan for execution
-  plan cancel <id>                Cancel a planning session
+  plan start --prompt "<prompt>" [--docs <paths>]
+                                  Start new planning session (dispatches planning_new workflow)
+  plan status --id <id>           Get planning session status
+  plan revise --id <id> --feedback "<feedback>"
+                                  Revise a plan (dispatches planning_revision workflow)
+  plan approve --id <id>          Approve a plan for execution
+  plan cancel --id <id>           Cancel a planning session
   
-  exec start <session_id>         Start execution for an approved plan
-  exec pause <session_id>         Pause execution
-  exec resume <session_id>        Resume execution
-  exec stop <session_id>          Stop execution
-  exec status <session_id>        Get execution status
+  === Execution ===
+  exec start --session <id>       Start execution (dispatches task workflows)
+  exec pause --session <id>       Pause all execution workflows
+  exec resume --session <id>      Resume execution
+  exec stop --session <id>        Stop all execution workflows
+  exec status --session <id>      Get execution status
   
-  pool status                     Show engineer pool status
-  pool resize <n>                 Resize engineer pool
+  === Agent Pool ===
+  pool status                     Show agent pool status
+  pool resize --size <n>          Resize agent pool
   
-  task create <coord_id> "<desc>" --id T1 [--deps T2,T3] [--engineer Alex]
-                                  Create a task in TaskManager
-  task start <coord_id> <task_id> --engineer Alex
-                                  Start a task (spawns engineer AI process)
-  task complete <coord_id> <task_id> [--files "a.cs,b.cs"]
-                                  Mark task as completed
-  task fail <coord_id> <task_id> --reason "error"
-                                  Mark task as failed
-  task reset <coord_id> <task_id> Reset task to ready (for retry)
-  task list <coord_id> [--status ready|pending|completed|deferred]
-                                  List all tasks
-  task ready <coord_id>           Get tasks ready for dispatch
-  task progress <coord_id>        Get completion progress
-  task assign <coord_id> <task_id> --engineer Betty
-                                  Assign task to engineer
-  task status <coord_id> <task_id> <stage> [--reason "why"]
-                                  Update task stage (test_passed|test_failed|compile_failed|completed|...)
-  task defer <coord_id> <task_id> --reason "why" [--blocked-by T7]
-                                  Defer task due to overlap with ongoing work
-  task undefer <coord_id> <task_id>
-                                  Un-defer task when blocker completes
+  agent pool                      Show available agents in the pool
+  agent roles                     List all available agent roles
+  agent release <agent_name>      Release an agent back to pool
+  agent complete --session <s> --workflow <w> --stage <stage> --result <r> [--data '<json>']
+                                  Signal agent completion (CLI callback)
+                                  Stages: context, implementation, review, analysis, 
+                                          error_analysis, delta_context, finalize
+                                  Results: success, failed, approved, changes_requested,
+                                           pass, critical, minor, complete
   
-  engineer list <coord_id>        List all engineers and their status
-  engineer status <coord_id> <name>
-                                  Get detailed status of one engineer
-  engineer log <coord_id> <name> [--lines 50]
-                                  Get recent log output from engineer
-  engineer request <coord_id> [count]
-                                  Request additional engineers from pool
-                                  (for when all assigned engineers are busy)
-  engineer release <coord_id> <name>
-                                  Release an idle engineer back to pool
-                                  (for when no ready tasks to work on)
-  engineer complete <coord_id> --engineer <name> --task <task_id> --stage <stage> [--unity "prep,test_editmode"] [--files "a.cs,b.cs"]
-                                  Engineer completes task stage & queues Unity pipeline
-                                  CRITICAL: Engineer process should EXIT after this call
-                                  Pipeline ops: prep, test_editmode, test_playmode, test_player_playmode
-  engineer pool                   Show available engineers in the pool
+  === Task Management ===
+  task progress --session <id>    Get task progress for session
+  task status --session <id> --task <task_id>
+                                  Get specific task status
+  task fail --session <id> --task <task_id> --reason "<msg>"
+                                  Mark a task as failed
   
-  unity compile --coordinator <id> --engineer <name>
-                                  Queue Unity compilation (reimport + compile)
-  unity test <editmode|playmode> --coordinator <id> --engineer <name>
+  === Unity ===
+  unity compile --coordinator <id> --agent <name>
+                                  Queue Unity compilation
+  unity test <editmode|playmode> --coordinator <id> --agent <name>
                                   Queue Unity tests
   unity status                    Get Unity Control Manager status
   unity wait --task <taskId> [--timeout 120]
                                   Wait for Unity task to complete
   unity console [--type error|warning] [--count 10]
                                   Read Unity console messages
-  unity notify-status --compiling <bool> --playing <bool> --errors <n>
-                                  (Internal) Polling agent status callback
   
   help                            Show this help message
 
+Workflow Types:
+  - planning_new        Full planning loop (Context → Planner → Analysts → Finalize)
+  - planning_revision   Quick revision (Planner → Codex → Finalize)
+  - task_implementation Per-task execution (Context → Engineer → Review → Unity)
+  - error_resolution    Fix compilation/test errors
+
 Notes:
   - Session IDs start with 'ps_' (e.g., ps_000001)
-  - Coordinator uses task commands to manage work after reading plan
-  - Engineers CAN use MCP directly for READ operations:
-    * mcp_unityMCP_read_console (read errors/warnings)
-    * mcp_unityMCP_manage_scene action:get_active
-  - Engineers MUST use 'apc unity' CLI for BLOCKING operations:
-    * compile (freezes Unity during reimport/compile)
-    * test (requires exclusive Unity access)
-    * These go through UnityControlManager queue (one at a time)
+  - Workflows are self-contained state machines that run concurrently
+  - The UnifiedCoordinatorService manages all workflows for a session
+  - Unity operations are serial (handled by UnityControlManager singleton)
 `;
 
         return {

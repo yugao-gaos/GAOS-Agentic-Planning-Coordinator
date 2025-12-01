@@ -1,0 +1,799 @@
+// ============================================================================
+// TaskImplementationWorkflow - Per-task execution: Context → Engineer → Review → Unity
+// ============================================================================
+
+import * as path from 'path';
+import * as fs from 'fs';
+import { BaseWorkflow } from './BaseWorkflow';
+import { WorkflowServices } from './IWorkflow';
+import { 
+    WorkflowConfig, 
+    WorkflowResult, 
+    TaskImplementationInput 
+} from '../../types/workflow';
+import { AgentRunner, AgentRunOptions } from '../AgentBackend';
+import { AgentRole, getDefaultRole } from '../../types';
+import { PipelineOperation, PipelineTaskContext } from '../../types/unity';
+import { ServiceLocator } from '../ServiceLocator';
+
+/**
+ * Task implementation workflow - implements a single task from the plan
+ * 
+ * Phases:
+ * 1. context - Gather task-specific context
+ * 2. implement - Engineer implements the task
+ * 3. review - Code reviewer checks implementation
+ * 4. approval - Handle review result (may loop back)
+ * 5. delta_context - Update project context documents
+ * 6. unity - Queue Unity pipeline and wait for result
+ * 7. finalize - Mark task complete or needs_work
+ */
+export class TaskImplementationWorkflow extends BaseWorkflow {
+    /** Base phases without Unity */
+    private static readonly BASE_PHASES = [
+        'context',
+        'implement',
+        'review',
+        'approval',
+        'delta_context',
+        'finalize'
+    ];
+    
+    /** Unity phase inserted before finalize */
+    private static readonly UNITY_PHASE = 'unity';
+    
+    /** This workflow works with or without Unity - just skips Unity phases */
+    static readonly requiresUnity = false;
+    
+    private static readonly MAX_REVIEW_ITERATIONS = 3;
+    
+    // Task state
+    private taskId: string;
+    private taskDescription: string;
+    private dependencies: string[];
+    private planPath: string;
+    private contextBriefPath?: string;
+    
+    // Execution state
+    private reviewIterations: number = 0;
+    private reviewResult: 'approved' | 'changes_requested' | 'pending' = 'pending';
+    private reviewFeedback: string = '';
+    private filesModified: string[] = [];
+    private unityResult: { success: boolean; errors?: string[] } | null = null;
+    private previousErrors: string[] = [];
+    
+    // Assigned agents
+    private contextAgentName?: string;
+    private engineerAgentName?: string;
+    private reviewerAgentName?: string;
+    private deltaAgentName?: string;
+    
+    private agentRunner: AgentRunner;
+    
+    constructor(config: WorkflowConfig, services: WorkflowServices) {
+        super(config, services);
+        this.agentRunner = ServiceLocator.resolve(AgentRunner);
+        
+        // Extract input
+        const input = config.input as TaskImplementationInput;
+        this.taskId = input.taskId;
+        this.taskDescription = input.taskDescription;
+        this.dependencies = input.dependencies || [];
+        this.planPath = input.planPath;
+        this.contextBriefPath = input.contextBriefPath;
+        this.previousErrors = input.previousErrors || [];
+    }
+    
+    getPhases(): string[] {
+        // Include Unity phase only if Unity features are enabled
+        if (this.unityEnabled) {
+            // Insert 'unity' before 'finalize'
+            const phases = [...TaskImplementationWorkflow.BASE_PHASES];
+            const finalizeIndex = phases.indexOf('finalize');
+            phases.splice(finalizeIndex, 0, TaskImplementationWorkflow.UNITY_PHASE);
+            return phases;
+        }
+        return TaskImplementationWorkflow.BASE_PHASES;
+    }
+    
+    /**
+     * Override: Return the task ID this workflow occupies
+     */
+    getOccupiedTaskIds(): string[] {
+        return [this.taskId];
+    }
+    
+    /**
+     * Handle conflict - if a revision affects our task, we should wait
+     */
+    handleConflict(taskId: string, otherWorkflowId: string): 'wait' | 'proceed' | 'abort' {
+        if (taskId === this.taskId) {
+            this.log(`⏸️ Task ${this.taskId} is affected by workflow ${otherWorkflowId.substring(0, 8)}, pausing...`);
+            return 'wait';
+        }
+        return 'proceed';
+    }
+    
+    async executePhase(phaseIndex: number): Promise<void> {
+        const phase = this.getPhases()[phaseIndex];
+        
+        // Declare occupancy at the start of context phase
+        if (phaseIndex === 0) {
+            this.declareTaskOccupancy(
+                [this.taskId],
+                'exclusive',
+                `Implementing task ${this.taskId}`
+            );
+        }
+        
+        switch (phase) {
+            case 'context':
+                await this.executeContextPhase();
+                break;
+                
+            case 'implement':
+                await this.executeImplementPhase();
+                break;
+                
+            case 'review':
+                await this.executeReviewPhase();
+                break;
+                
+            case 'approval':
+                await this.executeApprovalPhase();
+                break;
+                
+            case 'delta_context':
+                await this.executeDeltaContextPhase();
+                break;
+                
+            case 'unity':
+                await this.executeUnityPhase();
+                break;
+                
+            case 'finalize':
+                await this.executeFinalizePhase();
+                break;
+        }
+    }
+    
+    getState(): object {
+        return {
+            taskId: this.taskId,
+            taskDescription: this.taskDescription,
+            planPath: this.planPath,
+            contextBriefPath: this.contextBriefPath,
+            reviewIterations: this.reviewIterations,
+            reviewResult: this.reviewResult,
+            filesModified: this.filesModified,
+            unityResult: this.unityResult
+        };
+    }
+    
+    protected getProgressMessage(): string {
+        const phase = this.getPhases()[this.phaseIndex] || 'unknown';
+        switch (phase) {
+            case 'context':
+                return `Gathering context for ${this.taskId}...`;
+            case 'implement':
+                const iteration = this.reviewIterations > 0 
+                    ? ` (revision ${this.reviewIterations})` 
+                    : '';
+                return `Implementing ${this.taskId}${iteration}...`;
+            case 'review':
+                return `Code review for ${this.taskId}...`;
+            case 'approval':
+                return this.reviewResult === 'approved' 
+                    ? `${this.taskId} approved!`
+                    : `Changes requested for ${this.taskId}...`;
+            case 'delta_context':
+                return `Updating context for ${this.taskId}...`;
+            case 'unity':
+                return `Unity pipeline for ${this.taskId}...`;
+            case 'finalize':
+                return `Finalizing ${this.taskId}...`;
+            default:
+                return `Processing ${this.taskId}...`;
+        }
+    }
+    
+    protected getOutput(): any {
+        // When Unity is disabled, success is determined by code review approval
+        const success = this.status === 'completed' && 
+            (this.unityEnabled ? this.unityResult?.success !== false : this.reviewResult === 'approved');
+        
+        return {
+            taskId: this.taskId,
+            success,
+            filesModified: this.filesModified,
+            reviewIterations: this.reviewIterations,
+            unityResult: this.unityResult,
+            unityEnabled: this.unityEnabled
+        };
+    }
+    
+    // =========================================================================
+    // PHASE IMPLEMENTATIONS
+    // =========================================================================
+    
+    private async executeContextPhase(): Promise<void> {
+        this.log(`📂 PHASE: CONTEXT for task ${this.taskId}`);
+        
+        // Request a context agent
+        this.contextAgentName = await this.requestAgent('context_gatherer');
+        
+        const role = this.getRole('context_gatherer');
+        const prompt = this.buildContextPrompt(role);
+        
+        this.log(`Running context gatherer (${role?.defaultModel || 'gemini-3-pro'})...`);
+        
+        const result = await this.runAgentTask('context', prompt, role);
+        
+        if (result.success && result.output) {
+            // Save context brief
+            const briefDir = path.join(
+                this.stateManager.getPlanFolder(this.sessionId),
+                'context'
+            );
+            if (!fs.existsSync(briefDir)) {
+                fs.mkdirSync(briefDir, { recursive: true });
+            }
+            
+            this.contextBriefPath = path.join(briefDir, `${this.taskId}_brief.md`);
+            fs.writeFileSync(this.contextBriefPath, result.output);
+            this.log(`✓ Context brief saved: ${this.taskId}_brief.md`);
+        } else {
+            this.log(`⚠️ Context gathering failed, continuing without brief`);
+        }
+        
+        // Release context agent
+        if (this.contextAgentName) {
+            this.releaseAgent(this.contextAgentName);
+            this.contextAgentName = undefined;
+        }
+    }
+    
+    private async executeImplementPhase(): Promise<void> {
+        const iteration = this.reviewIterations > 0 
+            ? ` (revision ${this.reviewIterations})` 
+            : '';
+        this.log(`\n🔧 PHASE: IMPLEMENT${iteration} for task ${this.taskId}`);
+        
+        // Request an engineer agent
+        this.engineerAgentName = await this.requestAgent('engineer');
+        
+        const role = this.getRole('engineer');
+        const prompt = this.buildImplementPrompt(role);
+        
+        this.log(`Running engineer (${role?.defaultModel || 'sonnet-4.5'})...`);
+        
+        // Use CLI callback for structured completion
+        const result = await this.runAgentTaskWithCallback(
+            `implement_${this.taskId}`,
+            prompt,
+            'engineer',
+            {
+                expectedStage: 'implementation',
+                timeout: role?.timeoutMs || 600000,
+                model: role?.defaultModel,
+                cwd: this.stateManager.getWorkspaceRoot()
+            }
+        );
+        
+        if (result.fromCallback) {
+            // Got structured data from CLI callback - preferred path
+            if (this.isAgentSuccess(result)) {
+                this.filesModified = result.payload?.files || [];
+                this.log(`✓ Implementation complete via CLI callback (${this.filesModified.length} files)`);
+            } else {
+                const error = result.payload?.error || result.payload?.message || 'Unknown error';
+                throw new Error(`Engineer implementation failed for ${this.taskId}: ${error}`);
+            }
+        } else {
+            // Legacy fallback: parse output
+            if (result.success) {
+                this.filesModified = this.extractFilesFromOutput(result.rawOutput || '');
+                this.log(`✓ Implementation complete via output parsing (${this.filesModified.length} files)`);
+            } else {
+                throw new Error(`Engineer implementation failed for ${this.taskId}`);
+            }
+        }
+        
+        // Release engineer agent
+        if (this.engineerAgentName) {
+            this.releaseAgent(this.engineerAgentName);
+            this.engineerAgentName = undefined;
+        }
+    }
+    
+    private async executeReviewPhase(): Promise<void> {
+        this.reviewIterations++;
+        this.log(`\n🔍 PHASE: REVIEW (iteration ${this.reviewIterations}) for task ${this.taskId}`);
+        
+        // Request a reviewer agent
+        this.reviewerAgentName = await this.requestAgent('code_reviewer');
+        
+        const role = this.getRole('code_reviewer');
+        const prompt = this.buildReviewPrompt(role);
+        
+        this.log(`Running code reviewer (${role?.defaultModel || 'sonnet-4.5'})...`);
+        
+        // Use CLI callback for structured completion
+        const result = await this.runAgentTaskWithCallback(
+            `review_${this.taskId}`,
+            prompt,
+            'code_reviewer',
+            {
+                expectedStage: 'review',
+                timeout: role?.timeoutMs || 300000,
+                model: role?.defaultModel,
+                cwd: this.stateManager.getWorkspaceRoot()
+            }
+        );
+        
+        if (result.fromCallback) {
+            // Got structured data from CLI callback - preferred path
+            if (result.result === 'approved') {
+                this.reviewResult = 'approved';
+                this.reviewFeedback = '';
+                this.log(`✅ Review result via CLI callback: APPROVED`);
+            } else if (result.result === 'changes_requested') {
+                this.reviewResult = 'changes_requested';
+                this.reviewFeedback = result.payload?.feedback || 'Changes requested (no specific feedback)';
+                this.log(`⚠️ Review result via CLI callback: CHANGES_REQUESTED`);
+                this.log(`Feedback: ${this.reviewFeedback.substring(0, 100)}...`);
+            } else {
+                // Unexpected result - treat as approved to not block
+                this.log(`⚠️ Unexpected review result: ${result.result}, treating as approved`);
+                this.reviewResult = 'approved';
+            }
+        } else {
+            // Legacy fallback: parse output
+            if (result.success && result.rawOutput) {
+                const { approved, feedback } = this.parseReviewResult(result.rawOutput);
+                this.reviewResult = approved ? 'approved' : 'changes_requested';
+                this.reviewFeedback = feedback;
+                
+                const icon = approved ? '✅' : '⚠️';
+                this.log(`${icon} Review result via output parsing: ${this.reviewResult.toUpperCase()}`);
+                if (!approved) {
+                    this.log(`Feedback: ${feedback.substring(0, 100)}...`);
+                }
+            } else {
+                // Treat failed review as approved to not block
+                this.log(`⚠️ Review failed, treating as approved`);
+                this.reviewResult = 'approved';
+            }
+        }
+        
+        // Release reviewer agent
+        if (this.reviewerAgentName) {
+            this.releaseAgent(this.reviewerAgentName);
+            this.reviewerAgentName = undefined;
+        }
+    }
+    
+    private async executeApprovalPhase(): Promise<void> {
+        this.log(`\n✓ PHASE: APPROVAL for task ${this.taskId}`);
+        
+        if (this.reviewResult === 'changes_requested') {
+            if (this.reviewIterations < TaskImplementationWorkflow.MAX_REVIEW_ITERATIONS) {
+                this.log(`Changes requested - looping back to implement (iteration ${this.reviewIterations + 1})`);
+                // Loop back to implement phase (index 1)
+                this.phaseIndex = 0; // Will be incremented to 1
+            } else {
+                this.log(`⚠️ Max review iterations reached, proceeding despite changes`);
+                this.reviewResult = 'approved';
+            }
+        } else {
+            this.log(`✓ Approved after ${this.reviewIterations} review(s)`);
+        }
+    }
+    
+    private async executeDeltaContextPhase(): Promise<void> {
+        this.log(`\n📝 PHASE: DELTA CONTEXT for task ${this.taskId}`);
+        
+        // Request a delta context agent
+        this.deltaAgentName = await this.requestAgent('delta_context');
+        
+        const role = this.getRole('delta_context');
+        const prompt = this.buildDeltaContextPrompt(role);
+        
+        this.log(`Running delta context updater (${role?.defaultModel || 'sonnet-4.5'})...`);
+        
+        const result = await this.runAgentTask('delta_context', prompt, role);
+        
+        if (result.success) {
+            this.log(`✓ Delta context updated`);
+        } else {
+            this.log(`⚠️ Delta context update failed, continuing`);
+        }
+        
+        // Release delta agent
+        if (this.deltaAgentName) {
+            this.releaseAgent(this.deltaAgentName);
+            this.deltaAgentName = undefined;
+        }
+    }
+    
+    private async executeUnityPhase(): Promise<void> {
+        this.log(`\n🎮 PHASE: UNITY PIPELINE for task ${this.taskId}`);
+        
+        // Check if Unity is available
+        if (!this.isUnityAvailable() || !this.unityManager) {
+            this.log(`⚠️ Unity features disabled - skipping Unity pipeline`);
+            this.unityResult = { success: true }; // Treat as success when Unity is disabled
+            return;
+        }
+        
+        // Define operations: 'prep' (reimport + compile) and 'test_editmode'
+        const operations: PipelineOperation[] = ['prep', 'test_editmode'];
+        
+        // Create task context
+        const taskContext: PipelineTaskContext = {
+            taskId: this.taskId,
+            stage: `implementation_${this.id}`,
+            agentName: this.engineerAgentName || 'engineer',
+            filesModified: [] // Could track from engineer output
+        };
+        
+        this.log(`Queueing Unity pipeline: ${operations.join(' → ')}`);
+        this.setBlocked('Waiting for Unity pipeline');
+        
+        // Queue the pipeline and wait for result
+        try {
+            const result = await this.unityManager.queuePipelineAndWait(
+                this.id, // coordinatorId
+                operations,
+                [taskContext],
+                true // Allow merging with other queued requests
+            );
+            
+            this.unityResult = {
+                success: result.success,
+                errors: result.allErrors.map(e => e.message)
+            };
+            
+            if (result.success) {
+                this.log(`✓ Unity pipeline passed`);
+            } else {
+                this.log(`❌ Unity pipeline failed: ${result.allErrors.map(e => e.message).join(', ')}`);
+            }
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            this.log(`❌ Unity pipeline error: ${errorMsg}`);
+            this.unityResult = {
+                success: false,
+                errors: [errorMsg]
+            };
+        }
+        
+        this.setUnblocked();
+    }
+    
+    private async executeFinalizePhase(): Promise<void> {
+        this.log(`\n📋 PHASE: FINALIZE for task ${this.taskId}`);
+        
+        // Update task checkbox in plan file
+        if (this.unityResult?.success) {
+            await this.updateTaskCheckbox(true);
+            this.log(`✅ Task ${this.taskId} completed successfully`);
+        } else {
+            this.log(`⚠️ Task ${this.taskId} needs work (Unity errors)`);
+        }
+        
+        // Release task occupancy - coordinator can now dispatch other work on this task
+        this.releaseTaskOccupancy([this.taskId]);
+    }
+    
+    // =========================================================================
+    // PROMPT BUILDERS
+    // =========================================================================
+    
+    private buildContextPrompt(role: AgentRole | undefined): string {
+        if (!role?.promptTemplate) {
+            throw new Error('Missing prompt template for context_gatherer role');
+        }
+        const basePrompt = role.promptTemplate;
+        
+        const planContent = fs.existsSync(this.planPath)
+            ? fs.readFileSync(this.planPath, 'utf-8')
+            : '';
+        
+        return `${basePrompt}
+
+## Task
+${this.taskId}: ${this.taskDescription}
+
+## Dependencies
+${this.dependencies.length > 0 ? this.dependencies.join(', ') : 'None'}
+
+## Full Plan
+${planContent}
+
+## Your Task
+Gather context relevant to implementing this task:
+1. Find existing code patterns to follow
+2. Identify integration points
+3. Note any risks or constraints
+
+## Output
+Provide a focused context brief in markdown format.`;
+    }
+    
+    private buildImplementPrompt(role: AgentRole | undefined): string {
+        if (!role?.promptTemplate) {
+            throw new Error('Missing prompt template for engineer role');
+        }
+        const basePrompt = role.promptTemplate;
+        
+        const contextContent = this.contextBriefPath && fs.existsSync(this.contextBriefPath)
+            ? fs.readFileSync(this.contextBriefPath, 'utf-8')
+            : '';
+        
+        const planContent = fs.existsSync(this.planPath)
+            ? fs.readFileSync(this.planPath, 'utf-8')
+            : '';
+        
+        let revisionContext = '';
+        if (this.reviewIterations > 0 && this.reviewFeedback) {
+            revisionContext = `
+## REVISION REQUIRED
+This is revision ${this.reviewIterations}. Address the following feedback:
+
+${this.reviewFeedback}
+
+Focus on fixing the issues raised while preserving working code.`;
+        }
+        
+        let errorContext = '';
+        if (this.previousErrors.length > 0) {
+            errorContext = `
+## Previous Errors to Fix
+${this.previousErrors.join('\n')}`;
+        }
+        
+        return `${basePrompt}
+
+## Your Task
+${this.taskId}: ${this.taskDescription}
+
+## Plan
+${planContent}
+
+## Context Brief
+${contextContent}
+${revisionContext}
+${errorContext}
+
+## Instructions
+1. Implement the task as described
+2. Follow existing code patterns
+3. Write tests if appropriate for the task type
+4. List all files you create or modify
+
+## Output
+Implement the task. At the end, list all files modified:
+\`\`\`
+FILES_MODIFIED:
+- path/to/file1.cs
+- path/to/file2.cs
+\`\`\``;
+    }
+    
+    private buildReviewPrompt(role: AgentRole | undefined): string {
+        if (!role?.promptTemplate) {
+            throw new Error('Missing prompt template for code_reviewer role');
+        }
+        const basePrompt = role.promptTemplate;
+        
+        return `${basePrompt}
+
+## Task Being Reviewed
+${this.taskId}: ${this.taskDescription}
+
+## Files Modified
+${this.filesModified.map(f => `- ${f}`).join('\n')}
+
+## Review Checklist
+1. Does the implementation match the task description?
+2. Are code patterns consistent with the project?
+3. Are there any bugs or issues?
+4. Is the code well-organized and readable?
+
+## REQUIRED Output Format
+\`\`\`
+### Review Result: [APPROVED|CHANGES_REQUESTED]
+
+#### Issues Found
+- [List issues, or "None"]
+
+#### Suggestions
+- [List suggestions, or "None"]
+
+#### Summary
+[Brief summary of the review]
+\`\`\``;
+    }
+    
+    private buildDeltaContextPrompt(role: AgentRole | undefined): string {
+        if (!role?.promptTemplate) {
+            throw new Error('Missing prompt template for delta_context role');
+        }
+        const basePrompt = role.promptTemplate;
+        
+        return `${basePrompt}
+
+## Completed Task
+${this.taskId}: ${this.taskDescription}
+
+## Files Modified
+${this.filesModified.map(f => `- ${f}`).join('\n')}
+
+## Your Task
+Update the _AiDevLog/Context/ files to reflect:
+1. New code patterns introduced
+2. New APIs or interfaces
+3. Updated architecture decisions
+
+Keep updates concise and focused on what changed.`;
+    }
+    
+    // =========================================================================
+    // HELPER METHODS
+    // =========================================================================
+    
+    private async runAgentTask(
+        taskId: string,
+        prompt: string,
+        role: AgentRole | undefined
+    ): Promise<{ success: boolean; output: string }> {
+        const workspaceRoot = this.stateManager.getWorkspaceRoot();
+        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs');
+        
+        if (!fs.existsSync(logDir)) {
+            fs.mkdirSync(logDir, { recursive: true });
+        }
+        
+        const logFile = path.join(logDir, `${this.taskId}_${taskId}_${Date.now()}.log`);
+        
+        // Prepend continuation context if we were force-paused mid-agent
+        let finalPrompt = prompt;
+        const continuationPrompt = this.getContinuationPrompt();
+        if (continuationPrompt) {
+            finalPrompt = continuationPrompt + prompt;
+            this.log(`  📋 Using continuation context from paused session`);
+            this.clearContinuationContext();
+        }
+        
+        // Track the agent run ID for pause/resume
+        const agentRunId = `task_${this.sessionId}_${this.taskId}_${taskId}`;
+        this.currentAgentRunId = agentRunId;
+        
+        const options: AgentRunOptions = {
+            id: agentRunId,
+            prompt: finalPrompt,
+            cwd: workspaceRoot,
+            model: role?.defaultModel || 'sonnet-4.5',
+            logFile,
+            timeoutMs: role?.timeoutMs || 600000,
+            onProgress: (msg) => this.log(`  ${msg}`)
+        };
+        
+        try {
+            const result = await this.agentRunner.run(options);
+            return {
+                success: result.success,
+                output: result.output
+            };
+        } finally {
+            // Clear the agent run ID when done
+            this.currentAgentRunId = undefined;
+        }
+    }
+    
+    private parseReviewResult(output: string): { approved: boolean; feedback: string } {
+        const resultMatch = output.match(/###?\s*Review\s*Result:\s*(APPROVED|CHANGES_REQUESTED)/i);
+        const approved = resultMatch 
+            ? resultMatch[1].toUpperCase() === 'APPROVED'
+            : true; // Default to approved if can't parse
+        
+        // Extract issues/feedback
+        const issuesMatch = output.match(/####?\s*Issues\s*Found[\s\S]*?(?=####|$)/i);
+        const feedback = issuesMatch 
+            ? issuesMatch[0].replace(/####?\s*Issues\s*Found\s*/i, '').trim()
+            : '';
+        
+        return { approved, feedback };
+    }
+    
+    /**
+     * Extract files modified from agent output
+     * Uses multiple patterns to catch various agent output formats
+     */
+    private extractFilesFromOutput(output: string): string[] {
+        const files = new Set<string>();
+        const workspaceRoot = this.stateManager.getWorkspaceRoot();
+        
+        // Pattern 1: FILES_MODIFIED section (explicit listing)
+        const filesModifiedMatch = output.match(/FILES_MODIFIED:[\s\S]*?(?=```|###|\n\n|$)/i);
+        if (filesModifiedMatch) {
+            const lines = filesModifiedMatch[0].split('\n')
+                .filter(line => line.trim().startsWith('-'))
+                .map(line => line.replace(/^-\s*/, '').trim())
+                .filter(f => f.length > 0 && f.includes('.'));
+            lines.forEach(f => files.add(f));
+        }
+        
+        // Pattern 2: Tool call patterns (write_file, search_replace)
+        // Matches: "file_path": "path/to/file.ts" or file_path="path/to/file.ts"
+        const toolCallPatterns = [
+            /"file_path"\s*:\s*"([^"]+\.\w+)"/gi,
+            /file_path\s*=\s*"([^"]+\.\w+)"/gi,
+            /"target_file"\s*:\s*"([^"]+\.\w+)"/gi,
+            /target_file\s*=\s*"([^"]+\.\w+)"/gi
+        ];
+        
+        for (const pattern of toolCallPatterns) {
+            let match;
+            while ((match = pattern.exec(output)) !== null) {
+                files.add(match[1]);
+            }
+        }
+        
+        // Pattern 3: Common agent output patterns
+        const agentPatterns = [
+            /(?:Created|Creating|Wrote|Writing|Edited|Editing|Modified|Modifying)\s+[`'"]?([^\s`'"]+\.\w+)[`'"]?/gi,
+            /(?:Updated|Updating)\s+[`'"]?([^\s`'"]+\.\w+)[`'"]?/gi,
+            /(?:File|Saved to)\s*:\s*[`'"]?([^\s`'"]+\.\w+)[`'"]?/gi
+        ];
+        
+        for (const pattern of agentPatterns) {
+            let match;
+            while ((match = pattern.exec(output)) !== null) {
+                const file = match[1];
+                // Skip common false positives
+                if (!file.includes('http') && !file.startsWith('.') && file.includes('.')) {
+                    files.add(file);
+                }
+            }
+        }
+        
+        // Validate files exist (filter out non-existent files)
+        const validFiles: string[] = [];
+        for (const file of files) {
+            // Try both relative and absolute paths
+            const relativePath = path.join(workspaceRoot, file);
+            if (fs.existsSync(file) || fs.existsSync(relativePath)) {
+                validFiles.push(file);
+            }
+        }
+        
+        // Log if we found files vs validated files
+        if (files.size > validFiles.length) {
+            this.log(`  File tracking: found ${files.size} mentioned, ${validFiles.length} validated`);
+        }
+        
+        return validFiles.length > 0 ? validFiles : Array.from(files);
+    }
+    
+    private async updateTaskCheckbox(completed: boolean): Promise<void> {
+        if (!fs.existsSync(this.planPath)) return;
+        
+        let content = fs.readFileSync(this.planPath, 'utf-8');
+        
+        // Find and update the task checkbox
+        const taskPattern = new RegExp(
+            `^(\\s*-\\s*)\\[[ x]\\]\\s*(\\*\\*${this.taskId}\\*\\*|${this.taskId})`,
+            'gm'
+        );
+        
+        content = content.replace(taskPattern, (match, prefix) => {
+            const checkbox = completed ? '[x]' : '[ ]';
+            return `${prefix}${checkbox} **${this.taskId}**`;
+        });
+        
+        fs.writeFileSync(this.planPath, content);
+    }
+}
+

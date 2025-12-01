@@ -72,17 +72,21 @@
         "icon": "$(debug-stop)"
       },
       {
-        "command": "agenticPlanning.showEngineerTerminal",
-        "title": "Agentic: Show Engineer Terminal"
+        "command": "agenticPlanning.showAgentTerminal",
+        "title": "Agentic: Show Agent Terminal"
       },
       {
         "command": "agenticPlanning.poolStatus",
-        "title": "Agentic: Show Engineer Pool Status"
+        "title": "Agentic: Show Agent Pool Status"
       },
       {
-        "command": "agenticPlanning.refreshEngineerPool",
+        "command": "agenticPlanning.refreshAgentPool",
         "title": "Refresh",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "apc.openRoleSettings",
+        "title": "APC: Configure Agent Roles"
       },
       {
         "command": "agenticPlanning.refreshPlanningSessions",
@@ -111,6 +115,11 @@
         "title": "Agentic: Uninstall CLI"
       },
       {
+        "command": "agenticPlanning.retryFailedTask",
+        "title": "Retry Failed Task",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "agenticPlanning.stopPlanningSession",
         "title": "Stop Planning",
         "icon": "$(debug-stop)"
@@ -136,8 +145,8 @@
         "icon": "$(check)"
       },
       {
-        "command": "agenticPlanning.releaseEngineer",
-        "title": "Release Engineer",
+        "command": "agenticPlanning.releaseAgent",
+        "title": "Release Agent",
         "icon": "$(debug-stop)"
       },
       {
@@ -147,6 +156,11 @@
       {
         "command": "agenticPlanning.showRunningProcesses",
         "title": "Agentic: Show Running Processes"
+      },
+      {
+        "command": "agenticPlanning.openSettings",
+        "title": "Open Settings",
+        "icon": "$(gear)"
       }
     ],
     "viewsContainers": {
@@ -161,32 +175,22 @@
     "views": {
       "agentic-planning": [
         {
-          "id": "agenticPlanning.dependencyStatusView",
-          "name": "System Status"
-        },
-        {
-          "id": "agenticPlanning.planningSessionsView",
-          "name": "Planning Sessions"
-        },
-        {
-          "id": "agenticPlanning.engineerPoolView",
-          "name": "Engineer Pool"
-        },
-        {
-          "id": "agenticPlanning.unityControlView",
-          "name": "Unity Control Manager"
+          "type": "webview",
+          "id": "agenticPlanning.sidebarView",
+          "name": "",
+          "visibility": "visible"
         }
       ]
     },
     "configuration": {
       "title": "Agentic Planning Coordinator",
       "properties": {
-        "agenticPlanning.engineerPoolSize": {
+        "agenticPlanning.agentPoolSize": {
           "type": "number",
           "default": 5,
           "minimum": 1,
           "maximum": 20,
-          "description": "Total number of engineers available in the pool"
+          "description": "Total number of agents available in the pool"
         },
         "agenticPlanning.defaultBackend": {
           "type": "string",
@@ -204,7 +208,7 @@
         "agenticPlanning.autoOpenTerminals": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically open terminal for each engineer when started"
+          "description": "Automatically open terminal for each agent when started"
         },
         "agenticPlanning.stateUpdateInterval": {
           "type": "number",
@@ -215,127 +219,20 @@
           "type": "string",
           "default": "",
           "description": "Path to Unity Best Practices document (leave empty to use built-in defaults)"
+        },
+        "agenticPlanning.useIterativePlanning": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use iterative planning loop (Planner → Analysts → Planner loop until no critical issues). If disabled, uses legacy multi-agent debate."
+        },
+        "agenticPlanning.enableUnityFeatures": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable Unity-specific features (MCP integration, Unity Control Manager, compilation/testing pipelines). Disable for non-Unity projects."
         }
       }
     },
     "menus": {
-      "view/title": [
-        {
-          "command": "agenticPlanning.refreshDependencies",
-          "when": "view == agenticPlanning.dependencyStatusView",
-          "group": "navigation"
-        },
-        {
-          "command": "agenticPlanning.startPlanning",
-          "when": "view == agenticPlanning.planningSessionsView",
-          "group": "navigation"
-        },
-        {
-          "command": "agenticPlanning.refreshPlanningSessions",
-          "when": "view == agenticPlanning.planningSessionsView",
-          "group": "navigation"
-        },
-        {
-          "command": "agenticPlanning.refreshEngineerPool",
-          "when": "view == agenticPlanning.engineerPoolView",
-          "group": "navigation"
-        }
-      ],
-      "view/item/context": [
-        {
-          "command": "agenticPlanning.openDependencyInstall",
-          "when": "view == agenticPlanning.dependencyStatusView && viewItem == missing"
-        },
-        {
-          "command": "agenticPlanning.copyDependencyCommand",
-          "when": "view == agenticPlanning.dependencyStatusView && viewItem == missing"
-        },
-        {
-          "command": "agenticPlanning.removePlanningSession",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planningSession",
-          "group": "inline@1"
-        },
-        {
-          "command": "agenticPlanning.stopPlanningSession",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_planning",
-          "group": "inline@1"
-        },
-        {
-          "command": "agenticPlanning.resumePlanningSession",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_stopped",
-          "group": "inline@1"
-        },
-        {
-          "command": "agenticPlanning.resumePlanningSession",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_cancelled",
-          "group": "inline@1"
-        },
-        {
-          "command": "agenticPlanning.revisePlan",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_pending",
-          "group": "inline@1"
-        },
-        {
-          "command": "agenticPlanning.approvePlan",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_pending",
-          "group": "inline@2"
-        },
-        {
-          "command": "agenticPlanning.startExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_approved",
-          "group": "inline@1"
-        },
-        {
-          "command": "agenticPlanning.revisePlan",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_approved",
-          "group": "inline@2"
-        },
-        {
-          "command": "agenticPlanning.revisePlan",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planItem_executing",
-          "group": "inline@1"
-        },
-        {
-          "command": "agenticPlanning.pauseExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == executionItem_running",
-          "group": "inline@1"
-        },
-        {
-          "command": "agenticPlanning.stopExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == executionItem_running",
-          "group": "inline@2"
-        },
-        {
-          "command": "agenticPlanning.resumeExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == executionItem_paused",
-          "group": "inline@1"
-        },
-        {
-          "command": "agenticPlanning.stopExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == executionItem_paused",
-          "group": "inline@2"
-        },
-        {
-          "command": "agenticPlanning.startExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == executionItem_ready",
-          "group": "inline@1"
-        },
-        {
-          "command": "agenticPlanning.startExecution",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == executionItem_stopped",
-          "group": "inline@1"
-        },
-        {
-          "command": "agenticPlanning.removePlanningSession",
-          "when": "view == agenticPlanning.planningSessionsView && viewItem == planningSession",
-          "group": "2_delete@1"
-        },
-        {
-          "command": "agenticPlanning.releaseEngineer",
-          "when": "view == agenticPlanning.engineerPoolView && viewItem == busyEngineer",
-          "group": "inline@1"
-        }
-      ]
     }
   },
   "scripts": {

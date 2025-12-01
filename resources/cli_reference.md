@@ -1,131 +1,379 @@
 # APC CLI Reference for AI Agents
 
+## Overview
+
+The APC (Agentic Planning Coordinator) CLI provides commands for agents to interact with the workflow system. The primary mechanism for agents to communicate results is through **CLI callbacks**.
+
+---
+
+## Agent Completion Callbacks (NEW - Preferred Method)
+
+Agents should signal completion using the `apc agent complete` command. This is the **primary and preferred** method for agent-to-workflow communication.
+
+### Signal Completion
+
+```bash
+apc agent complete \
+    --session <session_id> \
+    --workflow <workflow_id> \
+    --stage <stage_name> \
+    --result <result_type> \
+    [--data '<json_payload>']
+```
+
+**Parameters:**
+- `--session`: Planning session ID (e.g., `ps_000001`)
+- `--workflow`: Workflow ID running the agent (provided in prompt)
+- `--stage`: The stage being completed (see table below)
+- `--result`: Result type (see table below)
+- `--data`: JSON payload with structured data (optional)
+
+### Stages and Results
+
+| Stage | Valid Results | Payload Fields |
+|-------|---------------|----------------|
+| `implementation` | `success`, `failed` | `files`, `message`, `error` |
+| `review` | `approved`, `changes_requested` | `feedback`, `files` |
+| `analysis` | `pass`, `critical`, `minor` | `issues`, `suggestions` |
+| `error_analysis` | `complete` | `rootCause`, `affectedFiles`, `suggestedFix`, `relatedTask` |
+| `context` | `success`, `failed` | `briefPath`, `message` |
+| `delta_context` | `success`, `failed` | `message` |
+| `finalize` | `success`, `failed` | `message` |
+
+### Examples
+
+**Implementation Success:**
+```bash
+apc agent complete \
+    --session ps_000001 \
+    --workflow wf_abc123 \
+    --stage implementation \
+    --result success \
+    --data '{"files":["Assets/Scripts/Player.cs","Assets/Scripts/Enemy.cs"]}'
+```
+
+**Review Approved:**
+```bash
+apc agent complete \
+    --session ps_000001 \
+    --workflow wf_abc123 \
+    --stage review \
+    --result approved
+```
+
+**Review with Changes Requested:**
+```bash
+apc agent complete \
+    --session ps_000001 \
+    --workflow wf_abc123 \
+    --stage review \
+    --result changes_requested \
+    --data '{"feedback":"Missing null checks in ProcessInput method","files":["Assets/Scripts/InputHandler.cs"]}'
+```
+
+**Analysis with Critical Issues:**
+```bash
+apc agent complete \
+    --session ps_000001 \
+    --workflow wf_abc123 \
+    --stage analysis \
+    --result critical \
+    --data '{"issues":["Plan misses authentication requirement","No error handling strategy"]}'
+```
+
+**Error Analysis:**
+```bash
+apc agent complete \
+    --session ps_000001 \
+    --workflow wf_abc123 \
+    --stage error_analysis \
+    --result complete \
+    --data '{"rootCause":"Missing using directive","affectedFiles":["Assets/Scripts/UI/MenuController.cs"],"suggestedFix":"Add using UnityEngine.UI"}'
+```
+
+### Retry on Failure
+
+If the `apc` command fails (network error, daemon not running):
+1. Wait 2 seconds
+2. Retry up to 3 times
+3. If still failing, output the error and exit
+
+---
+
 ## Task Management Commands
 
-Use these commands to manage tasks in the coordinator's TaskManager.
+### Get Task Progress
 
-### Create a Task
 ```bash
-apc task create <coordinator_id> "<description>" --id T1 --deps T2,T3 --engineer Alex
-```
-- `coordinator_id`: The active coordinator ID (e.g., `coord_6vt39z10`)
-- `description`: Task description
-- `--id`: Task ID (e.g., T1, T2)
-- `--deps`: Comma-separated dependency task IDs (optional)
-- `--engineer`: Assigned engineer name (optional)
-
-### Start a Task (Spawns Engineer AI)
-```bash
-apc task start <coordinator_id> <task_id> --engineer Alex
-```
-Marks task as in_progress AND spawns an engineer AI process to work on it.
-
-### Complete a Task
-```bash
-apc task complete <coordinator_id> <task_id> --files "path1.cs,path2.cs"
-```
-Marks task as completed. `--files` lists modified files (optional).
-
-### Fail a Task
-```bash
-apc task fail <coordinator_id> <task_id> --reason "compilation error"
+apc task progress --session <session_id>
 ```
 
-### Reset a Task (for retry)
+Returns task progress and list of tasks for a session.
+
+### Get Task Status
+
 ```bash
-apc task reset <coordinator_id> <task_id>
+apc task status --session <session_id> --task <task_id>
 ```
 
-### List All Tasks
-```bash
-apc task list <coordinator_id> --status ready
-```
-Filter by status: `pending`, `ready`, `in_progress`, `completed`, `failed`
+Returns detailed status of a specific task.
 
-### Get Ready Tasks
-```bash
-apc task ready <coordinator_id>
-```
-Returns tasks with all dependencies satisfied.
+### Mark Task Failed
 
-### Get Progress
 ```bash
-apc task progress <coordinator_id>
+apc task fail --session <session_id> --task <task_id> --reason "error message"
 ```
 
-### Assign Task to Engineer
+Marks a task as failed with a reason.
+
+---
+
+## Agent Management Commands
+
+### Show Agent Pool
+
 ```bash
-apc task assign <coordinator_id> <task_id> --engineer Betty
+apc agent pool
+```
+
+Show available agents not assigned to any coordinator.
+
+### List Available Roles
+
+```bash
+apc agent roles
+```
+
+List all available agent roles (engineer, reviewer, context, custom roles).
+
+### Release Agent
+
+```bash
+apc agent release <agent_name>
+```
+
+Release an agent back to the pool.
+
+---
+
+## Session & Workflow Commands
+
+### List Sessions
+
+```bash
+apc session list
+```
+
+List all planning sessions with workflow information.
+
+### Get Session Status
+
+```bash
+apc session status --id <session_id>
+```
+
+Get detailed session status including active workflows.
+
+### Pause Session
+
+```bash
+apc session pause --id <session_id>
+```
+
+Pause all workflows in a session.
+
+### Resume Session
+
+```bash
+apc session resume --id <session_id>
+```
+
+Resume a paused session.
+
+---
+
+## Execution Commands
+
+### Start Execution
+
+```bash
+apc exec start --session <session_id>
+```
+
+Start executing tasks for a session (dispatches task workflows).
+
+### Pause Execution
+
+```bash
+apc exec pause --session <session_id>
+```
+
+Pause all execution workflows.
+
+### Resume Execution
+
+```bash
+apc exec resume --session <session_id>
+```
+
+Resume paused execution.
+
+### Stop Execution
+
+```bash
+apc exec stop --session <session_id>
+```
+
+Stop all execution workflows.
+
+### Get Execution Status
+
+```bash
+apc exec status --session <session_id>
+```
+
+Get execution status including task progress.
+
+---
+
+## Unity Commands
+
+### Queue Compilation
+
+```bash
+apc unity compile --coordinator <id> --agent <name>
+```
+
+### Queue Tests
+
+```bash
+apc unity test <editmode|playmode> --coordinator <id> --agent <name> [--filter "TestName"]
+```
+
+### Get Unity Status
+
+```bash
+apc unity status
+```
+
+### Wait for Unity Task
+
+```bash
+apc unity wait --task <taskId> [--timeout 120]
+```
+
+### Read Console
+
+```bash
+apc unity console [--type error|warning] [--count 10]
 ```
 
 ---
 
-## Engineer Monitoring Commands
+## Plan Management Commands
 
-### List All Engineers
-```bash
-apc engineer list <coordinator_id>
-```
-Shows all engineers with their current status, task, and activity.
+### List Plans
 
-### Get Engineer Status
 ```bash
-apc engineer status <coordinator_id> <engineer_name>
+apc plan list
 ```
-Detailed info: current task, waiting tasks, history, files modified.
 
-### Get Engineer Log
+### Start Planning
+
 ```bash
-apc engineer log <coordinator_id> <engineer_name> --lines 100
+apc plan start --prompt "<requirement>" [--docs <paths>]
 ```
-Read recent output from the engineer's session.
+
+### Get Plan Status
+
+```bash
+apc plan status --id <session_id>
+```
+
+### Revise Plan
+
+```bash
+apc plan revise --id <session_id> --feedback "<feedback>"
+```
+
+### Approve Plan
+
+```bash
+apc plan approve --id <session_id>
+```
+
+### Cancel Plan
+
+```bash
+apc plan cancel --id <session_id>
+```
 
 ---
 
-## Coordinator Workflow Example
+## Workflow Commands
 
-### Phase 1: Setup (Create Tasks)
+### Dispatch Workflow
+
 ```bash
-# Read plan, then create all tasks
-apc task create coord_001 "GAOS Framework Integration" --id T1
-apc task create coord_001 "Special Gem Type System" --id T2 --deps T1
-apc task create coord_001 "Special Gem Combinations" --id T3 --deps T2
-apc task create coord_001 "Obstacles Set A" --id T4 --deps T1
-apc task create coord_001 "Obstacles Set B" --id T5 --deps T4
+apc workflow dispatch <sessionId> <type> [--input JSON]
 ```
 
-### Phase 2: Dispatch (Assign Ready Tasks)
-```bash
-# Check what's ready
-apc task ready coord_001
-# → T1 is ready (no dependencies)
+Types: `planning_new`, `planning_revision`, `task_implementation`, `error_resolution`
 
-# Start engineers on ready tasks
-apc task start coord_001 T1 --engineer Alex
+### Get Workflow Status
+
+```bash
+apc workflow status --session <id> --id <workflowId>
 ```
 
-### Phase 3: Monitor (React to Completions)
+### Cancel Workflow
+
 ```bash
-# When you see "📢 TASK COMPLETED" notification:
-
-# Check what's now ready
-apc task ready coord_001
-# → T2, T4 are now ready (T1 completed)
-
-# Check which engineers are idle
-apc engineer list coord_001
-
-# Dispatch more work
-apc task start coord_001 T2 --engineer Alex
-apc task start coord_001 T4 --engineer Betty
-
-# If engineer seems stuck, check their log
-apc engineer log coord_001 Alex --lines 50
+apc workflow cancel --session <id> --id <workflowId>
 ```
 
-### Progress Check
+### List Workflows
+
 ```bash
-apc task progress coord_001
-# → completed: 3, inProgress: 2, ready: 1, pending: 5, total: 11
+apc workflow list --session <id>
 ```
 
+---
+
+## Available Roles
+
+| Role | Description | Default Model |
+|------|-------------|---------------|
+| `engineer` | Executes implementation tasks | sonnet-4.5 |
+| `code_reviewer` | Reviews code before build/test | opus-4.5 |
+| `context_gatherer` | Gathers project context | gemini-3-pro |
+| `delta_context` | Updates context after task approval | gemini-3-pro |
+| `error_analyst` | Analyzes compilation/test errors | sonnet-4.5 |
+| `analyst_codex` | Reviews plans for implementation | gpt-5.1-codex-high |
+| `analyst_gemini` | Reviews plans for testing | gemini-3-pro |
+| `analyst_reviewer` | Reviews plans for architecture | sonnet-4.5 |
+| `planner` | Creates and updates execution plans | opus-4.5 |
+
+Use `apc agent roles` to see all available roles including custom ones.
+
+---
+
+## CLI Callback vs Output Parsing
+
+The workflow system supports two modes of agent communication:
+
+### CLI Callbacks (Preferred)
+
+- Agent explicitly calls `apc agent complete` with structured data
+- Workflow receives data immediately via signal mechanism
+- More reliable, less fragile
+- **This is the recommended approach**
+
+### Output Parsing (Legacy Fallback)
+
+- Workflow parses agent's text output for patterns
+- Used when agent exits without calling CLI callback
+- More fragile, can fail if agent output format varies
+- Kept for backward compatibility
+
+Agents should always use CLI callbacks when possible. The workflow system will automatically inject CLI callback instructions into agent prompts.

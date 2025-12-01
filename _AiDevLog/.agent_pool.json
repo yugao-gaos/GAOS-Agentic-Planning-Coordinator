@@ -1,0 +1,18 @@
+{
+  "totalAgents": 5,
+  "agentNames": [
+    "Alex",
+    "Betty",
+    "Cleo",
+    "Dany",
+    "Echo"
+  ],
+  "available": [
+    "Alex",
+    "Betty",
+    "Cleo",
+    "Dany",
+    "Echo"
+  ],
+  "busy": {}
+}

@@ -4,13 +4,13 @@
  * Provides a unified interface for running AI agents across different CLI backends.
  * Currently supports Cursor CLI, with the architecture ready for future backends.
  * 
- * Usage:
- *   const agentRunner = AgentRunner.getInstance();
+ * Obtain via ServiceLocator:
+ *   const agentRunner = ServiceLocator.resolve(AgentRunner);
  *   const result = await agentRunner.run({ id: 'task_1', prompt: '...', cwd: '...' });
  */
 
-import * as vscode from 'vscode';
 import { CursorAgentRunner, AgentRunOptions, AgentRunResult } from './CursorAgentRunner';
+import { ServiceLocator } from './ServiceLocator';
 
 // Re-export types for convenience
 export { AgentRunOptions, AgentRunResult } from './CursorAgentRunner';
@@ -61,9 +61,12 @@ export type AgentBackendType = 'cursor';
  * This is the primary interface consumers should use. It delegates to the
  * appropriate backend based on configuration.
  * 
+ * Obtain via ServiceLocator:
+ *   const runner = ServiceLocator.resolve(AgentRunner);
+ * 
  * Example:
  * ```typescript
- * const runner = AgentRunner.getInstance();
+ * const runner = ServiceLocator.resolve(AgentRunner);
  * 
  * // Check if backend is available
  * if (await runner.isAvailable()) {
@@ -78,23 +81,12 @@ export type AgentBackendType = 'cursor';
  * ```
  */
 export class AgentRunner implements IAgentBackend {
-    private static instance: AgentRunner;
     private backend: IAgentBackend | null = null;
     private backendType: AgentBackendType = 'cursor';
     
-    private constructor() {
+    constructor() {
         // Default to cursor backend
         this.initializeBackend('cursor');
-    }
-    
-    /**
-     * Get the singleton instance
-     */
-    static getInstance(): AgentRunner {
-        if (!AgentRunner.instance) {
-            AgentRunner.instance = new AgentRunner();
-        }
-        return AgentRunner.instance;
     }
     
     /**
@@ -106,8 +98,8 @@ export class AgentRunner implements IAgentBackend {
     setBackend(type: AgentBackendType | string): void {
         // Validate backend type - only 'cursor' is currently supported
         if (type !== 'cursor') {
-            vscode.window.showWarningMessage(
-                `Agent backend '${type}' is not yet implemented. Falling back to 'cursor' backend.`
+            console.warn(
+                `[AgentRunner] Agent backend '${type}' is not yet implemented. Falling back to 'cursor' backend.`
             );
             type = 'cursor';
         }
@@ -133,13 +125,13 @@ export class AgentRunner implements IAgentBackend {
     private initializeBackend(type: AgentBackendType): void {
         switch (type) {
             case 'cursor':
-                this.backend = CursorAgentRunner.getInstance();
+                this.backend = ServiceLocator.resolve(CursorAgentRunner);
                 console.log('[AgentRunner] Backend initialized: cursor');
                 break;
             default:
                 // Fallback to cursor for any unrecognized type
                 console.warn(`[AgentRunner] Unknown backend type: ${type}, falling back to cursor`);
-                this.backend = CursorAgentRunner.getInstance();
+                this.backend = ServiceLocator.resolve(CursorAgentRunner);
                 this.backendType = 'cursor';
                 break;
         }
@@ -195,6 +187,19 @@ export class AgentRunner implements IAgentBackend {
     }
     
     /**
+     * Get partial output from a running agent (if available)
+     * Returns undefined if the agent is not running or output is not available.
+     * 
+     * Note: This is currently a stub - full implementation would require
+     * tracking output buffers for each running agent.
+     */
+    getPartialOutput(_id: string): string | undefined {
+        // TODO: Implement partial output retrieval for pause/resume functionality
+        // This would require CursorAgentRunner to buffer output
+        return undefined;
+    }
+    
+    /**
      * Dispose resources
      */
     async dispose(): Promise<void> {
@@ -223,4 +228,3 @@ export class AgentRunner implements IAgentBackend {
         return this.ensureBackend().getRunningAgents().length > 0;
     }
 }
-

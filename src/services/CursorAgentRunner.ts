@@ -4,6 +4,7 @@ import * as os from 'os';
 import { spawn, ChildProcess, execSync } from 'child_process';
 import { ProcessManager, ProcessState } from './ProcessManager';
 import { IAgentBackend } from './AgentBackend';
+import { ServiceLocator } from './ServiceLocator';
 
 /**
  * Result from running a cursor agent
@@ -47,9 +48,11 @@ export interface AgentRunOptions {
  * This is the canonical way to run cursor agents in the extension.
  * 
  * Implements IAgentBackend for use with the AgentRunner abstraction layer.
+ * 
+ * Obtain via ServiceLocator:
+ *   const runner = ServiceLocator.resolve(CursorAgentRunner);
  */
 export class CursorAgentRunner implements IAgentBackend {
-    private static instance: CursorAgentRunner;
     private processManager: ProcessManager;
     private activeRuns: Map<string, {
         proc: ChildProcess;
@@ -57,15 +60,8 @@ export class CursorAgentRunner implements IAgentBackend {
         collectedOutput: string;
     }> = new Map();
 
-    private constructor() {
-        this.processManager = ProcessManager.getInstance();
-    }
-
-    static getInstance(): CursorAgentRunner {
-        if (!CursorAgentRunner.instance) {
-            CursorAgentRunner.instance = new CursorAgentRunner();
-        }
-        return CursorAgentRunner.instance;
+    constructor() {
+        this.processManager = ServiceLocator.resolve(ProcessManager);
     }
 
     /**
@@ -403,12 +399,74 @@ export class CursorAgentRunner implements IAgentBackend {
     getRunningAgents(): string[] {
         return Array.from(this.activeRuns.keys());
     }
-
+    
     /**
-     * Check if an agent is running
+     * Get partial output collected so far for a running agent
+     * Useful for saving state before killing
+     */
+    getPartialOutput(id: string): string | undefined {
+        const run = this.activeRuns.get(id);
+        return run?.collectedOutput;
+    }
+    
+    /**
+     * Check if an agent is currently running
      */
     isRunning(id: string): boolean {
         return this.activeRuns.has(id);
+    }
+    
+    /**
+     * Clean up old temp files (prompt files that weren't deleted)
+     * Should be called periodically or on extension activation
+     * 
+     * @param maxAgeMs Maximum age of files to keep (default: 1 hour)
+     * @returns Number of files cleaned up
+     */
+    cleanupTempFiles(maxAgeMs: number = 60 * 60 * 1000): number {
+        const tempDir = path.join(os.tmpdir(), 'apc_prompts');
+        let cleanedCount = 0;
+        
+        if (!fs.existsSync(tempDir)) {
+            return 0;
+        }
+        
+        try {
+            const now = Date.now();
+            const files = fs.readdirSync(tempDir);
+            
+            for (const file of files) {
+                if (!file.startsWith('prompt_')) continue;
+                
+                const filePath = path.join(tempDir, file);
+                try {
+                    const stats = fs.statSync(filePath);
+                    const age = now - stats.mtimeMs;
+                    
+                    if (age > maxAgeMs) {
+                        fs.unlinkSync(filePath);
+                        cleanedCount++;
+                    }
+                } catch (e) {
+                    // File may have been deleted already, ignore
+                }
+            }
+            
+            if (cleanedCount > 0) {
+                console.log(`[CursorAgentRunner] Cleaned up ${cleanedCount} old temp files`);
+            }
+        } catch (e) {
+            console.error('[CursorAgentRunner] Error cleaning temp files:', e);
+        }
+        
+        return cleanedCount;
+    }
+    
+    /**
+     * Get the temp directory path used for prompt files
+     */
+    getTempDir(): string {
+        return path.join(os.tmpdir(), 'apc_prompts');
     }
     
     /**
@@ -440,6 +498,9 @@ export class CursorAgentRunner implements IAgentBackend {
         for (const id of runningIds) {
             await this.stop(id);
         }
+        
+        // Clean up any leftover temp files
+        this.cleanupTempFiles(0); // Clean all temp files on dispose
         
         console.log('[CursorAgentRunner] Disposed');
     }

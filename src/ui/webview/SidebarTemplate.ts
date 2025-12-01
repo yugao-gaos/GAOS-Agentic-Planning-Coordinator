@@ -1,0 +1,138 @@
+/**
+ * Main template composer for sidebar webview.
+ * Combines styles, components, and scripts into a complete HTML document.
+ */
+import { getSidebarStyles } from './styles';
+import { getSidebarScript } from './scripts';
+import { 
+    renderStatusBar, 
+    renderSessionsSection,
+    renderAgentGrid,
+    getAgentBadgeText,
+    renderUnityContent,
+    getUnityBadgeInfo
+} from './components';
+import { SidebarState } from './types';
+import { ICONS } from './icons';
+
+/**
+ * Render state data for client-side updates.
+ * This extracts pre-computed values that the client script needs.
+ */
+export interface ClientState extends SidebarState {
+    agentBadgeText: string;
+    unityBadgeText: string;
+    unityBadgeBackground: string;
+}
+
+/**
+ * Build client state with pre-computed values.
+ */
+export function buildClientState(state: SidebarState): ClientState {
+    const unityBadgeInfo = getUnityBadgeInfo(state.unity);
+    
+    return {
+        ...state,
+        agentBadgeText: getAgentBadgeText(state.agents),
+        unityBadgeText: unityBadgeInfo.text,
+        unityBadgeBackground: unityBadgeInfo.background,
+    };
+}
+
+/**
+ * Generate the complete HTML for the sidebar webview.
+ */
+export function getSidebarHtml(initialState?: SidebarState, expandedSessionIds?: Set<string>): string {
+    // Build initial content
+    const sessionsHtml = initialState 
+        ? renderSessionsSection(initialState.sessions, expandedSessionIds || new Set())
+        : `
+            <div class="empty-state">
+                <div class="icon">📋</div>
+                <div>No planning sessions</div>
+                <div style="margin-top: 4px;">Click + to start a new session</div>
+            </div>
+        `;
+    
+    const agentsHtml = initialState
+        ? renderAgentGrid(initialState.agents)
+        : '<div class="agent-grid" id="agentGrid"></div>';
+    
+    const agentBadgeText = initialState 
+        ? getAgentBadgeText(initialState.agents) 
+        : '0/0';
+    
+    const unityHtml = initialState && initialState.unityEnabled
+        ? renderUnityContent(initialState.unity)
+        : `
+            <div class="unity-row">
+                <span class="unity-label">Queue</span>
+                <span class="unity-value" id="unityQueue">0 tasks</span>
+            </div>
+        `;
+    
+    const unityBadgeInfo = initialState 
+        ? getUnityBadgeInfo(initialState.unity)
+        : { text: 'Not Running', background: 'rgba(107, 114, 128, 0.3)' };
+    
+    const unityDisplay = initialState && !initialState.unityEnabled ? 'none' : 'block';
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+${getSidebarStyles()}
+    </style>
+</head>
+<body>
+    <!-- Status Bar -->
+    ${renderStatusBar()}
+
+    <div class="main-content">
+        <!-- Planning Sessions -->
+        <div class="section scrollable" style="flex: 2;">
+            <div class="section-header">
+                <span>Planning Sessions</span>
+                <button class="icon-btn" id="newSessionBtn" title="New Session">
+                    ${ICONS.add}
+                </button>
+            </div>
+            <div class="section-content" id="sessionsContent">
+                ${sessionsHtml}
+            </div>
+        </div>
+
+        <!-- Agent Pool -->
+        <div class="section scrollable" style="flex: 1; min-height: 100px;">
+            <div class="section-header">
+                <span>Agent Pool</span>
+                <span class="badge" id="agentBadge">${agentBadgeText}</span>
+            </div>
+            <div class="section-content" id="agentsContent">
+                ${agentsHtml}
+            </div>
+        </div>
+
+        <!-- Unity Control -->
+        <div class="section" style="flex-shrink: 0; display: ${unityDisplay};" id="unitySection">
+            <div class="section-header">
+                <span>Unity Control</span>
+                <span class="badge" id="unityBadge" style="background: ${unityBadgeInfo.background};">
+                    ${unityBadgeInfo.text}
+                </span>
+            </div>
+            <div class="unity-content" id="unityContent">
+                ${unityHtml}
+            </div>
+        </div>
+    </div>
+
+    <script>
+${getSidebarScript()}
+    </script>
+</body>
+</html>`;
+}
+

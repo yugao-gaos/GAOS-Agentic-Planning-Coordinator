@@ -1,0 +1,9 @@
+{
+  "globalSettings": {
+    "agentPoolSize": 5,
+    "defaultBackend": "cursor",
+    "workingDirectory": "/Users/imyu/Desktop/Agentic-Planning-Coordinator/_AiDevLog"
+  },
+  "activePlanningSessions": [],
+  "activeCoordinators": []
+}

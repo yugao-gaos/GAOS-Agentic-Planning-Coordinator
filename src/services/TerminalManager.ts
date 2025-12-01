@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { EngineerTerminal } from '../types';
+import { AgentTerminal } from '../types';
+import { ITerminalManager, IAgentTerminalInfo } from './ITerminalManager';
 
 interface CoordinatorTerminal {
     coordinatorId: string;
@@ -8,10 +9,16 @@ interface CoordinatorTerminal {
     logFile: string;
 }
 
-export class TerminalManager {
-    private engineerTerminals: Map<string, EngineerTerminal> = new Map();
+/**
+ * VS Code Terminal Manager - Creates terminals that tail log files
+ * 
+ * This is the VS Code-specific implementation of ITerminalManager.
+ * For headless/daemon mode, use HeadlessTerminalManager instead.
+ */
+export class TerminalManager implements ITerminalManager {
+    private agentTerminals: Map<string, AgentTerminal> = new Map();
     private coordinatorTerminals: Map<string, CoordinatorTerminal> = new Map();
-    private engineerOutputChannels: Map<string, vscode.OutputChannel> = new Map();
+    private agentOutputChannels: Map<string, vscode.OutputChannel> = new Map();
     private disposables: vscode.Disposable[] = [];
 
     constructor() {
@@ -19,11 +26,11 @@ export class TerminalManager {
         this.disposables.push(
             vscode.window.onDidCloseTerminal(terminal => {
                 // Find and remove the closed terminal from our map
-                for (const [name, engineerTerminal] of this.engineerTerminals) {
-                    if (engineerTerminal.terminal === terminal) {
+                for (const [name, agentTerminal] of this.agentTerminals) {
+                    if (agentTerminal.terminal === terminal) {
                         // Don't remove from map - we want to track that the terminal was closed
-                        // but the engineer process may still be running
-                        console.log(`Terminal closed for engineer: ${name}`);
+                        // but the agent process may still be running
+                        console.log(`Terminal closed for agent: ${name}`);
                         break;
                     }
                 }
@@ -32,18 +39,18 @@ export class TerminalManager {
     }
 
     /**
-     * Create a new terminal for an engineer session
+     * Create a new terminal for an agent session
      */
-    createEngineerTerminal(
-        engineerName: string,
+    createAgentTerminal(
+        agentName: string,
         sessionId: string,
         logFile: string,
         workspaceRoot: string
     ): vscode.Terminal {
-        const terminalName = `🔧 ${engineerName}`;
+        const terminalName = `🔧 ${agentName}`;
         
         // Check if terminal already exists and is still valid
-        const existing = this.engineerTerminals.get(engineerName);
+        const existing = this.agentTerminals.get(agentName);
         if (existing && this.isTerminalAlive(existing.terminal)) {
             // Update the stored info in case sessionId/logFile changed
             existing.sessionId = sessionId;
@@ -54,20 +61,20 @@ export class TerminalManager {
 
         // If existing terminal is dead, dispose it first
         if (existing) {
-            this.engineerTerminals.delete(engineerName);
+            this.agentTerminals.delete(agentName);
         }
 
-        // Create new terminal with proper engineer name
+        // Create new terminal with proper agent name
         const terminal = vscode.window.createTerminal({
             name: terminalName,
             cwd: workspaceRoot,
             iconPath: new vscode.ThemeIcon('person'),
-            message: `Engineer ${engineerName} | Session: ${sessionId}`
+            message: `Agent ${agentName} | Session: ${sessionId}`
         });
 
         // Store terminal reference
-        this.engineerTerminals.set(engineerName, {
-            name: engineerName,
+        this.agentTerminals.set(agentName, {
+            name: agentName,
             sessionId,
             terminal,
             logFile
@@ -83,29 +90,29 @@ export class TerminalManager {
     }
 
     /**
-     * Start tailing the engineer's log file in their terminal
+     * Start tailing the agent's log file in their terminal
      */
-    startLogTail(engineerName: string): void {
-        const engineerTerminal = this.engineerTerminals.get(engineerName);
-        if (!engineerTerminal) {
-            console.warn(`No terminal found for engineer: ${engineerName}`);
+    startLogTail(agentName: string): void {
+        const agentTerminal = this.agentTerminals.get(agentName);
+        if (!agentTerminal) {
+            console.warn(`No terminal found for agent: ${agentName}`);
             return;
         }
 
-        if (!this.isTerminalAlive(engineerTerminal.terminal)) {
-            console.warn(`Terminal for ${engineerName} is not alive`);
+        if (!this.isTerminalAlive(agentTerminal.terminal)) {
+            console.warn(`Terminal for ${agentName} is not alive`);
             return;
         }
 
         // Ensure log file exists, show current content, then start tailing
-        engineerTerminal.terminal.sendText(`touch "${engineerTerminal.logFile}" && cat "${engineerTerminal.logFile}" 2>/dev/null; echo "--- Live stream started ---"; tail -f "${engineerTerminal.logFile}"`);
+        agentTerminal.terminal.sendText(`touch "${agentTerminal.logFile}" && cat "${agentTerminal.logFile}" 2>/dev/null; echo "--- Live stream started ---"; tail -f "${agentTerminal.logFile}"`);
     }
     
     /**
-     * Append text to an engineer's terminal is now a no-op since we use tail -f on log file.
+     * Append text to an agent's terminal is now a no-op since we use tail -f on log file.
      * The CursorAgentRunner writes directly to the log file which the terminal tails.
      */
-    appendToTerminal(engineerName: string, text: string, type: 'text' | 'thinking' | 'tool' | 'tool_result' | 'error' | 'info'): void {
+    appendToTerminal(agentName: string, text: string, type: 'text' | 'thinking' | 'tool' | 'tool_result' | 'error' | 'info'): void {
         // No-op: output goes to log file which terminal tails via startStreamingLog()
     }
 
@@ -113,26 +120,26 @@ export class TerminalManager {
      * Start streaming the log file in terminal with tail -f
      * This shows live output as CursorAgentRunner writes to the log
      */
-    startStreamingLog(engineerName: string, logFile: string): void {
-        const engineerTerminal = this.engineerTerminals.get(engineerName);
-        if (!engineerTerminal || !this.isTerminalAlive(engineerTerminal.terminal)) {
-            console.warn(`No terminal found for engineer: ${engineerName}`);
+    startStreamingLog(agentName: string, logFile: string): void {
+        const agentTerminal = this.agentTerminals.get(agentName);
+        if (!agentTerminal || !this.isTerminalAlive(agentTerminal.terminal)) {
+            console.warn(`No terminal found for agent: ${agentName}`);
             return;
         }
 
         // Clear terminal and start tailing the log file
-        engineerTerminal.terminal.sendText('clear');
-        engineerTerminal.terminal.sendText(`echo "🔴 Live streaming output from: ${logFile}"`);
-        engineerTerminal.terminal.sendText(`echo ""`);
+        agentTerminal.terminal.sendText('clear');
+        agentTerminal.terminal.sendText(`echo "🔴 Live streaming output from: ${logFile}"`);
+        agentTerminal.terminal.sendText(`echo ""`);
         // Touch to create file if it doesn't exist, then tail with -f for continuous streaming
-        engineerTerminal.terminal.sendText(`touch "${logFile}" && tail -f "${logFile}"`);
-        engineerTerminal.terminal.show();
+        agentTerminal.terminal.sendText(`touch "${logFile}" && tail -f "${logFile}"`);
+        agentTerminal.terminal.show();
     }
 
     /**
-     * Show header in terminal for the engineer's task (writes to log file so it appears in tail)
+     * Show header in terminal for the agent's task (writes to log file so it appears in tail)
      */
-    showTaskHeader(engineerName: string, taskId: string, taskDescription: string): void {
+    showTaskHeader(agentName: string, taskId: string, taskDescription: string): void {
         // This is now handled by CursorAgentRunner writing header to log file
         // The terminal will see it via tail -f
     }
@@ -140,54 +147,54 @@ export class TerminalManager {
     /**
      * Show completion message (writes to log file so it appears in tail)
      */
-    showTaskCompletion(engineerName: string, success: boolean, message?: string): void {
+    showTaskCompletion(agentName: string, success: boolean, message?: string): void {
         // This is now handled by CursorAgentRunner writing to log file
         // The terminal will see it via tail -f
     }
 
     /**
-     * Send a command to an engineer's terminal
+     * Send a command to an agent's terminal
      */
-    sendCommand(engineerName: string, command: string): boolean {
-        const engineerTerminal = this.engineerTerminals.get(engineerName);
-        if (!engineerTerminal || !this.isTerminalAlive(engineerTerminal.terminal)) {
+    sendCommand(agentName: string, command: string): boolean {
+        const agentTerminal = this.agentTerminals.get(agentName);
+        if (!agentTerminal || !this.isTerminalAlive(agentTerminal.terminal)) {
             return false;
         }
 
-        engineerTerminal.terminal.sendText(command);
+        agentTerminal.terminal.sendText(command);
         return true;
     }
 
     /**
-     * Show an engineer's terminal (create if needed)
+     * Show an agent's terminal (create if needed)
      */
-    showEngineerTerminal(engineerName: string): boolean {
-        const engineerTerminal = this.engineerTerminals.get(engineerName);
+    showAgentTerminal(agentName: string): boolean {
+        const agentTerminal = this.agentTerminals.get(agentName);
         
-        if (engineerTerminal && this.isTerminalAlive(engineerTerminal.terminal)) {
-            engineerTerminal.terminal.show();
+        if (agentTerminal && this.isTerminalAlive(agentTerminal.terminal)) {
+            agentTerminal.terminal.show();
             return true;
         }
 
         // Terminal was closed but we have the info - recreate it
-        if (engineerTerminal) {
-            const terminalName = `🔧 ${engineerName}`;
+        if (agentTerminal) {
+            const terminalName = `🔧 ${agentName}`;
             const terminal = vscode.window.createTerminal({
                 name: terminalName,
                 iconPath: new vscode.ThemeIcon('person'),
-                message: `Engineer ${engineerName} - Reconnected | Session: ${engineerTerminal.sessionId}`
+                message: `Agent ${agentName} - Reconnected | Session: ${agentTerminal.sessionId}`
             });
 
-            this.engineerTerminals.set(engineerName, {
-                ...engineerTerminal,
+            this.agentTerminals.set(agentName, {
+                ...agentTerminal,
                 terminal
             });
 
             terminal.show();
             // Only tail if log file path exists
-            if (engineerTerminal.logFile) {
+            if (agentTerminal.logFile) {
                 terminal.sendText(`echo "📄 Reconnecting to log file..."`);
-            terminal.sendText(`tail -f "${engineerTerminal.logFile}"`);
+            terminal.sendText(`tail -f "${agentTerminal.logFile}"`);
             }
             return true;
         }
@@ -196,33 +203,41 @@ export class TerminalManager {
     }
 
     /**
-     * Close an engineer's terminal
+     * Close an agent's terminal
      */
-    closeEngineerTerminal(engineerName: string): void {
-        const engineerTerminal = this.engineerTerminals.get(engineerName);
-        if (engineerTerminal && this.isTerminalAlive(engineerTerminal.terminal)) {
-            engineerTerminal.terminal.dispose();
+    closeAgentTerminal(agentName: string): void {
+        const agentTerminal = this.agentTerminals.get(agentName);
+        if (agentTerminal && this.isTerminalAlive(agentTerminal.terminal)) {
+            agentTerminal.terminal.dispose();
         }
-        this.engineerTerminals.delete(engineerName);
+        this.agentTerminals.delete(agentName);
     }
 
     /**
-     * Close all engineer terminals
+     * Close all agent terminals
      */
     closeAllTerminals(): void {
-        for (const [name, engineerTerminal] of this.engineerTerminals) {
-            if (this.isTerminalAlive(engineerTerminal.terminal)) {
-                engineerTerminal.terminal.dispose();
+        for (const [name, agentTerminal] of this.agentTerminals) {
+            if (this.isTerminalAlive(agentTerminal.terminal)) {
+                agentTerminal.terminal.dispose();
             }
         }
-        this.engineerTerminals.clear();
+        this.agentTerminals.clear();
     }
 
     /**
-     * Get info about an engineer's terminal
+     * Get info about an agent's terminal
      */
-    getTerminalInfo(engineerName: string): EngineerTerminal | undefined {
-        return this.engineerTerminals.get(engineerName);
+    getTerminalInfo(agentName: string): IAgentTerminalInfo | undefined {
+        const info = this.agentTerminals.get(agentName);
+        if (info) {
+            return {
+                name: info.name,
+                sessionId: info.sessionId,
+                logFile: info.logFile
+            };
+        }
+        return undefined;
     }
 
     /**
@@ -234,12 +249,12 @@ export class TerminalManager {
     }
 
     /**
-     * Get all active engineer terminal names
+     * Get all active agent terminal names
      */
     getActiveTerminalNames(): string[] {
         const active: string[] = [];
-        for (const [name, engineerTerminal] of this.engineerTerminals) {
-            if (this.isTerminalAlive(engineerTerminal.terminal)) {
+        for (const [name, agentTerminal] of this.agentTerminals) {
+            if (this.isTerminalAlive(agentTerminal.terminal)) {
                 active.push(name);
             }
         }
@@ -355,16 +370,16 @@ export class TerminalManager {
     }
     
     /**
-     * Clear all terminal references for a coordinator and its engineers
+     * Clear all terminal references for a coordinator and its agents
      * Call this when stopping/resetting a coordinator
      */
-    clearCoordinatorTerminals(coordinatorId: string, engineerNames: string[]): void {
+    clearCoordinatorTerminals(coordinatorId: string, agentNames: string[]): void {
         // Close coordinator terminal
         this.closeCoordinatorTerminal(coordinatorId);
         
-        // Close engineer terminals
-        for (const name of engineerNames) {
-            this.closeEngineerTerminal(name);
+        // Close agent terminals
+        for (const name of agentNames) {
+            this.closeAgentTerminal(name);
         }
     }
     
@@ -372,11 +387,11 @@ export class TerminalManager {
      * Remove stale (dead) terminal references without closing active ones
      */
     cleanupStaleTerminals(): void {
-        // Clean up stale engineer terminals
-        for (const [name, engineerTerminal] of this.engineerTerminals) {
-            if (!this.isTerminalAlive(engineerTerminal.terminal)) {
-                console.log(`Cleaning up stale terminal reference for engineer: ${name}`);
-                this.engineerTerminals.delete(name);
+        // Clean up stale agent terminals
+        for (const [name, agentTerminal] of this.agentTerminals) {
+            if (!this.isTerminalAlive(agentTerminal.terminal)) {
+                console.log(`Cleaning up stale terminal reference for agent: ${name}`);
+                this.agentTerminals.delete(name);
             }
         }
         

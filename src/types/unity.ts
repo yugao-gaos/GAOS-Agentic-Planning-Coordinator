@@ -16,7 +16,12 @@ export type UnityTaskType =
  */
 export interface TaskRequester {
     coordinatorId: string;
-    engineerName: string;
+    /** 
+     * The agent name requesting this task.
+     * @deprecated Use agentName instead of engineerName
+     */
+    engineerName?: string;
+    agentName: string;
 }
 
 /**
@@ -129,7 +134,7 @@ export interface ErrorRegistryEntry {
     status: ErrorStatus;
     assignedTo?: {
         coordinatorId: string;
-        engineerName: string;
+        agentName: string;
     };
     assignedAt?: string;
     fixedBy?: string;
@@ -240,7 +245,7 @@ export type PipelineOperation =
 export interface PipelineTaskContext {
     taskId: string;                    // e.g., 'T1'
     stage: string;                     // e.g., 'implementation_v1', 'fix_v1'
-    engineerName: string;              // For context (engineer already stopped)
+    agentName: string;                 // For context (agent already stopped)
     filesModified: string[];           // For overlap analysis
 }
 

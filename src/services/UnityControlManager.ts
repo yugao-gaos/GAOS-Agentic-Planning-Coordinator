@@ -1,6 +1,6 @@
-import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
+import { TypedEventEmitter } from './TypedEventEmitter';
 import { spawn } from 'child_process';
 import {
     UnityTask,
@@ -22,9 +22,13 @@ import {
 } from '../types/unity';
 import { OutputChannelManager } from './OutputChannelManager';
 import { AgentRunner, AgentRunResult } from './AgentBackend';
+import { AgentRoleRegistry } from './AgentRoleRegistry';
+import { TaskManager, ErrorInfo, ERROR_RESOLUTION_SESSION_ID } from './TaskManager';
+import { UnifiedCoordinatorService } from './UnifiedCoordinatorService';
+import { ServiceLocator } from './ServiceLocator';
 
 // ============================================================================
-// Unity Control Manager - Singleton Background Service
+// Unity Control Manager - Background Service
 // ============================================================================
 
 /**
@@ -42,7 +46,7 @@ interface UnityEditorStatus {
 /**
  * Unity Control Manager - Manages Unity Editor operations that need queuing
  * 
- * This is a SINGLETON service that runs in the background and manages:
+ * This service runs in the background and manages:
  * - Task queue for operations that can freeze Unity (compile, reimport, tests, playmode)
  * - Unity Editor state monitoring via long-running polling agent
  * - Error collection and routing
@@ -64,10 +68,11 @@ interface UnityEditorStatus {
  * - Notifies manager via CLI: apc unity notify-status
  * 
  * Only ONE Unity blocking operation can run at a time.
+ * 
+ * Obtain via ServiceLocator:
+ *   const manager = ServiceLocator.resolve(UnityControlManager);
  */
 export class UnityControlManager {
-    private static instance: UnityControlManager;
-
     private workspaceRoot: string = '';
     private queue: UnityTask[] = [];
     private currentTask: UnityTask | null = null;
@@ -97,10 +102,10 @@ export class UnityControlManager {
     private pollingAgentRestartTimeout: NodeJS.Timeout | null = null;  // Track restart timeout
 
     // Event emitters
-    private _onStatusChanged = new vscode.EventEmitter<UnityControlManagerState>();
+    private _onStatusChanged = new TypedEventEmitter<UnityControlManagerState>();
     readonly onStatusChanged = this._onStatusChanged.event;
 
-    private _onTaskCompleted = new vscode.EventEmitter<{ task: UnityTask; result: UnityTaskResult }>();
+    private _onTaskCompleted = new TypedEventEmitter<{ task: UnityTask; result: UnityTaskResult }>();
     readonly onTaskCompleted = this._onTaskCompleted.event;
 
     // Output channel for logging
@@ -108,20 +113,20 @@ export class UnityControlManager {
 
     // Task ID counter
     private taskIdCounter: number = 0;
+    
+    // Agent Role Registry for customizable prompts
+    private agentRoleRegistry: AgentRoleRegistry | null = null;
 
-    private constructor() {
-        this.outputManager = OutputChannelManager.getInstance();
-        this.agentRunner = AgentRunner.getInstance();
+    constructor() {
+        this.outputManager = ServiceLocator.resolve(OutputChannelManager);
+        this.agentRunner = ServiceLocator.resolve(AgentRunner);
     }
-
+    
     /**
-     * Get singleton instance
+     * Set the agent role registry (for customizable prompts)
      */
-    static getInstance(): UnityControlManager {
-        if (!UnityControlManager.instance) {
-            UnityControlManager.instance = new UnityControlManager();
-        }
-        return UnityControlManager.instance;
+    setAgentRoleRegistry(registry: AgentRoleRegistry): void {
+        this.agentRoleRegistry = registry;
     }
 
     /**
@@ -133,6 +138,12 @@ export class UnityControlManager {
 
         this.log('Initializing Unity Control Manager...');
         this.log(`Workspace: ${workspaceRoot}`);
+
+        // Create ERROR_RESOLUTION session/plan (persistent, lives forever)
+        // This session handles all error-fixing tasks across all plans
+        const taskManager = ServiceLocator.resolve(TaskManager);
+        taskManager.registerSession(ERROR_RESOLUTION_SESSION_ID, '');
+        this.log('ERROR_RESOLUTION plan initialized');
 
         // Ensure temp scene exists
         await this.ensureTempSceneExists();
@@ -213,7 +224,7 @@ export class UnityControlManager {
             this.sortQueue();
         }
 
-        this.log(`Task queued: ${type} (ID: ${taskId}) from ${task.requestedBy.map(r => r.engineerName).join(', ')}`);
+        this.log(`Task queued: ${type} (ID: ${taskId}) from ${task.requestedBy.map(r => r.agentName).join(', ')}`);
         this.emitStatusUpdate();
 
         // Ensure polling agent is running when we have tasks
@@ -424,11 +435,11 @@ export class UnityControlManager {
             errors.push(...consoleResult.errors);
             warnings.push(...consoleResult.warnings);
 
-            // Step 6: Route errors to coordinators (via ErrorRouter)
+            // Step 6: Route errors to global error handling
             if (errors.length > 0) {
-                this.log(`Found ${errors.length} errors, routing to coordinators...`);
-                // Error routing will be handled by ErrorRouter service
-                // This service just collects and returns the errors
+                this.log(`Found ${errors.length} errors, routing to global handler...`);
+                // Error routing is handled by handlePipelineErrors() 
+                // which uses global TaskManager for cross-plan detection
             }
 
             return {
@@ -576,10 +587,8 @@ export class UnityControlManager {
             // Focus Unity for player
             await this.focusUnityEditor();
 
-            // Show notification
-            vscode.window.showInformationMessage(
-                '🎮 Player Test Started - Play the game and exit playmode when done'
-            );
+            // Log notification
+            this.log('🎮 Player Test Started - Play the game and exit playmode when done');
 
             // Monitor loop
             let lastCheckTime = Date.now();
@@ -611,11 +620,9 @@ export class UnityControlManager {
                     break;
                 }
 
-                // Update notification with error count
+                // Log error count
                 if (errors.length > 0) {
-                    vscode.window.showWarningMessage(
-                        `🎮 Playing... (${errors.length} errors collected)`
-                    );
+                    this.log(`🎮 Playing... (${errors.length} errors collected)`);
                 }
             }
 
@@ -818,7 +825,7 @@ export class UnityControlManager {
      * Provides consistent timeout handling and retry support
      */
     private async runCursorAgentCommand(prompt: string, retries: number = 2): Promise<string> {
-        const agentRunner = AgentRunner.getInstance();
+        const agentRunner = ServiceLocator.resolve(AgentRunner);
         const processId = `unity_cmd_${Date.now()}`;
         
         let lastError: Error | null = null;
@@ -1183,10 +1190,16 @@ export class UnityControlManager {
      * Get the prompt for the polling agent
      */
     private getPollingAgentPrompt(): string {
-        return `You are the UNITY POLLING AGENT. Your job is to continuously monitor Unity Editor state and report status.
+        // Get base prompt from settings
+        const basePrompt = this.agentRoleRegistry?.getEffectiveSystemPrompt('unity_polling');
+        if (!basePrompt) {
+            throw new Error('Missing system prompt for unity_polling - check DefaultSystemPrompts');
+        }
+
+        return `${basePrompt}
 
 ========================================
-🎯 YOUR ROLE: Monitor Unity, report compilation/play state, track errors
+📋 POLLING SESSION
 ========================================
 
 IMPORTANT: You must keep running and polling continuously. Do NOT exit after one check.
@@ -1262,8 +1275,8 @@ Begin polling now. First poll:`;
     /**
      * Queue a pipeline of Unity operations
      * 
-     * Engineers call this when they complete a task stage and need Unity verification:
-     *   apc engineer complete --task T1 --stage impl_v1 --unity "prep,test_editmode"
+     * Agents call this when they complete a task stage and need Unity verification:
+     *   apc agent complete --task T1 --stage impl_v1 --unity "prep,test_editmode"
      * 
      * @param coordinatorId - Which coordinator to notify on completion
      * @param operations - Sequence of operations (fail-fast)
@@ -1329,6 +1342,44 @@ Begin polling now. First poll:`;
         }
 
         return pipelineId;
+    }
+    
+    /**
+     * Queue a pipeline request and wait for the result
+     * This is a convenience wrapper for workflows that need to await the pipeline
+     */
+    async queuePipelineAndWait(
+        coordinatorId: string,
+        operations: PipelineOperation[],
+        tasksInvolved: PipelineTaskContext[],
+        mergeEnabled: boolean = true,
+        timeoutMs: number = 600000 // 10 minute default timeout
+    ): Promise<PipelineResult> {
+        return new Promise((resolve, reject) => {
+            const pipelineId = this.queuePipeline(coordinatorId, operations, tasksInvolved, mergeEnabled);
+            
+            // Set up a one-time listener for this specific pipeline
+            const timeoutId = setTimeout(() => {
+                reject(new Error(`Pipeline ${pipelineId} timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
+            
+            // Listen for completion
+            const originalCallback = this.onPipelineCompleteCallback;
+            this.onPipelineCompleteCallback = (result: PipelineResult) => {
+                // Call original callback if exists
+                if (originalCallback) {
+                    originalCallback(result);
+                }
+                
+                // Check if this is our pipeline
+                if (result.pipelineId === pipelineId) {
+                    clearTimeout(timeoutId);
+                    // Restore original callback
+                    this.onPipelineCompleteCallback = originalCallback;
+                    resolve(result);
+                }
+            };
+        });
     }
 
     /**
@@ -1400,8 +1451,8 @@ Begin polling now. First poll:`;
 
         this.log(`Pipeline ${this.currentPipeline.id} ${allSuccess ? 'completed' : 'failed'}`);
 
-        // Notify coordinator
-        this.notifyPipelineComplete(result);
+        // Notify coordinator (and handle errors if any)
+        await this.notifyPipelineComplete(result);
 
         // Reset state
         this.currentPipeline = null;
@@ -1564,7 +1615,7 @@ Begin polling now. First poll:`;
     /**
      * Notify coordinator of pipeline completion
      */
-    private notifyPipelineComplete(result: PipelineResult): void {
+    private async notifyPipelineComplete(result: PipelineResult): Promise<void> {
         // Fire event
         if (this.onPipelineCompleteCallback) {
             this.onPipelineCompleteCallback(result);
@@ -1577,6 +1628,12 @@ Begin polling now. First poll:`;
         this.log(`   Errors: ${result.allErrors.length}`);
         this.log(`   Test failures: ${result.allTestFailures.length}`);
         this.log(`   Tasks involved: ${result.tasksInvolved.map(t => t.taskId).join(', ')}`);
+
+        // If there are errors, route them to global error handling
+        if (result.allErrors.length > 0) {
+            this.log(`Routing ${result.allErrors.length} errors to global error handler...`);
+            await this.handlePipelineErrors(result.allErrors);
+        }
     }
 
     /**
@@ -1603,6 +1660,109 @@ Begin polling now. First poll:`;
                 taskCount: p.tasksInvolved.length
             }))
         };
+    }
+
+    // ========================================================================
+    // Global Error Handling - Cross-Plan Error Resolution
+    // ========================================================================
+
+    /**
+     * Handle pipeline errors by creating error-fixing tasks and pausing affected work
+     * 
+     * This is the main entry point for handling Unity compilation/test errors.
+     * It:
+     * 1. Finds all tasks across all plans that touch the affected files
+     * 2. Pauses those tasks and their dependents
+     * 3. Creates error-fixing tasks in the ERROR_RESOLUTION plan
+     * 4. Tells coordinator to execute ERROR_RESOLUTION plan
+     * 
+     * @param errors - Array of Unity errors from pipeline
+     * @returns IDs of created error-fixing tasks
+     */
+    async handlePipelineErrors(errors: UnityError[]): Promise<string[]> {
+        if (errors.length === 0) {
+            this.log('handlePipelineErrors: No errors to process');
+            return [];
+        }
+
+        this.log(`handlePipelineErrors: Processing ${errors.length} errors`);
+
+        // Convert Unity errors to ErrorInfo format
+        const errorInfos: ErrorInfo[] = errors.map(e => ({
+            id: e.id,
+            message: e.message,
+            file: e.file,
+            line: e.line,
+            code: e.code
+        }));
+
+        // Get global TaskManager
+        const taskManager = ServiceLocator.resolve(TaskManager);
+
+        // Extract files from errors
+        const errorFiles = errors
+            .filter(e => e.file)
+            .map(e => e.file!);
+
+        if (errorFiles.length === 0) {
+            this.log('handlePipelineErrors: No files identified in errors');
+        }
+
+        // 1. Find affected tasks across all plans
+        const affected = taskManager.findAffectedTasksAcrossPlans(errorFiles);
+        this.log(`handlePipelineErrors: Found ${affected.length} affected tasks across plans`);
+
+        const affectedTaskIds = affected.map(a => a.taskId);
+
+        if (affectedTaskIds.length > 0) {
+            // Pause affected tasks and their dependents
+            const pausedBySession = taskManager.pauseTasksAndDependents(
+                affectedTaskIds,
+                `Unity error in files: ${errorFiles.slice(0, 3).join(', ')}${errorFiles.length > 3 ? '...' : ''}`
+            );
+            
+            this.log(`handlePipelineErrors: Paused tasks in ${pausedBySession.size} session(s)`);
+            
+            for (const [sessionId, pausedTaskIds] of pausedBySession) {
+                this.log(`  Session ${sessionId}: ${pausedTaskIds.length} tasks paused`);
+            }
+        }
+
+        // 2. Create error-fixing tasks and add to ERROR_RESOLUTION plan
+        const errorTaskIds = taskManager.createErrorFixingTasks(
+            errorInfos,
+            affectedTaskIds
+        );
+
+        this.log(`handlePipelineErrors: Created ${errorTaskIds.length} error-fixing tasks in ERROR_RESOLUTION plan`);
+
+        // 3. Tell coordinator to execute ERROR_RESOLUTION plan
+        try {
+            const coordinator = ServiceLocator.resolve(UnifiedCoordinatorService);
+            await coordinator.startExecution(ERROR_RESOLUTION_SESSION_ID);
+            this.log(`handlePipelineErrors: Started ERROR_RESOLUTION plan execution`);
+        } catch (e) {
+            // Coordinator may not be initialized yet - that's ok
+            this.log(`handlePipelineErrors: Could not start ERROR_RESOLUTION execution: ${e}`);
+        }
+
+        return errorTaskIds;
+    }
+
+    /**
+     * Check for errors after a pipeline step and handle them
+     * Called automatically after prep/compile steps
+     */
+    private async checkAndHandleErrors(): Promise<void> {
+        const console = await this.readUnityConsole();
+        const compilationErrors = console.errors.filter(e => 
+            e.type === 'compilation' || e.code?.startsWith('CS')
+        );
+
+        if (compilationErrors.length > 0) {
+            this.log(`Detected ${compilationErrors.length} compilation errors, routing to global handler`);
+            await this.handlePipelineErrors(compilationErrors);
+        }
     }
 
     /**

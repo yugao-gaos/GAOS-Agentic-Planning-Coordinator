@@ -131,12 +131,15 @@ The extension maintains state in JSON files for AI agent access:
 _AiDevLog/
 ├── .extension_state.json      # Global settings, active sessions
 ├── .engineer_pool.json        # Pool allocation
-├── planning_sessions/
-│   └── ps_001.json            # Individual session state
 ├── coordinators/
 │   └── coord_001.json         # Individual coordinator state
 ├── Plans/
-│   └── Plan_ps_001_v1.md      # Generated plans
+│   └── ps_001/
+│       ├── plan.md            # Generated plan
+│       └── progress.log       # Planning progress log
+├── Context/                   # Project context files
+├── Docs/                      # Project documentation
+├── Errors/                    # Error registry
 └── Logs/
     └── engineers/
         └── Alex_session_xxx.log

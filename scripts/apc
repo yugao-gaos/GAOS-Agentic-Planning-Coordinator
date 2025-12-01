@@ -1,8 +1,8 @@
 #!/bin/bash
 # APC - Agentic Planning Coordinator CLI
 #
-# This script communicates with the VS Code extension via file-based IPC.
-# It writes commands to a request file and waits for responses.
+# This script communicates with the APC daemon via WebSocket.
+# The daemon is started by VS Code extension or can run standalone.
 
 set -e
 
@@ -12,6 +12,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 RED='\033[0;31m'
 GRAY='\033[0;90m'
+BOLD='\033[1m'
 RESET='\033[0m'
 
 # Find workspace root (look for _AiDevLog or .git)
@@ -30,183 +31,134 @@ find_workspace_root() {
 WORKSPACE_ROOT=$(find_workspace_root)
 WORKING_DIR="$WORKSPACE_ROOT/_AiDevLog"
 
-# Use /tmp for IPC files to keep project clean, with workspace hash to avoid conflicts
-# Note: Use printf without newline to match Node.js crypto hash calculation
-WORKSPACE_HASH=$(printf "%s" "$WORKSPACE_ROOT" | md5 | cut -c1-8)
-IPC_DIR="/tmp/apc_ipc_${WORKSPACE_HASH}"
-REQUEST_FILE="$IPC_DIR/request.json"
-RESPONSE_FILE="$IPC_DIR/response.json"
-LOCK_FILE="$IPC_DIR/lock"
+# Get script directory to find apc-ws-client.js
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WS_CLIENT="$SCRIPT_DIR/apc-ws-client.js"
 
-# Ensure directories exist
-mkdir -p "$WORKING_DIR"
-mkdir -p "$IPC_DIR"
+# Check if ws client exists
+if [[ ! -f "$WS_CLIENT" ]]; then
+    echo -e "${RED}Error: WebSocket client not found at $WS_CLIENT${RESET}"
+    echo -e "${YELLOW}Make sure the APC extension is properly installed.${RESET}"
+    exit 1
+fi
 
-# Generate unique request ID
-REQUEST_ID="req_$(date +%s)_$$"
+# Check for Node.js
+if ! command -v node &> /dev/null; then
+    echo -e "${RED}Error: Node.js is required but not installed.${RESET}"
+    exit 1
+fi
 
-# Cleanup on exit
-cleanup() {
-    rm -f "$LOCK_FILE" 2>/dev/null || true
-}
-trap cleanup EXIT
+# Compute workspace hash (must match Node.js crypto)
+WORKSPACE_HASH=$(printf "%s" "$WORKSPACE_ROOT" | md5 | cut -c1-8 2>/dev/null || printf "%s" "$WORKSPACE_ROOT" | md5sum | cut -c1-8)
+PID_FILE="${TMPDIR:-/tmp}/apc_daemon_${WORKSPACE_HASH}.pid"
+PORT_FILE="${TMPDIR:-/tmp}/apc_daemon_${WORKSPACE_HASH}.port"
 
-# Write request and wait for response
-send_request() {
-    local command="$1"
-    local args="$2"
-    local show_progress="${3:-false}"
-    local progress_session="${4:-}"
-    
-    # Create request
-    cat > "$REQUEST_FILE" << EOF
-{
-    "id": "$REQUEST_ID",
-    "command": "$command",
-    "args": $args,
-    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-}
-EOF
-    
-    # Remove old response file
-    rm -f "$RESPONSE_FILE" 2>/dev/null || true
-    
-    # Wait for response (timeout after 30 minutes for long planning operations)
-    # Planning sessions with AI agents can take 15+ minutes
-    local timeout=1800
-    local elapsed=0
-    local last_progress_line=0
-    local progress_file=""
-    local check_interval=1  # Check every 1 second (use integers for POSIX compatibility)
-    local last_heartbeat=0
-    local spinner_chars=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-    local spinner_idx=0
-    local iteration=0
-    
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${RESET}"
-    echo -e "${CYAN}║  Processing (timeout: ${timeout}s / 30min)                         ║${RESET}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${RESET}"
-    echo ""
-    
-    # Ensure planning_sessions directory exists
-    mkdir -p "$WORKING_DIR/planning_sessions" 2>/dev/null
-    
-    while [[ ! -f "$RESPONSE_FILE" ]] && [[ $elapsed -lt $timeout ]]; do
-        # If we should show progress, actively look for and tail progress files
-        if [[ "$show_progress" == "true" ]]; then
-            # Look for newest progress file every iteration (handles late creation)
-            local newest_file=$(find "$WORKING_DIR/planning_sessions" -name "*_progress.log" -mmin -5 -type f 2>/dev/null | head -1)
-            
-            if [[ -n "$newest_file" && -f "$newest_file" ]]; then
-                # Found a progress file
-                if [[ "$newest_file" != "$progress_file" ]]; then
-                    # New progress file found
-                    progress_file="$newest_file"
-                    echo -e "${GREEN}📂 Found progress: $(basename "$progress_file")${RESET}"
-                    last_progress_line=0
-                fi
-                
-                # Read and display new lines from progress file
-                local current_lines=$(wc -l < "$progress_file" 2>/dev/null | tr -d ' ' || echo "0")
-                
-                if [[ "$current_lines" -gt "$last_progress_line" ]]; then
-                    # Print new lines with color coding
-                    tail -n +$((last_progress_line + 1)) "$progress_file" 2>/dev/null | while IFS= read -r line; do
-                        # Color code based on content
-                        if [[ "$line" == *"PHASE"* ]] || [[ "$line" == *"═══"* ]]; then
-                            echo -e "${CYAN}$line${RESET}"
-                        elif [[ "$line" == *"✅"* ]] || [[ "$line" == *"Complete"* ]]; then
-                            echo -e "${GREEN}$line${RESET}"
-                        elif [[ "$line" == *"⚠️"* ]] || [[ "$line" == *"CONCERN"* ]]; then
-                            echo -e "${YELLOW}$line${RESET}"
-                        elif [[ "$line" == *"❌"* ]] || [[ "$line" == *"Error"* ]]; then
-                            echo -e "${RED}$line${RESET}"
-                        elif [[ "$line" == *"💭"* ]] || [[ "$line" == *"💓"* ]]; then
-                            # Thinking/heartbeat - dim gray
-                            echo -e "${GRAY}$line${RESET}"
-                        elif [[ "$line" == *"🔧"* ]] || [[ "$line" == *"Tool"* ]]; then
-                            echo -e "${YELLOW}$line${RESET}"
-                        else
-                        echo -e "${GRAY}$line${RESET}"
-                        fi
-                    done
-                    last_progress_line=$current_lines
-                fi
-            else
-                # No progress file yet - show spinner with status
-                local now=$(date +%s)
-                if [[ $((now - last_heartbeat)) -ge 3 ]]; then
-                    spinner_idx=$(( (spinner_idx + 1) % 10 ))
-                    echo -ne "\r${CYAN}${spinner_chars[$spinner_idx]} Waiting for planning session to start... (${elapsed}s)${RESET}   "
-                    last_heartbeat=$now
-                fi
-            fi
-        fi
-        
-        sleep $check_interval
-        elapsed=$((elapsed + check_interval))
-        iteration=$((iteration + 1))
-        
-        # Check if response appeared
-        if [[ -f "$RESPONSE_FILE" ]]; then
-            # Verify it's for our request
-            local resp_id=$(cat "$RESPONSE_FILE" 2>/dev/null | grep -o '"requestId"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-            if [[ "$resp_id" == "$REQUEST_ID" ]]; then
-                echo ""  # Clear any spinner output
-                # Show any remaining progress
-                if [[ "$show_progress" == "true" && -n "$progress_file" && -f "$progress_file" ]]; then
-                    local current_lines=$(wc -l < "$progress_file" 2>/dev/null | tr -d ' ' || echo "0")
-                    if [[ "$current_lines" -gt "$last_progress_line" ]]; then
-                        echo -e "${GREEN}📋 Final progress output:${RESET}"
-                        tail -n +$((last_progress_line + 1)) "$progress_file" | while IFS= read -r line; do
-                            echo -e "${GRAY}$line${RESET}"
-                        done
-                    fi
-                fi
-                break
-            fi
-        fi
-    done
-    
-    echo ""
-    
-    if [[ ! -f "$RESPONSE_FILE" ]]; then
-        echo -e "${RED}Error: Extension did not respond (timeout after ${timeout}s).${RESET}"
-        echo -e "${YELLOW}Make sure Cursor is running with the Agentic Planning extension active.${RESET}"
+# Check if daemon is running
+is_daemon_running() {
+    if [[ ! -f "$PID_FILE" ]]; then
         return 1
     fi
+    local pid=$(cat "$PID_FILE" 2>/dev/null)
+    if kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+# Get daemon port
+get_daemon_port() {
+    if [[ -f "$PORT_FILE" ]]; then
+        cat "$PORT_FILE" 2>/dev/null
+    else
+        echo "19840"
+    fi
+}
+
+# Send command via WebSocket client
+send_ws_command() {
+    local cmd="$1"
+    local params="${2:-{}}"
     
-    # Read and display response
-    local response=$(cat "$RESPONSE_FILE")
-    local success=$(echo "$response" | grep -o '"success"[[:space:]]*:[[:space:]]*[^,}]*' | grep -o 'true\|false')
+    # Call the WebSocket client
+    local result
+    result=$(node "$WS_CLIENT" "$cmd" "$params" 2>&1)
+    local exit_code=$?
     
-    # Clean up response file after reading
-    rm -f "$RESPONSE_FILE" 2>/dev/null || true
+    echo "$result"
+    return $exit_code
+}
+
+# Display formatted response
+display_response() {
+    local response="$1"
+    local success
+    local data
+    local error
+    local message
+    
+    # Parse JSON response
+    if command -v jq &> /dev/null; then
+        success=$(echo "$response" | jq -r '.success // false')
+        data=$(echo "$response" | jq -r '.data // empty')
+        error=$(echo "$response" | jq -r '.error // empty')
+        message=$(echo "$response" | jq -r '.message // empty')
+    else
+        # Fallback: basic grep parsing
+        success=$(echo "$response" | grep -o '"success"[[:space:]]*:[[:space:]]*true' && echo "true" || echo "false")
+        error=$(echo "$response" | grep -o '"error"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+        message=$(echo "$response" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
+    fi
     
     if [[ "$success" == "true" ]]; then
-        # Extract and display message/data
-        local message=$(echo "$response" | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-        if [[ -n "$message" ]]; then
-            echo -e "${GREEN}$message${RESET}"
+        if [[ -n "$message" && "$message" != "null" ]]; then
+            echo -e "${GREEN}✓ $message${RESET}"
         fi
-        
-        # Pretty print data if jq is available
-        if command -v jq &> /dev/null; then
-            local data=$(echo "$response" | jq -r '.data // empty' 2>/dev/null)
-            if [[ -n "$data" && "$data" != "null" ]]; then
+        if [[ -n "$data" && "$data" != "null" && "$data" != "" ]]; then
+            if command -v jq &> /dev/null; then
                 echo "$data" | jq '.'
+            else
+                echo "$data"
             fi
-        else
-            # Fallback: just show the response
-            echo "$response"
         fi
+        return 0
     else
-        local error=$(echo "$response" | grep -o '"error"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4)
-        echo -e "${RED}Error: $error${RESET}"
+        echo -e "${RED}✗ Error: ${error:-Unknown error}${RESET}"
         return 1
     fi
+}
+
+# Show progress while waiting for a long operation
+show_progress() {
+    local session_id="$1"
+    local progress_file="$WORKING_DIR/Plans/$session_id/progress.log"
+    local last_line=0
+    local check_count=0
+    local max_checks=1800  # 30 minutes at 1s intervals
     
-    return 0
+    while [[ $check_count -lt $max_checks ]]; do
+        if [[ -f "$progress_file" ]]; then
+            local current_lines=$(wc -l < "$progress_file" 2>/dev/null | tr -d ' ' || echo "0")
+            if [[ "$current_lines" -gt "$last_line" ]]; then
+                tail -n +$((last_line + 1)) "$progress_file" 2>/dev/null | while IFS= read -r line; do
+                    # Color code based on content
+                    if [[ "$line" == *"PHASE"* ]] || [[ "$line" == *"═══"* ]]; then
+                        echo -e "${CYAN}$line${RESET}"
+                    elif [[ "$line" == *"✅"* ]] || [[ "$line" == *"Complete"* ]]; then
+                        echo -e "${GREEN}$line${RESET}"
+                    elif [[ "$line" == *"⚠️"* ]] || [[ "$line" == *"CONCERN"* ]]; then
+                        echo -e "${YELLOW}$line${RESET}"
+                    elif [[ "$line" == *"❌"* ]] || [[ "$line" == *"Error"* ]]; then
+                        echo -e "${RED}$line${RESET}"
+                    else
+                        echo -e "${GRAY}$line${RESET}"
+                    fi
+                done
+                last_line=$current_lines
+            fi
+        fi
+        sleep 1
+        check_count=$((check_count + 1))
+    done
 }
 
 # Parse command
@@ -215,7 +167,19 @@ shift 2>/dev/null || true
 
 case "$COMMAND" in
     status|s)
-        send_request "status" "[]"
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${RESET}"
+        echo -e "${CYAN}║  APC Status                                              ║${RESET}"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${RESET}"
+        echo ""
+        
+        if ! is_daemon_running; then
+            echo -e "${YELLOW}⚠ Daemon is not running.${RESET}"
+            echo -e "${GRAY}Start Cursor with the APC extension to start the daemon.${RESET}"
+            exit 1
+        fi
+        
+        response=$(send_ws_command "status" "{}")
+        display_response "$response"
         ;;
     
     plan|p)
@@ -223,15 +187,16 @@ case "$COMMAND" in
         shift 2>/dev/null || true
         case "$SUB" in
             list|ls)
-                send_request "plan.list" "[]"
+                echo -e "${CYAN}Planning Sessions:${RESET}"
+                response=$(send_ws_command "plan.list" "{}")
+                display_response "$response"
                 ;;
-            new|n)
+            new|n|create)
                 # Collect all remaining args as the prompt
                 PROMPT="$*"
                 # Parse --docs flag if present
                 DOCS="[]"
                 if [[ "$PROMPT" == *"--docs"* ]]; then
-                    # Extract docs paths
                     DOCS_STR=$(echo "$PROMPT" | sed 's/.*--docs //' | tr ' ' '\n' | grep -v '^--' | head -5 | tr '\n' ',' | sed 's/,$//')
                     DOCS="[$(echo "$DOCS_STR" | sed 's/\([^,]*\)/"\1"/g')]"
                     PROMPT=$(echo "$PROMPT" | sed 's/--docs.*//')
@@ -242,8 +207,14 @@ case "$COMMAND" in
                 fi
                 # Escape quotes in prompt
                 PROMPT=$(echo "$PROMPT" | sed 's/"/\\"/g')
-                # Show progress for plan creation (pass true for show_progress)
-                send_request "plan.new" "{\"prompt\": \"$PROMPT\", \"docs\": $DOCS}" "true"
+                
+                echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${RESET}"
+                echo -e "${CYAN}║  Starting Planning Session...                            ║${RESET}"
+                echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${RESET}"
+                echo ""
+                
+                response=$(send_ws_command "plan.create" "{\"prompt\": \"$PROMPT\", \"docs\": $DOCS}")
+                display_response "$response"
                 ;;
             status|st)
                 ID="${1:-}"
@@ -251,7 +222,8 @@ case "$COMMAND" in
                     echo -e "${RED}Usage: apc plan status <session_id>${RESET}"
                     exit 1
                 fi
-                send_request "plan.status" "{\"id\": \"$ID\"}"
+                response=$(send_ws_command "plan.status" "{\"id\": \"$ID\"}")
+                display_response "$response"
                 ;;
             revise|r)
                 ID="${1:-}"
@@ -262,16 +234,23 @@ case "$COMMAND" in
                     exit 1
                 fi
                 FEEDBACK=$(echo "$FEEDBACK" | sed 's/"/\\"/g')
-                # Show progress for plan revision
-                send_request "plan.revise" "{\"id\": \"$ID\", \"feedback\": \"$FEEDBACK\"}" "true"
+                response=$(send_ws_command "plan.revise" "{\"id\": \"$ID\", \"feedback\": \"$FEEDBACK\"}")
+                display_response "$response"
                 ;;
             approve|a)
                 ID="${1:-}"
+                AUTOSTART="${2:-false}"
                 if [[ -z "$ID" ]]; then
-                    echo -e "${RED}Usage: apc plan approve <session_id>${RESET}"
+                    echo -e "${RED}Usage: apc plan approve <session_id> [--auto-start]${RESET}"
                     exit 1
                 fi
-                send_request "plan.approve" "{\"id\": \"$ID\"}"
+                if [[ "$AUTOSTART" == "--auto-start" ]] || [[ "$AUTOSTART" == "-a" ]]; then
+                    AUTOSTART="true"
+                else
+                    AUTOSTART="false"
+                fi
+                response=$(send_ws_command "plan.approve" "{\"id\": \"$ID\", \"autoStart\": $AUTOSTART}")
+                display_response "$response"
                 ;;
             cancel|c)
                 ID="${1:-}"
@@ -279,29 +258,35 @@ case "$COMMAND" in
                     echo -e "${RED}Usage: apc plan cancel <session_id>${RESET}"
                     exit 1
                 fi
-                send_request "plan.cancel" "{\"id\": \"$ID\"}"
+                response=$(send_ws_command "plan.cancel" "{\"id\": \"$ID\"}")
+                display_response "$response"
                 ;;
             *)
                 echo -e "${YELLOW}Usage: apc plan [list|new|status|revise|approve|cancel]${RESET}"
+                echo ""
+                echo "  list              List all planning sessions"
+                echo "  new \"<prompt>\"    Start new planning session"
+                echo "  status <id>       Get session status"
+                echo "  revise <id> \"..\" Revise plan with feedback"
+                echo "  approve <id>      Approve plan for execution"
+                echo "  cancel <id>       Cancel planning session"
                 ;;
         esac
         ;;
     
     exec|e|run)
-        SUB="${1:-list}"
+        SUB="${1:-status}"
         shift 2>/dev/null || true
         case "$SUB" in
-            list|ls)
-                send_request "exec.list" "[]"
-                ;;
             start|s)
                 SESSION="${1:-}"
                 if [[ -z "$SESSION" ]]; then
                     echo -e "${RED}Usage: apc exec start <session_id>${RESET}"
-                    echo -e "${YELLOW}Example: apc exec start ps_001${RESET}"
                     exit 1
                 fi
-                send_request "exec.start" "{\"session\": \"$SESSION\"}"
+                echo -e "${CYAN}Starting execution for $SESSION...${RESET}"
+                response=$(send_ws_command "exec.start" "{\"sessionId\": \"$SESSION\"}")
+                display_response "$response"
                 ;;
             status|st)
                 SESSION="${1:-}"
@@ -309,7 +294,8 @@ case "$COMMAND" in
                     echo -e "${RED}Usage: apc exec status <session_id>${RESET}"
                     exit 1
                 fi
-                send_request "exec.status" "{\"session\": \"$SESSION\"}"
+                response=$(send_ws_command "exec.status" "{\"sessionId\": \"$SESSION\"}")
+                display_response "$response"
                 ;;
             pause|p)
                 SESSION="${1:-}"
@@ -317,7 +303,8 @@ case "$COMMAND" in
                     echo -e "${RED}Usage: apc exec pause <session_id>${RESET}"
                     exit 1
                 fi
-                send_request "exec.pause" "{\"session\": \"$SESSION\"}"
+                response=$(send_ws_command "exec.pause" "{\"sessionId\": \"$SESSION\"}")
+                display_response "$response"
                 ;;
             resume|r)
                 SESSION="${1:-}"
@@ -325,7 +312,8 @@ case "$COMMAND" in
                     echo -e "${RED}Usage: apc exec resume <session_id>${RESET}"
                     exit 1
                 fi
-                send_request "exec.resume" "{\"session\": \"$SESSION\"}"
+                response=$(send_ws_command "exec.resume" "{\"sessionId\": \"$SESSION\"}")
+                display_response "$response"
                 ;;
             stop|x)
                 SESSION="${1:-}"
@@ -333,14 +321,56 @@ case "$COMMAND" in
                     echo -e "${RED}Usage: apc exec stop <session_id>${RESET}"
                     exit 1
                 fi
-                send_request "exec.stop" "{\"session\": \"$SESSION\"}"
+                response=$(send_ws_command "exec.stop" "{\"sessionId\": \"$SESSION\"}")
+                display_response "$response"
                 ;;
             *)
                 echo -e "${YELLOW}Usage: apc exec [start|status|pause|resume|stop]${RESET}"
-                echo -e "${YELLOW}Examples:${RESET}"
-                echo -e "${YELLOW}  apc exec start ps_001  - Start execution for approved plan${RESET}"
-                echo -e "${YELLOW}  apc exec pause ps_001  - Pause execution${RESET}"
-                echo -e "${YELLOW}  apc exec resume ps_001 - Resume execution${RESET}"
+                echo ""
+                echo "  start <id>    Start execution for approved plan"
+                echo "  status <id>   Get execution status"
+                echo "  pause <id>    Pause execution"
+                echo "  resume <id>   Resume paused execution"
+                echo "  stop <id>     Stop execution"
+                ;;
+        esac
+        ;;
+    
+    workflow|wf)
+        SUB="${1:-list}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            list|ls)
+                SESSION="${1:-}"
+                if [[ -z "$SESSION" ]]; then
+                    echo -e "${RED}Usage: apc workflow list <session_id>${RESET}"
+                    exit 1
+                fi
+                response=$(send_ws_command "workflow.list" "{\"sessionId\": \"$SESSION\"}")
+                display_response "$response"
+                ;;
+            status|st)
+                SESSION="${1:-}"
+                WORKFLOW="${2:-}"
+                if [[ -z "$SESSION" ]] || [[ -z "$WORKFLOW" ]]; then
+                    echo -e "${RED}Usage: apc workflow status <session_id> <workflow_id>${RESET}"
+                    exit 1
+                fi
+                response=$(send_ws_command "workflow.status" "{\"sessionId\": \"$SESSION\", \"workflowId\": \"$WORKFLOW\"}")
+                display_response "$response"
+                ;;
+            cancel|c)
+                SESSION="${1:-}"
+                WORKFLOW="${2:-}"
+                if [[ -z "$SESSION" ]] || [[ -z "$WORKFLOW" ]]; then
+                    echo -e "${RED}Usage: apc workflow cancel <session_id> <workflow_id>${RESET}"
+                    exit 1
+                fi
+                response=$(send_ws_command "workflow.cancel" "{\"sessionId\": \"$SESSION\", \"workflowId\": \"$WORKFLOW\"}")
+                display_response "$response"
+                ;;
+            *)
+                echo -e "${YELLOW}Usage: apc workflow [list|status|cancel]${RESET}"
                 ;;
         esac
         ;;
@@ -350,7 +380,8 @@ case "$COMMAND" in
         shift 2>/dev/null || true
         case "$SUB" in
             status|st)
-                send_request "pool.status" "[]"
+                response=$(send_ws_command "pool.status" "{}")
+                display_response "$response"
                 ;;
             resize|r)
                 SIZE="${1:-}"
@@ -358,7 +389,8 @@ case "$COMMAND" in
                     echo -e "${RED}Usage: apc pool resize <size>${RESET}"
                     exit 1
                 fi
-                send_request "pool.resize" "{\"size\": $SIZE}"
+                response=$(send_ws_command "pool.resize" "{\"size\": $SIZE}")
+                display_response "$response"
                 ;;
             *)
                 echo -e "${YELLOW}Usage: apc pool [status|resize]${RESET}"
@@ -366,34 +398,311 @@ case "$COMMAND" in
         esac
         ;;
     
+    agent|a)
+        SUB="${1:-pool}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            pool|p)
+                response=$(send_ws_command "agent.pool" "{}")
+                display_response "$response"
+                ;;
+            roles|r)
+                response=$(send_ws_command "agent.roles" "{}")
+                display_response "$response"
+                ;;
+            release)
+                AGENT="${1:-}"
+                if [[ -z "$AGENT" ]]; then
+                    echo -e "${RED}Usage: apc agent release <agent_name>${RESET}"
+                    exit 1
+                fi
+                response=$(send_ws_command "agent.release" "{\"agentName\": \"$AGENT\"}")
+                display_response "$response"
+                ;;
+            *)
+                echo -e "${YELLOW}Usage: apc agent [pool|roles|release]${RESET}"
+                ;;
+        esac
+        ;;
+    
+    unity|u)
+        SUB="${1:-status}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            status|st)
+                response=$(send_ws_command "unity.status" "{}")
+                display_response "$response"
+                ;;
+            compile|c)
+                response=$(send_ws_command "unity.compile" "{}")
+                display_response "$response"
+                ;;
+            test|t)
+                MODE="${1:-editmode}"
+                response=$(send_ws_command "unity.test" "{\"mode\": \"$MODE\"}")
+                display_response "$response"
+                ;;
+            *)
+                echo -e "${YELLOW}Usage: apc unity [status|compile|test]${RESET}"
+                ;;
+        esac
+        ;;
+    
+    session|sess)
+        SUB="${1:-list}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            list|ls)
+                response=$(send_ws_command "session.list" "{}")
+                display_response "$response"
+                ;;
+            status|st)
+                ID="${1:-}"
+                if [[ -z "$ID" ]]; then
+                    echo -e "${RED}Usage: apc session status <session_id>${RESET}"
+                    exit 1
+                fi
+                response=$(send_ws_command "session.status" "{\"id\": \"$ID\"}")
+                display_response "$response"
+                ;;
+            pause|p)
+                ID="${1:-}"
+                if [[ -z "$ID" ]]; then
+                    echo -e "${RED}Usage: apc session pause <session_id>${RESET}"
+                    exit 1
+                fi
+                response=$(send_ws_command "session.pause" "{\"id\": \"$ID\"}")
+                display_response "$response"
+                ;;
+            resume|r)
+                ID="${1:-}"
+                if [[ -z "$ID" ]]; then
+                    echo -e "${RED}Usage: apc session resume <session_id>${RESET}"
+                    exit 1
+                fi
+                response=$(send_ws_command "session.resume" "{\"id\": \"$ID\"}")
+                display_response "$response"
+                ;;
+            *)
+                echo -e "${YELLOW}Usage: apc session [list|status|pause|resume]${RESET}"
+                ;;
+        esac
+        ;;
+    
+    daemon|d)
+        SUB="${1:-status}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            status|st)
+                if is_daemon_running; then
+                    local port=$(get_daemon_port)
+                    local pid=$(cat "$PID_FILE" 2>/dev/null)
+                    echo -e "${GREEN}✓ Daemon is running${RESET}"
+                    echo -e "  PID:  $pid"
+                    echo -e "  Port: $port"
+                    echo -e "  Workspace: $WORKSPACE_ROOT"
+                else
+                    echo -e "${YELLOW}⚠ Daemon is not running${RESET}"
+                    echo -e "${GRAY}Run 'apc system run --headless' to start the daemon.${RESET}"
+                fi
+                ;;
+            *)
+                echo -e "${YELLOW}Usage: apc daemon [status]${RESET}"
+                echo ""
+                echo "  status    Check if daemon is running"
+                echo ""
+                echo -e "${GRAY}Use 'apc system run' to start the daemon.${RESET}"
+                ;;
+        esac
+        ;;
+    
+    system|sys)
+        SUB="${1:-help}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            run|start)
+                # Parse mode
+                MODE="headless"
+                DAEMON_PORT=""
+                VERBOSE=""
+                FORCE=""
+                
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        --headless|-h)
+                            MODE="headless"
+                            shift
+                            ;;
+                        --vscode|-v)
+                            MODE="vscode"
+                            shift
+                            ;;
+                        --interactive|-i)
+                            MODE="interactive"
+                            shift
+                            ;;
+                        --port|-p)
+                            DAEMON_PORT="$2"
+                            shift 2
+                            ;;
+                        --verbose)
+                            VERBOSE="--verbose"
+                            shift
+                            ;;
+                        --force|-f)
+                            FORCE="--force"
+                            shift
+                            ;;
+                        *)
+                            shift
+                            ;;
+                    esac
+                done
+                
+                echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${RESET}"
+                echo -e "${CYAN}║  Starting APC Daemon (${MODE} mode)                       ${RESET}"
+                echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${RESET}"
+                echo ""
+                
+                # Check if daemon is already running (unless --force)
+                if [[ -z "$FORCE" ]] && is_daemon_running; then
+                    local port=$(get_daemon_port)
+                    echo -e "${GREEN}✓ Daemon already running on port $port${RESET}"
+                    echo -e "${GRAY}Use --force to restart${RESET}"
+                    exit 0
+                fi
+                
+                # Build the start script path
+                START_SCRIPT="$SCRIPT_DIR/../out/daemon/start.js"
+                
+                if [[ ! -f "$START_SCRIPT" ]]; then
+                    # Try relative to extension
+                    START_SCRIPT="$(dirname "$SCRIPT_DIR")/out/daemon/start.js"
+                fi
+                
+                if [[ ! -f "$START_SCRIPT" ]]; then
+                    echo -e "${RED}Error: Daemon start script not found.${RESET}"
+                    echo -e "${YELLOW}Make sure the extension is compiled: npm run compile${RESET}"
+                    exit 1
+                fi
+                
+                # Build command
+                CMD="node \"$START_SCRIPT\" --$MODE"
+                [[ -n "$DAEMON_PORT" ]] && CMD="$CMD --port $DAEMON_PORT"
+                [[ -n "$VERBOSE" ]] && CMD="$CMD $VERBOSE"
+                [[ -n "$FORCE" ]] && CMD="$CMD $FORCE"
+                CMD="$CMD \"$WORKSPACE_ROOT\""
+                
+                echo -e "${GRAY}Starting: $CMD${RESET}"
+                echo ""
+                
+                # Execute
+                eval $CMD
+                ;;
+            
+            stop)
+                if ! is_daemon_running; then
+                    echo -e "${YELLOW}Daemon is not running${RESET}"
+                    exit 0
+                fi
+                
+                local pid=$(cat "$PID_FILE" 2>/dev/null)
+                echo -e "${CYAN}Stopping daemon (PID: $pid)...${RESET}"
+                
+                kill -TERM "$pid" 2>/dev/null
+                
+                # Wait for shutdown
+                local count=0
+                while is_daemon_running && [[ $count -lt 10 ]]; do
+                    sleep 0.5
+                    count=$((count + 1))
+                done
+                
+                if is_daemon_running; then
+                    echo -e "${YELLOW}Force killing daemon...${RESET}"
+                    kill -9 "$pid" 2>/dev/null
+                fi
+                
+                echo -e "${GREEN}✓ Daemon stopped${RESET}"
+                ;;
+            
+            restart)
+                echo -e "${CYAN}Restarting daemon...${RESET}"
+                "$0" system stop 2>/dev/null || true
+                sleep 1
+                "$0" system run "$@"
+                ;;
+            
+            *)
+                echo -e "${YELLOW}Usage: apc system [run|stop|restart]${RESET}"
+                echo ""
+                echo "  run [options]     Start the daemon"
+                echo "    --headless      Headless mode (automation, scripts)"
+                echo "    --vscode        VS Code mode (extension integration)"
+                echo "    --interactive   Interactive CLI mode (future)"
+                echo "    --port <port>   Override port (default: 19840)"
+                echo "    --force         Force restart if already running"
+                echo "    --verbose       Enable verbose logging"
+                echo ""
+                echo "  stop              Stop the running daemon"
+                echo "  restart           Restart the daemon"
+                echo ""
+                echo -e "${GREEN}Examples:${RESET}"
+                echo "  apc system run --headless"
+                echo "  apc system run --headless --port 19841"
+                echo "  apc system stop"
+                ;;
+        esac
+        ;;
+    
     help|--help|-h|h)
-        echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${RESET}"
-        echo -e "${CYAN}║       APC - Agentic Planning Coordinator             ║${RESET}"
-        echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${RESET}"
+        echo -e "${CYAN}╔══════════════════════════════════════════════════════════╗${RESET}"
+        echo -e "${CYAN}║       ${BOLD}APC - Agentic Planning Coordinator${RESET}${CYAN}               ║${RESET}"
+        echo -e "${CYAN}╚══════════════════════════════════════════════════════════╝${RESET}"
         echo ""
         echo "Usage: apc <command> [subcommand] [options]"
         echo ""
-        echo -e "${GREEN}Commands:${RESET}"
-        echo "  status, s                  Show overall status"
+        echo -e "${GREEN}System:${RESET}"
+        echo "  system run --headless     Start daemon (headless mode)"
+        echo "  system run --vscode       Start daemon (VS Code mode)"
+        echo "  system run --interactive  Start daemon (interactive mode)"
+        echo "  system stop               Stop the daemon"
+        echo "  system restart            Restart the daemon"
+        echo "  daemon status             Check daemon status"
         echo ""
-        echo -e "${YELLOW}Planning:${RESET}"
-        echo "  plan list                  List planning sessions"
-        echo "  plan new \"<prompt>\" [--docs <paths>]  Start new planning"
-        echo "  plan status <id>           Get plan status & debate results"
-        echo "  plan revise <id> \"<feedback>\"  Revise a plan"
-        echo "  plan approve <id>          Approve plan (auto-starts execution)"
+        echo -e "${GREEN}General:${RESET}"
+        echo "  status              Show overall system status"
         echo ""
-        echo -e "${YELLOW}Execution:${RESET}"
-        echo "  exec list                  List coordinators"
-        echo "  exec start <plan/session>  Start executing a plan"
-        echo "  exec status <id>           Get coordinator status"
-        echo "  exec pause <id>            Pause execution"
-        echo "  exec resume <id>           Resume execution"
-        echo "  exec stop <id>             Stop execution"
+        echo -e "${GREEN}Planning:${RESET}"
+        echo "  plan list           List all planning sessions"
+        echo "  plan new \"<prompt>\" Start new planning session"
+        echo "  plan status <id>    Get session status"
+        echo "  plan revise <id>    Revise plan with feedback"
+        echo "  plan approve <id>   Approve plan for execution"
+        echo "  plan cancel <id>    Cancel planning session"
         echo ""
-        echo -e "${YELLOW}Engineer Pool:${RESET}"
-        echo "  pool status                Show pool status"
-        echo "  pool resize <n>            Resize pool"
+        echo -e "${GREEN}Execution:${RESET}"
+        echo "  exec start <id>     Start execution"
+        echo "  exec status <id>    Get execution status"
+        echo "  exec pause <id>     Pause execution"
+        echo "  exec resume <id>    Resume execution"
+        echo "  exec stop <id>      Stop execution"
+        echo ""
+        echo -e "${GREEN}Workflows:${RESET}"
+        echo "  workflow list <id>  List workflows for session"
+        echo "  workflow status     Get workflow status"
+        echo "  workflow cancel     Cancel a workflow"
+        echo ""
+        echo -e "${GREEN}Agents:${RESET}"
+        echo "  pool status         Show agent pool status"
+        echo "  pool resize <n>     Resize agent pool"
+        echo "  agent roles         List available roles"
+        echo "  agent release <n>   Release agent back to pool"
+        echo ""
+        echo -e "${GREEN}Unity:${RESET}"
+        echo "  unity status        Unity control status"
+        echo "  unity compile       Queue compilation"
+        echo "  unity test <mode>   Queue tests (editmode/playmode)"
         echo ""
         ;;
     
