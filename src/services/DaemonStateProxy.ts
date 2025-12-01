@@ -113,9 +113,13 @@ export class DaemonStateProxy {
 
     /**
      * Get all planning sessions
+     * NOTE: Always use daemon API when client is connected, because
+     * even when VS Code starts the daemon, it runs in a separate process
+     * with its own StateManager instance.
      */
     async getPlanningSessions(): Promise<PlanningSession[]> {
-        if (this.isExternal && this.vsCodeClient) {
+        // Always prefer daemon API when client is connected
+        if (this.vsCodeClient?.isConnected()) {
             try {
                 const response = await this.vsCodeClient.listSessions();
                 // Daemon API returns summary data - cast to PlanningSession[] 
@@ -123,11 +127,11 @@ export class DaemonStateProxy {
                 return (response.sessions || []) as unknown as PlanningSession[];
             } catch (err) {
                 console.warn('[DaemonStateProxy] Failed to get sessions from daemon:', err);
-                return [];
+                // Fall through to local StateManager as fallback
             }
         }
 
-        // Local mode - use StateManager
+        // Fallback to local StateManager if daemon not connected
         return this.stateManager?.getAllPlanningSessions() || [];
     }
 
@@ -135,13 +139,14 @@ export class DaemonStateProxy {
      * Get a specific planning session by ID
      */
     async getPlanningSession(sessionId: string): Promise<PlanningSession | undefined> {
-        if (this.isExternal && this.vsCodeClient) {
+        // Always prefer daemon API when client is connected
+        if (this.vsCodeClient?.isConnected()) {
             try {
                 const response = await this.vsCodeClient.send('session.get', { id: sessionId });
                 return response.session;
             } catch (err) {
                 console.warn('[DaemonStateProxy] Failed to get session from daemon:', err);
-                return undefined;
+                // Fall through to local StateManager as fallback
             }
         }
 
@@ -164,7 +169,8 @@ export class DaemonStateProxy {
      * Get pool status summary
      */
     async getPoolStatus(): Promise<PoolStatus> {
-        if (this.isExternal && this.vsCodeClient) {
+        // Always prefer daemon API when client is connected
+        if (this.vsCodeClient?.isConnected()) {
             try {
                 const response = await this.vsCodeClient.getPoolStatus();
                 return {
@@ -174,7 +180,7 @@ export class DaemonStateProxy {
                 };
             } catch (err) {
                 console.warn('[DaemonStateProxy] Failed to get pool status from daemon:', err);
-                return { total: 0, available: [], busy: [] };
+                // Fall through to local service as fallback
             }
         }
 
@@ -186,13 +192,14 @@ export class DaemonStateProxy {
      * Get available agents
      */
     async getAvailableAgents(): Promise<string[]> {
-        if (this.isExternal && this.vsCodeClient) {
+        // Always prefer daemon API when client is connected
+        if (this.vsCodeClient?.isConnected()) {
             try {
                 const response = await this.vsCodeClient.getPoolStatus();
                 return response.available;
             } catch (err) {
                 console.warn('[DaemonStateProxy] Failed to get available agents from daemon:', err);
-                return [];
+                // Fall through to local service as fallback
             }
         }
 
@@ -203,7 +210,8 @@ export class DaemonStateProxy {
      * Get busy agents with details
      */
     async getBusyAgents(): Promise<BusyAgentInfo[]> {
-        if (this.isExternal && this.vsCodeClient) {
+        // Always prefer daemon API when client is connected
+        if (this.vsCodeClient?.isConnected()) {
             try {
                 const response = await this.vsCodeClient.getPoolStatus();
                 return response.busy.map(b => ({
@@ -215,7 +223,7 @@ export class DaemonStateProxy {
                 }));
             } catch (err) {
                 console.warn('[DaemonStateProxy] Failed to get busy agents from daemon:', err);
-                return [];
+                // Fall through to local service as fallback
             }
         }
 
@@ -226,13 +234,14 @@ export class DaemonStateProxy {
      * Get agent status
      */
     async getAgentStatus(agentName: string): Promise<AgentStatus | undefined> {
-        if (this.isExternal && this.vsCodeClient) {
+        // Always prefer daemon API when client is connected
+        if (this.vsCodeClient?.isConnected()) {
             try {
                 const response = await this.vsCodeClient.send('pool.agent.status', { name: agentName });
                 return response.agent;
             } catch (err) {
                 console.warn('[DaemonStateProxy] Failed to get agent status from daemon:', err);
-                return undefined;
+                // Fall through to local service as fallback
             }
         }
 
@@ -255,19 +264,19 @@ export class DaemonStateProxy {
      * Get agent assignments for UI display
      */
     async getAgentAssignmentsForUI(): Promise<AgentAssignment[]> {
-        if (this.isExternal && this.vsCodeClient) {
+        // Always prefer daemon API when client is connected
+        if (this.vsCodeClient?.isConnected()) {
             try {
                 const response = await this.vsCodeClient.send('task.assignments');
                 return response.assignments || [];
             } catch (err) {
                 console.warn('[DaemonStateProxy] Failed to get assignments from daemon:', err);
-                return [];
+                // Fall through to return empty
             }
         }
 
-        // Local mode - TaskManager needs to be accessed via imports
-        // The singleton pattern isn't available in this context; return empty
-        // The proxy is primarily for external daemon mode
+        // TaskManager needs to be accessed via imports
+        // Return empty since coordinator state isn't accessible without injected reference
         return [];
     }
 
@@ -287,7 +296,8 @@ export class DaemonStateProxy {
      * Get session state (workflows, revision status)
      */
     async getSessionState(sessionId: string): Promise<SessionState | undefined> {
-        if (this.isExternal && this.vsCodeClient) {
+        // Always prefer daemon API when client is connected
+        if (this.vsCodeClient?.isConnected()) {
             try {
                 const response = await this.vsCodeClient.send('session.state', { id: sessionId });
                 if (response.state) {
@@ -306,12 +316,11 @@ export class DaemonStateProxy {
                 return undefined;
             } catch (err) {
                 console.warn('[DaemonStateProxy] Failed to get session state from daemon:', err);
-                return undefined;
+                // Fall through to return undefined
             }
         }
 
-        // Local mode - proxy is primarily for external daemon mode
-        // Return undefined as coordinator state isn't accessible without injected reference
+        // Coordinator state isn't accessible without injected reference
         return undefined;
     }
 
@@ -319,17 +328,18 @@ export class DaemonStateProxy {
      * Get failed tasks for a session
      */
     async getFailedTasks(sessionId: string): Promise<FailedTask[]> {
-        if (this.isExternal && this.vsCodeClient) {
+        // Always prefer daemon API when client is connected
+        if (this.vsCodeClient?.isConnected()) {
             try {
                 const response = await this.vsCodeClient.send('session.failed_tasks', { id: sessionId });
                 return response.failedTasks || [];
             } catch (err) {
                 console.warn('[DaemonStateProxy] Failed to get failed tasks from daemon:', err);
-                return [];
+                // Fall through to return empty
             }
         }
 
-        // Local mode - return empty as coordinator state isn't accessible
+        // Coordinator state isn't accessible without injected reference
         return [];
     }
 
@@ -345,7 +355,8 @@ export class DaemonStateProxy {
             return undefined;
         }
 
-        if (this.isExternal && this.vsCodeClient) {
+        // Always prefer daemon API when client is connected
+        if (this.vsCodeClient?.isConnected()) {
             try {
                 const response = await this.vsCodeClient.getUnityStatus();
                 return {
@@ -358,12 +369,11 @@ export class DaemonStateProxy {
                 };
             } catch (err) {
                 console.warn('[DaemonStateProxy] Failed to get Unity status from daemon:', err);
-                return undefined;
+                // Fall through to return undefined
             }
         }
 
-        // Local mode - return undefined as Unity manager isn't accessible
-        // Unity status in local mode is handled directly by the UI components
+        // Unity manager isn't accessible without injected reference
         return undefined;
     }
 
