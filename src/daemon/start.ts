@@ -28,6 +28,7 @@ import {
     CoreConfig 
 } from './DaemonConfig';
 import { initializeServices } from './standalone';
+import { bootstrapServices } from '../services/Bootstrap';
 
 // ============================================================================
 // Types
@@ -172,6 +173,9 @@ async function startHeadlessMode(config: CoreConfig, verbose: boolean): Promise<
  */
 async function startVsCodeMode(config: CoreConfig, verbose: boolean): Promise<ApcDaemon> {
     console.log('[APC] Starting daemon for VS Code (services will be injected)...');
+    
+    // Bootstrap services for ServiceLocator (required by ApcDaemon constructor)
+    bootstrapServices();
     
     // Create daemon without services
     // VS Code extension will call daemon.setServices() after initialization

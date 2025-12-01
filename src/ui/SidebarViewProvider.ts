@@ -33,7 +33,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     private agentPoolService?: AgentPoolService;
     private unifiedCoordinator?: UnifiedCoordinatorService;
     private stateProxy?: DaemonStateProxy;
-    private refreshInterval?: NodeJS.Timeout;
     private disposables: vscode.Disposable[] = [];
     
     /** Whether Unity features are enabled */
@@ -190,13 +189,12 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             }
         });
 
-        // Start periodic refresh (less frequent since we have event-based updates now)
-        this.refreshInterval = setInterval(() => this.refresh(), 5000);
+        // No periodic refresh needed - we use event-based updates:
+        // 1. Workflow events (onWorkflowProgress, onSessionStateChanged)
+        // 2. File watcher for state changes (CLI updates)
+        // 3. Manual refresh button
         
         webviewView.onDidDispose(() => {
-            if (this.refreshInterval) {
-                clearInterval(this.refreshInterval);
-            }
             if (this.refreshDebounceTimer) {
                 clearTimeout(this.refreshDebounceTimer);
             }

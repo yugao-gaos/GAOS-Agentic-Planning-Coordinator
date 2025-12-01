@@ -133,62 +133,30 @@ export class DependencyService {
      */
     private async checkUnityMcp(): Promise<DependencyStatus> {
         try {
-            // Try to call a simple MCP command to see if Unity MCP is available
-            // This works for both workspace-specific and globally installed MCP servers
-            const workspaceFolders = this.vscodeIntegration.getWorkspaceFolders?.() || 
-                (this.workspaceRoot ? [this.workspaceRoot] : null);
-            if (!workspaceFolders || workspaceFolders.length === 0) {
-                return {
-                    name: 'Unity MCP',
-                    installed: false,
-                    required: true,
-                    description: 'No workspace open',
-                    platform: 'all'
-                };
-            }
-            
-            // Method 1: Try to query commands if VS Code integration available
-            if (this.vscodeIntegration.getCommands) {
-                try {
-                    const commands = await this.vscodeIntegration.getCommands();
-                    const unityMcpCommands = commands.filter(cmd => 
-                        cmd.includes('unityMCP') || 
-                        cmd.includes('mcp_unityMCP')
-                    );
-                    
-                    if (unityMcpCommands.length > 0) {
-                        // Unity MCP commands are registered, so it's installed
-                        return {
-                            name: 'Unity MCP',
-                            installed: true,
-                            required: true,
-                            description: `Unity MCP server available (${unityMcpCommands.length} commands)`,
-                            platform: 'all'
-                        };
-                    }
-                } catch (e) {
-                    // Command query failed, fall through to file check
-                }
-            }
-            
-            // Method 2: Check if MCP config exists in the workspace (fallback)
-            const workspaceRootPath = workspaceFolders[0];
+            // Check MCP config locations (global Cursor config + workspace configs)
             const mcpConfigPaths = [
-                path.join(workspaceRootPath, '.cursor', 'mcp.json'),
-                path.join(workspaceRootPath, 'mcp.json')
+                // Global Cursor MCP config (most common location)
+                path.join(os.homedir(), '.cursor', 'mcp.json'),
+                // Workspace-specific configs
+                ...(this.workspaceRoot ? [
+                    path.join(this.workspaceRoot, '.cursor', 'mcp.json'),
+                    path.join(this.workspaceRoot, 'mcp.json')
+                ] : [])
             ];
             
             let mcpConfigExists = false;
             let hasUnityMcp = false;
+            let configLocation = '';
             
             for (const configPath of mcpConfigPaths) {
                 if (fs.existsSync(configPath)) {
                     mcpConfigExists = true;
                     try {
                         const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-                        // Check if unityMCP is configured
+                        // Check if unityMCP is configured (Cursor uses mcpServers key)
                         if (config.mcpServers?.unityMCP || config.servers?.unityMCP) {
                             hasUnityMcp = true;
+                            configLocation = configPath;
                             break;
                         }
                     } catch (e) {
@@ -330,8 +298,13 @@ export class DependencyService {
                 fs.writeFileSync(targetPath, cmdContent);
             } else {
                 // Unix: Create a symlink
-                if (fs.existsSync(targetPath)) {
+                // Use lstat to detect broken symlinks (existsSync returns false for broken symlinks)
+                try {
+                    fs.lstatSync(targetPath);
+                    // File or symlink exists - remove it
                     fs.unlinkSync(targetPath);
+                } catch {
+                    // Path doesn't exist - that's fine
                 }
                 fs.symlinkSync(sourcePath, targetPath);
                 // Make sure source is executable

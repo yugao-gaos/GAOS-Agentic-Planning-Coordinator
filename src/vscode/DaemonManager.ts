@@ -14,6 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
+import * as http from 'http';
 
 /**
  * Daemon status information
@@ -186,15 +187,23 @@ export class DaemonManager {
      * This ensures consistent daemon startup across CLI and VS Code.
      */
     async startDaemon(): Promise<number> {
+        // Clean up any stale daemon files first
+        this.cleanupDaemonFiles();
+        
         // Use unified start script
         const startScript = path.join(this.extensionPath, 'out', 'daemon', 'start.js');
+        
+        console.log(`[DaemonManager] Extension path: ${this.extensionPath}`);
+        console.log(`[DaemonManager] Start script: ${startScript}`);
+        console.log(`[DaemonManager] Workspace root: ${this.workspaceRoot}`);
         
         // Check if start script exists
         if (!fs.existsSync(startScript)) {
             // Fallback to legacy entry point
             const legacyEntry = path.join(this.extensionPath, 'out', 'daemon', 'index.js');
+            console.log(`[DaemonManager] Start script not found, checking legacy: ${legacyEntry}`);
             if (!fs.existsSync(legacyEntry)) {
-                throw new Error(`Daemon scripts not found. Run 'npm run compile' first.`);
+                throw new Error(`Daemon scripts not found at ${startScript}. Run 'npm run compile' first.`);
             }
             console.log('[DaemonManager] Using legacy daemon entry (start.js not found)');
             return this.startDaemonLegacy(legacyEntry);
@@ -203,6 +212,7 @@ export class DaemonManager {
         // Start daemon with unified starter in --vscode mode
         // In vscode mode, services are NOT initialized by the daemon
         // They will be injected later by the extension
+        console.log('[DaemonManager] Spawning daemon process...');
         const daemonProcess = spawn('node', [
             startScript,
             '--vscode',
@@ -217,9 +227,6 @@ export class DaemonManager {
             }
         });
         
-        // Unref so VS Code can exit independently
-        daemonProcess.unref();
-        
         // Store reference for later cleanup
         this.daemonProcess = daemonProcess;
         
@@ -231,6 +238,18 @@ export class DaemonManager {
         daemonProcess.stderr?.on('data', (data) => {
             console.error(`[Daemon Error] ${data.toString().trim()}`);
         });
+        
+        // Handle process exit
+        daemonProcess.on('exit', (code, signal) => {
+            console.log(`[DaemonManager] Daemon process exited with code ${code}, signal ${signal}`);
+        });
+        
+        daemonProcess.on('error', (err) => {
+            console.error(`[DaemonManager] Failed to spawn daemon:`, err);
+        });
+        
+        // Unref so VS Code can exit independently (but after we set up handlers)
+        daemonProcess.unref();
         
         // Wait for daemon to start and write port file
         const port = await this.waitForDaemonReady(5000);
@@ -274,23 +293,61 @@ export class DaemonManager {
     }
     
     /**
-     * Wait for daemon to be ready (port file written)
+     * Wait for daemon to be ready (port file written AND daemon responding)
      */
     private async waitForDaemonReady(timeoutMs: number): Promise<number> {
         const startTime = Date.now();
         const portPath = this.getPortPath();
         
+        // First wait for port file
+        let port: number | null = null;
         while (Date.now() - startTime < timeoutMs) {
             if (fs.existsSync(portPath)) {
-                const port = parseInt(fs.readFileSync(portPath, 'utf-8').trim(), 10);
-                if (!isNaN(port)) {
-                    return port;
+                const p = parseInt(fs.readFileSync(portPath, 'utf-8').trim(), 10);
+                if (!isNaN(p)) {
+                    port = p;
+                    break;
                 }
             }
             await this.delay(100);
         }
         
-        throw new Error('Daemon failed to start within timeout');
+        if (!port) {
+            throw new Error('Daemon failed to start within timeout (no port file)');
+        }
+        
+        // Now verify daemon is actually responding
+        console.log(`[DaemonManager] Port file found (${port}), verifying daemon is ready...`);
+        while (Date.now() - startTime < timeoutMs) {
+            try {
+                const response = await this.checkDaemonHealth(port);
+                if (response) {
+                    console.log(`[DaemonManager] Daemon health check passed`);
+                    return port;
+                }
+            } catch {
+                // Daemon not ready yet, retry
+            }
+            await this.delay(100);
+        }
+        
+        throw new Error('Daemon failed to respond within timeout');
+    }
+    
+    /**
+     * Check if daemon is responding on the given port
+     */
+    private checkDaemonHealth(port: number): Promise<boolean> {
+        return new Promise((resolve) => {
+            const req = http.get(`http://127.0.0.1:${port}/health`, (res) => {
+                resolve(res.statusCode === 200);
+            });
+            req.on('error', () => resolve(false));
+            req.setTimeout(500, () => {
+                req.destroy();
+                resolve(false);
+            });
+        });
     }
     
     /**

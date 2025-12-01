@@ -95,7 +95,7 @@ function openAgentChat(): void {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
-    console.log('Agentic Planning Coordinator is activating...');
+    console.log('[APC] ===== ACTIVATION START =====');
 
     // Get workspace root
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -103,23 +103,28 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('Agentic Planning: No workspace folder open');
         return;
     }
-    console.log(`Agentic Planning: Workspace root = ${workspaceRoot}`);
+    console.log(`[APC] Step 1: Workspace root = ${workspaceRoot}`);
     
     // Bootstrap all services with ServiceLocator
+    console.log('[APC] Step 2: Bootstrapping services...');
     bootstrapServices();
-    console.log('Agentic Planning: Services bootstrapped');
+    console.log('[APC] Step 2: Services bootstrapped');
     
     // Initialize AgentRunner with configured backend
+    console.log('[APC] Step 3: Setting up AgentRunner...');
     const config = vscode.workspace.getConfiguration('agenticPlanning');
     const backendType = config.get<string>('defaultBackend', 'cursor') as AgentBackendType;
     const agentRunner = ServiceLocator.resolve(AgentRunner);
     agentRunner.setBackend(backendType);
-    console.log(`Agentic Planning: Agent backend = ${backendType}`);
+    console.log(`[APC] Step 3: Agent backend = ${backendType}`);
 
     // Create placeholder providers first so TreeViews are always registered
     // This prevents "no data provider" errors even if initialization fails
+    console.log('[APC] Step 4: Creating sidebar provider...');
     const dependencyService = ServiceLocator.resolve(DependencyService);
+    dependencyService.setWorkspaceRoot(workspaceRoot);
     const sidebarProvider = new SidebarViewProvider(context.extensionUri);
+    console.log('[APC] Step 4: Sidebar provider created');
     let planningSessionsProvider: PlanningSessionsProvider;
     let agentPoolProvider: AgentPoolProvider;
     
@@ -194,13 +199,15 @@ export async function activate(context: vscode.ExtensionContext) {
     // ========================================================================
     // Daemon Connection
     // ========================================================================
+    console.log('[APC] Step 6: Starting daemon connection...');
     
     // Initialize daemon manager and ensure daemon is running
     daemonManager = new DaemonManager(workspaceRoot, context.extensionPath);
     
     try {
+        console.log('[APC] Step 6a: Calling ensureDaemonRunning...');
         const daemonResult = await daemonManager.ensureDaemonRunning();
-        console.log(`Agentic Planning: Daemon on port ${daemonResult.port} (wasStarted: ${daemonResult.wasStarted}, isExternal: ${daemonResult.isExternal})`);
+        console.log(`[APC] Step 6b: Daemon on port ${daemonResult.port} (wasStarted: ${daemonResult.wasStarted}, isExternal: ${daemonResult.isExternal})`);
         
         // Create and connect VS Code client
         vsCodeClient = new VsCodeClient({
@@ -216,8 +223,27 @@ export async function activate(context: vscode.ExtensionContext) {
             showError: (msg) => vscode.window.showErrorMessage(msg)
         });
         
-        // Connect to daemon
-        await vsCodeClient.connect();
+        // Connect to daemon with retry (daemon may still be starting up)
+        console.log('[APC] Step 6c: Connecting to daemon...');
+        const maxRetries = 5;
+        let lastError: Error | undefined;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                await vsCodeClient.connect();
+                console.log(`[APC] Step 6d: Connected to daemon (attempt ${attempt})`);
+                break;
+            } catch (err) {
+                lastError = err as Error;
+                console.log(`[APC] Connection attempt ${attempt}/${maxRetries} failed: ${lastError.message}`);
+                if (attempt < maxRetries) {
+                    // Wait before retry (100ms, 200ms, 400ms, 800ms)
+                    await new Promise(r => setTimeout(r, 100 * Math.pow(2, attempt - 1)));
+                }
+            }
+        }
+        if (!vsCodeClient.isConnected()) {
+            throw lastError || new Error('Failed to connect to daemon');
+        }
         console.log('Agentic Planning: Connected to daemon');
         
         // If daemon was external (started by CLI), show info
@@ -362,42 +388,15 @@ Options:
         });
     });
 
+    console.log('[APC] Step 7: Registering webview provider...');
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(SidebarViewProvider.viewType, sidebarProvider)
     );
+    console.log('[APC] Step 7: Webview provider registered');
 
-    // Watch for state file changes to auto-refresh UI (CLI updates files directly)
-    // Structure: _AiDevLog/.cache/ for runtime state, _AiDevLog/Plans/{sessionId}/ for session state
-    const configWatch = vscode.workspace.getConfiguration('agenticPlanning');
-    const workingDirectory = configWatch.get<string>('workingDirectory', '_AiDevLog');
-    const stateFilesPattern = new vscode.RelativePattern(
-        vscode.Uri.file(workspaceRoot), 
-        `${workingDirectory}/{.cache/*.json,Plans/*/session.json,Plans/*/tasks.json}`
-    );
-    
-    const stateFileWatcher = vscode.workspace.createFileSystemWatcher(stateFilesPattern);
-    
-    // Debounce refresh to avoid rapid-fire updates
-    let refreshTimeout: NodeJS.Timeout | undefined;
-    const debouncedRefresh = () => {
-        if (refreshTimeout) {
-            clearTimeout(refreshTimeout);
-        }
-        refreshTimeout = setTimeout(async () => {
-            // Reload state from files (async with locking)
-            await stateManager.reloadFromFiles();
-            // Refresh all UI providers
-            sidebarProvider.refresh();
-        }, 500); // 500ms debounce
-    };
-    
-    stateFileWatcher.onDidChange(debouncedRefresh);
-    stateFileWatcher.onDidCreate(debouncedRefresh);
-    stateFileWatcher.onDidDelete(debouncedRefresh);
-    
-    context.subscriptions.push(stateFileWatcher);
-    
-    console.log('State file watcher initialized for auto-refresh');
+    // NOTE: File watcher removed - daemon events handle state synchronization
+    // The daemon broadcasts events (session.updated, pool.changed) which trigger UI refresh
+    // This is more efficient than watching files directly
 
     // Connect planning service events to UI refresh
     planningService.onSessionsChanged(() => {
