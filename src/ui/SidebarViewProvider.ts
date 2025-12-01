@@ -366,8 +366,10 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             let planStatus = 'Draft';
             if (s.status === 'approved' || s.status === 'executing' || s.status === 'completed' || s.status === 'paused') {
                 planStatus = 'Approved';
-            } else if (s.status === 'reviewing' || s.status === 'debating') {
+            } else if (s.status === 'reviewing') {
                 planStatus = 'Pending Review';
+            } else if (s.status === 'debating') {
+                planStatus = 'Planning...';
             } else if (s.status === 'revising') {
                 planStatus = 'Revising';
             }

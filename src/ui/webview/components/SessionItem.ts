@@ -35,11 +35,16 @@ const WORKFLOW_TYPE_INFO: Record<string, { icon: string; class: string; label: s
  * Get plan action buttons based on session status.
  */
 function getPlanButtons(status: string): string {
-    if (status === 'reviewing' || status === 'debating') {
+    // Only show Revise/Approve when plan is ready for review
+    if (status === 'reviewing') {
         return `
             <button class="sub-item-btn" data-action="revisePlan">Revise</button>
             <button class="sub-item-btn primary" data-action="approvePlan">Approve</button>
         `;
+    }
+    // Planning in progress - show stop button
+    if (status === 'debating') {
+        return `<button class="sub-item-btn danger" data-action="stopExecution">Stop</button>`;
     }
     if (status === 'revising') {
         return `<button class="sub-item-btn danger" data-action="stopRevision">Stop</button>`;
@@ -121,6 +126,8 @@ function getPlanBadgeClass(planStatus?: string): string {
     switch (planStatus) {
         case 'Approved': return 'approved';
         case 'Pending Review': return 'pending';
+        case 'Planning...': return 'running';
+        case 'Revising': return 'running';
         default: return 'draft';
     }
 }
