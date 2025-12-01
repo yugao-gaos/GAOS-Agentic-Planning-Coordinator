@@ -84,7 +84,7 @@ get_daemon_port() {
 # Send command via WebSocket client
 send_ws_command() {
     local cmd="$1"
-    local params="${2:-{}}"
+    local params="${2:-"{}"}"
     
     # Call the WebSocket client
     local result
