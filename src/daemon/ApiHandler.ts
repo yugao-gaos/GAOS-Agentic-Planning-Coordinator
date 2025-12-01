@@ -175,6 +175,7 @@ export interface IPlanningApi {
     approvePlan(id: string, autoStart?: boolean): Promise<void>;
     cancelPlan(id: string): Promise<void>;
     restartPlanning(id: string): Promise<{ success: boolean; error?: string }>;
+    removeSession(id: string): Promise<{ success: boolean; error?: string }>;
 }
 
 /**
@@ -384,7 +385,11 @@ export class ApiHandler {
             }
             
             case 'remove': {
-                this.services.stateManager.deletePlanningSession(params.id as string);
+                // Use planningService.removeSession which also deletes plan files on disk
+                const result = await this.services.planningService.removeSession(params.id as string);
+                if (!result.success) {
+                    throw new Error(result.error || 'Failed to remove session');
+                }
                 return { message: `Session ${params.id} removed` };
             }
             
