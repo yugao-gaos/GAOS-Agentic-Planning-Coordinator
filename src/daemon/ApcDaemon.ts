@@ -78,6 +78,10 @@ export class ApcDaemon {
     private verbose: boolean;
     private services: ApiServices | null = null;
     
+    /** Idle shutdown timer - daemon shuts down after 60s with no clients */
+    private idleShutdownTimer: NodeJS.Timeout | null = null;
+    private static readonly IDLE_SHUTDOWN_MS = 60000;  // 60 seconds
+    
     constructor(options: DaemonOptions = {}) {
         const workspaceRoot = options.workspaceRoot || findWorkspaceRoot();
         this.configLoader = new ConfigLoader(workspaceRoot);
@@ -192,6 +196,20 @@ export class ApcDaemon {
         this.state = 'stopping';
         this.log('info', `Stopping daemon: ${reason}`);
         
+        // Cancel idle shutdown timer if active
+        this.cancelIdleShutdownTimer();
+        
+        // Gracefully shutdown coordinator (pause workflows, release agents)
+        // This saves workflow state so they can be resumed on restart
+        if (this.services?.coordinator?.gracefulShutdown) {
+            try {
+                const result = await this.services.coordinator.gracefulShutdown();
+                this.log('info', `Graceful shutdown: ${result.workflowsPaused} workflows paused, ${result.agentsReleased} agents released`);
+            } catch (err) {
+                this.log('warn', `Graceful shutdown error: ${err}`);
+            }
+        }
+        
         // Broadcast shutdown event
         this.broadcaster.broadcast('daemon.shutdown', {
             reason,
@@ -273,6 +291,9 @@ export class ApcDaemon {
      * Handle new WebSocket connection
      */
     private handleConnection(ws: WebSocket, req: http.IncomingMessage): void {
+        // Cancel idle shutdown timer - we have a client now
+        this.cancelIdleShutdownTimer();
+        
         const clientId = this.generateClientId();
         
         const client: ConnectedClient = {
@@ -417,6 +438,38 @@ export class ApcDaemon {
             disconnectedAt: new Date().toISOString(),
             totalClients: this.clients.size
         });
+        
+        // Start idle shutdown timer if no clients remaining
+        if (this.clients.size === 0) {
+            this.startIdleShutdownTimer();
+        }
+    }
+    
+    /**
+     * Start the idle shutdown timer
+     * Daemon will gracefully shutdown after IDLE_SHUTDOWN_MS with no clients
+     */
+    private startIdleShutdownTimer(): void {
+        // Cancel any existing timer
+        this.cancelIdleShutdownTimer();
+        
+        this.log('info', `No clients connected. Starting idle shutdown timer (${ApcDaemon.IDLE_SHUTDOWN_MS / 1000}s)...`);
+        
+        this.idleShutdownTimer = setTimeout(async () => {
+            this.log('info', 'Idle shutdown timer expired. Initiating graceful shutdown...');
+            await this.stop('idle_timeout');
+        }, ApcDaemon.IDLE_SHUTDOWN_MS);
+    }
+    
+    /**
+     * Cancel the idle shutdown timer
+     */
+    private cancelIdleShutdownTimer(): void {
+        if (this.idleShutdownTimer) {
+            clearTimeout(this.idleShutdownTimer);
+            this.idleShutdownTimer = null;
+            this.log('info', 'Idle shutdown timer cancelled (client connected)');
+        }
     }
     
     // ========================================================================

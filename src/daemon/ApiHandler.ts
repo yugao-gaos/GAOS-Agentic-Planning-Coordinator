@@ -146,6 +146,12 @@ export interface ICoordinatorApi {
     
     // Start a workflow for a specific task
     startTaskWorkflow(sessionId: string, taskId: string, workflowType: string): Promise<string>;
+    
+    // Graceful shutdown - pause all workflows and release agents
+    gracefulShutdown?(): Promise<{ workflowsPaused: number; agentsReleased: number }>;
+    
+    // Recover paused workflows after restart
+    recoverAllSessions?(): Promise<number>;
 }
 
 /**
@@ -421,7 +427,8 @@ export class ApiHandler {
         }
         return {
             isRevising: state.isRevising,
-            activeWorkflows: Array.from(state.activeWorkflows.values()),
+            // Include workflow ID in each entry (Map keys are lost during serialization)
+            activeWorkflows: Array.from(state.activeWorkflows.entries()).map(([id, wf]) => ({ ...wf, id })),
             workflowHistory: state.workflowHistory || []
         };
     }
@@ -1213,6 +1220,22 @@ export class ApiHandler {
                 );
                 
                 return { message: `Coordinator evaluation triggered for ${sessionId}: ${reason}` };
+            }
+            
+            case 'shutdown': {
+                // Graceful shutdown - pause all workflows and release agents
+                if (!this.services.coordinator.gracefulShutdown) {
+                    throw new Error('Graceful shutdown not supported by coordinator');
+                }
+                
+                const result = await this.services.coordinator.gracefulShutdown();
+                return { 
+                    data: { 
+                        workflowsPaused: result.workflowsPaused,
+                        agentsReleased: result.agentsReleased
+                    },
+                    message: `Graceful shutdown: ${result.workflowsPaused} workflows paused, ${result.agentsReleased} agents released`
+                };
             }
             
             default:

@@ -495,6 +495,28 @@ export class VsCodeClient extends BaseApcClient {
             return { success: false, error: err instanceof Error ? err.message : String(err) };
         }
     }
+    
+    // ========================================================================
+    // Shutdown
+    // ========================================================================
+    
+    /**
+     * Request graceful shutdown of the daemon coordinator
+     * This pauses all workflows (saving state) and releases agents
+     * Should be called before disconnecting if workflows should be resumable
+     */
+    async requestGracefulShutdown(): Promise<{ success: boolean; workflowsPaused?: number; agentsReleased?: number; error?: string }> {
+        try {
+            const response = await this.send<{ workflowsPaused: number; agentsReleased: number }>('coordinator.shutdown');
+            return { 
+                success: true, 
+                workflowsPaused: response.workflowsPaused,
+                agentsReleased: response.agentsReleased
+            };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
 }
 
 

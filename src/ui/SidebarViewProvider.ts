@@ -368,6 +368,12 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     
                     // Collect active workflows from activeWorkflows Map<string, WorkflowProgress>
                     for (const [workflowId, progress] of sessionState.activeWorkflows) {
+                        // Skip entries with invalid workflow IDs
+                        if (!workflowId || typeof workflowId !== 'string') {
+                            console.warn(`[SidebarViewProvider] Skipping workflow with invalid ID:`, workflowId);
+                            continue;
+                        }
+                        
                         // Extract taskId from workflow ID for task_implementation workflows
                         // Workflow IDs for tasks are like "task_<sessionId>_<taskId>_<timestamp>"
                         let taskId: string | undefined;

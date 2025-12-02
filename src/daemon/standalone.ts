@@ -224,7 +224,10 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
             triggerCoordinatorEvaluation: (sessionId: string, eventType: string, payload: any) => 
                 coordinator.triggerCoordinatorEvaluation(sessionId, eventType as any, payload),
             startTaskWorkflow: (sessionId: string, taskId: string, workflowType: string) =>
-                coordinator.startTaskWorkflow(sessionId, taskId, workflowType)
+                coordinator.startTaskWorkflow(sessionId, taskId, workflowType),
+            // Graceful shutdown and recovery
+            gracefulShutdown: () => coordinator.gracefulShutdown(),
+            recoverAllSessions: () => coordinator.recoverAllSessions()
         },
         planningService: {
             listPlanningSessions: () => planningService.listPlanningSessions(),

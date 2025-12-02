@@ -1863,6 +1863,79 @@ export class UnifiedCoordinatorService {
     // =========================================================================
     
     /**
+     * Graceful shutdown - pauses all workflows (saving state) and releases agents
+     * 
+     * Call this before stopping the daemon to ensure workflows can be resumed on restart.
+     * Unlike dispose(), this preserves workflow state for recovery.
+     * 
+     * @returns Number of workflows paused and agents released
+     */
+    async gracefulShutdown(): Promise<{ workflowsPaused: number; agentsReleased: number }> {
+        this.log('Initiating graceful shutdown...');
+        
+        let workflowsPaused = 0;
+        let agentsReleased = 0;
+        
+        // Get WorkflowPauseManager for state persistence
+        const { WorkflowPauseManager } = await import('./workflows/WorkflowPauseManager');
+        const pauseManager = ServiceLocator.resolve(WorkflowPauseManager);
+        pauseManager.setStateManager(this.stateManager);
+        
+        // Pause all active workflows in all sessions
+        for (const [sessionId, state] of this.sessions) {
+            this.log(`  Shutting down session ${sessionId}...`);
+            
+            for (const [workflowId, workflow] of state.workflows) {
+                const status = workflow.getStatus();
+                
+                if (status === 'running' || status === 'paused') {
+                    try {
+                        // Get workflow progress for saving state
+                        const progress = workflow.getProgress();
+                        const taskId = state.workflowToTaskMap.get(workflowId);
+                        
+                        // Pause and save state
+                        await pauseManager.pauseWorkflow(
+                            workflowId,
+                            {
+                                workflowType: progress.type,
+                                sessionId,
+                                phaseIndex: progress.phaseIndex,
+                                phaseName: progress.phase,
+                                taskId,
+                                filesModified: [],  // Not tracked at this level
+                                agentRunId: undefined  // Agent tracking is internal to workflow
+                            },
+                            { reason: 'user_request', forceKill: false }  // Soft pause
+                        );
+                        
+                        workflowsPaused++;
+                        this.log(`    ⏸️  Paused workflow ${workflowId.substring(0, 12)} (${progress.type})`);
+                        
+                    } catch (e) {
+                        this.log(`    ⚠️  Failed to pause workflow ${workflowId}: ${e}`);
+                    }
+                }
+            }
+        }
+        
+        // Release all busy agents back to pool
+        const busyAgents = this.agentPoolService.getBusyAgents();
+        for (const agent of busyAgents) {
+            try {
+                this.agentPoolService.releaseAgents([agent.name]);
+                agentsReleased++;
+                this.log(`    🔓 Released agent ${agent.name}`);
+            } catch (e) {
+                this.log(`    ⚠️  Failed to release agent ${agent.name}: ${e}`);
+            }
+        }
+        
+        this.log(`Graceful shutdown complete: ${workflowsPaused} workflows paused, ${agentsReleased} agents released`);
+        return { workflowsPaused, agentsReleased };
+    }
+    
+    /**
      * Dispose all resources
      */
     dispose(): void {

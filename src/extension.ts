@@ -984,7 +984,8 @@ export async function deactivate() {
     }
     eventSubscriptions = [];
     
-    // Disconnect from daemon (but don't stop it - CLI may still need it)
+    // Disconnect from daemon (but don't stop it - other clients may still need it)
+    // Daemon will auto-shutdown after 60s with no clients, which triggers graceful shutdown
     if (vsCodeClient) {
         try {
             vsCodeClient.dispose();
