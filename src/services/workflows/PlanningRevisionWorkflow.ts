@@ -371,30 +371,23 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
         }
         const basePrompt = role.promptTemplate;
         
-        const existingContent = fs.readFileSync(this.planPath, 'utf-8');
-        
         return `${basePrompt}
 
 ## Mode: REVISE
 You are revising the plan based on user feedback.
 
-### Current Plan
-${existingContent}
+### Plan File
+Read and modify: ${this.planPath}
 
 ### User Feedback
 ${this.userFeedback}
 
 ### Instructions
-1. Make targeted changes to address the feedback
-2. Preserve structure where possible
-3. Update affected tasks and dependencies
-4. Keep task IDs consistent where possible (only change if necessary)
-
-## Output Instructions
-Write the revised plan to this EXACT file path:
-\`${this.planPath}\`
-
-Use the write tool to save the plan.`;
+1. Read the current plan using read_file
+2. Make targeted changes to address the feedback
+3. Preserve structure where possible
+4. Update affected tasks and dependencies
+5. Write the revised plan back to the same file`;
     }
     
     private buildReviewPrompt(role: AgentRole | undefined): string {
@@ -403,19 +396,13 @@ Use the write tool to save the plan.`;
         }
         const basePrompt = role.promptTemplate;
         
-        const planContent = fs.readFileSync(this.planPath, 'utf-8');
-        
-        const contextContent = fs.existsSync(this.contextPath) 
-            ? fs.readFileSync(this.contextPath, 'utf-8') 
-            : '';
-        
         return `${basePrompt}
 
-## Revised Plan to Review
-${planContent}
+## Files to Review
+- Plan: ${this.planPath}
+- Context: ${this.contextPath}
 
-## Project Context
-${contextContent}
+Read these files using read_file tool.
 
 ## User Feedback That Prompted This Revision
 ${this.userFeedback}
@@ -424,13 +411,11 @@ ${this.userFeedback}
 Review the revised plan and verify it addresses the user's feedback.
 
 ## REQUIRED Output Format
-You MUST output your review in this EXACT format:
-
 \`\`\`
 ### Review Result: [PASS|CRITICAL|MINOR]
 
 #### Critical Issues
-- [List blocking issues that MUST be fixed, or "None"]
+- [List blocking issues, or "None"]
 
 #### Minor Suggestions
 - [List optional improvements, or "None"]
@@ -446,27 +431,20 @@ You MUST output your review in this EXACT format:
     }
     
     private buildFinalizationPrompt(role: AgentRole | undefined): string {
-        const existingContent = fs.readFileSync(this.planPath, 'utf-8');
-        
         return `You are finalizing the revised execution plan.
 
-## Current Plan
-${existingContent}
+## Plan File
+Read and modify: ${this.planPath}
 
 ## Codex Review
 ${this.analystOutput || 'No review available'}
 
 ## Instructions
-1. Ensure all tasks use checkbox format: - [ ] **T{N}**: Description | Deps: X | Engineer: TBD
-2. Address any minor suggestions from the review
-3. Update the status to "READY FOR REVIEW (Revised)"
-4. Clean up any formatting issues
-
-## Output Instructions
-Write the finalized plan to this EXACT file path:
-\`${this.planPath}\`
-
-Use the write tool to save the plan. Update the status to "READY FOR REVIEW".`;
+1. Read the plan file using read_file
+2. Ensure all tasks use checkbox format: - [ ] **T{N}**: Description | Deps: X | Engineer: TBD
+3. Address any minor suggestions from the review
+4. Update status to "READY FOR REVIEW (Revised)"
+5. Write the finalized plan back using write tool`;
     }
     
     // =========================================================================

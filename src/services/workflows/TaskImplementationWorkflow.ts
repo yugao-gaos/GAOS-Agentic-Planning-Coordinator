@@ -501,10 +501,6 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         }
         const basePrompt = role.promptTemplate;
         
-        const planContent = fs.existsSync(this.planPath)
-            ? fs.readFileSync(this.planPath, 'utf-8')
-            : '';
-        
         return `${basePrompt}
 
 ## Task
@@ -513,8 +509,8 @@ ${this.taskId}: ${this.taskDescription}
 ## Dependencies
 ${this.dependencies.length > 0 ? this.dependencies.join(', ') : 'None'}
 
-## Full Plan
-${planContent}
+## Plan File
+Read the plan if you need more context: ${this.planPath}
 
 ## Your Task
 Gather context relevant to implementing this task:
@@ -534,10 +530,6 @@ Provide a focused context brief in markdown format.`;
         
         const contextContent = this.contextBriefPath && fs.existsSync(this.contextBriefPath)
             ? fs.readFileSync(this.contextBriefPath, 'utf-8')
-            : '';
-        
-        const planContent = fs.existsSync(this.planPath)
-            ? fs.readFileSync(this.planPath, 'utf-8')
             : '';
         
         let revisionContext = '';
@@ -563,8 +555,8 @@ ${this.previousErrors.join('\n')}`;
 ## Your Task
 ${this.taskId}: ${this.taskDescription}
 
-## Plan
-${planContent}
+## Plan File
+Read the plan if you need more context: ${this.planPath}
 
 ## Context Brief
 ${contextContent}

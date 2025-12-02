@@ -293,24 +293,12 @@ Write your findings in markdown format.`;
             throw new Error('Missing prompt template for planner role');
         }
         const basePrompt = role.promptTemplate;
+        
+        // Load the plan template path
+        const templatePath = path.join(this.stateManager.getWorkspaceRoot(), 'resources/templates/skeleton_plan.md');
+        const hasTemplate = fs.existsSync(templatePath);
 
         let modeInstructions = '';
-        let existingContent = '';
-        
-        if (fs.existsSync(this.planPath)) {
-            existingContent = fs.readFileSync(this.planPath, 'utf-8');
-        }
-        
-        const contextContent = fs.existsSync(this.contextPath) 
-            ? fs.readFileSync(this.contextPath, 'utf-8') 
-            : '';
-        
-        // Load the plan template
-        let planTemplate = '';
-        const templatePath = path.join(this.stateManager.getWorkspaceRoot(), 'resources/templates/skeleton_plan.md');
-        if (fs.existsSync(templatePath)) {
-            planTemplate = fs.readFileSync(templatePath, 'utf-8');
-        }
         
         if (mode === 'create') {
             modeInstructions = `## Mode: CREATE
@@ -319,62 +307,42 @@ You are creating the initial plan.
 ### Requirement
 ${this.requirement}
 
-### Project Context
-${contextContent}
+### Files to Read
+- Context (if exists): ${this.contextPath}
+${hasTemplate ? `- Plan Template: ${templatePath}` : ''}
 
-${planTemplate ? `### Plan Template (USE THIS STRUCTURE)
-\`\`\`markdown
-${planTemplate}
-\`\`\`
-
-Follow the template structure above. Replace {{PLACEHOLDERS}} with actual content.` : `Create a detailed task breakdown with:
-- [ ] **T{N}**: Task description | Deps: dependencies | Engineer: TBD
-
-Include sections for:
-1. Overview
-2. Task Breakdown (with checkboxes)
-3. Dependencies
-4. Risk Assessment
-5. Engineer Allocation`}`;
+### Instructions
+1. Read the context file if it exists
+${hasTemplate ? '2. Read and follow the plan template structure' : '2. Create a detailed task breakdown'}
+3. Write the plan to: ${this.planPath}`;
         } else {
             modeInstructions = `## Mode: UPDATE
 You are updating the plan based on analyst feedback.
 
-### Current Plan
-${existingContent}
+### Files
+- Current Plan: ${this.planPath}
 
 ### Analyst Feedback
 ${this.formatAnalystFeedback()}
 
 ### Instructions
-1. Address ALL Critical Issues raised by analysts
-2. Consider Minor Suggestions
-3. Preserve working parts of the plan
-4. Update task breakdown if needed`;
+1. Read the current plan
+2. Address ALL Critical Issues raised by analysts
+3. Consider Minor Suggestions  
+4. Write the updated plan back to the same file`;
         }
         
         return `${basePrompt}
 
 ${modeInstructions}
 
-## Output Instructions
-Write the complete plan to this EXACT file path:
-\`${this.planPath}\`
+## Plan Format
+Use checkbox format: - [ ] **T{N}**: Description | Deps: X | Engineer: TBD
 
-Use the write tool to save the plan. The plan should be a markdown file starting with "# [Project Name] Plan".
-
-Include these sections:
-1. Overview
-2. Task Breakdown (using checkbox format: - [ ] **T{N}**: Description | Deps: X | Engineer: TBD)
-3. Dependencies
-4. Risk Assessment`;
+Include sections: Overview, Task Breakdown, Dependencies, Risk Assessment`;
     }
     
     private buildFinalizationPrompt(forced: boolean, role: AgentRole | undefined): string {
-        const existingContent = fs.existsSync(this.planPath) 
-            ? fs.readFileSync(this.planPath, 'utf-8') 
-            : '';
-        
         const warnings = forced 
             ? `\n\n## WARNINGS (Max iterations reached)
 The following critical issues were not fully resolved:
@@ -383,25 +351,20 @@ ${this.criticalIssues.map(i => `- ${i}`).join('\n') || '- None recorded'}`
         
         return `You are finalizing the execution plan.
 
-## Current Plan
-${existingContent}
+## Plan File
+Read and modify: ${this.planPath}
 
 ## Analyst Feedback Summary
 ${this.formatAnalystFeedback()}
 ${warnings}
 
 ## Instructions
-1. Ensure all tasks use checkbox format: - [ ] **T{N}**: Description | Deps: X | Engineer: TBD
-2. Incorporate any minor suggestions that improve the plan
-3. Update the status to "READY FOR REVIEW"
-4. Clean up any formatting issues
+1. Read the plan file
+2. Ensure all tasks use checkbox format: - [ ] **T{N}**: Description | Deps: X | Engineer: TBD
+3. Incorporate any minor suggestions
+4. Update status to "READY FOR REVIEW"
 ${forced ? '5. Add a WARNINGS section noting unresolved critical issues' : ''}
-
-## Output Instructions
-Write the finalized plan to this EXACT file path:
-\`${this.planPath}\`
-
-Use the write tool to save the plan. Update the status to "READY FOR REVIEW".`;
+5. Write the finalized plan back to the same file`;
     }
     
     private buildAnalystPrompt(roleId: string, role: AgentRole | undefined): string {
@@ -410,24 +373,13 @@ Use the write tool to save the plan. Update the status to "READY FOR REVIEW".`;
         }
         const basePrompt = role.promptTemplate;
         
-        const planContent = fs.existsSync(this.planPath) 
-            ? fs.readFileSync(this.planPath, 'utf-8') 
-            : '';
-        
-        const contextContent = fs.existsSync(this.contextPath) 
-            ? fs.readFileSync(this.contextPath, 'utf-8') 
-            : '';
-        
         return `${basePrompt}
 
-## Plan to Review
-${planContent}
+## Files to Review
+- Plan: ${this.planPath}
+- Context: ${this.contextPath}
 
-## Project Context
-${contextContent}
-
-## Your Task
-Review the plan and provide feedback.
+Read these files using read_file tool, then provide your review.
 
 ## REQUIRED Output Format
 You MUST output your review in this EXACT format:
