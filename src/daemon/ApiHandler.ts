@@ -179,6 +179,8 @@ export interface ITaskManagerApi {
     completeTask(globalTaskId: string, summary?: string): void;
     updateTaskStage(globalTaskId: string, stage: string): void;
     markTaskFailed(globalTaskId: string, reason?: string): void;
+    /** Reload tasks from disk (for when daemon started before tasks were created) */
+    reloadPersistedTasks?(): void;
 }
 
 // Import types for agent completion signal
@@ -869,7 +871,23 @@ export class ApiHandler {
         switch (action) {
             case 'list': {
                 // List all tasks, optionally filtered by session
-                const allTasks = this.services.taskManager.getAllTasks();
+                let allTasks = this.services.taskManager.getAllTasks();
+                
+                // If no tasks in memory, try reloading from disk (daemon may have started before tasks were created)
+                if (allTasks.length === 0) {
+                    console.log('[ApiHandler] No tasks in memory, attempting reload from disk...');
+                    try {
+                        // TaskManager exposes reloadPersistedTasks for this purpose
+                        if (this.services.taskManager.reloadPersistedTasks) {
+                            this.services.taskManager.reloadPersistedTasks();
+                            allTasks = this.services.taskManager.getAllTasks();
+                            console.log(`[ApiHandler] Reloaded ${allTasks.length} tasks from disk`);
+                        }
+                    } catch (e) {
+                        console.warn('[ApiHandler] Failed to reload tasks:', e);
+                    }
+                }
+                
                 const tasks = sessionId 
                     ? allTasks.filter(t => t.sessionId === sessionId)
                     : allTasks;

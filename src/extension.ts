@@ -243,6 +243,13 @@ export async function activate(context: vscode.ExtensionContext) {
             })
         );
         
+        // Subscribe to coordinator status changes to update status indicator
+        eventSubscriptions.push(
+            vsCodeClient.subscribe('coordinator.statusChanged', () => {
+                sidebarProvider?.refresh();
+            })
+        );
+        
         // Subscribe to workflow completion events to update UI
         eventSubscriptions.push(
             vsCodeClient.subscribe('workflow.completed', () => {

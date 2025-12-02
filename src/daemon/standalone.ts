@@ -178,6 +178,17 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
         );
     });
     
+    // Subscribe to coordinator status changes and broadcast to clients
+    // This enables real-time UI updates showing coordinator state (idle, evaluating, etc.)
+    coordinator.onCoordinatorStatusChanged((status) => {
+        broadcaster.coordinatorStatusChanged(
+            status.state,
+            status.pendingEvents,
+            status.evaluationCount,
+            status.lastEvaluation
+        );
+    });
+    
     console.log('[Standalone] UnifiedCoordinatorService initialized');
     
     // Recover any paused sessions
@@ -280,7 +291,8 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
                     tm.createTaskFromCli(params),
                 completeTask: (globalTaskId: string, summary?: string) => tm.markTaskCompletedViaCli(globalTaskId, summary),
                 updateTaskStage: (globalTaskId: string, stage: string) => tm.updateTaskStage(globalTaskId, stage),
-                markTaskFailed: (globalTaskId: string, reason?: string) => tm.markTaskFailed(globalTaskId, reason)
+                markTaskFailed: (globalTaskId: string, reason?: string) => tm.markTaskFailed(globalTaskId, reason),
+                reloadPersistedTasks: () => tm.reloadPersistedTasks()
             };
         })(),
         roleRegistry: {

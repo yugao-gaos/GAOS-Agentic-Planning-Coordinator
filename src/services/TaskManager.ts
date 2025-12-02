@@ -349,8 +349,19 @@ export class TaskManager {
                 return;
             }
             
-            // Restore tasks to Map
+            // Restore tasks to Map with status validation/migration
+            let migratedCount = 0;
             for (const task of data.tasks) {
+                // Validate and migrate status if needed
+                const validStatuses: TaskStatus[] = ['created', 'in_progress', 'blocked', 'paused', 'completed', 'failed'];
+                if (!validStatuses.includes(task.status)) {
+                    const oldStatus = task.status;
+                    // Map legacy/invalid status values to valid ones
+                    task.status = this.migrateInvalidStatus(task);
+                    this.log(`[MIGRATE] Task ${task.id}: status "${oldStatus}" → "${task.status}"`);
+                    migratedCount++;
+                }
+                
                 this.tasks.set(task.id, task);
                 
                 // Rebuild file index
@@ -360,9 +371,49 @@ export class TaskManager {
             }
             
             this.log(`Loaded ${data.tasks.length} tasks from ${filePath} (last updated: ${data.lastUpdated})`);
+            
+            // Persist if we migrated any tasks to save the corrected statuses
+            if (migratedCount > 0) {
+                this.log(`[MIGRATE] Migrated ${migratedCount} tasks with invalid status, persisting...`);
+                this.persistTasks();
+            }
         } catch (err) {
             this.log(`[ERROR] Failed to load persisted tasks: ${err}`);
         }
+    }
+    
+    /**
+     * Migrate invalid task status to a valid one
+     * Used when loading tasks from disk that may have legacy status values
+     */
+    private migrateInvalidStatus(task: ManagedTask): TaskStatus {
+        const status = task.status as string;
+        
+        // Map known legacy status values
+        const legacyMapping: Record<string, TaskStatus> = {
+            'waiting': 'blocked',      // Old "waiting for dependencies" status
+            'pending': 'blocked',      // Old pending status
+            'ready': 'created',        // Old ready-to-start status
+            'running': 'in_progress',  // Old running status
+            'done': 'completed',       // Old done status
+            'error': 'failed',         // Old error status
+        };
+        
+        if (legacyMapping[status]) {
+            // If task has unmet dependencies, ensure it's blocked
+            // If all deps are complete, it should be 'created' so it can be started
+            if (status === 'waiting' || status === 'pending') {
+                const allDepsComplete = (task.dependencies || []).every(depId => {
+                    const depTask = this.tasks.get(depId);
+                    return depTask && depTask.status === 'completed';
+                });
+                return allDepsComplete ? 'created' : 'blocked';
+            }
+            return legacyMapping[status];
+        }
+        
+        // Default to 'created' for unknown status values
+        return 'created';
     }
     
     /**
