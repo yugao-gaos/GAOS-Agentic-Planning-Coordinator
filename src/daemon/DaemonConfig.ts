@@ -3,7 +3,7 @@
  * 
  * This module provides configuration loading without vscode dependencies.
  * Configuration can come from:
- * 1. Config file (_AiDevLog/.apc_config.json)
+ * 1. Config file (<working_dir>/.config/daemon.json)
  * 2. Environment variables
  * 3. Default values
  */
@@ -32,14 +32,8 @@ export interface CoreConfig {
     /** Default AI backend */
     defaultBackend: 'cursor';
     
-    /** Whether to use iterative planning loop */
-    useIterativePlanning: boolean;
-    
     /** State update interval in milliseconds */
     stateUpdateInterval: number;
-    
-    /** Path to Unity best practices document */
-    unityBestPracticesPath: string;
     
     /** Whether Unity features are enabled */
     enableUnityFeatures: boolean;
@@ -58,9 +52,7 @@ export const DEFAULT_CONFIG: Omit<CoreConfig, 'workspaceRoot'> = {
     workingDirectory: '_AiDevLog',
     agentPoolSize: 10,
     defaultBackend: 'cursor',
-    useIterativePlanning: true,
     stateUpdateInterval: 5000,
-    unityBestPracticesPath: '',
     enableUnityFeatures: true,  // Unity enabled by default
     port: 19840,
     logLevel: 'info'
@@ -76,13 +68,41 @@ export const DEFAULT_CONFIG: Omit<CoreConfig, 'workspaceRoot'> = {
 export class ConfigLoader {
     private config: CoreConfig;
     private configPath: string;
+    private changeCallbacks: Array<(config: CoreConfig) => void> = [];
     
     constructor(workspaceRoot: string) {
-        // Config now stored in .cache/ folder
-        this.configPath = path.join(workspaceRoot, '_AiDevLog', '.cache', 'apc_config.json');
-        // Migrate from old location if needed
-        this.migrateOldConfig(workspaceRoot);
+        // Config now stored in .config/ folder
+        this.configPath = path.join(workspaceRoot, '_AiDevLog', '.config', 'daemon.json');
+        // Migrate from old locations if needed
+        this.migrateConfig(workspaceRoot);
         this.config = this.loadConfig(workspaceRoot);
+    }
+    
+    /**
+     * Register a callback for configuration changes
+     */
+    onChange(callback: (config: CoreConfig) => void): () => void {
+        this.changeCallbacks.push(callback);
+        // Return unsubscribe function
+        return () => {
+            const index = this.changeCallbacks.indexOf(callback);
+            if (index >= 0) {
+                this.changeCallbacks.splice(index, 1);
+            }
+        };
+    }
+    
+    /**
+     * Notify all callbacks of configuration change
+     */
+    private notifyChange(): void {
+        for (const callback of this.changeCallbacks) {
+            try {
+                callback(this.getConfig());
+            } catch (err) {
+                console.error('ConfigLoader: Error in change callback:', err);
+            }
+        }
     }
     
     /**
@@ -100,11 +120,45 @@ export class ConfigLoader {
     }
     
     /**
-     * Update configuration (persists to file)
+     * Update configuration (persists to file and notifies listeners)
      */
     set<K extends keyof CoreConfig>(key: K, value: CoreConfig[K]): void {
         this.config[key] = value;
         this.saveConfig();
+        this.notifyChange();
+    }
+    
+    /**
+     * Update multiple config values at once
+     */
+    update(updates: Partial<CoreConfig>): void {
+        Object.assign(this.config, updates);
+        this.saveConfig();
+        this.notifyChange();
+    }
+    
+    /**
+     * Reset configuration to defaults
+     */
+    reset(): void {
+        this.config = {
+            workspaceRoot: this.config.workspaceRoot,
+            ...DEFAULT_CONFIG
+        };
+        this.saveConfig();
+        this.notifyChange();
+    }
+    
+    /**
+     * Reset a specific config value to default
+     */
+    resetKey<K extends keyof CoreConfig>(key: K): void {
+        if (key === 'workspaceRoot') {
+            return; // Can't reset workspace root
+        }
+        this.config[key] = DEFAULT_CONFIG[key] as any;
+        this.saveConfig();
+        this.notifyChange();
     }
     
     /**
@@ -165,16 +219,8 @@ export class ConfigLoader {
             sanitized.defaultBackend = raw.defaultBackend;
         }
         
-        if (typeof raw.useIterativePlanning === 'boolean') {
-            sanitized.useIterativePlanning = raw.useIterativePlanning;
-        }
-        
         if (typeof raw.stateUpdateInterval === 'number' && raw.stateUpdateInterval >= 1000) {
             sanitized.stateUpdateInterval = raw.stateUpdateInterval;
-        }
-        
-        if (typeof raw.unityBestPracticesPath === 'string') {
-            sanitized.unityBestPracticesPath = raw.unityBestPracticesPath;
         }
         
         if (typeof raw.enableUnityFeatures === 'boolean') {
@@ -209,11 +255,6 @@ export class ConfigLoader {
             }
         }
         
-        // APC_ITERATIVE_PLANNING
-        if (process.env.APC_ITERATIVE_PLANNING !== undefined) {
-            config.useIterativePlanning = process.env.APC_ITERATIVE_PLANNING === 'true';
-        }
-        
         // APC_PORT
         if (process.env.APC_PORT) {
             const port = parseInt(process.env.APC_PORT, 10);
@@ -237,41 +278,130 @@ export class ConfigLoader {
      * Save configuration to file
      */
     private saveConfig(): void {
-        // Ensure .cache directory exists
-        const dir = path.dirname(this.configPath);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-        
-        // Only save non-default values
-        const toSave: Partial<CoreConfig> = {};
-        const defaults = DEFAULT_CONFIG as any;
-        
-        for (const [key, value] of Object.entries(this.config)) {
-            if (key !== 'workspaceRoot' && value !== defaults[key]) {
-                (toSave as any)[key] = value;
+        try {
+            // Ensure .config directory exists
+            const dir = path.dirname(this.configPath);
+            if (!fs.existsSync(dir)) {
+                fs.mkdirSync(dir, { recursive: true });
             }
+            
+            // Only save non-default values
+            const toSave: Partial<CoreConfig> = {};
+            const defaults = DEFAULT_CONFIG as any;
+            
+            for (const [key, value] of Object.entries(this.config)) {
+                if (key !== 'workspaceRoot' && value !== defaults[key]) {
+                    (toSave as any)[key] = value;
+                }
+            }
+            
+            fs.writeFileSync(this.configPath, JSON.stringify(toSave, null, 2));
+        } catch (err) {
+            console.error(`ConfigLoader: Failed to save config to ${this.configPath}:`, err);
         }
-        
-        fs.writeFileSync(this.configPath, JSON.stringify(toSave, null, 2));
     }
     
     /**
-     * Migrate old config location to new .cache/ location
+     * Migrate config from old locations to new .config/daemon.json location
      */
-    private migrateOldConfig(workspaceRoot: string): void {
-        const oldPath = path.join(workspaceRoot, '_AiDevLog', '.apc_config.json');
-        if (fs.existsSync(oldPath) && !fs.existsSync(this.configPath)) {
+    private migrateConfig(workspaceRoot: string): void {
+        const workingDir = path.join(workspaceRoot, '_AiDevLog');
+        
+        // Check if new config already exists
+        if (fs.existsSync(this.configPath)) {
+            return;
+        }
+        
+        // Try to migrate from .cache/apc_config.json
+        const cacheConfigPath = path.join(workingDir, '.cache', 'apc_config.json');
+        if (fs.existsSync(cacheConfigPath)) {
             try {
                 const dir = path.dirname(this.configPath);
                 if (!fs.existsSync(dir)) {
                     fs.mkdirSync(dir, { recursive: true });
                 }
-                fs.renameSync(oldPath, this.configPath);
-                console.log('ConfigLoader: Migrated config to .cache/');
+                // Copy (don't move) for safety
+                const content = fs.readFileSync(cacheConfigPath, 'utf-8');
+                fs.writeFileSync(this.configPath, content);
+                console.log('ConfigLoader: Migrated config from .cache/ to .config/');
+                return;
             } catch (e) {
-                console.warn('ConfigLoader: Failed to migrate old config:', e);
+                console.warn('ConfigLoader: Failed to migrate from .cache/:', e);
             }
+        }
+        
+        // Try to migrate from old .apc_config.json
+        const oldConfigPath = path.join(workingDir, '.apc_config.json');
+        if (fs.existsSync(oldConfigPath)) {
+            try {
+                const dir = path.dirname(this.configPath);
+                if (!fs.existsSync(dir)) {
+                    fs.mkdirSync(dir, { recursive: true });
+                }
+                const content = fs.readFileSync(oldConfigPath, 'utf-8');
+                fs.writeFileSync(this.configPath, content);
+                console.log('ConfigLoader: Migrated config from old location to .config/');
+            } catch (e) {
+                console.warn('ConfigLoader: Failed to migrate from old location:', e);
+            }
+        }
+        
+        // Also migrate other config files to .config/
+        this.migrateOtherConfigs(workingDir);
+    }
+    
+    /**
+     * Migrate other config files (roles, workflows, etc.) to .config/
+     */
+    private migrateOtherConfigs(workingDir: string): void {
+        const oldConfigDir = path.join(workingDir, 'Config');
+        const newConfigDir = path.join(workingDir, '.config');
+        
+        if (!fs.existsSync(oldConfigDir)) {
+            return;
+        }
+        
+        try {
+            // Ensure new config dir exists
+            if (!fs.existsSync(newConfigDir)) {
+                fs.mkdirSync(newConfigDir, { recursive: true });
+            }
+            
+            // Migrate Roles/ -> roles/
+            const oldRolesDir = path.join(oldConfigDir, 'Roles');
+            const newRolesDir = path.join(newConfigDir, 'roles');
+            if (fs.existsSync(oldRolesDir) && !fs.existsSync(newRolesDir)) {
+                fs.cpSync(oldRolesDir, newRolesDir, { recursive: true });
+                console.log('ConfigLoader: Migrated Roles/ to .config/roles/');
+            }
+            
+            // Migrate SystemPrompts/ -> system_prompts/
+            const oldSystemPromptsDir = path.join(oldConfigDir, 'SystemPrompts');
+            const newSystemPromptsDir = path.join(newConfigDir, 'system_prompts');
+            if (fs.existsSync(oldSystemPromptsDir) && !fs.existsSync(newSystemPromptsDir)) {
+                fs.cpSync(oldSystemPromptsDir, newSystemPromptsDir, { recursive: true });
+                console.log('ConfigLoader: Migrated SystemPrompts/ to .config/system_prompts/');
+            }
+            
+            // Migrate workflow_settings.json -> workflows.json
+            const oldWorkflowSettings = path.join(oldConfigDir, 'workflow_settings.json');
+            const newWorkflowSettings = path.join(newConfigDir, 'workflows.json');
+            if (fs.existsSync(oldWorkflowSettings) && !fs.existsSync(newWorkflowSettings)) {
+                fs.copyFileSync(oldWorkflowSettings, newWorkflowSettings);
+                console.log('ConfigLoader: Migrated workflow_settings.json to .config/workflows.json');
+            }
+            
+            // Migrate context_presets.json
+            const oldContextPresets = path.join(oldConfigDir, 'context_presets.json');
+            const newContextPresets = path.join(newConfigDir, 'context_presets.json');
+            if (fs.existsSync(oldContextPresets) && !fs.existsSync(newContextPresets)) {
+                fs.copyFileSync(oldContextPresets, newContextPresets);
+                console.log('ConfigLoader: Migrated context_presets.json to .config/');
+            }
+            
+            console.log('ConfigLoader: Config migration to .config/ complete (old files preserved)');
+        } catch (e) {
+            console.warn('ConfigLoader: Failed to migrate other configs:', e);
         }
     }
 }

@@ -90,6 +90,11 @@
         "icon": "$(gear)"
       },
       {
+        "command": "apc.openDaemonSettings",
+        "title": "APC: Daemon Settings",
+        "icon": "$(settings-gear)"
+      },
+      {
         "command": "agenticPlanning.refreshPlanningSessions",
         "title": "Refresh",
         "icon": "$(refresh)"
@@ -186,12 +191,10 @@
     "configuration": {
       "title": "Agentic Planning Coordinator",
       "properties": {
-        "agenticPlanning.agentPoolSize": {
-          "type": "number",
-          "default": 10,
-          "minimum": 1,
-          "maximum": 20,
-          "description": "Total number of agents available in the pool"
+        "agenticPlanning.workingDirectory": {
+          "type": "string",
+          "default": "_AiDevLog",
+          "description": "Working directory for plans, logs, and state files"
         },
         "agenticPlanning.defaultBackend": {
           "type": "string",
@@ -201,35 +204,10 @@
           ],
           "description": "AI backend for agent sessions (only 'cursor' is currently supported)"
         },
-        "agenticPlanning.workingDirectory": {
-          "type": "string",
-          "default": "_AiDevLog",
-          "description": "Working directory for plans, logs, and state files"
-        },
         "agenticPlanning.autoOpenTerminals": {
           "type": "boolean",
           "default": true,
           "description": "Automatically open terminal for each agent when started"
-        },
-        "agenticPlanning.stateUpdateInterval": {
-          "type": "number",
-          "default": 5000,
-          "description": "Interval in ms to update state files"
-        },
-        "agenticPlanning.unityBestPracticesPath": {
-          "type": "string",
-          "default": "",
-          "description": "Path to Unity Best Practices document (leave empty to use built-in defaults)"
-        },
-        "agenticPlanning.useIterativePlanning": {
-          "type": "boolean",
-          "default": true,
-          "description": "Use iterative planning loop (Planner → Analysts → Planner loop until no critical issues). If disabled, uses legacy multi-agent debate."
-        },
-        "agenticPlanning.enableUnityFeatures": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable Unity-specific features (MCP integration, Unity Control Manager, compilation/testing pipelines). Disable for non-Unity projects."
         }
       }
     },

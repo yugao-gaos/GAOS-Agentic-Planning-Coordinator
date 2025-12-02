@@ -10,6 +10,7 @@ import {
     GlobalSettings
 } from '../types';
 import { getMemoryMonitor } from './MemoryMonitor';
+import { FolderStructureManager, getFolderStructureManager } from './FolderStructureManager';
 
 /**
  * Configuration interface for StateManager initialization.
@@ -197,6 +198,7 @@ const WRITE_DEBOUNCE_MS = 100;
 export class StateManager {
     private workspaceRoot: string;
     private workingDir: string;
+    private folderStructure: FolderStructureManager;
     private extensionState: ExtensionState;
     private agentPoolState: AgentPoolState;
     private planningSessions: Map<string, PlanningSession> = new Map();
@@ -240,6 +242,9 @@ export class StateManager {
         const defaultBackend = config.defaultBackend || 'cursor';
         
         this.workingDir = path.join(this.workspaceRoot, workingDirectory);
+        
+        // Initialize folder structure manager
+        this.folderStructure = getFolderStructureManager(this.workingDir);
         
         // Initialize file lock for cross-process state operations
         // Use temp directory to avoid polluting workspace
@@ -402,10 +407,10 @@ export class StateManager {
      * Ensure all directories for a plan session exist
      * 
      * Structure:
-     * - Plans/{sessionId}/           - Root plan folder
-     * - Plans/{sessionId}/logs/      - Workflow and agent logs
-     * - Plans/{sessionId}/logs/agents/ - Individual agent logs
-     * - Plans/{sessionId}/backups/   - Plan revision backups
+     * - {plans}/{sessionId}/           - Root plan folder
+     * - {plans}/{sessionId}/logs/      - Workflow and agent logs
+     * - {plans}/{sessionId}/logs/agents/ - Individual agent logs
+     * - {plans}/{sessionId}/backups/   - Plan revision backups
      */
     ensurePlanDirectories(sessionId: string): void {
         const dirs = [
@@ -433,22 +438,17 @@ export class StateManager {
     }
 
     private async ensureDirectories(): Promise<void> {
-        // Create base directories following the new structure:
-        // .cache/ - Runtime state (disposable)
-        // .config/ - User configurations (persistent)
-        // Plans/, Context/, Docs/ - User-visible data
-        const dirs = [
-            this.workingDir,
-            path.join(this.workingDir, '.cache'),
-            path.join(this.workingDir, '.config'),
-            path.join(this.workingDir, '.config', 'roles'),
-            path.join(this.workingDir, '.config', 'prompts'),
-            path.join(this.workingDir, 'Plans'),
-            path.join(this.workingDir, 'Docs'),
-            path.join(this.workingDir, 'Context')
+        // Use folder structure manager to create all required directories
+        this.folderStructure.ensureAllFolders();
+        
+        // Also ensure .config subdirectories
+        const configDir = this.folderStructure.getFolderPath('config');
+        const configSubDirs = [
+            path.join(configDir, 'roles'),
+            path.join(configDir, 'system_prompts')
         ];
-
-        for (const dir of dirs) {
+        
+        for (const dir of configSubDirs) {
             if (!fs.existsSync(dir)) {
                 fs.mkdirSync(dir, { recursive: true });
             }

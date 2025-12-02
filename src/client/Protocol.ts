@@ -539,3 +539,45 @@ export function isApcEvent(msg: unknown): msg is ApcEvent {
     return typeof msg === 'object' && msg !== null && 'event' in msg && 'timestamp' in msg && typeof (msg as ApcEvent).event === 'string';
 }
 
+// ============================================================================
+// Config Commands
+// ============================================================================
+
+export interface ConfigGetParams {
+    key?: string; // If omitted, return all config
+}
+
+export interface ConfigGetResponse {
+    config: Record<string, unknown> | unknown;
+}
+
+export interface ConfigSetParams {
+    key: string;
+    value: unknown;
+}
+
+export interface ConfigResetParams {
+    key?: string; // If omitted, reset all
+}
+
+// ============================================================================
+// Folder Commands
+// ============================================================================
+
+export interface FoldersGetParams {
+    folder?: string; // If omitted, return all folders
+}
+
+export interface FoldersGetResponse {
+    folders: Record<string, string> | string;
+}
+
+export interface FoldersSetParams {
+    folder: string;
+    name: string;
+}
+
+export interface FoldersResetParams {
+    folder?: string; // If omitted, reset all
+}
+

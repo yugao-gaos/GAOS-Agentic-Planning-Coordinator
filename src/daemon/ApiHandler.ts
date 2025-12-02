@@ -355,6 +355,12 @@ export class ApiHandler {
             case 'coordinator':
                 return this.handleCoordinator(action, params);
             
+            case 'config':
+                return this.handleConfig(action, params);
+            
+            case 'folders':
+                return this.handleFolders(action, params);
+            
             default:
                 throw new Error(`Unknown command category: ${category}`);
         }
@@ -1353,6 +1359,133 @@ export class ApiHandler {
             
             default:
                 throw new Error(`Unknown coordinator action: ${action}`);
+        }
+    }
+    
+    // ========================================================================
+    // Config Handler
+    // ========================================================================
+    
+    private async handleConfig(action: string, params: Record<string, unknown>): Promise<{ data?: unknown; message?: string }> {
+        const { ConfigLoader } = await import('./DaemonConfig');
+        
+        // Get config loader instance from state manager
+        const stateManager = this.services.stateManager as any;
+        const workspaceRoot = stateManager.getWorkspaceRoot?.() || stateManager.workspaceRoot;
+        
+        const configLoader = new ConfigLoader(workspaceRoot);
+        
+        switch (action) {
+            case 'get': {
+                const key = params.key as string | undefined;
+                
+                if (key) {
+                    // Get specific key
+                    const value = configLoader.get(key as any);
+                    return { data: { config: value } };
+                } else {
+                    // Get all config
+                    const config = configLoader.getConfig();
+                    // Don't return workspaceRoot to clients
+                    const { workspaceRoot: _, ...clientConfig } = config;
+                    return { data: { config: clientConfig } };
+                }
+            }
+            
+            case 'set': {
+                const key = params.key as string;
+                const value = params.value;
+                
+                if (!key) {
+                    throw new Error('Missing key parameter');
+                }
+                if (value === undefined) {
+                    throw new Error('Missing value parameter');
+                }
+                
+                configLoader.set(key as any, value as any);
+                return { message: `Config ${key} updated to ${value}` };
+            }
+            
+            case 'reset': {
+                const key = params.key as string | undefined;
+                
+                if (key) {
+                    configLoader.resetKey(key as any);
+                    return { message: `Config ${key} reset to default` };
+                } else {
+                    configLoader.reset();
+                    return { message: 'All config reset to defaults' };
+                }
+            }
+            
+            default:
+                throw new Error(`Unknown config action: ${action}`);
+        }
+    }
+    
+    // ========================================================================
+    // Folders Handler
+    // ========================================================================
+    
+    private async handleFolders(action: string, params: Record<string, unknown>): Promise<{ data?: unknown; message?: string }> {
+        const { getFolderStructureManager } = await import('../services/FolderStructureManager');
+        
+        // Get folder structure manager from state manager
+        const stateManager = this.services.stateManager as any;
+        const workingDir = stateManager.getWorkingDir?.();
+        
+        if (!workingDir) {
+            throw new Error('Working directory not available from state manager');
+        }
+        
+        const folderMgr = getFolderStructureManager(workingDir);
+        
+        switch (action) {
+            case 'get': {
+                const folder = params.folder as string | undefined;
+                
+                if (folder) {
+                    // Get specific folder
+                    const name = folderMgr.getFolder(folder as any);
+                    return { data: { folders: name } };
+                } else {
+                    // Get all folders
+                    const folders = folderMgr.getFolders();
+                    return { data: { folders } };
+                }
+            }
+            
+            case 'set': {
+                const folder = params.folder as string;
+                const name = params.name as string;
+                
+                if (!folder || !name) {
+                    throw new Error('Missing folder or name parameter');
+                }
+                
+                const success = folderMgr.setFolder(folder as any, name);
+                if (!success) {
+                    throw new Error(`Failed to set folder ${folder} to ${name}`);
+                }
+                
+                return { message: `Folder ${folder} set to ${name}` };
+            }
+            
+            case 'reset': {
+                const folder = params.folder as string | undefined;
+                
+                if (folder) {
+                    folderMgr.resetFolder(folder as any);
+                    return { message: `Folder ${folder} reset to default` };
+                } else {
+                    folderMgr.resetFolders();
+                    return { message: 'All folders reset to defaults' };
+                }
+            }
+            
+            default:
+                throw new Error(`Unknown folders action: ${action}`);
         }
     }
     

@@ -415,6 +415,82 @@ export class VsCodeClient extends BaseApcClient {
     }
     
     // ========================================================================
+    // Config Management
+    // ========================================================================
+    
+    /**
+     * Get daemon configuration (all or specific key)
+     */
+    async getConfig(key?: string): Promise<Record<string, unknown> | unknown> {
+        const params = key ? { key } : {};
+        const response = await this.send<{ config: Record<string, unknown> | unknown }>('config.get', params);
+        return response.config;
+    }
+    
+    /**
+     * Set daemon configuration
+     */
+    async setConfig(key: string, value: unknown): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('config.set', { key, value });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Reset daemon configuration (all or specific key)
+     */
+    async resetConfig(key?: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            const params = key ? { key } : {};
+            await this.send('config.reset', params);
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    // ========================================================================
+    // Folder Structure Management
+    // ========================================================================
+    
+    /**
+     * Get folder structure (all or specific folder)
+     */
+    async getFolders(folder?: string): Promise<Record<string, string> | string> {
+        const params = folder ? { folder } : {};
+        const response = await this.send<{ folders: Record<string, string> | string }>('folders.get', params);
+        return response.folders;
+    }
+    
+    /**
+     * Set folder name
+     */
+    async setFolder(folder: string, name: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('folders.set', { folder, name });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Reset folder structure (all or specific folder)
+     */
+    async resetFolders(folder?: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            const params = folder ? { folder } : {};
+            await this.send('folders.reset', params);
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    // ========================================================================
     // Workflow Management
     // ========================================================================
     

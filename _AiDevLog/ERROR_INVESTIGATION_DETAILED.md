@@ -416,3 +416,4 @@ The errors are **symptoms of normal operation** in a long-running system:
 
 The system is **working as designed**, but needs better **lifecycle synchronization** between coordinator (backend) and UI (frontend). The recommended fixes will eliminate these errors and improve the user experience.
 
+

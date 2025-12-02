@@ -746,6 +746,96 @@ case "$COMMAND" in
         esac
         ;;
     
+    config|cfg)
+        SUB="${1:-get}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            get|g)
+                KEY="${1:-}"
+                if [[ -n "$KEY" ]]; then
+                    response=$(send_ws_command "config.get" "{\"key\": \"$KEY\"}")
+                else
+                    response=$(send_ws_command "config.get" "{}")
+                fi
+                display_response "$response"
+                ;;
+            set|s)
+                KEY="${1:-}"
+                VALUE="${2:-}"
+                if [[ -z "$KEY" ]] || [[ -z "$VALUE" ]]; then
+                    echo -e "${RED}Usage: apc config set <key> <value>${RESET}"
+                    exit 1
+                fi
+                response=$(send_ws_command "config.set" "{\"key\": \"$KEY\", \"value\": \"$VALUE\"}")
+                display_response "$response"
+                ;;
+            reset|r)
+                KEY="${1:-}"
+                if [[ -n "$KEY" ]]; then
+                    response=$(send_ws_command "config.reset" "{\"key\": \"$KEY\"}")
+                else
+                    response=$(send_ws_command "config.reset" "{}")
+                fi
+                display_response "$response"
+                ;;
+            folders|f)
+                FOLDER_SUB="${1:-get}"
+                shift 2>/dev/null || true
+                case "$FOLDER_SUB" in
+                    get|g)
+                        FOLDER="${1:-}"
+                        if [[ -n "$FOLDER" ]]; then
+                            response=$(send_ws_command "folders.get" "{\"folder\": \"$FOLDER\"}")
+                        else
+                            response=$(send_ws_command "folders.get" "{}")
+                        fi
+                        display_response "$response"
+                        ;;
+                    set|s)
+                        FOLDER="${1:-}"
+                        NAME="${2:-}"
+                        if [[ -z "$FOLDER" ]] || [[ -z "$NAME" ]]; then
+                            echo -e "${RED}Usage: apc config folders set <folder> <name>${RESET}"
+                            exit 1
+                        fi
+                        response=$(send_ws_command "folders.set" "{\"folder\": \"$FOLDER\", \"name\": \"$NAME\"}")
+                        display_response "$response"
+                        ;;
+                    reset|r)
+                        FOLDER="${1:-}"
+                        if [[ -n "$FOLDER" ]]; then
+                            response=$(send_ws_command "folders.reset" "{\"folder\": \"$FOLDER\"}")
+                        else
+                            response=$(send_ws_command "folders.reset" "{}")
+                        fi
+                        display_response "$response"
+                        ;;
+                    *)
+                        echo -e "${YELLOW}Usage: apc config folders [get|set|reset]${RESET}"
+                        echo ""
+                        echo "  get [folder]       Get folder structure"
+                        echo "  set <folder> <name> Set folder name"
+                        echo "  reset [folder]     Reset to default"
+                        ;;
+                esac
+                ;;
+            *)
+                echo -e "${YELLOW}Usage: apc config [get|set|reset|folders]${RESET}"
+                echo ""
+                echo "  get [key]          Get config (all or specific key)"
+                echo "  set <key> <value>  Set config value"
+                echo "  reset [key]        Reset to default (all or specific key)"
+                echo "  folders <sub>      Manage folder structure"
+                echo ""
+                echo -e "${GREEN}Examples:${RESET}"
+                echo "  apc config get agentPoolSize"
+                echo "  apc config set agentPoolSize 15"
+                echo "  apc config folders get plans"
+                echo "  apc config folders set plans MyPlans"
+                ;;
+        esac
+        ;;
+    
     daemon|d)
         SUB="${1:-status}"
         shift 2>/dev/null || true
@@ -962,6 +1052,13 @@ case "$COMMAND" in
         echo "  pool resize <n>     Resize agent pool"
         echo "  agent roles         List available roles"
         echo "  agent release <n>   Release agent back to pool"
+        echo ""
+        echo -e "${GREEN}Config:${RESET}"
+        echo "  config get [key]          Get config (all or specific)"
+        echo "  config set <key> <value>  Set config value"
+        echo "  config reset [key]        Reset to default"
+        echo "  config folders get        Show folder structure"
+        echo "  config folders set <f> <n> Set folder name"
         echo ""
         echo -e "${GREEN}Unity:${RESET}"
         echo "  unity status        Unity control status"

@@ -612,6 +612,16 @@ Let's get started!`;
             RoleSettingsPanel.showWithClient(vsCodeClient, context.extensionUri);
         }),
         
+        // Daemon settings command - manage daemon configuration
+        vscode.commands.registerCommand('apc.openDaemonSettings', async () => {
+            if (!vsCodeClient.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. Run "apc system run --headless" first.');
+                return;
+            }
+            const { DaemonSettingsPanel } = await import('./ui/DaemonSettingsPanel');
+            DaemonSettingsPanel.show(context.extensionUri, vsCodeClient);
+        }),
+        
         // Workflow settings command
         vscode.commands.registerCommand('apc.openWorkflowSettings', () => {
             WorkflowSettingsPanel.show(context.extensionUri, workspaceRoot);
