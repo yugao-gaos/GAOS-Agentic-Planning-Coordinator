@@ -113,7 +113,8 @@ export class HistoryViewPanel {
                         percentage: hist.status === 'completed' ? 100 : 0,
                         startedAt: hist.startedAt || '',
                         taskId: hist.taskId,
-                        logPath: hist.logPath
+                        logPath: hist.logPath,
+                        summary: hist.summary
                     });
                 }
             }
@@ -390,6 +391,12 @@ export class HistoryViewPanel {
                     </div>
                 </div>
                 <div class="history-details">
+                    ${wf.summary ? `
+                    <div class="detail-row">
+                        <div class="detail-label">Summary:</div>
+                        <div class="detail-value">${this.escapeHtml(wf.summary)}</div>
+                    </div>
+                    ` : ''}
                     <div class="detail-row">
                         <div class="detail-label">Phase:</div>
                         <div class="detail-value">${this.escapeHtml(wf.phase)}</div>

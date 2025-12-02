@@ -244,7 +244,7 @@ export abstract class BaseWorkflow implements IWorkflow {
         try {
             const planFolder = this.stateManager.getPlanFolder(this.sessionId);
             if (planFolder) {
-                const logDir = path.join(planFolder, 'logs');
+                const logDir = path.join(planFolder, 'logs', 'workflow');
                 if (!fs.existsSync(logDir)) {
                     fs.mkdirSync(logDir, { recursive: true });
                 }

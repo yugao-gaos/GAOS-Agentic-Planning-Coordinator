@@ -154,6 +154,9 @@ export interface ICoordinatorApi {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     triggerCoordinatorEvaluation(sessionId: string, eventType: string, payload: any): Promise<any>;
     
+    // Update workflow history summary
+    updateWorkflowHistorySummary(sessionId: string, workflowId: string, summary: string): void;
+    
     // Start a workflow for a specific task
     startTaskWorkflow(sessionId: string, taskId: string, workflowType: string): Promise<string>;
     
@@ -719,6 +722,15 @@ export class ApiHandler {
                 return { data: workflows };
             }
             
+            case 'summarize': {
+                this.services.coordinator.updateWorkflowHistorySummary(
+                    params.sessionId as string,
+                    params.workflowId as string,
+                    params.summary as string
+                );
+                return { message: `Workflow summary updated for ${params.workflowId}` };
+            }
+            
             default:
                 throw new Error(`Unknown workflow action: ${action}`);
         }
@@ -1152,7 +1164,16 @@ export class ApiHandler {
         const task = this.services.taskManager!.getTask(globalTaskId);
         
         if (!task) {
-            throw new Error(`Task ${taskId} not found in session ${sessionId}`);
+            // Get all tasks for this session to help with debugging
+            const sessionTasks = this.services.taskManager!.getTasksForSession(sessionId);
+            const taskList = sessionTasks.length > 0 
+                ? sessionTasks.map(t => t.id.replace(`${sessionId}_`, '')).join(', ')
+                : '(no tasks)';
+            
+            throw new Error(
+                `Task ${taskId} not found in session ${sessionId}. ` +
+                `Available tasks for this session: ${taskList}`
+            );
         }
         
         return {

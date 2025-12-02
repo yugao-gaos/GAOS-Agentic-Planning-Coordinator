@@ -31,6 +31,7 @@ export class IdlePlanMonitor {
     private idlePlans: Map<string, IdlePlanState> = new Map();
     private outputManager?: OutputChannelManager;
     private hasTriggeredStartup: boolean = false;
+    private systemReady: boolean = false;
     
     constructor(
         private stateManager: StateManager,
@@ -46,8 +47,27 @@ export class IdlePlanMonitor {
     }
     
     /**
+     * Signal that the system is ready (dependencies checked, services initialized)
+     * This enables startup evaluation to proceed
+     */
+    setSystemReady(): void {
+        if (this.systemReady) {
+            return;  // Already set
+        }
+        
+        this.systemReady = true;
+        this.log('System marked as ready');
+        
+        // If monitor is already running but startup eval was skipped, trigger it now
+        if (this.checkInterval && !this.hasTriggeredStartup) {
+            this.log('System ready - triggering deferred startup evaluation');
+            this.triggerStartupEvaluation();
+        }
+    }
+    
+    /**
      * Start monitoring for idle plans
-     * @param triggerImmediately If true, trigger coordinator for existing approved plans immediately on startup
+     * @param triggerImmediately If true, trigger coordinator for existing approved plans immediately on startup (if system is ready)
      */
     start(triggerImmediately: boolean = true): void {
         if (this.checkInterval) {
@@ -57,8 +77,13 @@ export class IdlePlanMonitor {
         this.log('Starting idle plan monitor');
         
         // On startup, trigger immediately for any existing approved plans
+        // BUT only if system is ready (dependencies checked, services initialized)
         if (triggerImmediately && !this.hasTriggeredStartup) {
-            this.triggerStartupEvaluation();
+            if (this.systemReady) {
+                this.triggerStartupEvaluation();
+            } else {
+                this.log('Startup evaluation deferred - waiting for system ready signal');
+            }
         }
         
         this.checkInterval = setInterval(() => {

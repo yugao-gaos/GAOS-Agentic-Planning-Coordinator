@@ -208,6 +208,13 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
     idlePlanMonitor.start();
     console.log('[Standalone] IdlePlanMonitor started');
     
+    // Signal system ready - this allows IdlePlanMonitor to trigger startup evaluation
+    // After a short delay to ensure all async initialization is complete
+    setTimeout(() => {
+        idlePlanMonitor.setSystemReady();
+        console.log('[Standalone] System initialization complete - marked as ready');
+    }, 1000);  // 1 second delay to ensure everything is fully initialized
+    
     // Return API services interface
     return {
         stateManager: {
@@ -244,6 +251,8 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
             signalAgentCompletion: (signal: any) => coordinator.signalAgentCompletion(signal),
             triggerCoordinatorEvaluation: (sessionId: string, eventType: string, payload: any) => 
                 coordinator.triggerCoordinatorEvaluation(sessionId, eventType as any, payload),
+            updateWorkflowHistorySummary: (sessionId: string, workflowId: string, summary: string) =>
+                coordinator.updateWorkflowHistorySummary(sessionId, workflowId, summary),
             startTaskWorkflow: (sessionId: string, taskId: string, workflowType: string) =>
                 coordinator.startTaskWorkflow(sessionId, taskId, workflowType),
             // Graceful shutdown and recovery

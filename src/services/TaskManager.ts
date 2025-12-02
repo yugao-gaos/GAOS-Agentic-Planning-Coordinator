@@ -504,6 +504,8 @@ export class TaskManager {
      * 
      * Tasks with invalid format are skipped (not loaded).
      * The coordinator will detect missing tasks and recreate them.
+     * 
+     * Loads from per-plan storage: _AiDevLog/Plans/{sessionId}/tasks.json
      */
     private loadPersistedTasks(): void {
         const stateManager = this.getStateManager();

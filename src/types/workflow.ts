@@ -121,6 +121,7 @@ export interface CompletedWorkflowSummary {
     completedAt: string;
     result?: string;
     logPath?: string;
+    summary?: string;  // One-paragraph completion summary
 }
 
 /**

@@ -281,6 +281,54 @@ case "$COMMAND" in
         esac
         ;;
     
+    workflow|wf)
+        SUB="${1:-list}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            summarize|sum)
+                SESSION=""
+                WORKFLOW=""
+                SUMMARY=""
+                
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        --session|-s)
+                            SESSION="$2"
+                            shift 2
+                            ;;
+                        --workflow|-w)
+                            WORKFLOW="$2"
+                            shift 2
+                            ;;
+                        --summary)
+                            SUMMARY="$2"
+                            shift 2
+                            ;;
+                        *)
+                            shift
+                            ;;
+                    esac
+                done
+                
+                if [[ -z "$SESSION" ]] || [[ -z "$WORKFLOW" ]] || [[ -z "$SUMMARY" ]]; then
+                    echo -e "${RED}Usage: apc workflow summarize --session <id> --workflow <id> --summary \"<text>\"${RESET}"
+                    exit 1
+                fi
+                
+                # Escape quotes in summary
+                SUMMARY=$(echo "$SUMMARY" | sed 's/"/\\"/g')
+                
+                response=$(send_ws_command "workflow.summarize" "{\"sessionId\": \"$SESSION\", \"workflowId\": \"$WORKFLOW\", \"summary\": \"$SUMMARY\"}")
+                display_response "$response"
+                ;;
+            *)
+                echo -e "${YELLOW}Usage: apc workflow [summarize]${RESET}"
+                echo ""
+                echo "  summarize    Add completion summary to workflow history"
+                ;;
+        esac
+        ;;
+    
     exec|e|run)
         SUB="${1:-status}"
         shift 2>/dev/null || true

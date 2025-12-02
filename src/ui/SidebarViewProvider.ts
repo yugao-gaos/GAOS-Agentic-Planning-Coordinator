@@ -359,7 +359,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                             percentage: hist.status === 'completed' ? 100 : 0,
                             startedAt: hist.startedAt,
                             taskId: hist.taskId,
-                            logPath: hist.logPath
+                            logPath: hist.logPath,
+                            summary: hist.summary
                         });
                     }
                     

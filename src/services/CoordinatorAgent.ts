@@ -218,9 +218,6 @@ export class CoordinatorAgent {
             this.log(`[DEBUG] Prompt length: ${prompt.length} chars`);
         }
         
-        // Save prompt to log file for debugging
-        this.saveCoordinatorLog(input.sessionId, evalId, 'prompt', prompt);
-        
         // Set up log file for streaming output capture
         // Use global coordinator logs folder since coordinator is global (not session-specific)
         const logDir = this.getGlobalCoordinatorLogsFolder();
@@ -243,10 +240,8 @@ export class CoordinatorAgent {
             onProgress: (msg) => this.log(`[eval] ${msg}`)
         });
         
-        // Save parsed output to log file for debugging
-        // Note: result.output only contains parsed 'result' type messages, not raw JSON
-        this.saveCoordinatorLog(input.sessionId, evalId, 'output', 
-            result.output || '(no parsed output - check stream.log for raw output)');
+        // Clean up old streaming log files after saving (keep last N runs worth)
+        this.cleanupOldLogs(logDir);
         
         this.log(`[DEBUG] Coordinator stream log: ${logFile}`);
         
@@ -292,52 +287,25 @@ export class CoordinatorAgent {
     }
     
     /**
-     * Save coordinator prompt/output to log file for debugging
-     * Logs are saved to global folder: _AiDevLog/Logs/Coordinator/
-     * 
-     * Automatically cleans up old logs, keeping only the most recent runs.
+     * Maximum number of evaluation runs to keep streaming logs for.
+     * Only stream logs (.log files) are kept now.
      */
-    private saveCoordinatorLog(sessionId: string, evalId: string, type: 'prompt' | 'output', content: string): void {
-        try {
-            const logDir = this.getGlobalCoordinatorLogsFolder();
-            if (!fs.existsSync(logDir)) {
-                fs.mkdirSync(logDir, { recursive: true });
-            }
-            
-            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            // Include sessionId in filename for reference, but store in global folder
-            const filename = `${timestamp}_${sessionId}_${evalId}_${type}.txt`;
-            const filepath = path.join(logDir, filename);
-            
-            fs.writeFileSync(filepath, content);
-            this.log(`[DEBUG] Saved coordinator ${type} to: ${filepath}`);
-            
-            // Clean up old log files after saving (keep last N runs worth)
-            this.cleanupOldLogs(logDir);
-        } catch (err) {
-            this.log(`[WARN] Failed to save coordinator log: ${err}`);
-        }
-    }
-    
-    /**
-     * Maximum number of evaluation runs to keep logs for.
-     * Each run creates 3 files: prompt, output, and stream log.
-     */
-    private static readonly MAX_LOG_RUNS = 10;
+    private static readonly MAX_LOG_RUNS = 3;
     
     /**
      * Clean up old coordinator log files, keeping only the most recent runs.
      * Files are sorted by name (which includes timestamp) to determine age.
+     * Only keeps streaming logs (.log files).
      */
     private cleanupOldLogs(logDir: string): void {
         try {
             const files = fs.readdirSync(logDir)
-                .filter(f => f.endsWith('.txt') || f.endsWith('.log'))
+                .filter(f => f.endsWith('.log'))  // Only streaming logs
                 .sort()
                 .reverse(); // Newest first (timestamp is in filename)
             
-            // Each eval run produces ~3 files (prompt, output, stream), so keep MAX_LOG_RUNS * 3
-            const maxFiles = CoordinatorAgent.MAX_LOG_RUNS * 3;
+            // Keep only last N streaming logs
+            const maxFiles = CoordinatorAgent.MAX_LOG_RUNS;
             
             if (files.length > maxFiles) {
                 const filesToDelete = files.slice(maxFiles);

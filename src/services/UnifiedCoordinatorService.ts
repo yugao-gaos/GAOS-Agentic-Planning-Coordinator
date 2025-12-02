@@ -1183,6 +1183,34 @@ export class UnifiedCoordinatorService {
     }
     
     /**
+     * Update workflow history with summary (called via CLI)
+     */
+    updateWorkflowHistorySummary(
+        sessionId: string,
+        workflowId: string,
+        summary: string
+    ): void {
+        const state = this.sessions.get(sessionId);
+        if (!state) {
+            this.log(`Cannot update summary: session ${sessionId} not found`);
+            return;
+        }
+        
+        // Find the workflow in history and update its summary
+        const historyEntry = state.workflowHistory.find(h => h.id === workflowId);
+        if (historyEntry) {
+            historyEntry.summary = summary;
+            
+            // Persist updated history to disk
+            this.stateManager.saveWorkflowHistory(sessionId, state.workflowHistory);
+            
+            this.log(`✅ Updated workflow summary for ${workflowId.substring(0, 8)}`);
+        } else {
+            this.log(`Cannot update summary: workflow ${workflowId} not found in history`);
+        }
+    }
+    
+    /**
      * Handle workflow completion
      */
     private async handleWorkflowComplete(
@@ -1203,6 +1231,7 @@ export class UnifiedCoordinatorService {
         // Add to workflow history (newest first) with sliding window
         const workflow = state.workflows.get(workflowId);
         const taskId = state.workflowToTaskMap.get(workflowId);
+        
         const historySummary: CompletedWorkflowSummary = {
             id: workflowId,
             type: workflow?.type || 'unknown',

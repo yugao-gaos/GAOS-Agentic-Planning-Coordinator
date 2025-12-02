@@ -43,6 +43,8 @@ export interface WorkflowInfo {
     waitingForAgent?: boolean;
     /** Role ID of agent being waited for */
     waitingForAgentRole?: string;
+    /** Brief summary of what was accomplished or why it failed */
+    summary?: string;
 }
 
 export interface SessionInfo {

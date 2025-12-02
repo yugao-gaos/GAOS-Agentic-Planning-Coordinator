@@ -971,6 +971,37 @@ apc task status --session ps_000001 --id T1
 apc task complete --session ps_000001 --id T1
 \`\`\`
 
+**Record workflow summary (when workflow completes):**
+\`\`\`bash
+apc workflow summarize --session ps_000001 --workflow wf_abc123 --summary "Implemented Player controller with movement and collision detection. Modified 3 files: PlayerController.cs, PlayerMovement.cs, CollisionHandler.cs. All tests passed."
+\`\`\`
+
+## Workflow Completion Summaries
+
+**IMPORTANT: When you receive a workflow_completed event, you MUST write a summary!**
+
+After processing the workflow completion (dispatching next tasks, etc.), use:
+\`\`\`bash
+apc workflow summarize --session <sessionId> --workflow <workflowId> --summary "<1-2 sentence summary>"
+\`\`\`
+
+The summary should capture:
+- What was accomplished (task completed, errors fixed, plan created, etc.)
+- Key files or components affected
+- Important outcomes or decisions
+
+**Examples:**
+\`\`\`bash
+# Task implementation completed
+apc workflow summarize --session ps_000001 --workflow wf_abc123 --summary "Completed task T5: Implemented combo system with 3 attack types. Modified ComboSystem.cs and ComboData.cs. Unity tests passed."
+
+# Error resolution completed
+apc workflow summarize --session ps_000001 --workflow wf_def456 --summary "Fixed compilation errors in EnemyAI.cs related to missing namespace. Resolved null reference exception in SpawnManager."
+
+# Planning workflow completed
+apc workflow summarize --session ps_000001 --workflow wf_ghi789 --summary "Generated new plan with 8 tasks for implementing inventory system. Identified dependencies and created task breakdown."
+\`\`\`
+
 ## What To Do
 
 1. Run \`apc task list\` to see existing tasks and their status

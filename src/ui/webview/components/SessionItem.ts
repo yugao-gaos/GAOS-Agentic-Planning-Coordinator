@@ -196,6 +196,11 @@ function renderHistoryItem(wf: WorkflowInfo): string {
         ? '<span style="color: #10b981;">✓</span>' 
         : '<span style="color: #f14c4c;">✗</span>';
     
+    // Include summary if available
+    const summaryLine = wf.summary 
+        ? `<div class="workflow-summary" style="font-size: 11px; opacity: 0.6; margin-left: 24px; margin-top: 2px;">${wf.summary}</div>`
+        : '';
+    
     return `
         <div class="nested-item level-3 history-item ${wf.status}">
             <div class="nested-icon ${typeInfo.class}" style="opacity: 0.6;">
@@ -204,6 +209,7 @@ function renderHistoryItem(wf: WorkflowInfo): string {
             <span class="nested-label" style="opacity: 0.7;">${label}</span>
             <span class="workflow-phase" style="font-size: 10px; opacity: 0.7;">${statusIcon} ${wf.phase}</span>
         </div>
+        ${summaryLine}
     `;
 }
 
