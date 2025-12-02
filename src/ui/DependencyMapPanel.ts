@@ -1,6 +1,4 @@
 import * as vscode from 'vscode';
-import { TaskManager, ManagedTask } from '../services/TaskManager';
-import { ServiceLocator } from '../services/ServiceLocator';
 import { VsCodeClient } from '../vscode/VsCodeClient';
 
 /**
@@ -41,12 +39,12 @@ export class DependencyMapPanel {
         panel: vscode.WebviewPanel,
         extensionUri: vscode.Uri,
         sessionId: string,
-        vsCodeClient?: VsCodeClient
+        vsCodeClient: VsCodeClient
     ) {
         this.panel = panel;
         this.extensionUri = extensionUri;
         this.sessionId = sessionId;
-        this.vsCodeClient = vsCodeClient || null;
+        this.vsCodeClient = vsCodeClient;
 
         // Handle messages from webview
         this.panel.webview.onDidReceiveMessage(
@@ -78,7 +76,7 @@ export class DependencyMapPanel {
     /**
      * Show the dependency map panel for a session
      */
-    public static show(sessionId: string, extensionUri: vscode.Uri, vsCodeClient?: VsCodeClient): void {
+    public static show(sessionId: string, extensionUri: vscode.Uri, vsCodeClient: VsCodeClient): void {
         const column = vscode.window.activeTextEditor
             ? vscode.window.activeTextEditor.viewColumn
             : undefined;
@@ -151,65 +149,23 @@ export class DependencyMapPanel {
 
         console.log(`[DependencyMapPanel] getTasks() called for sessionId: ${this.sessionId}`);
 
-        if (this.vsCodeClient) {
-            try {
-                // Get tasks for this session
-                console.log(`[DependencyMapPanel] Querying daemon for tasks with sessionId: ${this.sessionId}`);
-                const response = await this.vsCodeClient.send<{ data: ApiTask[] }>('task.list', { sessionId: this.sessionId });
-                tasks = response.data || [];
-                console.log(`[DependencyMapPanel] Daemon returned ${tasks.length} tasks for session ${this.sessionId}`);
-                
-                // If no tasks for this session, get all tasks to check other sessions
-                if (tasks.length === 0) {
-                    console.log(`[DependencyMapPanel] No tasks found, fetching all tasks to check other sessions`);
-                    const allResponse = await this.vsCodeClient.send<{ data: ApiTask[] }>('task.list', {});
-                    allTasks = allResponse.data || [];
-                    console.log(`[DependencyMapPanel] Found ${allTasks.length} total tasks across all sessions`);
-                }
-            } catch (err) {
-                console.error('[DependencyMapPanel] Failed to fetch tasks from daemon:', err);
+        try {
+            // Get tasks for this session from daemon
+            console.log(`[DependencyMapPanel] Querying daemon for tasks with sessionId: ${this.sessionId}`);
+            const response = await this.vsCodeClient.send<{ data: ApiTask[] }>('task.list', { sessionId: this.sessionId });
+            tasks = response.data || [];
+            console.log(`[DependencyMapPanel] Daemon returned ${tasks.length} tasks for session ${this.sessionId}`);
+            
+            // If no tasks for this session, get all tasks to check other sessions
+            if (tasks.length === 0) {
+                console.log(`[DependencyMapPanel] No tasks found, fetching all tasks to check other sessions`);
+                const allResponse = await this.vsCodeClient.send<{ data: ApiTask[] }>('task.list', {});
+                allTasks = allResponse.data || [];
+                console.log(`[DependencyMapPanel] Found ${allTasks.length} total tasks across all sessions`);
             }
-        }
-
-        // Fallback to local TaskManager if API returned no tasks
-        if (tasks.length === 0 && !this.vsCodeClient) {
-            try {
-                console.log(`[DependencyMapPanel] Falling back to local TaskManager`);
-                const taskManager = ServiceLocator.resolve(TaskManager);
-                const managedTasks = taskManager.getTasksForSession(this.sessionId);
-                console.log(`[DependencyMapPanel] TaskManager returned ${managedTasks.length} tasks for session ${this.sessionId}`);
-                
-                // Convert ManagedTask to ApiTask format
-                tasks = managedTasks.map(t => ({
-                    id: t.id.replace(`${this.sessionId}_`, ''),
-                    globalId: t.id,
-                    sessionId: t.sessionId,
-                    description: t.description,
-                    status: t.status,
-                    type: t.taskType,
-                    dependencies: t.dependencies,
-                    dependents: t.dependents,
-                    priority: t.priority
-                }));
-                
-                if (tasks.length === 0) {
-                    const allManagedTasks = taskManager.getAllTasks();
-                    console.log(`[DependencyMapPanel] TaskManager has ${allManagedTasks.length} total tasks across all sessions`);
-                    allTasks = allManagedTasks.map(t => ({
-                        id: t.id.replace(`${t.sessionId}_`, ''),
-                        globalId: t.id,
-                        sessionId: t.sessionId,
-                        description: t.description,
-                        status: t.status,
-                        type: t.taskType,
-                        dependencies: t.dependencies,
-                        dependents: t.dependents,
-                        priority: t.priority
-                    }));
-                }
-            } catch (err) {
-                console.error('[DependencyMapPanel] TaskManager not available:', err);
-            }
+        } catch (err) {
+            console.error('[DependencyMapPanel] Failed to fetch tasks from daemon:', err);
+            vscode.window.showErrorMessage('Cannot load tasks: Daemon connection error. Please ensure the daemon is running.');
         }
 
         // Convert to TaskNode format

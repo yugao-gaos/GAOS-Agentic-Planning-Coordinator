@@ -1,11 +1,5 @@
 import * as vscode from 'vscode';
 import { DependencyService } from '../services/DependencyService';
-import { StateManager } from '../services/StateManager';
-import { AgentPoolService } from '../services/AgentPoolService';
-import { UnityControlManager } from '../services/UnityControlManager';
-import { UnifiedCoordinatorService } from '../services/UnifiedCoordinatorService';
-import { TaskManager } from '../services/TaskManager';
-import { WorkflowProgress } from '../types/workflow';
 import { DaemonStateProxy } from '../services/DaemonStateProxy';
 import { ROLE_WORKFLOW_MAP } from '../types/constants';
 import { ServiceLocator } from '../services/ServiceLocator';
@@ -31,9 +25,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
 
     private _view?: vscode.WebviewView;
     private dependencyService: DependencyService;
-    private stateManager?: StateManager;
-    private agentPoolService?: AgentPoolService;
-    private unifiedCoordinator?: UnifiedCoordinatorService;
     private stateProxy?: DaemonStateProxy;
     private disposables: vscode.Disposable[] = [];
     
@@ -74,43 +65,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         });
         
         this.refresh();
-    }
-
-    public setServices(stateManager: StateManager, agentPoolService: AgentPoolService) {
-        this.stateManager = stateManager;
-        this.agentPoolService = agentPoolService;
-        
-        // Subscribe to UnifiedCoordinatorService events
-        this.subscribeToWorkflowEvents();
-    }
-    
-    /**
-     * Subscribe to workflow events for real-time UI updates
-     */
-    private subscribeToWorkflowEvents(): void {
-        try {
-            this.unifiedCoordinator = ServiceLocator.resolve(UnifiedCoordinatorService);
-            
-            // Subscribe to workflow progress updates
-            this.disposables.push(
-                this.unifiedCoordinator.onWorkflowProgress((_progress: WorkflowProgress) => {
-                    // Debounced refresh to avoid UI flicker
-                    this.debouncedRefresh();
-                })
-            );
-            
-            // Subscribe to session state changes
-            this.disposables.push(
-                this.unifiedCoordinator.onSessionStateChanged((_sessionId: string) => {
-                    this.debouncedRefresh();
-                })
-            );
-            
-            console.log('[SidebarViewProvider] Subscribed to workflow events');
-        } catch (e) {
-            // UnifiedCoordinatorService may not be initialized yet
-            console.log('[SidebarViewProvider] UnifiedCoordinatorService not yet available');
-        }
     }
     
     private refreshDebounceTimer?: NodeJS.Timeout;
@@ -214,8 +168,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     {
                         let planPath = data.planPath;
                         // If planPath not provided directly, try to look it up from session
-                        if (!planPath && data.sessionId) {
-                            const session = this.stateManager?.getPlanningSession(data.sessionId);
+                        if (!planPath && data.sessionId && this.stateProxy) {
+                            const sessions = await this.stateProxy.getPlanningSessions();
+                            const session = sessions.find(s => s.id === data.sessionId);
                             planPath = session?.currentPlanPath;
                         }
                         if (planPath) {
@@ -366,10 +321,10 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         // Sessions with workflow information
         const sessions: SessionInfo[] = [];
         
-        // Get sessions from proxy or local state manager
+        // Get sessions from proxy
         const allSessions = this.stateProxy 
             ? await this.stateProxy.getPlanningSessions()
-            : (this.stateManager?.getAllPlanningSessions() || []);
+            : [];
             
         for (const s of allSessions) {
             // Get active workflows for this session from proxy or coordinator
@@ -400,7 +355,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                             totalPhases: 1,
                             percentage: hist.status === 'completed' ? 100 : 0,
                             startedAt: hist.startedAt,
-                            taskId: hist.taskId
+                            taskId: hist.taskId,
+                            logPath: hist.logPath
                         });
                     }
                     
@@ -425,7 +381,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                             percentage: progress.percentage,
                             startedAt: progress.startedAt,
                             taskId,
-                            logPath: progress.logPath
+                            logPath: progress.logPath,
+                            waitingForAgent: progress.waitingForAgent,
+                            waitingForAgentRole: progress.waitingForAgentRole
                         });
                         
                         // Count task workflows
@@ -448,10 +406,10 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             if (activeWorkflows.length === 0 && s.execution) {
                 taskCount = s.execution.progress?.total || 0;
                 completedTasks = s.execution.progress?.completed || 0;
-                // Get agent count from proxy or TaskManager
+                // Get agent count from proxy
                 const sessionAssignments = this.stateProxy
                     ? await this.stateProxy.getSessionAgentAssignments(s.id)
-                    : ServiceLocator.resolve(TaskManager).getAgentAssignmentsForUI().filter((a: { sessionId: string }) => a.sessionId === s.id);
+                    : [];
                 agentCount = sessionAssignments.length;
             }
             
@@ -528,11 +486,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     let taskId: string | undefined;
                     let matchedWorkflowId: string | undefined;
                     
-                    // Match agent to workflow by workflowId (preferred) or fall back to role matching
-                    for (const wf of activeWorkflows) {
-                        if (wf.status === 'running') {
-                            // Prefer direct workflowId match if available
-                            if (agent.workflowId && agent.workflowId === wf.id) {
+                    // Match agent to workflow by workflowId ONLY (no fallback)
+                    // AgentPoolService is the single source of truth for workflowId
+                    if (agent.workflowId) {
+                        for (const wf of activeWorkflows) {
+                            if (wf.id === agent.workflowId) {
                                 workflowType = wf.type;
                                 currentPhase = wf.phase;
                                 taskId = wf.taskId;
@@ -540,22 +498,14 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                                 break;
                             }
                         }
-                    }
-                    
-                    // Fall back to role-based matching only if no workflowId match
-                    if (!matchedWorkflowId) {
-                        for (const wf of activeWorkflows) {
-                            if (wf.status === 'running') {
-                                const possibleWorkflows = ROLE_WORKFLOW_MAP[agent.roleId || ''] || [];
-                                if (possibleWorkflows.includes(wf.type)) {
-                                    workflowType = wf.type;
-                                    currentPhase = wf.phase;
-                                    taskId = wf.taskId;
-                                    matchedWorkflowId = wf.id;
-                                    break;
-                                }
-                            }
+                        
+                        // Log warning if workflowId doesn't match any active workflow
+                        if (!matchedWorkflowId) {
+                            console.warn(`[SidebarViewProvider] Agent ${agent.name} has workflowId=${agent.workflowId} but no matching workflow found in session ${s.id}`);
                         }
+                    } else {
+                        // Log warning if agent is busy but has no workflowId
+                        console.warn(`[SidebarViewProvider] Busy agent ${agent.name} in session ${s.id} has no workflowId set`);
                     }
                     
                     sessionAgents.push({
@@ -616,23 +566,21 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 roleColor = role?.color;
             }
             
-            // Find workflow context for this agent from sessions
+            // Find workflow context for this agent from AgentPoolService workflowId
             let workflowType: string | undefined;
             let currentPhase: string | undefined;
             let taskId: string | undefined;
             let sessionId: string | undefined;
             
-            // Search through sessions to find matching workflow
+            // Search through sessions to find matching workflow using workflowId
             for (const session of sessions) {
-                if (agent.coordinatorId === session.id || 
-                    (session.executionStatus && agent.coordinatorId)) {
+                if (agent.coordinatorId === session.id || agent.sessionId === session.id) {
                     sessionId = session.id.substring(0, 8);
                     
-                    // Find matching workflow using shared constant
-                    for (const wf of session.activeWorkflows) {
-                        if (wf.status === 'running') {
-                            const possibleWorkflows = ROLE_WORKFLOW_MAP[agent.roleId || ''] || [];
-                            if (possibleWorkflows.includes(wf.type)) {
+                    // Find matching workflow by workflowId ONLY (no role-based fallback)
+                    if (agent.workflowId) {
+                        for (const wf of session.activeWorkflows) {
+                            if (wf.id === agent.workflowId) {
                                 workflowType = wf.type;
                                 currentPhase = wf.phase;
                                 taskId = wf.taskId;
@@ -640,7 +588,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                             }
                         }
                     }
-                    if (workflowType) break;
+                    break;
                 }
             }
             
@@ -649,6 +597,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 status: 'busy',
                 roleId: agent.roleId,
                 coordinatorId: agent.coordinatorId,
+                workflowId: agent.workflowId,  // Use workflowId from AgentPoolService
                 roleColor: roleColor || '#f97316',  // Default orange
                 workflowType,
                 currentPhase,
@@ -676,23 +625,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             
             if (unityStatus) {
                 unity = unityStatus;
-            } else {
-                // Fallback to local Unity manager
-                try {
-                    const unityManager = ServiceLocator.resolve(UnityControlManager);
-                    const localStatus = unityManager.getUnityStatus();
-                    unity = {
-                        connected: unityManager.isPollingAgentRunning(),
-                        isPlaying: localStatus?.isPlaying || false,
-                        isCompiling: localStatus?.isCompiling || false,
-                        hasErrors: localStatus?.hasErrors || false,
-                        errorCount: localStatus?.errorCount || 0,
-                        queueLength: unityManager.getQueue().length
-                    };
-                } catch (e) {
-                    console.warn('[SidebarViewProvider] Unity manager not available:', e);
-                }
             }
+            // No fallback - if daemon doesn't provide unity status, we simply don't show it
         }
 
         // Get coordinator status

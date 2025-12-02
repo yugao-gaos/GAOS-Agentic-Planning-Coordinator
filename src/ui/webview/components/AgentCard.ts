@@ -33,10 +33,17 @@ function renderBusyAgent(agent: AgentInfo): string {
     // Build status line - role name
     const statusLine = agent.roleId || 'Working';
     
-    // Build detail line: current phase (skip if same as role to avoid duplication)
-    let detailLine = '';
-    if (agent.currentPhase && agent.currentPhase !== agent.roleId) {
-        detailLine = agent.currentPhase;
+    // Build workflow/task line showing what the agent is working on
+    let workflowLine = '';
+    if (agent.workflowType && agent.taskId) {
+        // Task workflow: show "T1 impl"
+        workflowLine = `${agent.taskId} ${agent.workflowType}`;
+    } else if (agent.workflowType) {
+        // Non-task workflow: show type
+        workflowLine = agent.workflowType;
+    } else if (agent.currentPhase) {
+        // Fallback to phase if no workflow info
+        workflowLine = agent.currentPhase;
     }
     
     // Session line
@@ -51,8 +58,8 @@ function renderBusyAgent(agent: AgentInfo): string {
                 <span class="agent-name">${agent.name}</span>
             </div>
             <div class="agent-status-line" style="color: ${roleColor};">${statusLine}</div>
-            ${detailLine ? `<div class="agent-task-line">${detailLine}</div>` : ''}
-            ${sessionLine ? `<div class="agent-task-line" style="opacity: 0.6;">${sessionLine}</div>` : ''}
+            ${workflowLine ? `<div class="agent-task-line">${workflowLine}</div>` : ''}
+            ${sessionLine ? `<div class="agent-task-line" style="opacity: 0.6; font-size: 10px;">${sessionLine}</div>` : ''}
             <button class="agent-stop-btn" data-agent="${agent.name}">
                 ${ICONS.stop}
                 Stop

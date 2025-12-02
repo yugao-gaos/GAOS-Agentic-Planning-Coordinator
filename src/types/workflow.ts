@@ -52,6 +52,8 @@ export interface WorkflowProgress {
     taskId?: string;         // Task ID for task_implementation/error_resolution workflows
     estimatedRemaining?: number; // Milliseconds
     logPath?: string;        // Path to workflow log file
+    waitingForAgent?: boolean;   // True when workflow is waiting for an agent to be allocated
+    waitingForAgentRole?: string; // Role ID of the agent being waited for
 }
 
 /**
@@ -118,6 +120,7 @@ export interface CompletedWorkflowSummary {
     startedAt: string;
     completedAt: string;
     result?: string;
+    logPath?: string;
 }
 
 /**

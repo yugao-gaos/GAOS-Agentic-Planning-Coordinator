@@ -185,6 +185,8 @@ export interface ITaskManagerApi {
     deleteTask?(globalTaskId: string, reason?: string): boolean;
     /** Validate task format, returns { valid: true } or { valid: false, reason: string } */
     validateTaskFormat?(task: any): { valid: true } | { valid: false; reason: string };
+    /** Get agent assignments for UI display */
+    getAgentAssignmentsForUI?(): Array<{ name: string; sessionId: string; roleId?: string; workflowId?: string; currentTaskId?: string; status: string; assignedAt: string; lastActivityAt?: string; logFile: string }>;
 }
 
 // Import types for agent completion signal
@@ -1074,6 +1076,20 @@ export class ApiHandler {
                     throw new Error('Missing reason parameter');
                 }
                 return this.taskFail(sessionId, taskId, params.reason as string);
+            }
+            
+            case 'assignments': {
+                // Get agent assignments for UI - optionally filtered by session
+                if (!this.services.taskManager.getAgentAssignmentsForUI) {
+                    return { data: [] };
+                }
+                
+                const allAssignments = this.services.taskManager.getAgentAssignmentsForUI();
+                const assignments = sessionId
+                    ? allAssignments.filter(a => a.sessionId === sessionId)
+                    : allAssignments;
+                
+                return { data: assignments };
             }
             
             default:

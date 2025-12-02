@@ -7,7 +7,6 @@
  */
 
 import { VsCodeClient } from '../vscode/VsCodeClient';
-import { AgentAssignment } from './TaskManager';
 import { TypedEventEmitter } from './TypedEventEmitter';
 import {
     PlanningSession,
@@ -15,6 +14,19 @@ import {
     AgentRole
 } from '../types';
 import { WorkflowProgress, FailedTask, CompletedWorkflowSummary } from '../types/workflow';
+
+// Agent assignment interface (was from TaskManager, now defined here for extension use)
+export interface AgentAssignment {
+    name: string;
+    sessionId: string;
+    roleId?: string;
+    workflowId?: string;
+    currentTaskId?: string;
+    status: string;
+    assignedAt: string;
+    lastActivityAt?: string;
+    logFile: string;
+}
 
 // ============================================================================
 // Types

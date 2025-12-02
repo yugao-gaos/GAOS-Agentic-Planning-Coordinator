@@ -84,6 +84,10 @@ export abstract class BaseWorkflow implements IWorkflow {
     private pausePromise: Promise<void> | null = null;
     private pauseResolve: (() => void) | null = null;
     
+    // Agent waiting state
+    protected waitingForAgent: boolean = false;
+    protected waitingForAgentRole: string | undefined;
+    
     // ========================================================================
     // Events (from IWorkflow)
     // ========================================================================
@@ -310,7 +314,9 @@ export abstract class BaseWorkflow implements IWorkflow {
                 : '',
             updatedAt: new Date().toISOString(),
             taskId,
-            logPath: this.workflowLogPath
+            logPath: this.workflowLogPath,
+            waitingForAgent: this.waitingForAgent,
+            waitingForAgentRole: this.waitingForAgentRole
         };
     }
     
@@ -885,13 +891,27 @@ ${ctx.partialOutput.slice(-3000)}
      */
     protected requestAgent(roleId: string): Promise<string> {
         return new Promise((resolve) => {
+            // Set waiting state and emit progress update
+            this.waitingForAgent = true;
+            this.waitingForAgentRole = roleId;
+            this.emitProgress();
+            this.log(`Waiting for agent with role: ${roleId}`);
+            
             const request: AgentRequest = {
                 workflowId: this.id,
                 roleId,
                 priority: this.priority,
                 callback: (agentName: string) => {
+                    // Clear waiting state when agent is allocated
+                    this.waitingForAgent = false;
+                    this.waitingForAgentRole = undefined;
+                    
                     this.allocatedAgents.push(agentName);
                     this.log(`Agent allocated: ${agentName} (role: ${roleId})`);
+                    
+                    // Emit progress update to clear waiting indicator in UI
+                    this.emitProgress();
+                    
                     resolve(agentName);
                 }
             };

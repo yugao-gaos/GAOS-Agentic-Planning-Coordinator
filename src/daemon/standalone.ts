@@ -30,7 +30,7 @@ import { AgentRunner } from '../services/AgentBackend';
 import { OutputChannelManager } from '../services/OutputChannelManager';
 import { TaskManager } from '../services/TaskManager';
 import { UnityControlManager } from '../services/UnityControlManager';
-import { bootstrapServices, ServiceLocator } from '../services/Bootstrap';
+import { bootstrapDaemonServices, ServiceLocator } from '../services/DaemonBootstrap';
 import { EventBroadcaster } from './EventBroadcaster';
 
 /**
@@ -43,7 +43,7 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
     console.log(`[Standalone] Agent pool size: ${config.agentPoolSize}`);
     
     // Bootstrap all services with ServiceLocator
-    bootstrapServices();
+    bootstrapDaemonServices();
     
     // Initialize output channel manager (file-only mode for standalone)
     const outputManager = ServiceLocator.resolve(OutputChannelManager);

@@ -148,8 +148,15 @@ function renderWorkflowItem(wf: WorkflowInfo, agents: AgentInfo[]): string {
     const percentage = Math.round(wf.percentage);
     const isActive = wf.status === 'running';
     
+    // Build phase display with waiting indicator if applicable
+    let phaseDisplay = `${wf.phase} (${wf.phaseIndex + 1}/${wf.totalPhases})`;
+    if (wf.waitingForAgent) {
+        const roleLabel = wf.waitingForAgentRole || 'agent';
+        phaseDisplay = `⏳ Waiting for ${roleLabel}...`;
+    }
+    
     return `
-        <div class="workflow-item ${wf.status}${isActive ? ' active' : ''}" 
+        <div class="workflow-item ${wf.status}${isActive ? ' active' : ''}${wf.waitingForAgent ? ' waiting' : ''}" 
              data-action="openWorkflowLog" 
              data-workflow-log="${wf.logPath || ''}" 
              title="Click to view workflow log" 
@@ -161,7 +168,7 @@ function renderWorkflowItem(wf: WorkflowInfo, agents: AgentInfo[]): string {
                 </div>
                 <div class="workflow-info">
                     <span class="workflow-type-label">${label}</span>
-                    <span class="workflow-phase">${wf.phase} (${wf.phaseIndex + 1}/${wf.totalPhases})</span>
+                    <span class="workflow-phase">${phaseDisplay}</span>
                 </div>
                 ${agentBadges}
             </div>

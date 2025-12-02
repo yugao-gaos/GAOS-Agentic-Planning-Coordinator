@@ -85,17 +85,24 @@ export class HistoryViewPanel {
         }
 
         try {
-            // Get session info using the session.get API
-            const sessionResponse = await this._vsCodeClient.send<any>('session.get', { id: this._sessionId });
+            // Get session metadata using session.get API
+            const sessionGetResponse = await this._vsCodeClient.send<any>('session.get', { id: this._sessionId });
             
-            if (!sessionResponse) {
+            if (!sessionGetResponse || !sessionGetResponse.session) {
+                return null;
+            }
+
+            // Get session state (workflows, history) using session.state API
+            const sessionStateResponse = await this._vsCodeClient.send<any>('session.state', { id: this._sessionId });
+            
+            if (!sessionStateResponse || !sessionStateResponse.state) {
                 return null;
             }
 
             // Transform workflow history from daemon state
             const workflowHistory: WorkflowInfo[] = [];
-            if (sessionResponse.state?.workflowHistory) {
-                for (const hist of sessionResponse.state.workflowHistory) {
+            if (sessionStateResponse.state.workflowHistory) {
+                for (const hist of sessionStateResponse.state.workflowHistory) {
                     workflowHistory.push({
                         id: hist.id,
                         type: hist.type,
@@ -112,8 +119,8 @@ export class HistoryViewPanel {
             }
 
             return {
-                sessionId: sessionResponse.id,
-                requirement: sessionResponse.requirement || 'Unknown',
+                sessionId: sessionGetResponse.session.id,
+                requirement: sessionGetResponse.session.requirement || 'Unknown',
                 history: workflowHistory
             };
         } catch (error) {

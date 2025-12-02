@@ -130,15 +130,14 @@ export interface SessionContext {
 export type AgentRole = 'context' | 'engineer' | 'reviewer';
 
 /**
- * Agent assignment tracking (unified for all roles)
- * This is the canonical source of truth for agent assignments.
- * AgentPoolService provides allocation, but TaskManager tracks assignments.
+ * Agent task context tracking
+ * Tracks task-specific information for agents.
+ * 
+ * NOTE: AgentPoolService is authoritative for agent allocation/status.
+ * TaskManager only tracks task-related context for routing and history.
  */
-export interface AgentAssignment {
+export interface AgentTaskContext {
     agentName: string;
-    sessionId: string;
-    currentRole: AgentRole;
-    status: 'idle' | 'working' | 'waiting' | 'error_fixing';
     
     // Current work
     currentTask?: ManagedTask;
@@ -152,15 +151,10 @@ export interface AgentAssignment {
     filesModified: string[];        // All files touched
     errorContext: Map<string, string[]>;  // errorId -> related files
     
-    // Session info
-    logFile: string;
-    processId?: number;
-    
     // Session continuity
     sessionContext: SessionContext;
     
     // Timing
-    assignedAt: string;
     lastActivityAt: string;
 }
 
@@ -169,7 +163,7 @@ export interface AgentAssignment {
  */
 export interface DispatchDecision {
     task: ManagedTask;
-    agent: AgentAssignment;
+    agentName: string;
     reason: string;
 }
 
@@ -220,8 +214,11 @@ export interface TaskConflictInfo {
  * - Tracks task dependencies and status globally
  * - Provides cross-plan file overlap detection
  * - Routes errors to relevant tasks/sessions
- * - Manages engineer assignments
+ * - Tracks task-specific agent context (history, errors, files)
  * - Creates error-fixing tasks
+ * 
+ * NOTE: AgentPoolService is authoritative for agent allocation/status.
+ * TaskManager delegates status queries to AgentPoolService.
  * 
  * Obtain via ServiceLocator:
  *   const taskManager = ServiceLocator.resolve(TaskManager);
@@ -230,8 +227,9 @@ export class TaskManager {
     // Global task storage (all tasks from all plans)
     private tasks: Map<string, ManagedTask> = new Map();
     
-    // Agent tracking (global) - unified for all roles (engineer, context, reviewer, etc.)
-    private agents: Map<string, AgentAssignment> = new Map();
+    // Agent task context tracking (task history, errors, files)
+    // NOTE: For allocation status, query AgentPoolService
+    private agentTaskContext: Map<string, AgentTaskContext> = new Map();
     
     // Session tracking
     private sessions: Map<string, SessionRegistration> = new Map();
@@ -262,7 +260,7 @@ export class TaskManager {
 
     // Callbacks
     private onTaskCompletedCallback?: (task: ManagedTask) => void;
-    private onAgentIdleCallback?: (agent: AgentAssignment) => void;
+    private onAgentIdleCallback?: (agentName: string) => void;
     private onTasksPausedCallback?: (notification: PausedTaskNotification) => void;
 
     // Configuration for task retention
@@ -281,7 +279,7 @@ export class TaskManager {
         const memMonitor = getMemoryMonitor();
         memMonitor.registerService('TaskManager', () => ({
             taskCount: this.tasks.size,
-            agentCount: this.agents.size,
+            agentContextCount: this.agentTaskContext.size,
             sessionCount: this.sessions.size,
             fileIndexSize: this.fileToTaskIndex.size,
             occupancyCount: this.taskOccupancy.size,
@@ -290,6 +288,18 @@ export class TaskManager {
         
         // Start periodic cleanup (every hour)
         this.startPeriodicCleanup();
+    }
+    
+    /**
+     * Get AgentPoolService for status queries
+     * AgentPoolService is the authoritative source for agent allocation/status
+     */
+    private getAgentPoolService(): import('./AgentPoolService').AgentPoolService | null {
+        try {
+            return ServiceLocator.resolve<import('./AgentPoolService').AgentPoolService>('AgentPoolService' as any);
+        } catch {
+            return null;
+        }
     }
     
     // ========================================================================
@@ -1167,55 +1177,56 @@ export class TaskManager {
     /**
      * Register an agent with the TaskManager
      */
+    /**
+     * Register an agent's task context
+     * NOTE: AgentPoolService is authoritative for allocation status.
+     * This only creates task-specific tracking (history, errors, files).
+     */
     registerAgent(
         agentName: string,
         sessionId: string,
         logFile: string,
         roleId: AgentRole = 'engineer'
-    ): AgentAssignment {
-        const assignment: AgentAssignment = {
-            agentName,
-            sessionId,
-            status: 'idle',
-            currentRole: roleId,
-            waitingTasks: [],
-            taskHistory: [],
-            filesModified: [],
-            errorContext: new Map(),
-            logFile,
-            sessionContext: {
-                sessionId,
-                pendingErrors: []
-            },
-            assignedAt: new Date().toISOString(),
-            lastActivityAt: new Date().toISOString()
-        };
-
-        this.agents.set(agentName, assignment);
-        this.log(`Registered agent: ${agentName} for session ${sessionId} (role: ${roleId})`);
-        return assignment;
+    ): void {
+        // Create task context if doesn't exist
+        if (!this.agentTaskContext.has(agentName)) {
+            const context: AgentTaskContext = {
+                agentName,
+                waitingTasks: [],
+                taskHistory: [],
+                filesModified: [],
+                errorContext: new Map(),
+                sessionContext: {
+                    sessionId,
+                    pendingErrors: []
+                },
+                lastActivityAt: new Date().toISOString()
+            };
+            this.agentTaskContext.set(agentName, context);
+            this.log(`Registered task context for agent: ${agentName} (session: ${sessionId}, role: ${roleId})`);
+        }
     }
     
     /**
      * Update an agent's role
+     * NOTE: Role stored in AgentPoolService.
      */
     updateAgentRole(agentName: string, roleId: AgentRole): void {
-        const agent = this.agents.get(agentName);
-        if (agent) {
-            agent.currentRole = roleId;
-            agent.lastActivityAt = new Date().toISOString();
+        const context = this.agentTaskContext.get(agentName);
+        if (context) {
+            context.lastActivityAt = new Date().toISOString();
             this.log(`Updated ${agentName} role to: ${roleId}`);
         }
     }
     
     /**
      * Get agent assignments for UI display
-     * Returns all engineers with their current role and task info
+     * Delegates to AgentPoolService for current status
      */
     getAgentAssignmentsForUI(): Array<{
         name: string;
         roleId: AgentRole;
-        status: AgentAssignment['status'];
+        status: 'idle' | 'busy';
         sessionId: string;
         currentTaskId?: string;
         logFile: string;
@@ -1223,17 +1234,28 @@ export class TaskManager {
         assignedAt: string;
         lastActivityAt: string;
     }> {
-        return Array.from(this.agents.values()).map(a => ({
-            name: a.agentName,
-            roleId: a.currentRole,
-            status: a.status,
-            sessionId: a.sessionId,
-            currentTaskId: a.currentTaskId || a.currentTask?.id,
-            logFile: a.logFile,
-            processId: a.processId,
-            assignedAt: a.assignedAt,
-            lastActivityAt: a.lastActivityAt
-        }));
+        const poolService = this.getAgentPoolService();
+        if (!poolService) {
+            return [];
+        }
+        
+        const busyAgents = poolService.getBusyAgents();
+        return busyAgents.map(agent => {
+            const context = this.agentTaskContext.get(agent.name);
+            return {
+                name: agent.name,
+                roleId: (agent.roleId === 'context_gatherer' ? 'context' : 
+                        agent.roleId === 'code_reviewer' ? 'reviewer' : 
+                        'engineer') as AgentRole,
+                status: 'busy' as const,
+                sessionId: agent.sessionId,
+                currentTaskId: context?.currentTaskId || context?.currentTask?.id,
+                logFile: agent.task || '',
+                processId: undefined,
+                assignedAt: new Date().toISOString(),
+                lastActivityAt: context?.lastActivityAt || new Date().toISOString()
+            };
+        });
     }
 
     /**
@@ -1275,19 +1297,28 @@ export class TaskManager {
     }
 
     /**
-     * Get idle agents
+     * Get idle agents (available agents from AgentPoolService)
+     * Returns just agent names since TaskManager doesn't own agent state
      */
-    getIdleAgents(): AgentAssignment[] {
-        return Array.from(this.agents.values())
-            .filter(a => a.status === 'idle');
+    getIdleAgents(): string[] {
+        const poolService = this.getAgentPoolService();
+        if (!poolService) {
+            return [];
+        }
+        
+        return poolService.getAvailableAgents();
     }
     
     /**
      * Get best task for an agent (considers all sessions)
+     * Uses AgentPoolService for agent session lookup
      */
     getBestTaskForAgent(agentName: string): ManagedTask | undefined {
-        const agent = this.agents.get(agentName);
-        if (!agent) return undefined;
+        const poolService = this.getAgentPoolService();
+        const agentStatus = poolService?.getAgentStatus(agentName);
+        const sessionId = agentStatus?.sessionId || '';
+        
+        if (!sessionId) return undefined;
         
         // Priority 1: Error-fixing tasks (highest priority)
         const errorTasks = this.getPendingErrorFixingTasks()
@@ -1297,12 +1328,12 @@ export class TaskManager {
         }
         
         // Priority 2: Tasks assigned to this agent in their session
-        const readyTasks = this.getReadyTasksForSession(agent.sessionId);
+        const readyTasks = this.getReadyTasksForSession(sessionId);
         const assignedTask = readyTasks.find(t => t.assignedAgent === agentName);
         if (assignedTask) return assignedTask;
 
         // Priority 3: Any ready task in their session
-        const idleAgents = new Set(this.getIdleAgents().map(a => a.agentName));
+        const idleAgents = new Set(this.getIdleAgents());
         
         for (const task of readyTasks) {
             if (task.assignedAgent && 
@@ -1318,29 +1349,30 @@ export class TaskManager {
     
     /**
      * Find optimal dispatch decisions
+     * Returns recommendations for which agents should work on which tasks
      */
     findDispatchDecisions(): DispatchDecision[] {
         const decisions: DispatchDecision[] = [];
-        const idleAgents = this.getIdleAgents();
+        const idleAgentNames = this.getIdleAgents(); // Now returns string[]
 
-        if (idleAgents.length === 0) {
+        if (idleAgentNames.length === 0) {
             return [];
         }
 
         const assignedTasks = new Set<string>();
 
-        for (const agent of idleAgents) {
-            const task = this.getBestTaskForAgent(agent.agentName);
+        for (const agentName of idleAgentNames) {
+            const task = this.getBestTaskForAgent(agentName);
             
             if (task && !assignedTasks.has(task.id)) {
                 decisions.push({
                     task,
-                    agent,
+                    agentName,  // Now stores just the agent name
                     reason: task.sessionId === ERROR_RESOLUTION_SESSION_ID
-                        ? `Error-fixing task for ${agent.agentName}`
-                        : task.assignedAgent === agent.agentName
-                            ? `Assigned task for ${agent.agentName}`
-                            : `Available task for idle ${agent.agentName}`
+                        ? `Error-fixing task for ${agentName}`
+                        : task.assignedAgent === agentName
+                            ? `Assigned task for ${agentName}`
+                            : `Available task for idle ${agentName}`
                 });
                 assignedTasks.add(task.id);
             }
@@ -1354,10 +1386,9 @@ export class TaskManager {
      */
     dispatchTask(taskId: string, agentName: string): void {
         const task = this.tasks.get(taskId);
-        const agent = this.agents.get(agentName);
 
-        if (!task || !agent) {
-            this.log(`Cannot dispatch: task=${taskId} agent=${agentName}`);
+        if (!task) {
+            this.log(`Cannot dispatch: task=${taskId} not found`);
             return;
         }
 
@@ -1367,9 +1398,13 @@ export class TaskManager {
             task.startedAt = new Date().toISOString();
         }
 
-        agent.status = 'working';
-        agent.currentTask = task;
-        agent.lastActivityAt = new Date().toISOString();
+        // Update task context
+        const context = this.agentTaskContext.get(agentName);
+        if (context) {
+            context.currentTask = task;
+            context.currentTaskId = taskId;
+            context.lastActivityAt = new Date().toISOString();
+        }
 
         this.log(`Dispatched ${taskId} to ${agentName}`);
     }
@@ -1423,14 +1458,19 @@ export class TaskManager {
 
         // Update agent context
         if (task.actualAgent) {
-            const agent = this.agents.get(task.actualAgent);
-            if (agent) {
-                agent.taskHistory.push(taskId);
-                agent.filesModified.push(...(filesModified || []));
-                agent.currentTask = undefined;
-                agent.status = 'idle';
-                agent.lastActivityAt = new Date().toISOString();
-                this.onAgentIdleCallback?.(agent);
+            const context = this.agentTaskContext.get(task.actualAgent);
+            if (context) {
+                context.taskHistory.push(taskId);
+                context.filesModified.push(...(filesModified || []));
+                context.currentTask = undefined;
+                context.currentTaskId = undefined;
+                context.lastActivityAt = new Date().toISOString();
+            }
+            
+            // Notify idle callback with agent name
+            const poolService = this.getAgentPoolService();
+            if (poolService?.getAgentStatus(task.actualAgent)) {
+                this.onAgentIdleCallback?.(task.actualAgent);
             }
         }
 
@@ -1454,11 +1494,16 @@ export class TaskManager {
         task.currentWorkflow = undefined;
 
         if (task.actualAgent) {
-            const agent = this.agents.get(task.actualAgent);
-            if (agent) {
-                agent.currentTask = undefined;
-                agent.status = 'idle';
-                this.onAgentIdleCallback?.(agent);
+            const context = this.agentTaskContext.get(task.actualAgent);
+            if (context) {
+                context.currentTask = undefined;
+                context.currentTaskId = undefined;
+            }
+            
+            // Notify idle callback with agent name
+            const poolService = this.getAgentPoolService();
+            if (poolService?.getAgentStatus(task.actualAgent)) {
+                this.onAgentIdleCallback?.(task.actualAgent);
             }
         }
 
@@ -1559,23 +1604,28 @@ export class TaskManager {
     /**
      * Get all agents
      */
-    getAllAgents(): AgentAssignment[] {
-        return Array.from(this.agents.values());
-    }
-    
     /**
-     * Get agent by name
+     * Get agent task context (task-specific tracking only)
+     * For allocation status, query AgentPoolService directly
      */
-    getAgent(agentName: string): AgentAssignment | undefined {
-        return this.agents.get(agentName);
+    getAgentTaskContext(agentName: string): AgentTaskContext | undefined {
+        return this.agentTaskContext.get(agentName);
     }
     
     /**
-     * Release agent
+     * Get all agent task contexts
+     */
+    getAllAgentTaskContexts(): AgentTaskContext[] {
+        return Array.from(this.agentTaskContext.values());
+    }
+    
+    /**
+     * Release agent task context
+     * NOTE: AgentPoolService handles allocation release
      */
     releaseAgent(agentName: string): void {
-        this.agents.delete(agentName);
-        this.log(`Released agent ${agentName}`);
+        this.agentTaskContext.delete(agentName);
+        this.log(`Released task context for agent ${agentName}`);
     }
     
     /**
@@ -1619,8 +1669,9 @@ export class TaskManager {
 
     /**
      * Register callback for when an agent becomes idle
+     * Callback receives agent name (query AgentPoolService for full status)
      */
-    onAgentIdle(callback: (agent: AgentAssignment) => void): void {
+    onAgentIdle(callback: (agentName: string) => void): void {
         this.onAgentIdleCallback = callback;
     }
     
@@ -1963,10 +2014,10 @@ export class TaskManager {
         agentName: string;
         overlappingFiles: string[];
     } | null {
-        for (const agent of this.agents.values()) {
-            if (agent.status === 'working' && agent.currentTask) {
+        for (const context of this.agentTaskContext.values()) {
+            if (context.currentTask) {
                 const overlapping = files.filter(f => 
-                    agent.filesModified.some(wf => 
+                    context.filesModified.some(wf => 
                         wf === f || 
                         wf.endsWith(path.basename(f)) ||
                         f.endsWith(path.basename(wf))
@@ -1974,10 +2025,14 @@ export class TaskManager {
                 );
                 
                 if (overlapping.length > 0) {
+                    // Get session from AgentPoolService
+                    const poolService = this.getAgentPoolService();
+                    const agentStatus = poolService?.getAgentStatus(context.agentName);
+                    
                     return {
-                        taskId: agent.currentTask.id,
-                        sessionId: agent.sessionId,
-                        agentName: agent.agentName,
+                        taskId: context.currentTask.id,
+                        sessionId: agentStatus?.sessionId || context.currentTask.sessionId,
+                        agentName: context.agentName,
                         overlappingFiles: overlapping
                     };
                 }

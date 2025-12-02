@@ -1,20 +1,23 @@
 /**
- * Bootstrap.ts - Service registration in dependency order
+ * DaemonBootstrap.ts - Service registration for DAEMON ONLY
  * 
- * This module registers all services with the ServiceLocator in the correct
- * dependency order. Services at lower levels are registered first so they
- * can be resolved by services at higher levels.
+ * ⚠️ DAEMON-ONLY: This module is ONLY called by the daemon (standalone.ts, start.ts)
+ * ⚠️ NEVER import this in extension.ts - extension is a pure GUI client
+ * 
+ * This module registers all core business logic services with the ServiceLocator
+ * in the correct dependency order. Services at lower levels are registered first
+ * so they can be resolved by services at higher levels.
  * 
  * Dependency Levels:
  * - Level 0: No dependencies (OutputChannelManager, EventBroadcaster, etc.)
  * - Level 1: Depends on Level 0 (ProcessManager, TaskManager)
  * - Level 2: Depends on Level 1 (CursorAgentRunner, WorkflowPauseManager)
  * - Level 3: Depends on Level 2 (AgentRunner, UnityControlManager)
- * - Level 4: UnifiedCoordinatorService - requires external deps, registered in extension.ts
+ * - Level 4: UnifiedCoordinatorService - requires external deps, registered in standalone.ts
  * 
- * Usage:
- *   import { bootstrapServices } from './services/Bootstrap';
- *   bootstrapServices();
+ * Usage (DAEMON ONLY):
+ *   import { bootstrapDaemonServices } from './services/DaemonBootstrap';
+ *   bootstrapDaemonServices();
  */
 
 import { ServiceLocator } from './ServiceLocator';
@@ -39,24 +42,26 @@ import { AgentRunner } from './AgentBackend';
 import { UnityControlManager } from './UnityControlManager';
 
 /**
- * Bootstrap all services with the ServiceLocator
+ * Bootstrap all DAEMON services with the ServiceLocator
  * 
- * Call this during extension activation, before any services are used.
+ * ⚠️ DAEMON-ONLY: Call this ONLY in daemon startup (standalone.ts, start.ts)
+ * ⚠️ NEVER call from extension.ts - extension is a pure GUI client
+ * 
  * Services are registered in dependency order so that when a service
  * is instantiated, its dependencies are already registered.
  * 
  * Note: UnifiedCoordinatorService is NOT registered here because it requires
  * external dependencies (StateManager, AgentPoolService, AgentRoleRegistry)
- * that are created in extension.ts. Register it manually after those are ready.
+ * that are created in standalone.ts. Register it there after those are ready.
  */
-export function bootstrapServices(): void {
+export function bootstrapDaemonServices(): void {
     // Prevent double initialization
     if (ServiceLocator.isInitialized()) {
-        console.log('[Bootstrap] Services already initialized, skipping');
+        console.log('[DaemonBootstrap] Services already initialized, skipping');
         return;
     }
 
-    console.log('[Bootstrap] Registering services...');
+    console.log('[DaemonBootstrap] Registering daemon services...');
 
     // ========================================================================
     // Level 0 - No dependencies
@@ -100,8 +105,14 @@ export function bootstrapServices(): void {
     // );
 
     ServiceLocator.markInitialized();
-    console.log('[Bootstrap] Services registered:', ServiceLocator.getRegisteredServices().join(', '));
+    console.log('[DaemonBootstrap] Daemon services registered:', ServiceLocator.getRegisteredServices().join(', '));
 }
+
+/**
+ * Legacy export for backward compatibility
+ * @deprecated Use bootstrapDaemonServices instead
+ */
+export const bootstrapServices = bootstrapDaemonServices;
 
 /**
  * Re-export ServiceLocator for convenience

@@ -28,7 +28,7 @@ import {
     CoreConfig 
 } from './DaemonConfig';
 import { initializeServices } from './standalone';
-import { bootstrapServices } from '../services/Bootstrap';
+import { bootstrapDaemonServices } from '../services/DaemonBootstrap';
 
 // ============================================================================
 // Types

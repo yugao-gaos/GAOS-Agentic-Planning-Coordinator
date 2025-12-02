@@ -1,8 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import { StateManager } from '../services/StateManager';
-import { TaskManager } from '../services/TaskManager';
 import { PlanningSession, PlanStatus, ExecutionState } from '../types';
 import { ServiceLocator } from '../services/ServiceLocator';
 
@@ -164,12 +162,12 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
                 executionContextValue
             ));
             
-            // Agents working on this session (only if in execution phase)
+            // TODO: Agents working on this session - will be restored when DaemonStateProxy is extended
+            // Currently commented out to remove TaskManager dependency
+            /*
             if (session.execution && isInExecutionPhase) {
-                // Get agents from TaskManager (single source of truth)
-                const taskManager = ServiceLocator.resolve(TaskManager);
-                const sessionAgents = taskManager.getAgentAssignmentsForUI()
-                    .filter(a => a.sessionId === session.id);
+                // Get agents from daemon via proxy
+                const sessionAgents = []; // TODO: Get from daemon
                 
                 if (sessionAgents.length > 0) {
                     details.push(new PlanningSessionItem(
@@ -181,7 +179,6 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
                     
                     // Individual agent status - clicking opens their log
                     for (const agent of sessionAgents) {
-                        // Map TaskManager status to display status
                         const displayStatus = agent.status === 'error_fixing' ? 'working' 
                             : agent.status === 'waiting' ? 'idle' 
                             : agent.status;
@@ -209,6 +206,7 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
                     }
                 }
             }
+            */
             
             // Show execution summary when completed (if available)
             // Note: Execution summary path would need to be stored on the session if desired

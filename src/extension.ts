@@ -8,13 +8,10 @@ import { WorkflowSettingsPanel } from './ui/WorkflowSettingsPanel';
 import { DependencyMapPanel } from './ui/DependencyMapPanel';
 import { HistoryViewPanel } from './ui/HistoryViewPanel';
 import { SidebarViewProvider } from './ui/SidebarViewProvider';
-import { AgentRunner, AgentBackendType } from './services/AgentBackend';
-import { EventBroadcaster } from './daemon/EventBroadcaster';
-import { TaskFailedFinalEventData } from './client/ClientEvents';
 import { DaemonManager } from './vscode/DaemonManager';
 import { VsCodeClient } from './vscode/VsCodeClient';
 import { DaemonStateProxy } from './services/DaemonStateProxy';
-import { bootstrapServices, ServiceLocator } from './services/Bootstrap';
+import { ServiceLocator } from './services/ServiceLocator';
 import { ProcessManager } from './services/ProcessManager';
 
 // Module-level references (kept minimal - only what must be local)
@@ -116,18 +113,50 @@ export async function activate(context: vscode.ExtensionContext) {
     }
     console.log(`[APC] Step 1: Workspace root = ${workspaceRoot}`);
     
-    // Bootstrap base services with ServiceLocator (for local-only services)
-    console.log('[APC] Step 2: Bootstrapping base services...');
-    bootstrapServices();
-    console.log('[APC] Step 2: Base services bootstrapped');
+    // Register extension-local services only (NO daemon services!)
+    // Extension is a pure GUI client - all state comes from daemon
+    // Note: AgentRunner is in daemon - workflows spawn agents there
+    console.log('[APC] Step 2: Registering extension-local services...');
+    ServiceLocator.register(DependencyService, () => new DependencyService());
+    ServiceLocator.register(ProcessManager, () => new ProcessManager());
+    ServiceLocator.markInitialized();
+    console.log('[APC] Step 2: Extension-local services registered');
     
-    // Initialize AgentRunner with configured backend (needed for local agent spawning)
-    console.log('[APC] Step 3: Setting up AgentRunner...');
-    const config = vscode.workspace.getConfiguration('agenticPlanning');
-    const backendType = config.get<string>('defaultBackend', 'cursor') as AgentBackendType;
-    const agentRunner = ServiceLocator.resolve(AgentRunner);
-    agentRunner.setBackend(backendType);
-    console.log(`[APC] Step 3: Agent backend = ${backendType}`);
+    // ========================================================================
+    // ARCHITECTURE GUARD: Verify extension hasn't registered daemon services
+    // ========================================================================
+    console.log('[APC] Step 2a: Verifying architecture guards...');
+    
+    // List of services that should ONLY exist in daemon, NEVER in extension
+    const daemonOnlyServices = [
+        'StateManager',
+        'TaskManager', 
+        'AgentPoolService',
+        'AgentRoleRegistry',
+        'UnifiedCoordinatorService',
+        'AgentRunner',
+        'CursorAgentRunner',
+        'UnityControlManager',
+        'WorkflowPauseManager',
+        'EventBroadcaster',
+        'OutputChannelManager',
+        'PlanCache',
+        'ErrorClassifier'
+    ];
+    
+    const registeredServices = ServiceLocator.getRegisteredServices();
+    const violations = daemonOnlyServices.filter(service => registeredServices.includes(service));
+    
+    if (violations.length > 0) {
+        const errorMsg = `FATAL ARCHITECTURE VIOLATION: Extension registered daemon-only services: ${violations.join(', ')}`;
+        console.error(`[APC] ${errorMsg}`);
+        vscode.window.showErrorMessage(errorMsg);
+        throw new Error(errorMsg);
+    }
+    
+    console.log('[APC] Step 2a: Architecture guards passed ✓');
+    console.log(`[APC] Extension services: ${registeredServices.join(', ')}`);
+    console.log('[APC] (All core business logic runs in daemon)');
 
     // Initialize local-only services
     terminalManager = new TerminalManager();
@@ -135,6 +164,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // Initialize DependencyService (local utility)
     const dependencyService = ServiceLocator.resolve(DependencyService);
     dependencyService.setWorkspaceRoot(workspaceRoot);
+    const config = vscode.workspace.getConfiguration('agenticPlanning');
     const unityFeaturesEnabled = config.get<boolean>('enableUnityFeatures', true);
     dependencyService.setUnityEnabled(unityFeaturesEnabled);
     
@@ -142,23 +172,23 @@ export async function activate(context: vscode.ExtensionContext) {
     dependencyService.startPeriodicCheck(30000);
 
     // Create UI providers
-    console.log('[APC] Step 4: Creating sidebar provider...');
+    console.log('[APC] Step 3: Creating sidebar provider...');
     const sidebarProvider = new SidebarViewProvider(context.extensionUri);
     sidebarProvider.setUnityEnabled(unityFeaturesEnabled);
-    console.log('[APC] Step 4: Sidebar provider created');
+    console.log('[APC] Step 3: Sidebar provider created');
     
     // ========================================================================
     // Daemon Connection - This is the main state source
     // ========================================================================
-    console.log('[APC] Step 5: Starting daemon connection...');
+    console.log('[APC] Step 4: Starting daemon connection...');
     
     // Initialize daemon manager and ensure daemon is running
     daemonManager = new DaemonManager(workspaceRoot, context.extensionPath);
     
     try {
-        console.log('[APC] Step 5a: Calling ensureDaemonRunning...');
+        console.log('[APC] Step 4a: Calling ensureDaemonRunning...');
         const daemonResult = await daemonManager.ensureDaemonRunning();
-        console.log(`[APC] Step 5b: Daemon on port ${daemonResult.port} (wasStarted: ${daemonResult.wasStarted}, isExternal: ${daemonResult.isExternal})`);
+        console.log(`[APC] Step 4b: Daemon on port ${daemonResult.port} (wasStarted: ${daemonResult.wasStarted}, isExternal: ${daemonResult.isExternal})`);
         
         // Create and connect VS Code client using singleton
         vsCodeClient = getOrCreateDaemonClient(daemonResult.port);
@@ -171,13 +201,13 @@ export async function activate(context: vscode.ExtensionContext) {
         });
         
         // Connect to daemon with retry (daemon may still be starting up)
-        console.log('[APC] Step 5c: Connecting to daemon...');
+        console.log('[APC] Step 4c: Connecting to daemon...');
         const maxRetries = 5;
         let lastError: Error | undefined;
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 await vsCodeClient.connect();
-                console.log(`[APC] Step 5d: Connected to daemon (attempt ${attempt})`);
+                console.log(`[APC] Step 4d: Connected to daemon (attempt ${attempt})`);
                 break;
             } catch (err) {
                 lastError = err as Error;
@@ -311,59 +341,64 @@ export async function activate(context: vscode.ExtensionContext) {
         sidebarProvider.setStateProxy(daemonStateProxy);
     }
     
-    // Clean up old temp files from previous sessions
-    const cleaned = (agentRunner as any).cleanupTempFiles?.();
-    if (cleaned > 0) {
-        console.log(`Agentic Planning: Cleaned up ${cleaned} old temp files`);
-    }
+    // Note: Agent temp file cleanup is now handled by daemon
+    // (AgentRunner lives in daemon where agents are actually spawned)
     
-    // Listen for task.failedFinal events to open agent chat for user intervention
-    const broadcaster = ServiceLocator.resolve(EventBroadcaster);
-    const taskFailedHandler = async (data: TaskFailedFinalEventData) => {
-        const isNeedsClarity = data.errorType === 'needs_clarity';
-        
-        const prompt = isNeedsClarity 
-            ? `Engineer needs clarity on task "${data.taskId}":
-${data.clarityQuestion || data.lastError}
+    // Listen for task.failedFinal events from daemon via WebSocket
+    // (Don't use local EventBroadcaster - extension doesn't have daemon services)
+    eventSubscriptions.push(
+        vsCodeClient.subscribe('task.failedFinal', async (data: unknown) => {
+            const failedData = data as { 
+                errorType?: string; 
+                taskId?: string; 
+                clarityQuestion?: string; 
+                lastError?: string; 
+                sessionId?: string; 
+                attempts?: number; 
+                canRetry?: boolean 
+            };
+            const isNeedsClarity = failedData.errorType === 'needs_clarity';
+            
+            const prompt = isNeedsClarity 
+                ? `Engineer needs clarity on task "${failedData.taskId}":
+${failedData.clarityQuestion || failedData.lastError}
 
-Session: ${data.sessionId}
+Session: ${failedData.sessionId}
 Please help clarify, then use:
-  apc plan revise ${data.sessionId} "<your clarification>"`
-            : `Task "${data.taskId}" failed after ${data.attempts} attempt(s).
+  apc plan revise ${failedData.sessionId} "<your clarification>"`
+                : `Task "${failedData.taskId}" failed after ${failedData.attempts} attempt(s).
 
-Error: ${data.lastError}
-Session: ${data.sessionId}
-${data.canRetry ? 'Can retry.' : 'Cannot retry (permanent error).'}
+Error: ${failedData.lastError}
+Session: ${failedData.sessionId}
+${failedData.canRetry ? 'Can retry.' : 'Cannot retry (permanent error).'}
 
 Options:
-1. Revise plan: apc plan revise ${data.sessionId} "<feedback>"
-2. ${data.canRetry ? `Retry: apc task retry ${data.sessionId} ${data.taskId}` : 'Skip task via revision'}`;
+1. Revise plan: apc plan revise ${failedData.sessionId} "<feedback>"
+2. ${failedData.canRetry ? `Retry: apc task retry ${failedData.sessionId} ${failedData.taskId}` : 'Skip task via revision'}`;
 
-        // Copy prompt to clipboard and open agent chat
-        await vscode.env.clipboard.writeText(prompt);
-        openAgentChat();
-        
-        // Also show a notification
-        const action = isNeedsClarity ? 'Needs Clarity' : 'Task Failed';
-        vscode.window.showWarningMessage(
-            `${action}: ${data.taskId} - ${data.lastError.substring(0, 50)}...`,
-            'View in Chat'
-        ).then(selection => {
-            if (selection === 'View in Chat') {
-                // Chat was already opened, just show info
-                vscode.window.showInformationMessage('Check the agent chat for details and next steps.');
-            }
-        });
-    };
-    broadcaster.on('task.failedFinal', taskFailedHandler);
-    // Track for cleanup (EventEmitter style - need to store handler reference)
-    eventSubscriptions.push(() => broadcaster.removeListener('task.failedFinal', taskFailedHandler));
+            // Copy prompt to clipboard and open agent chat
+            await vscode.env.clipboard.writeText(prompt);
+            openAgentChat();
+            
+            // Also show a notification
+            const action = isNeedsClarity ? 'Needs Clarity' : 'Task Failed';
+            vscode.window.showWarningMessage(
+                `${action}: ${failedData.taskId} - ${failedData.lastError?.substring(0, 50)}...`,
+                'View in Chat'
+            ).then(selection => {
+                if (selection === 'View in Chat') {
+                    // Chat was already opened, just show info
+                    vscode.window.showInformationMessage('Check the agent chat for details and next steps.');
+                }
+            });
+        })
+    );
 
-    console.log('[APC] Step 6: Registering webview provider...');
+    console.log('[APC] Step 5: Registering webview provider...');
     context.subscriptions.push(
         vscode.window.registerWebviewViewProvider(SidebarViewProvider.viewType, sidebarProvider)
     );
-    console.log('[APC] Step 6: Webview provider registered');
+    console.log('[APC] Step 5: Webview provider registered');
 
     // Check dependencies on startup
     dependencyService.checkAllDependencies().then(statuses => {

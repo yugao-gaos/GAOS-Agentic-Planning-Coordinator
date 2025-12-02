@@ -1165,7 +1165,8 @@ export class UnifiedCoordinatorService {
             taskId,
             startedAt: workflow?.getProgress().startedAt || state.createdAt,
             completedAt: new Date().toISOString(),
-            result: result.error
+            result: result.error,
+            logPath: workflow?.getProgress().logPath
         };
         state.workflowHistory.unshift(historySummary); // Add to front (newest first)
         

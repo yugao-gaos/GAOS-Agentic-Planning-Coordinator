@@ -39,6 +39,10 @@ export interface WorkflowInfo {
     taskId?: string;
     /** Path to workflow log file */
     logPath?: string;
+    /** True when workflow is waiting for agent allocation */
+    waitingForAgent?: boolean;
+    /** Role ID of agent being waited for */
+    waitingForAgentRole?: string;
 }
 
 export interface SessionInfo {
