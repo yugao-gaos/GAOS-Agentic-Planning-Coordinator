@@ -1025,7 +1025,7 @@ ${ctx.partialOutput.slice(-3000)}
         const agentPromise = agentRunner.run({
             id: runId,
             prompt: enhancedPrompt,
-            model: options.model ?? role?.defaultModel ?? 'claude-sonnet',
+            model: options.model ?? role?.defaultModel ?? 'sonnet-4.5',
             cwd: options.cwd ?? process.cwd(),
             logFile,
             timeoutMs: timeout,

@@ -20,10 +20,17 @@ export interface ModelOption {
 
 export const SUPPORTED_MODELS: ModelOption[] = [
     { value: 'sonnet-4.5', label: 'Claude Sonnet 4.5', description: 'Balanced performance and speed' },
+    { value: 'sonnet-4.5-thinking', label: 'Claude Sonnet 4.5 Thinking', description: 'Extended reasoning' },
     { value: 'opus-4.5', label: 'Claude Opus 4.5', description: 'Maximum capability' },
+    { value: 'opus-4.5-thinking', label: 'Claude Opus 4.5 Thinking', description: 'Max capability + reasoning' },
+    { value: 'opus-4.1', label: 'Claude Opus 4.1', description: 'Previous gen Opus' },
     { value: 'gemini-3-pro', label: 'Gemini 3 Pro', description: 'Google multimodal model' },
-    { value: 'haiku-3.5', label: 'Claude Haiku 3.5', description: 'Fast and efficient' },
-    { value: 'gpt-5.1-codex-high', label: 'GPT-5.1 Codex High', description: 'OpenAI code specialist' }
+    { value: 'gpt-5', label: 'GPT-5', description: 'OpenAI latest' },
+    { value: 'gpt-5.1', label: 'GPT-5.1', description: 'OpenAI enhanced' },
+    { value: 'gpt-5-codex', label: 'GPT-5 Codex', description: 'OpenAI code specialist' },
+    { value: 'gpt-5.1-codex-high', label: 'GPT-5.1 Codex High', description: 'OpenAI code specialist high' },
+    { value: 'grok', label: 'Grok', description: 'xAI model' },
+    { value: 'auto', label: 'Auto', description: 'Let Cursor choose' }
 ];
 
 /**

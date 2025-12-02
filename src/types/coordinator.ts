@@ -287,7 +287,7 @@ export interface CoordinatorAgentConfig {
 export const DEFAULT_COORDINATOR_CONFIG: CoordinatorAgentConfig = {
     maxHistoryEntries: 20,
     evaluationTimeout: 30000,
-    model: 'claude-sonnet',
+    model: 'sonnet-4.5',
     includePlanContent: true,
     maxPlanContentLength: 50000,
     debug: false,
