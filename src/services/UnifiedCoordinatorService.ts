@@ -234,14 +234,17 @@ export class UnifiedCoordinatorService {
         }
         
         // Load any existing coordinator history from disk
-        const savedHistory = this.stateManager.loadCoordinatorHistory(sessionId);
+        const savedCoordinatorHistory = this.stateManager.loadCoordinatorHistory(sessionId);
+        
+        // Load any existing workflow history from disk
+        const savedWorkflowHistory = this.stateManager.loadWorkflowHistory(sessionId) as CompletedWorkflowSummary[];
         
         const state: SessionState = {
             sessionId,
             workflows: new Map(),
             pendingWorkflowIds: [],
             completedWorkflowIds: [],
-            workflowHistory: [],
+            workflowHistory: savedWorkflowHistory,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
             
@@ -253,12 +256,15 @@ export class UnifiedCoordinatorService {
             workflowToTaskMap: new Map(),
             
             // AI Coordinator history (loaded from disk if available)
-            coordinatorHistory: savedHistory,
+            coordinatorHistory: savedCoordinatorHistory,
             pendingQuestions: []
         };
         
         this.sessions.set(sessionId, state);
-        this.log(`Session initialized: ${sessionId}${savedHistory.length > 0 ? ` (loaded ${savedHistory.length} history entries)` : ''}`);
+        const historyInfo = [];
+        if (savedCoordinatorHistory.length > 0) historyInfo.push(`${savedCoordinatorHistory.length} coordinator`);
+        if (savedWorkflowHistory.length > 0) historyInfo.push(`${savedWorkflowHistory.length} workflow`);
+        this.log(`Session initialized: ${sessionId}${historyInfo.length > 0 ? ` (loaded ${historyInfo.join(', ')} history entries)` : ''}`);
         this._onSessionStateChanged.fire(sessionId);
     }
     
@@ -634,6 +640,7 @@ export class UnifiedCoordinatorService {
      * Handle agent release from workflow
      */
     private handleAgentReleased(agentName: string): void {
+        console.log(`[UnifiedCoordinatorService] handleAgentReleased called for ${agentName}`);
         const taskManager = ServiceLocator.resolve(TaskManager);
         
         // Sync with TaskManager - release the agent assignment
@@ -642,6 +649,22 @@ export class UnifiedCoordinatorService {
         // Release from AgentPoolService (thin allocation layer)
         this.agentPoolService.releaseAgents([agentName]);
         this.log(`Agent released: ${agentName}`);
+        
+        // Broadcast pool change so UI updates immediately
+        try {
+            const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+            const poolStatus = this.agentPoolService.getPoolStatus();
+            const busyAgents = this.agentPoolService.getBusyAgents();
+            console.log(`[UnifiedCoordinatorService] Broadcasting pool.changed: available=${poolStatus.available.length}, busy=${busyAgents.length}`);
+            broadcaster.poolChanged(
+                poolStatus.total,
+                poolStatus.available,
+                busyAgents.map(b => ({ name: b.name, coordinatorId: b.coordinatorId || '', roleId: b.roleId }))
+            );
+            console.log(`[UnifiedCoordinatorService] pool.changed broadcast complete`);
+        } catch (e) {
+            console.error(`[UnifiedCoordinatorService] Failed to broadcast pool.changed:`, e);
+        }
         
         // Try to fulfill pending requests
         this.processAgentQueue();
@@ -692,6 +715,12 @@ export class UnifiedCoordinatorService {
                         sessionId = sid;
                         break;
                     }
+                }
+                
+                // Update AgentPoolService with the correct sessionId
+                // (allocateAgents initially sets sessionId to empty)
+                if (sessionId) {
+                    this.agentPoolService.updateAgentSession(agentName, { sessionId });
                 }
                 
                 // Sync with TaskManager - register the agent with role
@@ -923,6 +952,9 @@ export class UnifiedCoordinatorService {
             result: result.error
         };
         state.workflowHistory.unshift(historySummary); // Add to front (newest first)
+        
+        // Persist workflow history to disk
+        this.stateManager.saveWorkflowHistory(sessionId, state.workflowHistory);
         
         this.log(`Workflow ${workflowId.substring(0,8)} completed: ${result.success ? 'SUCCESS' : 'FAILED'}`);
         
@@ -1255,6 +1287,8 @@ export class UnifiedCoordinatorService {
                 const completedAt = new Date(progress.updatedAt).getTime();
                 
                 if (now - completedAt > MAX_AGE_MS) {
+                    // Dispose workflow before removing to clean up event listeners
+                    workflow.dispose();
                     state.workflows.delete(workflowId);
                     cleaned++;
                 }
@@ -1606,13 +1640,16 @@ export class UnifiedCoordinatorService {
      * Signal agent completion from CLI callback
      * 
      * Called by CliHandler when an agent calls:
-     *   apc agent complete --session <s> --workflow <w> --stage <stage> --result <r> --data '<json>'
+     *   apc agent complete --session <s> --workflow <w> --stage <stage> --result <r> [--task <t>] --data '<json>'
      * 
      * @param signal The completion signal from the agent
      * @returns true if signal was delivered to a waiting workflow, false otherwise
      */
     signalAgentCompletion(signal: AgentCompletionSignal): boolean {
-        const key = `${signal.workflowId}_${signal.stage}`;
+        // Key includes taskId if present (for parallel tasks within same workflow/stage)
+        const key = signal.taskId 
+            ? `${signal.workflowId}_${signal.stage}_${signal.taskId}`
+            : `${signal.workflowId}_${signal.stage}`;
         const pending = this.completionSignals.get(key);
         
         if (pending) {
@@ -1644,15 +1681,20 @@ export class UnifiedCoordinatorService {
      * @param workflowId The workflow waiting for completion
      * @param stage The stage to wait for (implementation, review, etc.)
      * @param timeoutMs Timeout in milliseconds (default 10 minutes)
+     * @param taskId Optional unique task ID for parallel tasks within same workflow/stage
      * @returns Promise that resolves with the completion signal
      */
     waitForAgentCompletion(
         workflowId: string,
         stage: string,
-        timeoutMs: number = 600000
+        timeoutMs: number = 600000,
+        taskId?: string
     ): Promise<AgentCompletionSignal> {
         return new Promise((resolve, reject) => {
-            const key = `${workflowId}_${stage}`;
+            // Key includes taskId if present (for parallel tasks within same workflow/stage)
+            const key = taskId 
+                ? `${workflowId}_${stage}_${taskId}`
+                : `${workflowId}_${stage}`;
             
             // Check if already waiting
             if (this.completionSignals.has(key)) {
@@ -1663,7 +1705,7 @@ export class UnifiedCoordinatorService {
             // Set up timeout
             const timeoutId = setTimeout(() => {
                 this.completionSignals.delete(key);
-                reject(new Error(`Timeout waiting for agent completion: ${stage} (${timeoutMs}ms)`));
+                reject(new Error(`Timeout waiting for agent completion: ${stage}${taskId ? '/' + taskId : ''} (${timeoutMs}ms)`));
             }, timeoutMs);
             
             // Register the pending signal
@@ -1674,7 +1716,7 @@ export class UnifiedCoordinatorService {
                 timeoutId
             });
             
-            this.log(`⏳ Waiting for agent completion: ${workflowId.substring(0, 8)}/${stage}`);
+            this.log(`⏳ Waiting for agent completion: ${workflowId.substring(0, 8)}/${stage}${taskId ? '/' + taskId : ''}`);
         });
     }
     
@@ -1685,10 +1727,14 @@ export class UnifiedCoordinatorService {
      * 
      * @param workflowId The workflow ID
      * @param stage The stage (optional - cancels all if not specified)
+     * @param taskId Optional task ID for parallel tasks
      */
-    cancelPendingSignal(workflowId: string, stage?: string): void {
+    cancelPendingSignal(workflowId: string, stage?: string, taskId?: string): void {
         if (stage) {
-            const key = `${workflowId}_${stage}`;
+            // Key includes taskId if present
+            const key = taskId 
+                ? `${workflowId}_${stage}_${taskId}`
+                : `${workflowId}_${stage}`;
             const pending = this.completionSignals.get(key);
             if (pending) {
                 clearTimeout(pending.timeoutId);
@@ -1709,9 +1755,16 @@ export class UnifiedCoordinatorService {
     
     /**
      * Check if there's a pending signal wait for a workflow/stage
+     * 
+     * @param workflowId The workflow ID
+     * @param stage The stage to check
+     * @param taskId Optional task ID for parallel tasks
      */
-    hasPendingSignal(workflowId: string, stage: string): boolean {
-        return this.completionSignals.has(`${workflowId}_${stage}`);
+    hasPendingSignal(workflowId: string, stage: string, taskId?: string): boolean {
+        const key = taskId 
+            ? `${workflowId}_${stage}_${taskId}`
+            : `${workflowId}_${stage}`;
+        return this.completionSignals.has(key);
     }
     
     // =========================================================================

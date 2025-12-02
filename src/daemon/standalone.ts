@@ -12,7 +12,7 @@
  * Environment Variables:
  *   APC_WORKSPACE_ROOT - Workspace root path
  *   APC_PORT - Port to listen on (default: 19840)
- *   APC_POOL_SIZE - Agent pool size (default: 5)
+ *   APC_POOL_SIZE - Agent pool size (default: 10)
  *   APC_VERBOSE - Enable verbose logging (true/false)
  */
 
@@ -105,17 +105,71 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
     // Subscribe to agent allocation events and broadcast to clients
     const broadcaster = ServiceLocator.resolve(EventBroadcaster);
     coordinator.onAgentAllocated(({ agentName, sessionId, roleId, workflowId }) => {
-        // Get log file path from TaskManager
-        const logDir = stateManager.getPlanFolder(sessionId);
-        const logFile = logDir ? `${logDir}/logs/${agentName}_${Date.now()}.log` : undefined;
+        console.log(`[Standalone] onAgentAllocated: agent=${agentName}, session=${sessionId}, role=${roleId}, workflow=${workflowId}`);
         
-        broadcaster.broadcast('agent.allocated', {
-            agentName,
-            sessionId,
-            roleId,
-            workflowId,
-            logFile
-        });
+        try {
+            // Get log file path - include workflow ID and agent name for unique temp files
+            // Guard against empty sessionId
+            const logDir = sessionId ? stateManager.getPlanFolder(sessionId) : undefined;
+            const logFile = logDir ? `${logDir}/logs/agents/${workflowId}_${agentName}.log` : undefined;
+            
+            broadcaster.broadcast('agent.allocated', {
+                agentName,
+                sessionId,
+                roleId,
+                workflowId,
+                logFile
+            });
+            
+            // Also broadcast pool change so UI shows agent as busy
+            const poolStatus = agentPoolService.getPoolStatus();
+            const busyAgents = agentPoolService.getBusyAgents();
+            console.log(`[Standalone] Broadcasting pool.changed after allocation: available=${poolStatus.available.length}, busy=${busyAgents.length}`);
+            broadcaster.poolChanged(
+                poolStatus.total,
+                poolStatus.available,
+                busyAgents.map(b => ({ name: b.name, coordinatorId: b.coordinatorId || '', roleId: b.roleId }))
+            );
+        } catch (e) {
+            console.error(`[Standalone] Error in onAgentAllocated handler:`, e);
+            
+            // Still try to broadcast pool.changed even if other parts failed
+            try {
+                const poolStatus = agentPoolService.getPoolStatus();
+                const busyAgents = agentPoolService.getBusyAgents();
+                broadcaster.poolChanged(
+                    poolStatus.total,
+                    poolStatus.available,
+                    busyAgents.map(b => ({ name: b.name, coordinatorId: b.coordinatorId || '', roleId: b.roleId }))
+                );
+            } catch (e2) {
+                console.error(`[Standalone] Failed to broadcast pool.changed:`, e2);
+            }
+        }
+    });
+    
+    // Subscribe to session state changes and broadcast to clients
+    // This ensures UI updates when workflows start/complete/change state
+    coordinator.onSessionStateChanged((sessionId) => {
+        const session = stateManager.getPlanningSession(sessionId);
+        if (session) {
+            broadcaster.broadcast('session.updated', {
+                sessionId,
+                status: session.status,
+                previousStatus: session.status,
+                changes: ['workflow_state_changed'],
+                updatedAt: new Date().toISOString()
+            });
+        }
+        
+        // Also broadcast pool state since agent allocations may have changed
+        const poolStatus2 = agentPoolService.getPoolStatus();
+        const busyAgents2 = agentPoolService.getBusyAgents();
+        broadcaster.poolChanged(
+            poolStatus2.total,
+            poolStatus2.available,
+            busyAgents2.map(b => ({ name: b.name, coordinatorId: b.coordinatorId || '', roleId: b.roleId }))
+        );
     });
     
     console.log('[Standalone] UnifiedCoordinatorService initialized');
