@@ -112,9 +112,9 @@ function getPlanBadgeClass(planStatus?: string): string {
 }
 
 /**
- * Render a single workflow item with optional agent info.
+ * Render a single workflow item with multiple agents and animated progress background.
  */
-function renderWorkflowItem(wf: WorkflowInfo, agent?: AgentInfo): string {
+function renderWorkflowItem(wf: WorkflowInfo, agents: AgentInfo[]): string {
     const typeInfo = WORKFLOW_TYPE_INFO[wf.type] || {
         icon: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/></svg>',
         class: '',
@@ -126,25 +126,33 @@ function renderWorkflowItem(wf: WorkflowInfo, agent?: AgentInfo): string {
         ? wf.taskId 
         : typeInfo.label;
     
-    // Build agent badge if agent is assigned to this workflow
-    const agentBadge = agent ? `<span class="workflow-agent" style="color: ${agent.roleColor || '#f97316'};">${agent.name}</span>` : '';
+    // Build agent badges for all agents working on this workflow
+    const agentBadges = agents.length > 0 
+        ? `<div class="workflow-agents">${agents.map(a => 
+            `<span class="workflow-agent" style="--agent-color: ${a.roleColor || '#f97316'};">${a.name}</span>`
+          ).join('')}</div>`
+        : '';
+    
+    const percentage = Math.round(wf.percentage);
+    const isActive = wf.status === 'running';
     
     return `
-        <div class="workflow-item ${wf.status}" data-action="openWorkflowLog" data-workflow-log="${wf.logPath || ''}" title="Click to view workflow log" style="cursor: pointer;">
-            <div class="workflow-type-icon ${typeInfo.class}">
-                ${typeInfo.icon}
-            </div>
-            <div class="workflow-info">
-                <span class="workflow-type-label">${label}</span>
-                <span class="workflow-phase">${wf.phase} (${wf.phaseIndex + 1}/${wf.totalPhases})</span>
-            </div>
-            <div class="workflow-progress">
-                <div class="workflow-progress-bar">
-                    <div class="workflow-progress-fill ${wf.status}" style="width: ${Math.round(wf.percentage)}%;"></div>
+        <div class="workflow-item ${wf.status}${isActive ? ' active' : ''}" 
+             data-action="openWorkflowLog" 
+             data-workflow-log="${wf.logPath || ''}" 
+             title="Click to view workflow log" 
+             style="--progress: ${percentage}%; cursor: pointer;">
+            <div class="workflow-progress-bg"></div>
+            <div class="workflow-content">
+                <div class="workflow-type-icon ${typeInfo.class}">
+                    ${typeInfo.icon}
                 </div>
-                <span class="workflow-percentage">${Math.round(wf.percentage)}%</span>
+                <div class="workflow-info">
+                    <span class="workflow-type-label">${label}</span>
+                    <span class="workflow-phase">${wf.phase} (${wf.phaseIndex + 1}/${wf.totalPhases})</span>
+                </div>
+                ${agentBadges}
             </div>
-            ${agentBadge}
         </div>
     `;
 }
@@ -180,21 +188,22 @@ function renderHistoryItem(wf: WorkflowInfo): string {
 }
 
 /**
- * Find the agent assigned to a specific workflow.
+ * Find all agents assigned to a specific workflow.
+ * Multiple agents can work on a single workflow (e.g., planner + reviewer in revision).
  */
-function findAgentForWorkflow(wf: WorkflowInfo, agents: AgentInfo[]): AgentInfo | undefined {
-    if (!agents || agents.length === 0) return undefined;
+function findAgentsForWorkflow(wf: WorkflowInfo, agents: AgentInfo[]): AgentInfo[] {
+    if (!agents || agents.length === 0) return [];
     
-    // Match by workflow type to role
-    const roleForType: Record<string, string[]> = {
-        'planning_new': ['planner'],
-        'planning_revision': ['planner'],
-        'task_implementation': ['engineer'],
+    // Map workflow types to roles that could be working on them
+    const rolesForType: Record<string, string[]> = {
+        'planning_new': ['planner', 'analyst_architect', 'analyst_quality'],
+        'planning_revision': ['planner', 'analyst_architect', 'analyst_quality', 'analyst_reviewer'],
+        'task_implementation': ['engineer', 'context', 'code_reviewer'],
         'error_resolution': ['engineer']
     };
     
-    const matchingRoles = roleForType[wf.type] || [];
-    return agents.find(a => matchingRoles.includes(a.roleId || ''));
+    const matchingRoles = rolesForType[wf.type] || [];
+    return agents.filter(a => matchingRoles.includes(a.roleId || ''));
 }
 
 /**
@@ -326,7 +335,7 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                             </div>
                             <span class="nested-label">Active (${session.activeWorkflows.length})</span>
                         </div>
-                        ${session.activeWorkflows.map(wf => renderWorkflowItem(wf, findAgentForWorkflow(wf, session.sessionAgents || []))).join('')}
+                        ${session.activeWorkflows.map(wf => renderWorkflowItem(wf, findAgentsForWorkflow(wf, session.sessionAgents || []))).join('')}
                     ` : ''}
                     
                     <!-- Workflow History (completed, newest first) -->

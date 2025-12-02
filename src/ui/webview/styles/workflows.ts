@@ -1,32 +1,100 @@
 /**
- * Workflow item styles.
+ * Workflow item styles with animated progress background.
  */
 export const workflowStyles = `
-/* Workflow items under coordinator (Level 3 indentation) */
+/* Workflow items with progress as background */
 .workflow-item {
+    position: relative;
     display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 8px;
-    padding-left: 56px;  /* Level 3 indentation to align with history items */
+    align-items: stretch;
+    padding: 0;
+    padding-left: 56px;  /* Level 3 indentation */
     font-size: 10px;
     border-left: 2px solid rgba(0, 122, 204, 0.3);
     margin-left: 0;
+    overflow: hidden;
+    min-height: 28px;
 }
 
+/* Progress background layer */
+.workflow-progress-bg {
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: var(--progress, 0%);
+    background: linear-gradient(90deg, 
+        rgba(0, 122, 204, 0.15) 0%, 
+        rgba(0, 122, 204, 0.08) 100%);
+    transition: width 0.5s ease;
+    z-index: 0;
+}
+
+/* Content layer above progress */
+.workflow-content {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px 6px 0;
+    width: 100%;
+}
+
+/* Active workflow shine animation */
+.workflow-item.active .workflow-progress-bg {
+    background: linear-gradient(90deg, 
+        rgba(0, 122, 204, 0.2) 0%, 
+        rgba(0, 122, 204, 0.1) 100%);
+}
+
+.workflow-item.active .workflow-progress-bg::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: linear-gradient(
+        90deg,
+        transparent 0%,
+        rgba(255, 255, 255, 0.15) 50%,
+        transparent 100%
+    );
+    animation: workflowShine 2s ease-in-out infinite;
+}
+
+@keyframes workflowShine {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(200%); }
+}
+
+/* Status-specific styles */
 .workflow-item.running {
-    border-left-color: rgba(0, 122, 204, 0.6);
-    background: rgba(0, 122, 204, 0.05);
+    border-left-color: rgba(0, 122, 204, 0.7);
 }
 
 .workflow-item.paused {
     border-left-color: rgba(249, 115, 22, 0.6);
 }
 
+.workflow-item.paused .workflow-progress-bg {
+    background: linear-gradient(90deg, 
+        rgba(249, 115, 22, 0.12) 0%, 
+        rgba(249, 115, 22, 0.05) 100%);
+}
+
 .workflow-item.completed {
     border-left-color: rgba(115, 201, 145, 0.6);
 }
 
+.workflow-item.completed .workflow-progress-bg {
+    background: linear-gradient(90deg, 
+        rgba(115, 201, 145, 0.12) 0%, 
+        rgba(115, 201, 145, 0.05) 100%);
+}
+
+/* Icon styles */
 .workflow-type-icon {
     width: 14px;
     height: 14px;
@@ -47,73 +115,48 @@ export const workflowStyles = `
 .workflow-type-icon.task { color: #007acc; }
 .workflow-type-icon.error { color: #f14c4c; }
 
+/* Info section */
 .workflow-info {
-    flex: 1;
     display: flex;
-    align-items: center;
-    gap: 6px;
+    flex-direction: column;
+    gap: 1px;
     min-width: 0;
+    flex-shrink: 0;
 }
 
 .workflow-type-label {
-    font-weight: 500;
+    font-weight: 600;
     white-space: nowrap;
+    font-size: 10px;
 }
 
 .workflow-phase {
     color: var(--vscode-descriptionForeground);
     white-space: nowrap;
+    font-size: 9px;
+    opacity: 0.8;
 }
 
-.workflow-progress {
+/* Multiple agents container */
+.workflow-agents {
     display: flex;
-    align-items: center;
-    gap: 6px;
-    flex-shrink: 0;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-left: auto;
+    justify-content: flex-end;
+    max-width: 50%;
 }
 
-.workflow-progress-bar {
-    width: 50px;
-    height: 4px;
-    background: var(--vscode-widget-border);
-    border-radius: 2px;
-    overflow: hidden;
-}
-
-.workflow-progress-fill {
-    height: 100%;
-    background: #007acc;
-    transition: width 0.3s ease;
-    border-radius: 2px;
-}
-
-.workflow-progress-fill.running {
-    animation: progressPulse 1.5s ease-in-out infinite;
-}
-
-.workflow-percentage {
-    font-size: 9px;
-    color: var(--vscode-descriptionForeground);
-    min-width: 28px;
-    text-align: right;
-}
-
-.workflow-time {
-    font-size: 9px;
-    color: var(--vscode-descriptionForeground);
-    opacity: 0.7;
-    white-space: nowrap;
-}
-
-/* Agent badge in workflow item */
+/* Agent badge with role color */
 .workflow-agent {
     font-size: 9px;
-    font-weight: 500;
-    padding: 1px 6px;
-    border-radius: 8px;
-    background: rgba(255, 255, 255, 0.05);
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--agent-color, #f97316) 15%, transparent);
+    color: var(--agent-color, #f97316);
     white-space: nowrap;
-    flex-shrink: 0;
+    border: 1px solid color-mix(in srgb, var(--agent-color, #f97316) 30%, transparent);
 }
 
 /* Execution progress text in header */
@@ -125,5 +168,12 @@ export const workflowStyles = `
     background: rgba(0, 122, 204, 0.15);
     margin-right: 4px;
 }
-`;
 
+/* Time display */
+.workflow-time {
+    font-size: 9px;
+    color: var(--vscode-descriptionForeground);
+    opacity: 0.7;
+    white-space: nowrap;
+}
+`;
