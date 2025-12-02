@@ -325,6 +325,9 @@ export class TaskManager {
     /**
      * Load persisted tasks from disk on startup
      * Restores tasks from previous daemon session
+     * 
+     * Tasks with invalid format are skipped (not loaded).
+     * The coordinator will detect missing tasks and recreate them.
      */
     private loadPersistedTasks(): void {
         const stateManager = this.getStateManager();
@@ -349,20 +352,19 @@ export class TaskManager {
                 return;
             }
             
-            // Restore tasks to Map with status validation/migration
-            let migratedCount = 0;
+            // Restore tasks to Map, skipping invalid ones
+            let loadedCount = 0;
+            let skippedCount = 0;
             for (const task of data.tasks) {
-                // Validate and migrate status if needed
-                const validStatuses: TaskStatus[] = ['created', 'in_progress', 'blocked', 'paused', 'completed', 'failed'];
-                if (!validStatuses.includes(task.status)) {
-                    const oldStatus = task.status;
-                    // Map legacy/invalid status values to valid ones
-                    task.status = this.migrateInvalidStatus(task);
-                    this.log(`[MIGRATE] Task ${task.id}: status "${oldStatus}" → "${task.status}"`);
-                    migratedCount++;
+                const validation = this.validateTaskFormat(task);
+                if (!validation.valid) {
+                    this.log(`[SKIP] Task ${task.id}: ${validation.reason}`);
+                    skippedCount++;
+                    continue;
                 }
                 
                 this.tasks.set(task.id, task);
+                loadedCount++;
                 
                 // Rebuild file index
                 if (task.filesModified && task.filesModified.length > 0) {
@@ -370,11 +372,10 @@ export class TaskManager {
                 }
             }
             
-            this.log(`Loaded ${data.tasks.length} tasks from ${filePath} (last updated: ${data.lastUpdated})`);
-            
-            // Persist if we migrated any tasks to save the corrected statuses
-            if (migratedCount > 0) {
-                this.log(`[MIGRATE] Migrated ${migratedCount} tasks with invalid status, persisting...`);
+            this.log(`Loaded ${loadedCount} tasks from ${filePath} (last updated: ${data.lastUpdated})`);
+            if (skippedCount > 0) {
+                this.log(`[WARN] Skipped ${skippedCount} tasks with invalid format - coordinator will recreate them`);
+                // Persist to remove invalid tasks from file
                 this.persistTasks();
             }
         } catch (err) {
@@ -383,37 +384,39 @@ export class TaskManager {
     }
     
     /**
-     * Migrate invalid task status to a valid one
-     * Used when loading tasks from disk that may have legacy status values
+     * Validate task format
+     * Returns { valid: true } or { valid: false, reason: string }
      */
-    private migrateInvalidStatus(task: ManagedTask): TaskStatus {
-        const status = task.status as string;
-        
-        // Map known legacy status values
-        const legacyMapping: Record<string, TaskStatus> = {
-            'waiting': 'blocked',      // Old "waiting for dependencies" status
-            'pending': 'blocked',      // Old pending status
-            'ready': 'created',        // Old ready-to-start status
-            'running': 'in_progress',  // Old running status
-            'done': 'completed',       // Old done status
-            'error': 'failed',         // Old error status
-        };
-        
-        if (legacyMapping[status]) {
-            // If task has unmet dependencies, ensure it's blocked
-            // If all deps are complete, it should be 'created' so it can be started
-            if (status === 'waiting' || status === 'pending') {
-                const allDepsComplete = (task.dependencies || []).every(depId => {
-                    const depTask = this.tasks.get(depId);
-                    return depTask && depTask.status === 'completed';
-                });
-                return allDepsComplete ? 'created' : 'blocked';
-            }
-            return legacyMapping[status];
+    validateTaskFormat(task: any): { valid: true } | { valid: false; reason: string } {
+        // Required fields
+        if (!task.id || typeof task.id !== 'string') {
+            return { valid: false, reason: 'missing or invalid id' };
+        }
+        if (!task.sessionId || typeof task.sessionId !== 'string') {
+            return { valid: false, reason: 'missing or invalid sessionId' };
+        }
+        if (!task.description || typeof task.description !== 'string') {
+            return { valid: false, reason: 'missing or invalid description' };
         }
         
-        // Default to 'created' for unknown status values
-        return 'created';
+        // Valid status values
+        const validStatuses: TaskStatus[] = ['created', 'in_progress', 'blocked', 'paused', 'completed', 'failed'];
+        if (!validStatuses.includes(task.status)) {
+            return { valid: false, reason: `invalid status "${task.status}"` };
+        }
+        
+        // Valid task types
+        const validTypes: TaskType[] = ['implementation', 'error_fix'];
+        if (!validTypes.includes(task.taskType)) {
+            return { valid: false, reason: `invalid taskType "${task.taskType}"` };
+        }
+        
+        // Dependencies must be array
+        if (task.dependencies && !Array.isArray(task.dependencies)) {
+            return { valid: false, reason: 'dependencies must be an array' };
+        }
+        
+        return { valid: true };
     }
     
     /**
@@ -486,6 +489,49 @@ export class TaskManager {
         }
     }
     
+    /**
+     * Delete a task from the system
+     * Used when a task has invalid format and needs to be recreated by coordinator
+     * 
+     * @param taskId Global task ID (e.g., "ps_000001_T1")
+     * @param reason Reason for deletion (for logging)
+     * @returns true if task was deleted, false if not found
+     */
+    deleteTask(taskId: string, reason?: string): boolean {
+        const task = this.tasks.get(taskId);
+        if (!task) {
+            this.log(`[DELETE] Task ${taskId} not found`);
+            return false;
+        }
+        
+        // Remove from dependents lists of dependencies
+        for (const depId of task.dependencies) {
+            const depTask = this.tasks.get(depId);
+            if (depTask) {
+                depTask.dependents = depTask.dependents.filter(id => id !== taskId);
+            }
+        }
+        
+        // Remove from dependencies of dependent tasks (they'll be blocked again)
+        for (const dependentId of task.dependents) {
+            const dependentTask = this.tasks.get(dependentId);
+            if (dependentTask) {
+                dependentTask.dependencies = dependentTask.dependencies.filter(id => id !== taskId);
+            }
+        }
+        
+        // Remove from file index
+        this.removeTaskFromFileIndex(taskId);
+        
+        // Remove from tasks map
+        this.tasks.delete(taskId);
+        
+        this.log(`[DELETE] Task ${taskId} deleted${reason ? `: ${reason}` : ''}`);
+        this.persistTasks();
+        
+        return true;
+    }
+    
     // ========================================================================
     // Stage/Status Helpers
     // ========================================================================
@@ -553,6 +599,8 @@ export class TaskManager {
     /**
      * Create a task from CLI command
      * This is the only way tasks should be created in the new architecture
+     * 
+     * Validates all input parameters before creating the task.
      */
     createTaskFromCli(params: TaskCreateParams): { success: boolean; error?: string } {
         const { 
@@ -569,6 +617,33 @@ export class TaskManager {
             previousAttempts,
             previousFixSummary
         } = params;
+
+        // Validate required fields
+        if (!sessionId || typeof sessionId !== 'string' || sessionId.trim() === '') {
+            return { success: false, error: 'Invalid sessionId: must be a non-empty string' };
+        }
+        if (!taskId || typeof taskId !== 'string' || taskId.trim() === '') {
+            return { success: false, error: 'Invalid taskId: must be a non-empty string' };
+        }
+        if (!description || typeof description !== 'string' || description.trim() === '') {
+            return { success: false, error: 'Invalid description: must be a non-empty string' };
+        }
+        
+        // Validate taskType
+        const validTypes: TaskType[] = ['implementation', 'error_fix'];
+        if (!validTypes.includes(taskType)) {
+            return { success: false, error: `Invalid taskType "${taskType}": must be "implementation" or "error_fix"` };
+        }
+        
+        // Validate dependencies format
+        if (!Array.isArray(dependencies)) {
+            return { success: false, error: 'Invalid dependencies: must be an array' };
+        }
+        for (const dep of dependencies) {
+            if (typeof dep !== 'string' || dep.trim() === '') {
+                return { success: false, error: `Invalid dependency "${dep}": must be a non-empty string` };
+            }
+        }
 
         const globalTaskId = `${sessionId}_${taskId}`;
         

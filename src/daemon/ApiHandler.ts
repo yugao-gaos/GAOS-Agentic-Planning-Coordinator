@@ -181,6 +181,10 @@ export interface ITaskManagerApi {
     markTaskFailed(globalTaskId: string, reason?: string): void;
     /** Reload tasks from disk (for when daemon started before tasks were created) */
     reloadPersistedTasks?(): void;
+    /** Delete a task (used when task has invalid format) */
+    deleteTask?(globalTaskId: string, reason?: string): boolean;
+    /** Validate task format, returns { valid: true } or { valid: false, reason: string } */
+    validateTaskFormat?(task: any): { valid: true } | { valid: false; reason: string };
 }
 
 // Import types for agent completion signal
@@ -950,15 +954,27 @@ export class ApiHandler {
                 
                 const workflowType = (params.workflow || 'task_implementation') as string;
                 
-                // Get the task to verify it exists and is ready
+                // Get the task to verify it exists
                 const globalTaskId = `${sessionId}_${taskId}`;
                 const task = this.services.taskManager.getTask(globalTaskId);
                 if (!task) {
                     throw new Error(`Task ${taskId} not found in session ${sessionId}`);
                 }
                 
-                if (task.status !== 'created' && task.status !== 'pending') {
-                    throw new Error(`Task ${taskId} cannot be started (status: ${task.status})`);
+                // Validate task format - if invalid, delete and fail
+                // This triggers coordinator to recreate with correct format
+                if (this.services.taskManager.validateTaskFormat) {
+                    const validation = this.services.taskManager.validateTaskFormat(task);
+                    if (!validation.valid) {
+                        const reason = `Invalid task format: ${validation.reason}`;
+                        this.services.taskManager.deleteTask?.(globalTaskId, reason);
+                        throw new Error(`Task ${taskId} deleted due to invalid format (${validation.reason}). Coordinator will recreate.`);
+                    }
+                }
+                
+                // Only 'created' status can be started (task is ready)
+                if (task.status !== 'created') {
+                    throw new Error(`Task ${taskId} cannot be started (status: ${task.status}). Only 'created' tasks can be started.`);
                 }
                 
                 // Check dependencies

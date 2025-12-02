@@ -292,6 +292,8 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
                 completeTask: (globalTaskId: string, summary?: string) => tm.markTaskCompletedViaCli(globalTaskId, summary),
                 updateTaskStage: (globalTaskId: string, stage: string) => tm.updateTaskStage(globalTaskId, stage),
                 markTaskFailed: (globalTaskId: string, reason?: string) => tm.markTaskFailed(globalTaskId, reason),
+                deleteTask: (globalTaskId: string, reason?: string) => tm.deleteTask(globalTaskId, reason),
+                validateTaskFormat: (task: any) => tm.validateTaskFormat(task),
                 reloadPersistedTasks: () => tm.reloadPersistedTasks()
             };
         })(),
