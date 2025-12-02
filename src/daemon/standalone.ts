@@ -215,7 +215,9 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
             getFailedTasks: (sessionId: string) => coordinator.getFailedTasks(sessionId),
             signalAgentCompletion: (signal: any) => coordinator.signalAgentCompletion(signal),
             triggerCoordinatorEvaluation: (sessionId: string, eventType: string, payload: any) => 
-                coordinator.triggerCoordinatorEvaluation(sessionId, eventType as any, payload)
+                coordinator.triggerCoordinatorEvaluation(sessionId, eventType as any, payload),
+            startTaskWorkflow: (sessionId: string, taskId: string, workflowType: string) =>
+                coordinator.startTaskWorkflow(sessionId, taskId, workflowType)
         },
         planningService: {
             listPlanningSessions: () => planningService.listPlanningSessions(),
@@ -257,6 +259,11 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
                 },
                 getTasksForSession: (sessionId: string) => tm.getTasksForSession(sessionId),
                 getTask: (globalTaskId: string) => tm.getTask(globalTaskId),
+                getAllTasks: () => tm.getAllTasks(),
+                createTaskFromCli: (params: { sessionId: string; taskId: string; description: string; dependencies?: string[]; taskType?: 'implementation' | 'error_fix'; priority?: number; errorText?: string }) => 
+                    tm.createTaskFromCli(params),
+                completeTask: (globalTaskId: string, summary?: string) => tm.markTaskCompletedViaCli(globalTaskId, summary),
+                updateTaskStage: (globalTaskId: string, stage: string) => tm.updateTaskStage(globalTaskId, stage),
                 markTaskFailed: (globalTaskId: string, reason?: string) => tm.markTaskFailed(globalTaskId, reason)
             };
         })(),

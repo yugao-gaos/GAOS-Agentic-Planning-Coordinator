@@ -488,6 +488,174 @@ case "$COMMAND" in
         esac
         ;;
     
+    task|t)
+        SUB="${1:-list}"
+        shift 2>/dev/null || true
+        case "$SUB" in
+            list|ls)
+                SESSION="${1:-}"
+                if [[ -n "$SESSION" ]]; then
+                    response=$(send_ws_command "task.list" "{\"session\": \"$SESSION\"}")
+                else
+                    response=$(send_ws_command "task.list" "{}")
+                fi
+                display_response "$response"
+                ;;
+            create|c)
+                # Parse named parameters
+                SESSION=""
+                TASK_ID=""
+                DESC=""
+                DEPS=""
+                TYPE="implementation"
+                PRIORITY=""
+                ERROR_TEXT=""
+                
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        --session|-s)
+                            SESSION="$2"
+                            shift 2
+                            ;;
+                        --id|-i)
+                            TASK_ID="$2"
+                            shift 2
+                            ;;
+                        --desc|-d)
+                            DESC="$2"
+                            shift 2
+                            ;;
+                        --deps)
+                            DEPS="$2"
+                            shift 2
+                            ;;
+                        --type|-t)
+                            TYPE="$2"
+                            shift 2
+                            ;;
+                        --priority|-p)
+                            PRIORITY="$2"
+                            shift 2
+                            ;;
+                        --error-text)
+                            ERROR_TEXT="$2"
+                            shift 2
+                            ;;
+                        *)
+                            shift
+                            ;;
+                    esac
+                done
+                
+                if [[ -z "$SESSION" ]] || [[ -z "$TASK_ID" ]] || [[ -z "$DESC" ]]; then
+                    echo -e "${RED}Usage: apc task create --session <id> --id <taskId> --desc \"description\" [--deps T1,T2] [--type implementation|error_fix] [--priority N]${RESET}"
+                    exit 1
+                fi
+                
+                # Build JSON params
+                PARAMS="{\"session\": \"$SESSION\", \"id\": \"$TASK_ID\", \"desc\": \"$DESC\", \"type\": \"$TYPE\""
+                [[ -n "$DEPS" ]] && PARAMS="$PARAMS, \"deps\": \"$DEPS\""
+                [[ -n "$PRIORITY" ]] && PARAMS="$PARAMS, \"priority\": $PRIORITY"
+                [[ -n "$ERROR_TEXT" ]] && PARAMS="$PARAMS, \"errorText\": \"$ERROR_TEXT\""
+                PARAMS="$PARAMS}"
+                
+                response=$(send_ws_command "task.create" "$PARAMS")
+                display_response "$response"
+                ;;
+            start|s)
+                # Parse named parameters
+                SESSION=""
+                TASK_ID=""
+                WORKFLOW="task_implementation"
+                
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        --session|-s)
+                            SESSION="$2"
+                            shift 2
+                            ;;
+                        --id|-i)
+                            TASK_ID="$2"
+                            shift 2
+                            ;;
+                        --workflow|-w)
+                            WORKFLOW="$2"
+                            shift 2
+                            ;;
+                        *)
+                            shift
+                            ;;
+                    esac
+                done
+                
+                if [[ -z "$SESSION" ]] || [[ -z "$TASK_ID" ]]; then
+                    echo -e "${RED}Usage: apc task start --session <id> --id <taskId> [--workflow task_implementation]${RESET}"
+                    exit 1
+                fi
+                
+                response=$(send_ws_command "task.start" "{\"session\": \"$SESSION\", \"id\": \"$TASK_ID\", \"workflow\": \"$WORKFLOW\"}")
+                display_response "$response"
+                ;;
+            complete|done)
+                # Parse named parameters
+                SESSION=""
+                TASK_ID=""
+                SUMMARY=""
+                
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        --session|-s)
+                            SESSION="$2"
+                            shift 2
+                            ;;
+                        --id|-i)
+                            TASK_ID="$2"
+                            shift 2
+                            ;;
+                        --summary)
+                            SUMMARY="$2"
+                            shift 2
+                            ;;
+                        *)
+                            shift
+                            ;;
+                    esac
+                done
+                
+                if [[ -z "$SESSION" ]] || [[ -z "$TASK_ID" ]]; then
+                    echo -e "${RED}Usage: apc task complete --session <id> --id <taskId> [--summary \"Done\"]${RESET}"
+                    exit 1
+                fi
+                
+                PARAMS="{\"session\": \"$SESSION\", \"id\": \"$TASK_ID\""
+                [[ -n "$SUMMARY" ]] && PARAMS="$PARAMS, \"summary\": \"$SUMMARY\""
+                PARAMS="$PARAMS}"
+                
+                response=$(send_ws_command "task.complete" "$PARAMS")
+                display_response "$response"
+                ;;
+            status|st)
+                SESSION="${1:-}"
+                TASK_ID="${2:-}"
+                if [[ -z "$SESSION" ]] || [[ -z "$TASK_ID" ]]; then
+                    echo -e "${RED}Usage: apc task status <session_id> <task_id>${RESET}"
+                    exit 1
+                fi
+                response=$(send_ws_command "task.status" "{\"session\": \"$SESSION\", \"task\": \"$TASK_ID\"}")
+                display_response "$response"
+                ;;
+            *)
+                echo -e "${YELLOW}Usage: apc task [list|create|start|complete|status]${RESET}"
+                echo ""
+                echo "  list [session]              List all tasks (optionally for a session)"
+                echo "  create --session <id> --id <taskId> --desc \"...\" [--deps T1,T2] [--type implementation]"
+                echo "  start --session <id> --id <taskId> [--workflow task_implementation]"
+                echo "  complete --session <id> --id <taskId> [--summary \"...\"]"
+                echo "  status <session_id> <task_id>"
+                ;;
+        esac
+        ;;
+    
     unity|u)
         SUB="${1:-status}"
         shift 2>/dev/null || true
@@ -755,6 +923,13 @@ case "$COMMAND" in
         echo "  workflow list <id>  List workflows for session"
         echo "  workflow status     Get workflow status"
         echo "  workflow cancel     Cancel a workflow"
+        echo ""
+        echo -e "${GREEN}Tasks:${RESET}"
+        echo "  task list [session] List all tasks"
+        echo "  task create ...     Create a new task"
+        echo "  task start ...      Start a task workflow"
+        echo "  task complete ...   Mark task complete"
+        echo "  task status <s> <t> Get task status"
         echo ""
         echo -e "${GREEN}Agents:${RESET}"
         echo "  pool status         Show agent pool status"

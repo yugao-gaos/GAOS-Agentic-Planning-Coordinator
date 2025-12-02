@@ -143,6 +143,9 @@ export interface ICoordinatorApi {
     // Coordinator evaluation trigger
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     triggerCoordinatorEvaluation(sessionId: string, eventType: string, payload: any): Promise<any>;
+    
+    // Start a workflow for a specific task
+    startTaskWorkflow(sessionId: string, taskId: string, workflowType: string): Promise<string>;
 }
 
 /**
@@ -150,8 +153,12 @@ export interface ICoordinatorApi {
  */
 export interface ITaskManagerApi {
     getProgressForSession(sessionId: string): { completed: number; pending: number; inProgress: number; failed: number; ready: number; total: number };
-    getTasksForSession(sessionId: string): Array<{ id: string; description: string; status: string; stage?: string; dependencies: string[]; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string }>;
-    getTask(globalTaskId: string): { id: string; description: string; status: string; stage?: string; dependencies: string[]; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string } | undefined;
+    getTasksForSession(sessionId: string): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string }>;
+    getTask(globalTaskId: string): { id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string } | undefined;
+    getAllTasks(): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string }>;
+    createTaskFromCli(params: { sessionId: string; taskId: string; description: string; dependencies?: string[]; taskType?: 'implementation' | 'error_fix'; priority?: number; errorText?: string }): { success: boolean; error?: string };
+    completeTask(globalTaskId: string, summary?: string): void;
+    updateTaskStage(globalTaskId: string, stage: string): void;
     markTaskFailed(globalTaskId: string, reason?: string): void;
 }
 
@@ -837,8 +844,114 @@ export class ApiHandler {
         }
         
         const sessionId = (params.session || params.sessionId) as string;
+        const taskId = (params.task || params.taskId || params.id) as string;
         
         switch (action) {
+            case 'list': {
+                // List all tasks, optionally filtered by session
+                const allTasks = this.services.taskManager.getAllTasks();
+                const tasks = sessionId 
+                    ? allTasks.filter(t => t.sessionId === sessionId)
+                    : allTasks;
+                
+                return {
+                    data: tasks.map(t => ({
+                        id: t.id.includes('_') ? t.id.split('_').slice(1).join('_') : t.id,
+                        globalId: t.id,
+                        sessionId: t.sessionId,
+                        description: t.description,
+                        status: t.status,
+                        type: t.taskType,
+                        dependencies: t.dependencies,
+                        priority: t.priority
+                    })),
+                    message: `Found ${tasks.length} task(s)`
+                };
+            }
+            
+            case 'create': {
+                if (!sessionId) {
+                    throw new Error('Missing session parameter');
+                }
+                if (!taskId) {
+                    throw new Error('Missing id parameter');
+                }
+                if (!params.desc && !params.description) {
+                    throw new Error('Missing desc parameter');
+                }
+                
+                const result = this.services.taskManager.createTaskFromCli({
+                    sessionId,
+                    taskId,
+                    description: (params.desc || params.description) as string,
+                    dependencies: params.deps ? String(params.deps).split(',').filter(d => d.trim()) : [],
+                    taskType: (params.type as 'implementation' | 'error_fix') || 'implementation',
+                    priority: params.priority ? Number(params.priority) : 0,
+                    errorText: params.errorText as string | undefined
+                });
+                
+                if (!result.success) {
+                    throw new Error(result.error || 'Failed to create task');
+                }
+                
+                return { message: `Task ${taskId} created in session ${sessionId}` };
+            }
+            
+            case 'start': {
+                if (!sessionId) {
+                    throw new Error('Missing session parameter');
+                }
+                if (!taskId) {
+                    throw new Error('Missing id parameter');
+                }
+                
+                const workflowType = (params.workflow || 'task_implementation') as string;
+                
+                // Get the task to verify it exists and is ready
+                const globalTaskId = `${sessionId}_${taskId}`;
+                const task = this.services.taskManager.getTask(globalTaskId);
+                if (!task) {
+                    throw new Error(`Task ${taskId} not found in session ${sessionId}`);
+                }
+                
+                if (task.status !== 'created' && task.status !== 'pending') {
+                    throw new Error(`Task ${taskId} cannot be started (status: ${task.status})`);
+                }
+                
+                // Check dependencies
+                const unmetDeps = task.dependencies.filter(depId => {
+                    const depTask = this.services.taskManager!.getTask(depId) || 
+                                   this.services.taskManager!.getTask(`${sessionId}_${depId}`);
+                    return !depTask || depTask.status !== 'completed';
+                });
+                
+                if (unmetDeps.length > 0) {
+                    throw new Error(`Task ${taskId} has unmet dependencies: ${unmetDeps.join(', ')}`);
+                }
+                
+                // Start workflow for this task via coordinator
+                if (this.services.coordinator) {
+                    await this.services.coordinator.startTaskWorkflow(sessionId, taskId, workflowType);
+                    return { message: `Started ${workflowType} workflow for task ${taskId}` };
+                } else {
+                    throw new Error('Coordinator not available to start workflow');
+                }
+            }
+            
+            case 'complete': {
+                if (!sessionId) {
+                    throw new Error('Missing session parameter');
+                }
+                if (!taskId) {
+                    throw new Error('Missing id parameter');
+                }
+                
+                const globalTaskId = `${sessionId}_${taskId}`;
+                this.services.taskManager.completeTask(globalTaskId, params.summary as string);
+                
+                return { message: `Task ${taskId} marked complete` };
+            }
+            
             case 'progress': {
                 if (!sessionId) {
                     throw new Error('Missing session parameter');
@@ -850,23 +963,23 @@ export class ApiHandler {
                 if (!sessionId) {
                     throw new Error('Missing session parameter');
                 }
-                if (!params.task && !params.taskId) {
+                if (!taskId) {
                     throw new Error('Missing task parameter');
                 }
-                return { data: this.taskStatus(sessionId, (params.task || params.taskId) as string) };
+                return { data: this.taskStatus(sessionId, taskId) };
             }
             
             case 'fail': {
                 if (!sessionId) {
                     throw new Error('Missing session parameter');
                 }
-                if (!params.task && !params.taskId) {
+                if (!taskId) {
                     throw new Error('Missing task parameter');
                 }
                 if (!params.reason) {
                     throw new Error('Missing reason parameter');
                 }
-                return this.taskFail(sessionId, (params.task || params.taskId) as string, params.reason as string);
+                return this.taskFail(sessionId, taskId, params.reason as string);
             }
             
             default:

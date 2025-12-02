@@ -443,6 +443,59 @@ export class UnifiedCoordinatorService {
         return config.id;
     }
     
+    /**
+     * Start a workflow for a specific task (called by coordinator AI via CLI)
+     * 
+     * @param sessionId - The planning session
+     * @param taskId - The task ID (local, not global)
+     * @param workflowType - The workflow type to run
+     * @returns Workflow ID
+     */
+    async startTaskWorkflow(sessionId: string, taskId: string, workflowType: string): Promise<string> {
+        const taskManager = ServiceLocator.resolve(TaskManager);
+        const globalTaskId = `${sessionId}_${taskId}`;
+        
+        // Get the task
+        const task = taskManager.getTask(globalTaskId);
+        if (!task) {
+            throw new Error(`Task ${taskId} not found in session ${sessionId}`);
+        }
+        
+        // Get plan path
+        const session = this.stateManager.getPlanningSession(sessionId);
+        const planPath = session?.currentPlanPath || '';
+        
+        // Build workflow input based on workflow type
+        let input: Record<string, any>;
+        
+        if (workflowType === 'task_implementation') {
+            input = {
+                taskId,
+                taskDescription: task.description,
+                dependencies: task.dependencies,
+                planPath
+            };
+        } else if (workflowType === 'error_resolution') {
+            input = {
+                taskId,
+                errors: task.errorText ? [task.errorText] : [],
+                previousAttempts: task.previousAttempts || 0,
+                previousFixSummary: task.previousFixSummary
+            };
+        } else {
+            input = {
+                taskId,
+                taskDescription: task.description,
+                planPath
+            };
+        }
+        
+        // Mark task as in progress
+        taskManager.markTaskInProgress(globalTaskId);
+        
+        // Dispatch the workflow
+        return this.dispatchWorkflow(sessionId, workflowType as WorkflowType, input);
+    }
     
     /**
      * Start execution by triggering AI Coordinator evaluation
