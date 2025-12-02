@@ -142,6 +142,9 @@ export class CoordinatorAgent {
             this.log(`[DEBUG] Prompt length: ${prompt.length} chars`);
         }
         
+        // Save prompt to log file for debugging
+        this.saveCoordinatorLog(input.sessionId, evalId, 'prompt', prompt);
+        
         // Run the AI agent - it will call run_terminal_cmd directly
         const result = await this.agentRunner.run({
             id: evalId,
@@ -151,6 +154,9 @@ export class CoordinatorAgent {
             timeoutMs: this.config.evaluationTimeout,
             onProgress: (msg) => this.log(`[eval] ${msg}`)
         });
+        
+        // Save output to log file for debugging
+        this.saveCoordinatorLog(input.sessionId, evalId, 'output', result.output || '(no output)');
         
         // Debug logging: show raw output info
         const outputLength = result.output?.length || 0;
@@ -177,6 +183,27 @@ export class CoordinatorAgent {
         }
         
         return decision;
+    }
+    
+    /**
+     * Save coordinator prompt/output to log file for debugging
+     */
+    private saveCoordinatorLog(sessionId: string, evalId: string, type: 'prompt' | 'output', content: string): void {
+        try {
+            const logDir = `${this.workspaceRoot}/_AiDevLog/Plans/${sessionId}/coordinators`;
+            if (!fs.existsSync(logDir)) {
+                fs.mkdirSync(logDir, { recursive: true });
+            }
+            
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            const filename = `${timestamp}_${evalId}_${type}.txt`;
+            const filepath = `${logDir}/${filename}`;
+            
+            fs.writeFileSync(filepath, content);
+            this.log(`[DEBUG] Saved coordinator ${type} to: ${filepath}`);
+        } catch (err) {
+            this.log(`[WARN] Failed to save coordinator log: ${err}`);
+        }
     }
 
     /**

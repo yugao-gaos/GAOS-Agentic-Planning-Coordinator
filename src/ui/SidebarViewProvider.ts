@@ -298,7 +298,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     
     /** Track sessions that have been triggered recently to avoid spam */
     private recentlyTriggeredSessions: Map<string, number> = new Map();
-    private static readonly TRIGGER_COOLDOWN_MS = 30000; // 30 seconds between triggers per session
+    private static readonly TRIGGER_COOLDOWN_MS = 60000; // 60 seconds between triggers per session
     
     /**
      * Check for idle approved plans with available agents and trigger coordinator evaluation
