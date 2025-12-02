@@ -106,6 +106,10 @@ export interface SessionListResponse {
         totalWorkflows: number;
         createdAt: string;
         updatedAt: string;
+        /** Path to current plan file (if any) */
+        currentPlanPath?: string;
+        /** Plan version history */
+        planHistory?: Array<{ version: number; path: string; timestamp: string }>;
     }>;
 }
 

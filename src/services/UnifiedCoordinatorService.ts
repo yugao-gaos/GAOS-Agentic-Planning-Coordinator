@@ -270,8 +270,33 @@ export class UnifiedCoordinatorService {
     
     /**
      * Get session workflow state for UI
+     * Auto-initializes sessions that exist in StateManager but aren't in memory,
+     * unless they're completed (no need to track completed sessions in memory).
      */
     getSessionState(sessionId: string): SessionWorkflowState | undefined {
+        // Auto-initialize if session exists in StateManager but not in memory
+        if (!this.sessions.has(sessionId)) {
+            const planningSession = this.stateManager.getPlanningSession(sessionId);
+            if (planningSession) {
+                if (planningSession.status !== 'completed') {
+                    // Initialize non-completed sessions to track workflow state
+                    this.initSession(sessionId);
+                } else {
+                    // For completed sessions, return minimal state with workflow history from disk
+                    const savedWorkflowHistory = this.stateManager.loadWorkflowHistory(sessionId) as CompletedWorkflowSummary[];
+                    return {
+                        sessionId,
+                        activeWorkflows: new Map(),
+                        pendingWorkflows: [],
+                        completedWorkflows: [],
+                        workflowHistory: savedWorkflowHistory,
+                        isRevising: false,
+                        pausedForRevision: []
+                    };
+                }
+            }
+        }
+        
         const state = this.sessions.get(sessionId);
         if (!state) return undefined;
         
@@ -984,6 +1009,26 @@ export class UnifiedCoordinatorService {
         
         // Fire event
         this._onWorkflowComplete.fire({ sessionId, workflowId, result });
+        
+        // Broadcast workflow completion to all WebSocket clients
+        // This ensures the extension UI updates even when daemon runs separately
+        try {
+            const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+            broadcaster.broadcast('workflow.completed', {
+                workflowId,
+                sessionId,
+                type: workflow?.type || 'unknown',
+                success: result.success,
+                output: result.output,
+                error: result.error,
+                duration: result.duration || 0,
+                completedAt: new Date().toISOString()
+            }, sessionId);
+            this.log(`Broadcast workflow.completed for ${workflowId.substring(0, 8)}`);
+        } catch (e) {
+            // Broadcaster may not be available in some contexts
+            console.warn(`[UnifiedCoordinatorService] Failed to broadcast workflow.completed:`, e);
+        }
         
         // Handle revision workflow completion (cleanup legacy state)
         // Note: workflow variable already declared above

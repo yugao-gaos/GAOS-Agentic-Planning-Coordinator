@@ -425,7 +425,9 @@ export class ApiHandler {
                     activeWorkflows: workflows.filter(w => w.status === 'running').length,
                     totalWorkflows: workflows.length,
                     createdAt: s.createdAt,
-                    updatedAt: s.updatedAt
+                    updatedAt: s.updatedAt,
+                    currentPlanPath: s.currentPlanPath,
+                    planHistory: s.planHistory
                 };
             })
         };

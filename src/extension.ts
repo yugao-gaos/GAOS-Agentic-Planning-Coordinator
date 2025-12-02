@@ -236,6 +236,14 @@ export async function activate(context: vscode.ExtensionContext) {
             })
         );
         
+        // Subscribe to workflow completion events to update UI
+        eventSubscriptions.push(
+            vsCodeClient.subscribe('workflow.completed', () => {
+                console.log('[APC] Workflow completed, refreshing UI');
+                sidebarProvider?.refresh();
+            })
+        );
+        
         // Subscribe to disconnection events to update UI
         eventSubscriptions.push(
             vsCodeClient.subscribe('disconnected', () => {
