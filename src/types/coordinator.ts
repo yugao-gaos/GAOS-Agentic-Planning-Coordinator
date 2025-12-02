@@ -128,13 +128,16 @@ export interface ManualEvaluationPayload {
  */
 export interface TaskSummary {
     id: string;
+    sessionId?: string;  // Added for multi-plan support
     description: string;
-    status: 'pending' | 'in_progress' | 'completed' | 'failed' | 'paused' | 'blocked';
+    status: 'created' | 'pending' | 'in_progress' | 'completed' | 'failed' | 'paused' | 'blocked';
     type: 'implementation' | 'error_fix' | 'context_gathering';
     dependencies: string[];
     dependencyStatus: 'all_complete' | 'some_pending' | 'some_failed';
     assignedAgent?: string;
     errors?: string[];
+    errorCount?: number;
+    retryCount?: number;
     attempts: number;
     priority: number;
 }
@@ -157,19 +160,32 @@ export interface ActiveWorkflowSummary {
 /**
  * Complete input provided to AI coordinator for decision-making
  */
+/**
+ * Summary of an approved plan for coordinator
+ */
+export interface PlanSummary {
+    sessionId: string;
+    planPath: string;
+    requirement: string;
+    status: string;
+}
+
 export interface CoordinatorInput {
     /** The event that triggered this evaluation */
     event: CoordinatorEvent;
     
-    /** Session identifier */
+    /** Primary session identifier (for the triggering event) */
     sessionId: string;
     
-    // ---- Plan Context ----
-    /** Path to the plan file */
+    // ---- Plan Context (Multi-Plan Support) ----
+    /** All approved and uncompleted plans */
+    approvedPlans: PlanSummary[];
+    
+    /** @deprecated Use approvedPlans instead - kept for backward compatibility */
     planPath: string;
-    /** Full plan content (markdown) */
+    /** @deprecated Use approvedPlans instead */
     planContent: string;
-    /** Original requirement that started this plan */
+    /** @deprecated Use approvedPlans instead */
     planRequirement: string;
     
     // ---- History for Continuity ----
@@ -186,7 +202,7 @@ export interface CoordinatorInput {
         currentTask?: string;
         roles: string[];
     }>;
-    /** All tasks in this session */
+    /** All tasks across all sessions */
     tasks: TaskSummary[];
     /** Currently running workflows */
     activeWorkflows: ActiveWorkflowSummary[];

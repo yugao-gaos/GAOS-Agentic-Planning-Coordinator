@@ -20,7 +20,8 @@ import {
     CoordinatorInput,
     CoordinatorHistoryEntry,
     TaskSummary,
-    ActiveWorkflowSummary
+    ActiveWorkflowSummary,
+    PlanSummary
 } from '../types/coordinator';
 import { IWorkflow } from './workflows';
 
@@ -63,7 +64,9 @@ export class CoordinatorContext {
     /**
      * Build the full input context for the AI Coordinator
      * 
-     * @param sessionId - The session to build context for
+     * Coordinator is global - it sees ALL approved plans and ALL tasks.
+     * 
+     * @param sessionId - The primary session (triggering event)
      * @param event - The triggering event
      * @param sessionState - Snapshot of session state from UnifiedCoordinatorService
      * @returns Complete context for AI evaluation
@@ -75,11 +78,14 @@ export class CoordinatorContext {
     ): Promise<CoordinatorInput> {
         const session = this.stateManager.getPlanningSession(sessionId);
         
-        // Get plan content
+        // Get ALL approved plans (not just the triggering session)
+        const approvedPlans = this.getApprovedPlans();
+        
+        // Get plan content for backward compatibility
         const { planPath, planContent } = this.getPlanContent(session);
         
-        // Build task summaries from TaskManager
-        const tasks = this.buildTaskSummaries(sessionId);
+        // Build task summaries from TaskManager (ALL tasks, not just this session)
+        const tasks = this.buildAllTaskSummaries();
         
         // Build workflow summaries from session state
         const activeWorkflows = sessionState 
@@ -93,6 +99,7 @@ export class CoordinatorContext {
         return {
             event,
             sessionId,
+            approvedPlans,
             planPath,
             planContent,
             planRequirement: session?.requirement || '',
@@ -104,6 +111,59 @@ export class CoordinatorContext {
             sessionStatus: session?.status || 'unknown',
             pendingQuestions: sessionState?.pendingQuestions || []
         };
+    }
+    
+    /**
+     * Get all approved and uncompleted plans
+     */
+    private getApprovedPlans(): PlanSummary[] {
+        const sessions = this.stateManager.getAllPlanningSessions();
+        return sessions
+            .filter(s => s.status === 'approved') // Only approved plans need tasks created
+            .map(s => ({
+                sessionId: s.id,
+                planPath: s.currentPlanPath || '',
+                requirement: s.requirement || '',
+                status: s.status
+            }));
+    }
+    
+    /**
+     * Build task summaries for ALL sessions (global view)
+     */
+    private buildAllTaskSummaries(): TaskSummary[] {
+        const taskManager = ServiceLocator.resolve(TaskManager);
+        const allTasks = taskManager.getAllTasks();
+        
+        return allTasks.map(task => {
+            // Determine dependency status
+            let dependencyStatus: 'all_complete' | 'some_pending' | 'some_failed' = 'all_complete';
+            if (task.dependencies && task.dependencies.length > 0) {
+                const depTasks = task.dependencies.map(depId => {
+                    // Try both local and global ID formats
+                    return taskManager.getTask(depId) || taskManager.getTask(`${task.sessionId}_${depId}`);
+                });
+                
+                if (depTasks.some(t => t?.status === 'failed')) {
+                    dependencyStatus = 'some_failed';
+                } else if (depTasks.some(t => t?.status !== 'completed')) {
+                    dependencyStatus = 'some_pending';
+                }
+            }
+            
+            return {
+                id: task.id,
+                sessionId: task.sessionId,
+                description: task.description,
+                status: task.status,
+                type: task.taskType as 'implementation' | 'error_fix' | 'context_gathering',
+                priority: task.priority,
+                dependencies: task.dependencies || [],
+                dependencyStatus,
+                assignedAgent: undefined, // TaskManager doesn't track this directly
+                attempts: task.previousAttempts || 0
+            };
+        });
     }
 
     /**

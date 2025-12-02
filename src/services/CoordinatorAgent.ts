@@ -233,7 +233,7 @@ export class CoordinatorAgent {
      * 
      * Structure:
      * 1. roleIntro (configurable) - Base role description
-     * 2. Runtime context (dynamic) - Events, Plan, History, State
+     * 2. Runtime context (dynamic) - Events, Plans, History, State
      * 3. decisionInstructions (configurable) - Decision guidelines and output format
      */
     private buildPrompt(input: CoordinatorInput): string {
@@ -242,6 +242,7 @@ export class CoordinatorAgent {
         const workflowsSection = this.formatWorkflows(input.activeWorkflows);
         const agentsSection = this.formatAgents(input.agentStatuses, input.availableAgents);
         const eventSection = this.formatEventSection(input);
+        const plansSection = this.formatApprovedPlans(input);
         
         // Get customizable prompt parts from registry (or use defaults)
         const promptConfig = this.roleRegistry?.getCoordinatorPrompt() || DefaultCoordinatorPrompt;
@@ -268,27 +269,22 @@ TRIGGERING EVENT(S)
 ${eventSection}
 
 ═══════════════════════════════════════════════════════════════════════════════
-THE PLAN
+APPROVED PLANS
 ═══════════════════════════════════════════════════════════════════════════════
 
-Requirement: ${input.planRequirement}
-Plan File: ${input.planPath || 'N/A'}
-
-**Read the plan file using read_file tool to see task breakdown.**
+${plansSection}
 
 ═══════════════════════════════════════════════════════════════════════════════
 DECISION HISTORY (${input.history.length} previous evaluations)
 ═══════════════════════════════════════════════════════════════════════════════
 
-${historySection || 'No previous decisions in this session.'}
+${historySection || 'No previous decisions.'}
 
 ═══════════════════════════════════════════════════════════════════════════════
 CURRENT STATE
 ═══════════════════════════════════════════════════════════════════════════════
 
-Session Status: ${input.sessionStatus}
-
---- TASKS ---
+--- TASKS (use \`apc task list\` for full details) ---
 ${tasksSection}
 
 --- ACTIVE WORKFLOWS ---
@@ -296,11 +292,6 @@ ${workflowsSection}
 
 --- AGENTS ---
 ${agentsSection}
-
---- PENDING QUESTIONS ---
-${input.pendingQuestions.length > 0 
-    ? input.pendingQuestions.map(q => `[${q.id}] ${q.question} (asked ${q.askedAt})`).join('\n')
-    : 'No pending questions.'}
 
 ═══════════════════════════════════════════════════════════════════════════════
 YOUR DECISION
@@ -439,6 +430,25 @@ ${decisionInstructions}`;
             : '';
 
         return `${availableList}${busyList}\n\nTotal: ${statuses.length} agents (${available.length} available, ${busyAgents.length} busy)`;
+    }
+
+    /**
+     * Format approved plans for multi-plan coordinator view
+     */
+    private formatApprovedPlans(input: CoordinatorInput): string {
+        const plans = input.approvedPlans || [];
+        
+        if (plans.length === 0) {
+            // Fallback to legacy single plan
+            if (input.planPath) {
+                return `1 plan:\n- Session: ${input.sessionId}\n  Plan: ${input.planPath}\n  Requirement: ${input.planRequirement}`;
+            }
+            return 'No approved plans.';
+        }
+        
+        return `${plans.length} approved plan(s):\n\n` + plans.map((p, i) => 
+            `[${i + 1}] Session: ${p.sessionId}\n    Plan File: ${p.planPath}\n    Requirement: ${p.requirement}\n    Status: ${p.status}`
+        ).join('\n\n');
     }
 
     /**
