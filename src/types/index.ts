@@ -820,54 +820,56 @@ Your job is to:
         decisionInstructions: `Based on the triggering event and current state, decide what actions to take.
 
 ## STEP 1: Check Existing Tasks
-Run: \`apc task list\` to see all current tasks and avoid duplicates.
+Run: \`apc task list\` to see all current tasks, their status, and dependencies.
 
 ## STEP 2: Read Plans
 For each approved plan, use read_file to understand the tasks needed.
 
 ## Key Principles
-1. **Maximize Agent Usage**: If N agents are available, create and start up to N tasks
+1. **Dependencies First**: ONLY start tasks whose dependencies are ALL completed
+   - A task with deps "T1,T2" can only start if both T1 and T2 are completed
+   - Tasks with no dependencies can start immediately
 2. **Avoid Duplicates**: Check existing tasks before creating new ones
-3. **Task Dependencies**: Only start tasks whose dependencies are complete
-4. **Multi-Plan Support**: Handle tasks from ALL approved plans
+3. **Maximize Agent Usage**: Start up to N ready tasks (N = available agents)
 
 ## Available Workflows
 {{WORKFLOW_SELECTION}}
 
 ## Commands (use run_terminal_cmd tool)
 
-**List existing tasks:**
+**List existing tasks (shows status and deps):**
 \`\`\`bash
 apc task list
 \`\`\`
 
-**Create task:**
+**Create task (no deps - can start immediately):**
 \`\`\`bash
 apc task create --session <sessionId> --id T1 --desc "Task description" --type implementation
 \`\`\`
 
-**Create with dependencies:**
+**Create task with dependencies (can only start after deps complete):**
 \`\`\`bash
-apc task create --session <sessionId> --id T2 --desc "..." --deps T1 --type implementation
+apc task create --session <sessionId> --id T3 --desc "..." --deps T1,T2 --type implementation
 \`\`\`
 
-**Start task:**
+**Start task (only if deps are met):**
 \`\`\`bash
 apc task start --session <sessionId> --id T1 --workflow task_implementation
 \`\`\`
 
 ## What To Do
 
-1. Run \`apc task list\` to see existing tasks
+1. Run \`apc task list\` to see existing tasks and their dependency status
 2. Read plan file(s) to identify needed tasks
-3. Create tasks that don't exist yet (avoid duplicates)
-4. Start as many tasks as you have available agents
+3. Create tasks that don't exist yet (with correct deps from plan)
+4. Start ONLY tasks that are ready (status=created/pending AND all deps completed)
+5. Start up to N tasks where N = number of available agents
 
 ## Your Response
 
 After executing commands, provide:
 
-REASONING: <Brief explanation of decisions made>
+REASONING: <Brief explanation of what tasks were created/started and why>
 CONFIDENCE: <0.0-1.0>
 
 Now execute:`
