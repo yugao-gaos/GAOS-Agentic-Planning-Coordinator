@@ -22,6 +22,8 @@ import {
     UnityInfo,
     WorkflowInfo,
     FailedTaskInfo,
+    CoordinatorStatusInfo,
+    ConnectionHealthInfo,
 } from './webview';
 
 export class SidebarViewProvider implements vscode.WebviewViewProvider {
@@ -61,6 +63,13 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     public setStateProxy(proxy: DaemonStateProxy): void {
         this.stateProxy = proxy;
         this.unityEnabled = proxy.isUnityEnabled();
+        
+        // Subscribe to connection health changes
+        proxy.onConnectionHealthChanged((health) => {
+            console.log('[SidebarViewProvider] Connection health changed:', health.state);
+            this.debouncedRefresh();
+        });
+        
         this.refresh();
     }
 
@@ -214,12 +223,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                         }
                     }
                     break;
-                case 'openProgressLog':
-                    if (data.progressLogPath) {
-                        const uri = vscode.Uri.file(data.progressLogPath);
-                        vscode.window.showTextDocument(uri);
-                    }
-                    break;
+                // NOTE: 'openProgressLog' removed - progress.log no longer generated
+                // Use workflow logs (openWorkflowLog) instead
                 case 'openWorkflowLog':
                     if (data.logPath) {
                         const uri = vscode.Uri.file(data.logPath);
@@ -230,6 +235,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     vscode.commands.executeCommand('agenticPlanning.retryFailedTask', { 
                         sessionId: data.sessionId, 
                         taskId: data.taskId 
+                    });
+                    break;
+                case 'openDependencyMap':
+                    vscode.commands.executeCommand('agenticPlanning.openDependencyMap', { 
+                        sessionId: data.sessionId 
                     });
                     break;
                 case 'openRoleSettings':
@@ -309,7 +319,17 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     errorCount: 0,
                     queueLength: 0
                 },
-                unityEnabled: this.unityEnabled
+                unityEnabled: this.unityEnabled,
+                coordinatorStatus: {
+                    state: 'idle',
+                    pendingEvents: 0,
+                    evaluationCount: 0
+                },
+                connectionHealth: {
+                    state: 'unknown',
+                    lastPingSuccess: false,
+                    consecutiveFailures: 0
+                }
             };
         }
 
@@ -453,10 +473,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 planStatus = 'No Plan';
             }
             
-            // Get progress log path
-            const progressLogPath = this.stateProxy 
-                ? await this.stateProxy.getProgressLogPath(s.id)
-                : this.stateManager?.getProgressLogPath(s.id);
+            // NOTE: progressLogPath removed - progress.log no longer generated
+            // Workflow logs are available via activeWorkflows[].logPath
             
             // Get failed tasks from proxy or coordinator
             let failedTasks: FailedTaskInfo[] = [];
@@ -535,7 +553,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 planStatus,
                 planVersion: s.planHistory?.length || 1,
                 executionStatus,
-                progressLogPath,
                 activeWorkflows,
                 workflowHistory,
                 isRevising,
@@ -646,13 +663,57 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             }
         }
 
+        // Get coordinator status
+        let coordinatorStatus: CoordinatorStatusInfo = {
+            state: 'idle',
+            pendingEvents: 0,
+            evaluationCount: 0
+        };
+        
+        if (this.stateProxy) {
+            try {
+                const status = await this.stateProxy.getCoordinatorStatus();
+                if (status) {
+                    coordinatorStatus = status;
+                }
+            } catch (e) {
+                console.warn('[SidebarViewProvider] Failed to get coordinator status:', e);
+            }
+        } else if (this.unifiedCoordinator) {
+            // Fallback to local coordinator
+            try {
+                const status = this.unifiedCoordinator.getCoordinatorStatus();
+                coordinatorStatus = status;
+            } catch (e) {
+                console.warn('[SidebarViewProvider] Failed to get local coordinator status:', e);
+            }
+        }
+
+        // Get connection health
+        let connectionHealth: ConnectionHealthInfo = {
+            state: 'unknown',
+            lastPingSuccess: true,
+            consecutiveFailures: 0
+        };
+        
+        if (this.stateProxy) {
+            const health = this.stateProxy.getConnectionHealth();
+            connectionHealth = {
+                state: health.state,
+                lastPingSuccess: health.lastPingSuccess,
+                consecutiveFailures: health.consecutiveFailures
+            };
+        }
+
         return {
             systemStatus,
             missingCount: missingDeps.length,
             sessions,
             agents,
             unity,
-            unityEnabled: this.unityEnabled
+            unityEnabled: this.unityEnabled,
+            coordinatorStatus,
+            connectionHealth
         };
     }
 

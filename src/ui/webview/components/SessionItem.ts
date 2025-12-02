@@ -287,8 +287,7 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
             </div>
             
             <!-- Session Body -->
-            <div class="session-body ${isExpanded ? 'expanded' : ''}" 
-                 data-progress-log="${session.progressLogPath || ''}">
+            <div class="session-body ${isExpanded ? 'expanded' : ''}">
                 
                 <!-- Plan sub-item -->
                 <div class="sub-item" data-action="openPlan">
@@ -301,16 +300,6 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                     <div class="sub-item-spacer"></div>
                     <div class="sub-item-actions">${planButtons}</div>
                 </div>
-                
-                <!-- Progress Log sub-item -->
-                ${session.progressLogPath ? `
-                    <div class="sub-item" data-action="openProgressLog" data-progress-path="${session.progressLogPath}">
-                        <div class="sub-item-icon">${ICONS.list}</div>
-                        <span class="sub-item-label">Progress Log</span>
-                        <div class="sub-item-spacer"></div>
-                        <span style="font-size: 10px; opacity: 0.6;">(click to view)</span>
-                    </div>
-                ` : ''}
                 
                 <!-- Coordinator sub-item (expandable) -->
                 <div class="sub-item expandable coordinator-header" data-coord-toggle="${session.id}">

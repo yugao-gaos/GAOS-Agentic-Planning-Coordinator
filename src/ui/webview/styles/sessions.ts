@@ -427,6 +427,29 @@ export const sessionStyles = `
     background: rgba(241, 76, 76, 0.3);
 }
 
+/* Deps button - compact icon button for dependency map */
+.sub-item-btn.deps-btn {
+    padding: 3px 5px;
+    min-width: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(59, 130, 246, 0.15);
+    border-color: rgba(59, 130, 246, 0.3);
+    color: #60a5fa;
+}
+
+.sub-item-btn.deps-btn:hover {
+    background: rgba(59, 130, 246, 0.25);
+    border-color: rgba(59, 130, 246, 0.5);
+}
+
+.sub-item-btn.deps-btn svg {
+    width: 12px;
+    height: 12px;
+    fill: currentColor;
+}
+
 /* Spin animation for session activity */
 @keyframes spin {
     from { transform: rotate(0deg); }

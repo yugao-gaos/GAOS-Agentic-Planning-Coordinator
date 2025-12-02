@@ -61,6 +61,13 @@ export interface IApcClient {
      */
     getConnectionState(): ConnectionState;
     
+    /**
+     * Ping the daemon to check connectivity
+     * @param timeoutMs Optional timeout in milliseconds (default: 5000)
+     * @returns Promise that resolves to true if daemon responds, false otherwise
+     */
+    ping(timeoutMs?: number): Promise<boolean>;
+    
     // ========================================================================
     // Command Execution
     // ========================================================================
@@ -184,6 +191,30 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
     
     getConnectionState(): ConnectionState {
         return this.state;
+    }
+    
+    /**
+     * Ping the daemon to check connectivity
+     * @param timeoutMs Optional timeout in milliseconds (default: 5000)
+     * @returns Promise that resolves to true if daemon responds, false otherwise
+     */
+    async ping(timeoutMs: number = 5000): Promise<boolean> {
+        if (!this.isConnected()) {
+            return false;
+        }
+        
+        try {
+            // Use a simple status request as a ping
+            const result = await Promise.race([
+                this.send('status'),
+                new Promise<never>((_, reject) => 
+                    setTimeout(() => reject(new Error('Ping timeout')), timeoutMs)
+                )
+            ]);
+            return !!result;
+        } catch (e) {
+            return false;
+        }
     }
     
     protected setState(state: ConnectionState): void {

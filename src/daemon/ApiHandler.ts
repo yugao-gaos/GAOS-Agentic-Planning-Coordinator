@@ -122,6 +122,16 @@ export interface WorkflowStatusData {
 }
 
 /**
+ * Coordinator status for UI display
+ */
+export interface CoordinatorStatusData {
+    state: 'idle' | 'queuing' | 'evaluating' | 'cooldown';
+    pendingEvents: number;
+    lastEvaluation?: string;
+    evaluationCount: number;
+}
+
+/**
  * Minimal coordinator interface for API handler
  */
 export interface ICoordinatorApi {
@@ -146,6 +156,9 @@ export interface ICoordinatorApi {
     
     // Start a workflow for a specific task
     startTaskWorkflow(sessionId: string, taskId: string, workflowType: string): Promise<string>;
+    
+    // Get coordinator status for UI
+    getCoordinatorStatus?(): CoordinatorStatusData;
     
     // Graceful shutdown - pause all workflows and release agents
     gracefulShutdown?(): Promise<{ workflowsPaused: number; agentsReleased: number }>;
@@ -1196,6 +1209,16 @@ export class ApiHandler {
     
     private async handleCoordinator(action: string, params: Record<string, unknown>): Promise<{ data?: unknown; message?: string }> {
         switch (action) {
+            case 'status': {
+                // Get coordinator status for UI display
+                const status = this.services.coordinator.getCoordinatorStatus?.();
+                return { 
+                    data: { 
+                        status: status || { state: 'idle', pendingEvents: 0, evaluationCount: 0 }
+                    }
+                };
+            }
+            
             case 'evaluate': {
                 const sessionId = params.sessionId as string;
                 const reason = params.reason as string || 'manual_evaluation';

@@ -235,8 +235,15 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
         this.log(`Running planner revision (${role?.defaultModel || 'opus-4.5'})...`);
         
         // Backup current plan BEFORE streaming starts (streaming will overwrite)
-        const backupPath = this.planPath.replace('.md', `_backup_${Date.now()}.md`);
+        // Store backups in dedicated backups folder to keep plan folder clean
+        const backupsFolder = this.stateManager.getBackupsFolder(this.sessionId);
+        if (!fs.existsSync(backupsFolder)) {
+            fs.mkdirSync(backupsFolder, { recursive: true });
+        }
+        const backupFilename = `plan_backup_${Date.now()}.md`;
+        const backupPath = path.join(backupsFolder, backupFilename);
         fs.copyFileSync(this.planPath, backupPath);
+        this.log(`Created backup: backups/${backupFilename}`);
         
         // Stream revised plan directly to plan file (commentary goes to log)
         const result = await this.runAgentTask('planner_revise', prompt, role, true);

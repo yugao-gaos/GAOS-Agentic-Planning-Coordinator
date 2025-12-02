@@ -18,6 +18,8 @@ export function getSidebarScript(): string {
         const statusDot = document.getElementById('statusDot');
         const statusText = document.getElementById('statusText');
         const statusInfo = document.getElementById('statusInfo');
+        const coordinatorDot = document.getElementById('coordinatorDot');
+        const coordinatorText = document.getElementById('coordinatorText');
         const sessionsContent = document.getElementById('sessionsContent');
         const agentGrid = document.getElementById('agentGrid');
         const agentBadge = document.getElementById('agentBadge');
@@ -177,12 +179,6 @@ export function getSidebarScript(): string {
                         const planPath = item.dataset.planPath;
                         // Always send the message with sessionId so extension can look up plan path if needed
                         vscode.postMessage({ type: 'openPlan', planPath, sessionId });
-                    } else if (action === 'openProgressLog') {
-                        // Check for progressPath on element first, then fall back to session's progress log
-                        const progressPath = el.dataset.progressPath || item.querySelector('.session-body')?.dataset.progressLog;
-                        if (progressPath) {
-                            vscode.postMessage({ type: 'openProgressLog', progressLogPath: progressPath });
-                        }
                     } else if (action === 'openWorkflowLog') {
                         const workflowLog = el.dataset.workflowLog;
                         if (workflowLog) {
@@ -268,6 +264,26 @@ export function getSidebarScript(): string {
         }
 
         /**
+         * Get coordinator status display text
+         */
+        function getCoordinatorDisplayText(status) {
+            if (!status) return 'Idle';
+            
+            switch (status.state) {
+                case 'idle':
+                    return 'Idle';
+                case 'queuing':
+                    return 'Queuing (' + status.pendingEvents + ')';
+                case 'evaluating':
+                    return 'Evaluating...';
+                case 'cooldown':
+                    return 'Cooldown';
+                default:
+                    return 'Idle';
+            }
+        }
+
+        /**
          * Update the UI with new state.
          */
         function updateState(state) {
@@ -285,6 +301,24 @@ export function getSidebarScript(): string {
             } else {
                 statusText.textContent = 'Checking...';
                 statusInfo.style.cursor = 'default';
+            }
+            
+            // Coordinator status
+            if (coordinatorDot && coordinatorText) {
+                const coordStatus = state.coordinatorStatus || { state: 'idle', pendingEvents: 0 };
+                coordinatorDot.className = 'coordinator-dot ' + coordStatus.state;
+                coordinatorText.textContent = getCoordinatorDisplayText(coordStatus);
+            }
+            
+            // Connection health warning
+            const healthWarning = document.getElementById('healthWarning');
+            if (healthWarning && state.connectionHealth) {
+                if (state.connectionHealth.state === 'unhealthy') {
+                    healthWarning.style.display = 'block';
+                    healthWarning.textContent = '⚠ Connection unstable (' + state.connectionHealth.consecutiveFailures + ' failures)';
+                } else {
+                    healthWarning.style.display = 'none';
+                }
             }
 
             // Sessions - use pre-rendered HTML from server

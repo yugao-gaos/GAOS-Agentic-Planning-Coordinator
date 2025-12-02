@@ -819,6 +819,8 @@ Your job is to:
 
         decisionInstructions: `Based on the triggering event and current state, decide what actions to take.
 
+**AVAILABLE AGENTS: {{AVAILABLE_AGENT_COUNT}}**
+
 ## STEP 1: Check Existing Tasks
 Run: \`apc task list\` to see all current tasks, their status, and dependencies.
 
@@ -830,7 +832,11 @@ For each approved plan, use read_file to understand the tasks needed.
    - A task with deps "T1,T2" can only start if both T1 and T2 are completed
    - Tasks with no dependencies can start immediately
 2. **Avoid Duplicates**: Check existing tasks before creating new ones
-3. **Maximize Agent Usage**: Start up to N ready tasks (N = available agents)
+3. **INCREMENTAL TASK CREATION**: Do NOT create all tasks from the plan at once!
+   - Only create tasks that can START IMMEDIATELY (no unmet deps)
+   - Create at most {{AVAILABLE_AGENT_COUNT}} new tasks per evaluation
+   - Leave remaining tasks for future coordinator evaluations
+   - The coordinator will be triggered again when tasks complete
 
 ## Available Workflows
 {{WORKFLOW_SELECTION}}
@@ -845,40 +851,32 @@ Each separate command has overhead. Chain related commands in a single run_termi
 apc task list
 \`\`\`
 
-**Create multiple tasks (chain with &&):**
+**Create AND Start tasks together:**
+Only create tasks you can start NOW. Create them, then immediately start them.
 \`\`\`bash
 apc task create --session <sessionId> --id T0 --desc "First task" --type implementation && \\
-apc task create --session <sessionId> --id T1 --desc "Second task" --deps T0 --type implementation && \\
-apc task create --session <sessionId> --id T2 --desc "Third task" --deps T0 --type implementation
-\`\`\`
-
-**Create and start in one call:**
-\`\`\`bash
-apc task create --session <sessionId> --id T0 --desc "Foundation task" --type implementation && \\
-apc task create --session <sessionId> --id T1 --desc "Depends on T0" --deps T0 --type implementation && \\
-apc task start --session <sessionId> --id T0 --workflow task_implementation
-\`\`\`
-
-**Start multiple ready tasks:**
-\`\`\`bash
+apc task create --session <sessionId> --id T1 --desc "Second task (no deps, can start)" --type implementation && \\
 apc task start --session <sessionId> --id T0 --workflow task_implementation && \\
-apc task start --session <sessionId> --id T1 --workflow task_implementation && \\
-apc task start --session <sessionId> --id T2 --workflow task_implementation
+apc task start --session <sessionId> --id T1 --workflow task_implementation
 \`\`\`
+
+**When dependencies are incomplete:**
+If a task depends on unfinished tasks, DON'T create it yet. Wait for dependencies to complete.
 
 ## What To Do
 
-1. Run \`apc task list\` to see existing tasks
-2. Read plan file(s) to identify needed tasks  
-3. **In ONE chained command**: Create all missing tasks with correct deps
-4. **In ONE chained command**: Start all ready tasks (no deps OR deps completed)
-5. Start up to N tasks where N = available agents
+1. Run \`apc task list\` to see existing tasks and their status
+2. Read plan file(s) to identify needed tasks
+3. Identify tasks that can START NOW (no dependencies OR all dependencies completed)
+4. Create ONLY those ready-to-start tasks (max {{AVAILABLE_AGENT_COUNT}})
+5. **IMMEDIATELY start all created tasks** in the same chained command
+6. Leave tasks with unmet dependencies for next evaluation
 
 ## Your Response
 
 After executing commands, provide:
 
-REASONING: <Brief explanation of what tasks were created/started and why>
+REASONING: <Brief explanation of what tasks were created/started and why. List tasks left for later.>
 CONFIDENCE: <0.0-1.0>
 
 Now execute:`

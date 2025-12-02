@@ -52,6 +52,10 @@ export class DependencyService {
     /** Whether Unity features are enabled (affects which dependencies are checked) */
     private unityEnabled: boolean = true;
     
+    /** Periodic check timer */
+    private periodicCheckTimer: NodeJS.Timeout | null = null;
+    private lastCheckTime: number = 0;
+    
     // Optional VS Code integration (set by VS Code client)
     private vscodeIntegration: {
         openExternal?: (url: string) => Promise<void>;
@@ -124,6 +128,7 @@ export class DependencyService {
         }
 
         this.cachedStatus = dependencies;
+        this.lastCheckTime = Date.now();
         this._onStatusChanged.fire();
         return dependencies;
     }
@@ -545,10 +550,76 @@ export class DependencyService {
         }
     }
     
+    // ========================================================================
+    // Periodic Check Methods
+    // ========================================================================
+    
+    /**
+     * Start periodic dependency checking
+     * @param intervalMs Interval in milliseconds between checks (default: 30000)
+     */
+    startPeriodicCheck(intervalMs: number = 30000): void {
+        // Stop any existing timer
+        this.stopPeriodicCheck();
+        
+        console.log(`[DependencyService] Starting periodic check every ${intervalMs / 1000}s`);
+        
+        this.periodicCheckTimer = setInterval(async () => {
+            try {
+                const previousStatus = [...this.cachedStatus];
+                await this.checkAllDependencies();
+                
+                // Check if status changed
+                const statusChanged = this.hasStatusChanged(previousStatus, this.cachedStatus);
+                if (statusChanged) {
+                    console.log('[DependencyService] Dependency status changed');
+                    this._onStatusChanged.fire();
+                }
+            } catch (e) {
+                console.warn('[DependencyService] Periodic check failed:', e);
+            }
+        }, intervalMs);
+    }
+    
+    /**
+     * Stop periodic dependency checking
+     */
+    stopPeriodicCheck(): void {
+        if (this.periodicCheckTimer) {
+            clearInterval(this.periodicCheckTimer);
+            this.periodicCheckTimer = null;
+            console.log('[DependencyService] Stopped periodic check');
+        }
+    }
+    
+    /**
+     * Check if dependency status has changed
+     */
+    private hasStatusChanged(previous: DependencyStatus[], current: DependencyStatus[]): boolean {
+        if (previous.length !== current.length) return true;
+        
+        for (const curr of current) {
+            const prev = previous.find(p => p.name === curr.name);
+            if (!prev) return true;
+            if (prev.installed !== curr.installed) return true;
+            if (prev.version !== curr.version) return true;
+        }
+        
+        return false;
+    }
+    
+    /**
+     * Get the time of the last dependency check
+     */
+    getLastCheckTime(): number {
+        return this.lastCheckTime;
+    }
+    
     /**
      * Dispose resources
      */
     dispose(): void {
+        this.stopPeriodicCheck();
         this._onStatusChanged.dispose();
     }
 

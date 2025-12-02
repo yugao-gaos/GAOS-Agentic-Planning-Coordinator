@@ -113,17 +113,8 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
             ));
         }
 
-        // Progress log (in plan folder: _AiDevLog/Plans/{sessionId}/progress.log)
-        const progressLogPath = this.stateManager.getProgressLogPath(session.id);
-        if (await fileExists(progressLogPath)) {
-            details.push(new PlanningSessionItem(
-                session,
-                'progress',
-                `Progress Log`,
-                this.stateManager,
-                progressLogPath
-            ));
-        }
+        // NOTE: Progress log item removed - progress.log is no longer generated
+        // Workflow logs are available in logs/ folder under each session
 
         // Version
         details.push(new PlanningSessionItem(

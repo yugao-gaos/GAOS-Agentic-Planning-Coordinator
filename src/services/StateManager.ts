@@ -299,19 +299,13 @@ export class StateManager {
     }
 
     /**
-     * Get the progress log file path
-     * Structure: _AiDevLog/Plans/{sessionId}/progress.log
+     * Get the backups folder for a session
+     * Structure: _AiDevLog/Plans/{sessionId}/backups/
+     * 
+     * Used for plan revision backups to keep plan folder clean.
      */
-    getProgressLogPath(sessionId: string): string {
-        return path.join(this.getPlanFolder(sessionId), 'progress.log');
-    }
-
-    /**
-     * Get the completions folder for a session
-     * Structure: _AiDevLog/Plans/{sessionId}/completions/
-     */
-    getCompletionsFolder(sessionId: string): string {
-        return path.join(this.getPlanFolder(sessionId), 'completions');
+    getBackupsFolder(sessionId: string): string {
+        return path.join(this.getPlanFolder(sessionId), 'backups');
     }
 
     /**
@@ -387,22 +381,6 @@ export class StateManager {
     }
 
     /**
-     * Get the summaries folder for a session
-     * Structure: _AiDevLog/Plans/{sessionId}/summaries/
-     */
-    getSummariesFolder(sessionId: string): string {
-        return path.join(this.getPlanFolder(sessionId), 'summaries');
-    }
-
-    /**
-     * Get the execution summary path
-     * Structure: _AiDevLog/Plans/{sessionId}/summaries/execution_summary.md
-     */
-    getExecutionSummaryPath(sessionId: string): string {
-        return path.join(this.getSummariesFolder(sessionId), 'execution_summary.md');
-    }
-
-    /**
      * @deprecated Use getGlobalTasksFilePath() instead - tasks are now global
      * Get the tasks file path for a session (per-session, legacy)
      * Structure: _AiDevLog/Plans/{sessionId}/tasks.json
@@ -413,14 +391,19 @@ export class StateManager {
 
     /**
      * Ensure all directories for a plan session exist
+     * 
+     * Structure:
+     * - Plans/{sessionId}/           - Root plan folder
+     * - Plans/{sessionId}/logs/      - Workflow and agent logs
+     * - Plans/{sessionId}/logs/agents/ - Individual agent logs
+     * - Plans/{sessionId}/backups/   - Plan revision backups
      */
     ensurePlanDirectories(sessionId: string): void {
         const dirs = [
             this.getPlanFolder(sessionId),
-            this.getCompletionsFolder(sessionId),
             this.getLogsFolder(sessionId),
             this.getAgentLogsFolder(sessionId),
-            this.getSummariesFolder(sessionId)
+            this.getBackupsFolder(sessionId)
         ];
 
         for (const dir of dirs) {

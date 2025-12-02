@@ -39,7 +39,7 @@ import {
 // PlanCache removed - tasks are now managed via TaskManager, not parsed from plan
 import { TaskManager, ERROR_RESOLUTION_SESSION_ID } from './TaskManager';
 import { EventBroadcaster } from '../daemon/EventBroadcaster';
-import { CoordinatorAgent } from './CoordinatorAgent';
+import { CoordinatorAgent, CoordinatorStatus } from './CoordinatorAgent';
 import { CoordinatorContext } from './CoordinatorContext';
 import {
     CoordinatorEvent,
@@ -158,6 +158,9 @@ export class UnifiedCoordinatorService {
     private readonly _onAgentAllocated = new TypedEventEmitter<{ agentName: string; sessionId: string; roleId: string; workflowId: string }>();
     readonly onAgentAllocated = this._onAgentAllocated.event;
     
+    private readonly _onCoordinatorStatusChanged = new TypedEventEmitter<CoordinatorStatus>();
+    readonly onCoordinatorStatusChanged = this._onCoordinatorStatusChanged.event;
+    
     // AI Coordinator Agent (handles debouncing, evaluation, and history)
     private coordinatorAgent: CoordinatorAgent;
     private coordinatorContext: CoordinatorContext;
@@ -192,6 +195,11 @@ export class UnifiedCoordinatorService {
             this.logDecisionToHistory(sessionId, decision);
         });
         
+        // Forward coordinator state changes to service-level event
+        this.coordinatorAgent.onStateChanged((status) => {
+            this._onCoordinatorStatusChanged.fire(status);
+        });
+        
         // Create the context builder for AI evaluations
         this.coordinatorContext = new CoordinatorContext(this.stateManager, this.agentPoolService);
         
@@ -218,6 +226,13 @@ export class UnifiedCoordinatorService {
      */
     isUnityEnabled(): boolean {
         return this.unityEnabled;
+    }
+    
+    /**
+     * Get the current coordinator status for UI display
+     */
+    getCoordinatorStatus(): CoordinatorStatus {
+        return this.coordinatorAgent.getStatus();
     }
     
     // =========================================================================
@@ -1961,6 +1976,7 @@ export class UnifiedCoordinatorService {
         this._onWorkflowProgress.dispose();
         this._onWorkflowComplete.dispose();
         this._onSessionStateChanged.dispose();
+        this._onCoordinatorStatusChanged.dispose();
     }
 }
 

@@ -5,6 +5,7 @@ import { PlanningSessionsProvider, PlanningSessionItem } from './ui/PlanningSess
 import { AgentPoolProvider } from './ui/AgentPoolProvider';
 import { RoleSettingsPanel } from './ui/RoleSettingsPanel';
 import { WorkflowSettingsPanel } from './ui/WorkflowSettingsPanel';
+import { DependencyMapPanel } from './ui/DependencyMapPanel';
 import { SidebarViewProvider } from './ui/SidebarViewProvider';
 import { AgentRunner, AgentBackendType } from './services/AgentBackend';
 import { EventBroadcaster } from './daemon/EventBroadcaster';
@@ -117,6 +118,9 @@ export async function activate(context: vscode.ExtensionContext) {
     dependencyService.setWorkspaceRoot(workspaceRoot);
     const unityFeaturesEnabled = config.get<boolean>('enableUnityFeatures', true);
     dependencyService.setUnityEnabled(unityFeaturesEnabled);
+    
+    // Start periodic dependency checks (every 30 seconds)
+    dependencyService.startPeriodicCheck(30000);
 
     // Create UI providers
     console.log('[APC] Step 4: Creating sidebar provider...');
@@ -187,6 +191,9 @@ export async function activate(context: vscode.ExtensionContext) {
             unityEnabled: unityFeaturesEnabled
         });
         console.log('[APC] DaemonStateProxy created (daemon-only mode)');
+        
+        // Start connection health monitoring (every 15 seconds)
+        daemonStateProxy.startConnectionMonitor(15000);
         
         // Pass proxy to providers
         sidebarProvider.setStateProxy(daemonStateProxy);
@@ -264,6 +271,8 @@ export async function activate(context: vscode.ExtensionContext) {
             vsCodeClient,
             unityEnabled: unityFeaturesEnabled
         });
+        // Start connection health monitoring (even if disconnected - will check periodically)
+        daemonStateProxy.startConnectionMonitor(15000);
         sidebarProvider.setStateProxy(daemonStateProxy);
     }
     
@@ -536,6 +545,32 @@ Let's get started!`;
         // Workflow settings command
         vscode.commands.registerCommand('apc.openWorkflowSettings', () => {
             WorkflowSettingsPanel.show(context.extensionUri, workspaceRoot);
+        }),
+        
+        // Dependency map command - shows task dependencies visualization
+        vscode.commands.registerCommand('agenticPlanning.openDependencyMap', async (args?: { sessionId?: string }) => {
+            let sessionId = args?.sessionId;
+            
+            if (!sessionId) {
+                // No session specified - show picker
+                const sessions = await daemonStateProxy.getPlanningSessions();
+                if (sessions.length === 0) {
+                    vscode.window.showWarningMessage('No planning sessions available.');
+                    return;
+                }
+                const selected = await vscode.window.showQuickPick(
+                    sessions.map(s => ({ 
+                        label: s.id.substring(0, 8), 
+                        description: s.requirement.substring(0, 50) + '...',
+                        session: s 
+                    })),
+                    { placeHolder: 'Select a session to view dependency map' }
+                );
+                if (!selected) return;
+                sessionId = selected.session.id;
+            }
+            
+            DependencyMapPanel.show(sessionId, context.extensionUri, vsCodeClient);
         }),
 
         // Refresh commands for tree views
@@ -972,6 +1007,25 @@ This will trigger the multi-agent debate to revise the plan.`;
 
 export async function deactivate() {
     console.log('Agentic Planning Coordinator deactivating...');
+    
+    // Stop periodic dependency checks
+    try {
+        const dependencyService = ServiceLocator.resolve(DependencyService);
+        dependencyService.stopPeriodicCheck();
+        console.log('Dependency periodic check stopped');
+    } catch (e) {
+        // Ignore if service not available
+    }
+    
+    // Stop connection health monitoring
+    if (daemonStateProxy) {
+        try {
+            daemonStateProxy.dispose();
+            console.log('DaemonStateProxy disposed');
+        } catch (e) {
+            // Ignore cleanup errors
+        }
+    }
     
     // Clean up event subscriptions first (prevents memory leaks and duplicate handlers)
     console.log(`Cleaning up ${eventSubscriptions.length} event subscriptions`);

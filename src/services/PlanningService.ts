@@ -134,35 +134,13 @@ export class PlanningService extends EventEmitter {
     // ========================================================================
 
     /**
-     * Get the progress file path for a session
+     * Write progress update to output channel
+     * Note: File-based progress.log removed - use workflow logs in logs/ folder instead
      */
-    private getProgressFilePath(sessionId: string): string {
-        return this.stateManager.getProgressLogPath(sessionId);
-    }
-
-    /**
-     * Write progress update to both the progress file AND output channel
-     */
-    private writeProgress(sessionId: string, phase: string, message: string): void {
-        const progressPath = this.getProgressFilePath(sessionId);
+    private writeProgress(_sessionId: string, phase: string, message: string): void {
         const timestamp = new Date().toISOString().split('T')[1].split('.')[0];
         const line = `[${timestamp}] [${phase}] ${message}`;
-        
         this.outputManager.appendLine(line);
-        
-        const dir = path.dirname(progressPath);
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-        
-        try {
-            const fd = fs.openSync(progressPath, 'a');
-            fs.writeSync(fd, line + '\n');
-            fs.fsyncSync(fd);
-            fs.closeSync(fd);
-        } catch (e) {
-            fs.appendFileSync(progressPath, line + '\n');
-        }
     }
 
     private notifyChange(): void {

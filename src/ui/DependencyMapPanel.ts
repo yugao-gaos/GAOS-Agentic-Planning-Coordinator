@@ -129,8 +129,8 @@ export class DependencyMapPanel {
 
         if (this.vsCodeClient) {
             try {
-                const response = await this.vsCodeClient.send<{ tasks: ManagedTask[] }>('tasks.getForSession', { sessionId: this.sessionId });
-                tasks = response.tasks || [];
+                const response = await this.vsCodeClient.send<{ data: ManagedTask[] }>('task.list', { sessionId: this.sessionId });
+                tasks = response.data || [];
             } catch (err) {
                 console.error('[DependencyMapPanel] Failed to fetch tasks from daemon:', err);
             }

@@ -10,6 +10,21 @@ export interface SidebarState {
     agents: AgentInfo[];
     unity: UnityInfo;
     unityEnabled: boolean;
+    coordinatorStatus: CoordinatorStatusInfo;
+    connectionHealth: ConnectionHealthInfo;
+}
+
+export interface ConnectionHealthInfo {
+    state: 'healthy' | 'unhealthy' | 'unknown';
+    lastPingSuccess: boolean;
+    consecutiveFailures: number;
+}
+
+export interface CoordinatorStatusInfo {
+    state: 'idle' | 'queuing' | 'evaluating' | 'cooldown';
+    pendingEvents: number;
+    lastEvaluation?: string;
+    evaluationCount: number;
 }
 
 export interface WorkflowInfo {
@@ -38,7 +53,6 @@ export interface SessionInfo {
     planStatus?: string;
     planVersion: number;
     executionStatus?: string;
-    progressLogPath?: string;
     activeWorkflows: WorkflowInfo[];
     workflowHistory: WorkflowInfo[];  // Completed workflows (newest first)
     isRevising: boolean;

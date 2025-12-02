@@ -18,6 +18,7 @@ import { OutputChannelManager } from './OutputChannelManager';
 import { AgentRoleRegistry } from './AgentRoleRegistry';
 import { ServiceLocator } from './ServiceLocator';
 import { StateManager } from './StateManager';
+import { TypedEventEmitter } from './TypedEventEmitter';
 import {
     CoordinatorEvent,
     CoordinatorEventType,
@@ -35,6 +36,21 @@ import {
 } from '../types/coordinator';
 import { DefaultCoordinatorPrompt } from '../types';
 import { getEffectiveCoordinatorPrompts } from './WorkflowSettingsManager';
+
+/**
+ * Coordinator Agent State - exposed for UI display
+ */
+export type CoordinatorState = 'idle' | 'queuing' | 'evaluating' | 'cooldown';
+
+/**
+ * Coordinator status information for UI
+ */
+export interface CoordinatorStatus {
+    state: CoordinatorState;
+    pendingEvents: number;
+    lastEvaluation?: string;
+    evaluationCount: number;
+}
 
 /**
  * AI Coordinator Agent - Makes intelligent decisions about workflow dispatch
@@ -84,6 +100,12 @@ export class CoordinatorAgent {
     
     // Callback for executing decisions
     private executeDecisionCallback?: (sessionId: string, decision: CoordinatorDecision) => Promise<void>;
+    
+    // State tracking for UI
+    private currentState: CoordinatorState = 'idle';
+    private lastEvaluationTime?: string;
+    private readonly _onStateChanged = new TypedEventEmitter<CoordinatorStatus>();
+    readonly onStateChanged = this._onStateChanged.event;
 
     constructor(config: Partial<CoordinatorAgentConfig> = {}, roleRegistry?: AgentRoleRegistry) {
         this.agentRunner = ServiceLocator.resolve(AgentRunner);
@@ -119,6 +141,39 @@ export class CoordinatorAgent {
      */
     setWorkspaceRoot(root: string): void {
         this.workspaceRoot = root;
+    }
+    
+    // ========================================================================
+    // State Tracking (for UI display)
+    // ========================================================================
+    
+    /**
+     * Get the current coordinator state
+     */
+    getState(): CoordinatorState {
+        return this.currentState;
+    }
+    
+    /**
+     * Get full coordinator status for UI
+     */
+    getStatus(): CoordinatorStatus {
+        return {
+            state: this.currentState,
+            pendingEvents: this.pendingEvents.length,
+            lastEvaluation: this.lastEvaluationTime,
+            evaluationCount: this.evaluationCount
+        };
+    }
+    
+    /**
+     * Update coordinator state and fire event
+     */
+    private setState(newState: CoordinatorState): void {
+        if (this.currentState !== newState) {
+            this.currentState = newState;
+            this._onStateChanged.fire(this.getStatus());
+        }
     }
 
     /**
@@ -273,11 +328,13 @@ export class CoordinatorAgent {
         const workflowPrompts = this.workflowRegistry?.getCoordinatorPrompts(this.unityEnabled, userOverrides) || '';
         
         // Replace template variables in decision instructions
+        const availableAgentCount = input.availableAgents?.length ?? 0;
         const decisionInstructions = promptConfig.decisionInstructions
             .replace('{{sessionId}}', input.sessionId)
             .replace('{{timestamp}}', String(Date.now()))
             .replace('{{WORKFLOW_SELECTION}}', workflowPrompts || 'No workflows registered')
-            .replace('{{planPath}}', input.planPath || 'N/A');
+            .replace('{{planPath}}', input.planPath || 'N/A')
+            .replace(/\{\{AVAILABLE_AGENT_COUNT\}\}/g, String(availableAgentCount));
         
         return `${promptConfig.roleIntro}
 
@@ -573,6 +630,11 @@ ${JSON.stringify(input.event.payload, null, 2)}`;
             this.firstEventAt = Date.now();
         }
         
+        // Update state to queuing (unless already evaluating)
+        if (this.currentState !== 'evaluating') {
+            this.setState('queuing');
+        }
+        
         this.log(`Queued event ${eventType} for session ${sessionId} (${this.pendingEvents.length} pending)`);
         
         const now = Date.now();
@@ -622,8 +684,12 @@ ${JSON.stringify(input.event.payload, null, 2)}`;
         this.debounceTimer = null;
         
         if (this.pendingEvents.length === 0) {
+            this.setState('idle');
             return;
         }
+        
+        // Set state to evaluating
+        this.setState('evaluating');
         
         const allEvents = [...this.pendingEvents];
         this.pendingEvents = [];
@@ -679,6 +745,17 @@ ${JSON.stringify(input.event.payload, null, 2)}`;
         }
         
         this.lastEvalCompletedAt = Date.now();
+        this.lastEvaluationTime = new Date().toISOString();
+        
+        // Set state to cooldown, then schedule transition back to idle
+        this.setState('cooldown');
+        
+        // After cooldown period, transition to idle (if no new events queued)
+        setTimeout(() => {
+            if (this.currentState === 'cooldown' && this.pendingEvents.length === 0) {
+                this.setState('idle');
+            }
+        }, this.debounceConfig.cooldownMs);
     }
     
     /**
@@ -783,6 +860,7 @@ ${JSON.stringify(input.event.payload, null, 2)}`;
             this.debounceTimer = null;
         }
         this.pendingEvents = [];
+        this._onStateChanged.dispose();
     }
 }
 

@@ -8,6 +8,7 @@
 
 import { VsCodeClient } from '../vscode/VsCodeClient';
 import { AgentAssignment } from './TaskManager';
+import { TypedEventEmitter } from './TypedEventEmitter';
 import {
     PlanningSession,
     AgentStatus,
@@ -48,6 +49,13 @@ export interface UnityStatus {
     queueLength: number;
 }
 
+export interface CoordinatorStatusInfo {
+    state: 'idle' | 'queuing' | 'evaluating' | 'cooldown';
+    pendingEvents: number;
+    lastEvaluation?: string;
+    evaluationCount: number;
+}
+
 export interface DaemonStateProxyOptions {
     /** VS Code client for daemon communication */
     vsCodeClient: VsCodeClient;
@@ -59,9 +67,28 @@ export interface DaemonStateProxyOptions {
 // DaemonStateProxy
 // ============================================================================
 
+export type ConnectionHealthState = 'healthy' | 'unhealthy' | 'unknown';
+
+export interface ConnectionHealthInfo {
+    state: ConnectionHealthState;
+    lastPingSuccess: boolean;
+    lastPingTime?: number;
+    consecutiveFailures: number;
+}
+
 export class DaemonStateProxy {
     private vsCodeClient: VsCodeClient;
     private unityEnabled: boolean;
+    
+    // Connection health monitoring
+    private healthCheckTimer: NodeJS.Timeout | null = null;
+    private consecutiveFailures: number = 0;
+    private lastPingSuccess: boolean = true;
+    private lastPingTime?: number;
+    private currentHealthState: ConnectionHealthState = 'unknown';
+    
+    private readonly _onConnectionHealthChanged = new TypedEventEmitter<ConnectionHealthInfo>();
+    readonly onConnectionHealthChanged = this._onConnectionHealthChanged.event;
 
     constructor(options: DaemonStateProxyOptions) {
         this.vsCodeClient = options.vsCodeClient;
@@ -84,6 +111,92 @@ export class DaemonStateProxy {
      */
     isUnityEnabled(): boolean {
         return this.unityEnabled;
+    }
+    
+    /**
+     * Get current connection health info
+     */
+    getConnectionHealth(): ConnectionHealthInfo {
+        return {
+            state: this.currentHealthState,
+            lastPingSuccess: this.lastPingSuccess,
+            lastPingTime: this.lastPingTime,
+            consecutiveFailures: this.consecutiveFailures
+        };
+    }
+    
+    /**
+     * Start periodic connection health monitoring
+     * @param intervalMs Interval between health checks (default: 15000)
+     */
+    startConnectionMonitor(intervalMs: number = 15000): void {
+        this.stopConnectionMonitor();
+        
+        console.log(`[DaemonStateProxy] Starting connection monitor (interval: ${intervalMs / 1000}s)`);
+        
+        // Do initial health check
+        this.performHealthCheck();
+        
+        this.healthCheckTimer = setInterval(() => {
+            this.performHealthCheck();
+        }, intervalMs);
+    }
+    
+    /**
+     * Stop connection health monitoring
+     */
+    stopConnectionMonitor(): void {
+        if (this.healthCheckTimer) {
+            clearInterval(this.healthCheckTimer);
+            this.healthCheckTimer = null;
+            console.log('[DaemonStateProxy] Connection monitor stopped');
+        }
+    }
+    
+    /**
+     * Perform a health check ping
+     */
+    private async performHealthCheck(): Promise<void> {
+        const previousState = this.currentHealthState;
+        
+        try {
+            const pingSuccess = await this.vsCodeClient.ping(5000);
+            this.lastPingTime = Date.now();
+            this.lastPingSuccess = pingSuccess;
+            
+            if (pingSuccess) {
+                this.consecutiveFailures = 0;
+                this.currentHealthState = 'healthy';
+            } else {
+                this.consecutiveFailures++;
+                // Consider unhealthy after 2 consecutive failures
+                if (this.consecutiveFailures >= 2) {
+                    this.currentHealthState = 'unhealthy';
+                }
+            }
+        } catch (e) {
+            this.consecutiveFailures++;
+            this.lastPingSuccess = false;
+            this.lastPingTime = Date.now();
+            
+            if (this.consecutiveFailures >= 2) {
+                this.currentHealthState = 'unhealthy';
+            }
+        }
+        
+        // Emit event if health state changed
+        if (previousState !== this.currentHealthState) {
+            console.log(`[DaemonStateProxy] Connection health changed: ${previousState} -> ${this.currentHealthState}`);
+            this._onConnectionHealthChanged.fire(this.getConnectionHealth());
+        }
+    }
+    
+    /**
+     * Dispose resources
+     */
+    dispose(): void {
+        this.stopConnectionMonitor();
+        this._onConnectionHealthChanged.dispose();
     }
 
     // ========================================================================
@@ -124,22 +237,8 @@ export class DaemonStateProxy {
         }
     }
 
-    /**
-     * Get progress log path for a session
-     */
-    async getProgressLogPath(sessionId: string): Promise<string | undefined> {
-        if (!this.vsCodeClient.isConnected()) {
-            return undefined;
-        }
-
-        try {
-            const response: { session?: { progressLogPath?: string } } = await this.vsCodeClient.send('session.get', { id: sessionId });
-            return response.session?.progressLogPath;
-        } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get progress log path:', err);
-            return undefined;
-        }
-    }
+    // NOTE: getProgressLogPath removed - progress.log is no longer generated
+    // Use workflow logs in logs/ folder instead
 
     // ========================================================================
     // Agent Pool
@@ -373,5 +472,22 @@ export class DaemonStateProxy {
             return { success: false, error: 'Daemon not connected' };
         }
         return this.vsCodeClient.requestCoordinatorEvaluation(sessionId, reason);
+    }
+    
+    /**
+     * Get coordinator status for UI display
+     */
+    async getCoordinatorStatus(): Promise<CoordinatorStatusInfo | undefined> {
+        if (!this.vsCodeClient.isConnected()) {
+            return undefined;
+        }
+
+        try {
+            const response: { status?: CoordinatorStatusInfo } = await this.vsCodeClient.send('coordinator.status');
+            return response.status;
+        } catch (err) {
+            console.warn('[DaemonStateProxy] Failed to get coordinator status from daemon:', err);
+            return undefined;
+        }
     }
 }
