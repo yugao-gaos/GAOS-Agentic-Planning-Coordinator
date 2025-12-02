@@ -338,7 +338,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             // Use proxy for session state when available
             const sessionState = this.stateProxy 
                 ? await this.stateProxy.getSessionState(s.id)
-                : this.unifiedCoordinator?.getSessionState(s.id);
+                : undefined;
                 
             if (sessionState) {
                 try {
@@ -447,12 +447,12 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             // NOTE: progressLogPath removed - progress.log no longer generated
             // Workflow logs are available via activeWorkflows[].logPath
             
-            // Get failed tasks from proxy or coordinator
+            // Get failed tasks from proxy
             let failedTasks: FailedTaskInfo[] = [];
             try {
                 const failed = this.stateProxy
                     ? await this.stateProxy.getFailedTasks(s.id)
-                    : (this.unifiedCoordinator?.getFailedTasks(s.id) || []);
+                    : [];
                 failedTasks = failed.map(f => ({
                     taskId: f.taskId,
                     description: f.description,
@@ -466,17 +466,24 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 
             // Get agents assigned to this session with workflow context
             const sessionAgents: AgentInfo[] = [];
-            const busyAgents: Array<{ name: string; roleId?: string; coordinatorId: string; sessionId: string; workflowId?: string; task?: string }> = this.stateProxy 
+            const busyAgentsRaw = this.stateProxy 
                 ? await this.stateProxy.getBusyAgents()
-                : (this.agentPoolService?.getBusyAgents() || []);
+                : [];
+            const busyAgents = busyAgentsRaw.map(b => ({
+                name: b.name,
+                roleId: b.roleId,
+                sessionId: b.sessionId,
+                workflowId: b.coordinatorId, // Map coordinatorId back to workflowId
+                task: b.task
+            }));
             for (const agent of busyAgents) {
-                // Match agents by session ID (coordinatorId is deprecated)
-                if (agent.coordinatorId === s.id || agent.sessionId === s.id) {
+                // Match agents by session ID
+                if (agent.sessionId === s.id) {
                     let roleColor: string | undefined;
                     if (agent.roleId) {
                         const role = this.stateProxy 
                             ? await this.stateProxy.getRole(agent.roleId) 
-                            : this.agentPoolService?.getRole(agent.roleId);
+                            : undefined;
                         roleColor = role?.color;
                     }
                     
@@ -486,8 +493,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     let taskId: string | undefined;
                     let matchedWorkflowId: string | undefined;
                     
-                    // Match agent to workflow by workflowId ONLY (no fallback)
-                    // AgentPoolService is the single source of truth for workflowId
+                    // Match agent to workflow by workflowId
                     if (agent.workflowId) {
                         for (const wf of activeWorkflows) {
                             if (wf.id === agent.workflowId) {
@@ -503,16 +509,12 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                         if (!matchedWorkflowId) {
                             console.warn(`[SidebarViewProvider] Agent ${agent.name} has workflowId=${agent.workflowId} but no matching workflow found in session ${s.id}`);
                         }
-                    } else {
-                        // Log warning if agent is busy but has no workflowId
-                        console.warn(`[SidebarViewProvider] Busy agent ${agent.name} in session ${s.id} has no workflowId set`);
                     }
                     
                     sessionAgents.push({
                         name: agent.name,
                         status: 'busy',
                         roleId: agent.roleId,
-                        coordinatorId: agent.coordinatorId,
                         workflowId: agent.workflowId || matchedWorkflowId,
                         roleColor: roleColor || '#f97316',
                         workflowType,
@@ -522,6 +524,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     });
                 }
             }
+            
+            // Collect agents on bench for this session (not yet available in daemon)
+            const sessionBench: AgentInfo[] = [];
             
             sessions.push({
                 id: s.id,
@@ -539,7 +544,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 workflowHistory,
                 isRevising,
                 failedTasks,
-                sessionAgents
+                sessionAgents,
+                benchAgents: sessionBench,
+                benchCount: sessionBench.length
             });
         }
 
@@ -547,14 +554,23 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         const agents: AgentInfo[] = [];
         const allAvailableAgents = this.stateProxy 
             ? await this.stateProxy.getAvailableAgents()
-            : (this.agentPoolService?.getAvailableAgents() || []);
-        const allBusyAgents: Array<{ name: string; roleId?: string; coordinatorId: string; sessionId: string; workflowId?: string; task?: string }> = this.stateProxy 
+            : [];
+        const allBusyAgentsRaw = this.stateProxy 
             ? await this.stateProxy.getBusyAgents()
-            : (this.agentPoolService?.getBusyAgents() || []);
+            : [];
+        const allBusyAgents = allBusyAgentsRaw.map(b => ({
+            name: b.name,
+            roleId: b.roleId,
+            sessionId: b.sessionId,
+            workflowId: b.coordinatorId, // Map coordinatorId back to workflowId
+            task: b.task
+        }));
         
         for (const name of allAvailableAgents) {
             agents.push({ name, status: 'available' });
         }
+        
+        // Collect allocated (bench) agents (not yet available in daemon)
         
         for (const agent of allBusyAgents) {
             // Get role color if available
@@ -562,7 +578,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             if (agent.roleId) {
                 const role = this.stateProxy 
                     ? await this.stateProxy.getRole(agent.roleId) 
-                    : this.agentPoolService?.getRole(agent.roleId);
+                    : undefined;
                 roleColor = role?.color;
             }
             
@@ -574,7 +590,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             
             // Search through sessions to find matching workflow using workflowId
             for (const session of sessions) {
-                if (agent.coordinatorId === session.id || agent.sessionId === session.id) {
+                if (agent.workflowId && agent.sessionId === session.id) {
                     sessionId = session.id.substring(0, 8);
                     
                     // Find matching workflow by workflowId ONLY (no role-based fallback)
@@ -596,7 +612,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 name: agent.name,
                 status: 'busy',
                 roleId: agent.roleId,
-                coordinatorId: agent.coordinatorId,
                 workflowId: agent.workflowId,  // Use workflowId from AgentPoolService
                 roleColor: roleColor || '#f97316',  // Default orange
                 workflowType,
@@ -644,14 +659,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 }
             } catch (e) {
                 console.warn('[SidebarViewProvider] Failed to get coordinator status:', e);
-            }
-        } else if (this.unifiedCoordinator) {
-            // Fallback to local coordinator
-            try {
-                const status = this.unifiedCoordinator.getCoordinatorStatus();
-                coordinatorStatus = status;
-            } catch (e) {
-                console.warn('[SidebarViewProvider] Failed to get local coordinator status:', e);
             }
         }
 

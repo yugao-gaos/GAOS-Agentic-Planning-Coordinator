@@ -393,24 +393,24 @@ export class DaemonSettingsPanel {
     <div id="general" class="tab-content active">
         <div class="section">
             <div class="section-title">
-                Agent Pool
-            </div>
-            
-            <div class="form-group">
-                <label for="agentPoolSize">
-                    Pool Size
-                    ${isDefault('agentPoolSize', 10) ? '<span class="badge default">Default</span>' : '<span class="badge custom">Custom</span>'}
-                </label>
-                <input 
-                    type="number" 
-                    id="agentPoolSize" 
-                    value="${this.daemonConfig.agentPoolSize || 10}"
-                    min="1"
-                    max="20"
-                    onchange="setConfig('agentPoolSize', this.value)"
-                />
-                <div class="hint">Number of agents available in the pool (1-20)</div>
-            </div>
+                    Agent Pool
+                </div>
+                
+                <div class="form-group">
+                    <label for="agentPoolSize">
+                        Pool Size
+                        <span id="agentPoolSizeBadge" class="badge default">Default</span>
+                    </label>
+                    <input 
+                        type="number" 
+                        id="agentPoolSize" 
+                        value="${this.daemonConfig.agentPoolSize || 10}"
+                        min="1"
+                        max="20"
+                        onchange="setConfig('agentPoolSize', this.value); updateBadge('agentPoolSize', 10)"
+                    />
+                    <div class="hint">Number of agents available in the pool (1-20)</div>
+                </div>
         </div>
         
         <div class="section">
@@ -418,30 +418,30 @@ export class DaemonSettingsPanel {
                 Performance
             </div>
             
-            <div class="form-group">
-                <label for="stateUpdateInterval">
-                    State Update Interval
-                    ${isDefault('stateUpdateInterval', 5000) ? '<span class="badge default">Default</span>' : '<span class="badge custom">Custom</span>'}
-                </label>
-                <input 
-                    type="number" 
-                    id="stateUpdateInterval" 
-                    value="${this.daemonConfig.stateUpdateInterval || 5000}"
-                    min="1000"
-                    step="1000"
-                    onchange="setConfig('stateUpdateInterval', this.value)"
-                />
-                <div class="hint">Interval in milliseconds to update state files (minimum 1000ms)</div>
-            </div>
-            
-            <div class="form-group">
-                <label for="logLevel">
-                    Log Level
-                    ${isDefault('logLevel', 'info') ? '<span class="badge default">Default</span>' : '<span class="badge custom">Custom</span>'}
-                </label>
-                <select id="logLevel" onchange="setConfig('logLevel', this.value)">
-                    <option value="debug" ${this.daemonConfig.logLevel === 'debug' ? 'selected' : ''}>Debug</option>
-                    <option value="info" ${this.daemonConfig.logLevel === 'info' || !this.daemonConfig.logLevel ? 'selected' : ''}>Info</option>
+                <div class="form-group">
+                    <label for="stateUpdateInterval">
+                        State Update Interval
+                        <span id="stateUpdateIntervalBadge" class="badge default">Default</span>
+                    </label>
+                    <input 
+                        type="number" 
+                        id="stateUpdateInterval" 
+                        value="${this.daemonConfig.stateUpdateInterval || 5000}"
+                        min="1000"
+                        step="1000"
+                        onchange="setConfig('stateUpdateInterval', this.value); updateBadge('stateUpdateInterval', 5000)"
+                    />
+                    <div class="hint">Interval in milliseconds to update state files (minimum 1000ms)</div>
+                </div>
+                
+                <div class="form-group">
+                    <label for="logLevel">
+                        Log Level
+                        <span id="logLevelBadge" class="badge default">Default</span>
+                    </label>
+                    <select id="logLevel" onchange="setConfig('logLevel', this.value); updateBadge('logLevel', 'info')">
+                        <option value="debug" ${this.daemonConfig.logLevel === 'debug' ? 'selected' : ''}>Debug</option>
+                        <option value="info" ${this.daemonConfig.logLevel === 'info' || !this.daemonConfig.logLevel ? 'selected' : ''}>Info</option>
                     <option value="warn" ${this.daemonConfig.logLevel === 'warn' ? 'selected' : ''}>Warning</option>
                     <option value="error" ${this.daemonConfig.logLevel === 'error' ? 'selected' : ''}>Error</option>
                 </select>
@@ -467,10 +467,10 @@ export class DaemonSettingsPanel {
                         type="checkbox" 
                         id="enableUnityFeatures" 
                         ${this.daemonConfig.enableUnityFeatures !== false ? 'checked' : ''}
-                        onchange="setConfig('enableUnityFeatures', this.checked)"
+                        onchange="setConfig('enableUnityFeatures', this.checked); updateCheckboxBadge('enableUnityFeatures', true)"
                     />
                     Enable Unity Features
-                    ${isDefault('enableUnityFeatures', true) ? '<span class="badge default">Default</span>' : '<span class="badge custom">Custom</span>'}
+                    <span id="enableUnityFeaturesBadge" class="badge default">Default</span>
                 </label>
                 <div class="hint">
                     Enable Unity-specific features: MCP integration, Unity Control Manager, 
@@ -526,7 +526,7 @@ export class DaemonSettingsPanel {
             <div class="form-group">
                 <label for="port">
                     Port
-                    ${isDefault('port', 19840) ? '<span class="badge default">Default</span>' : '<span class="badge custom">Custom</span>'}
+                    <span id="portBadge" class="badge default">Default</span>
                 </label>
                 <input 
                     type="number" 
@@ -534,7 +534,7 @@ export class DaemonSettingsPanel {
                     value="${this.daemonConfig.port || 19840}"
                     min="1024"
                     max="65535"
-                    onchange="setConfig('port', this.value)"
+                    onchange="setConfig('port', this.value); updateBadge('port', 19840)"
                 />
                 <div class="hint">WebSocket port for daemon (requires daemon restart)</div>
             </div>
@@ -599,6 +599,26 @@ export class DaemonSettingsPanel {
                 vscode.postMessage({
                     command: 'resetFolders'
                 });
+            }
+        }
+        
+        function updateBadge(key, defaultValue) {
+            const badge = document.getElementById(key + 'Badge');
+            if (badge) {
+                const value = ${JSON.stringify(this.daemonConfig)}[key];
+                const isDefault = value === undefined || value === defaultValue;
+                badge.className = isDefault ? 'badge default' : 'badge custom';
+                badge.textContent = isDefault ? 'Default' : 'Custom';
+            }
+        }
+        
+        function updateCheckboxBadge(key, defaultValue) {
+            const badge = document.getElementById(key + 'Badge');
+            if (badge) {
+                const checkbox = document.getElementById(key);
+                const isDefault = checkbox ? checkbox.checked === defaultValue : false;
+                badge.className = isDefault ? 'badge default' : 'badge custom';
+                badge.textContent = isDefault ? 'Default' : 'Custom';
             }
         }
         

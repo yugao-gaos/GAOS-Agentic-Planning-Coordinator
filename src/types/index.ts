@@ -844,15 +844,59 @@ For each approved plan, use read_file to understand the tasks needed.
 
 ## ⚠️ CRITICAL: CLI Parameter Rules
 
-### Task ID Format
-- Use SIMPLE IDs: \`T1\`, \`T2\`, \`T3\`, etc.
-- Do NOT prefix with session ID (wrong: \`ps_000001_T1\`)
-- The system automatically scopes IDs to the session
+### Task ID Format - READ CAREFULLY!
+
+**RULE: Task IDs must be SIMPLE identifiers WITHOUT any prefixes or underscores**
+
+✅ CORRECT Examples:
+- \`T1\`, \`T2\`, \`T3\`, \`T10\`, \`T99\`
+- Simple letter+number format ONLY
+
+❌ WRONG Examples (WILL CAUSE ERRORS):
+- \`ps_000001_T1\` - NO session prefixes
+- \`session_T1\` - NO underscores at all
+- \`T1_impl\` - NO underscores at all
+- \`T-1\` - NO dashes, use numbers only
+
+**WHY THIS MATTERS:**
+The system automatically creates the full ID as \`{sessionId}_{taskId}\`.
+- If you pass \`--id T1\`, system creates \`ps_000001_T1\` ✅
+- If you pass \`--id ps_000001_T1\`, system creates \`ps_000001_ps_000001_T1\` ❌ BROKEN!
+
+**COMMAND FORMAT:**
+\`\`\`bash
+# CORRECT:
+apc task create --session ps_000001 --id T1 --desc "..." --type implementation
+
+# WRONG (causes double prefix bug):
+apc task create --session ps_000001 --id ps_000001_T1 --desc "..."
+\`\`\`
+
+### Dependency Format
+
+Dependencies can use EITHER format:
+- **Simple IDs** (recommended): \`--deps T1,T2,T3\`
+- **Full IDs** (same session only): \`--deps ps_000001_T1,ps_000001_T2\`
+
+❌ DO NOT mix session prefixes:
+- \`--deps ps_000002_T1\` - Cross-session dependencies are NOT supported
+
+**Dependencies MUST exist before you create tasks that depend on them!**
+Create tasks in dependency order:
+\`\`\`bash
+# CORRECT order:
+apc task create --session ps_000001 --id T1 --desc "Base task" && \\
+apc task create --session ps_000001 --id T2 --deps T1 --desc "Depends on T1"
+
+# WRONG order (T2 creation will FAIL):
+apc task create --session ps_000001 --id T2 --deps T1 --desc "..." && \\
+apc task create --session ps_000001 --id T1 --desc "..."
+\`\`\`
 
 ### Task Types (--type parameter)
 - \`implementation\` - For new features and enhancements
 - \`error_fix\` - For fixing bugs and errors
-- ❌ Do NOT use "bugfix", "bug_fix", "fix", or other variants
+- ❌ Do NOT use "bugfix", "bug_fix", "fix", "impl", or other variants
 
 ### Task Status Lifecycle
 - \`created\` → Can be started with \`task start\`
@@ -884,8 +928,9 @@ For each approved plan, use read_file to understand the tasks needed.
 apc task list
 \`\`\`
 
-**Create AND Start tasks together:**
+**Create AND Start tasks together (CORRECT FORMAT):**
 \`\`\`bash
+# Notice: --id uses SIMPLE IDs (T1, T2) not full IDs
 apc task create --session ps_000001 --id T1 --desc "First task" --type implementation && \\
 apc task create --session ps_000001 --id T2 --desc "Second task" --type implementation && \\
 apc task start --session ps_000001 --id T1 --workflow task_implementation && \\
@@ -894,7 +939,26 @@ apc task start --session ps_000001 --id T2 --workflow task_implementation
 
 **Create task with dependencies (will be blocked until deps complete):**
 \`\`\`bash
+# T1 and T2 must be created first!
 apc task create --session ps_000001 --id T3 --desc "Depends on T1 and T2" --type implementation --deps T1,T2
+\`\`\`
+
+**COMMON MISTAKES TO AVOID:**
+\`\`\`bash
+# ❌ WRONG: Using full ID in --id parameter
+apc task create --session ps_000001 --id ps_000001_T1 --desc "..."
+#                                       ^^^^^^^^^^^^^^ Remove this prefix!
+
+# ❌ WRONG: Creating task before its dependencies
+apc task create --session ps_000001 --id T5 --deps T4 --desc "..."
+# Will FAIL if T4 doesn't exist yet
+
+# ❌ WRONG: Using underscore in task ID
+apc task create --session ps_000001 --id T1_impl --desc "..."
+#                                       ^^^^^^^ No underscores!
+
+# ✅ CORRECT: Simple IDs only
+apc task create --session ps_000001 --id T1 --desc "..." --type implementation
 \`\`\`
 
 **Check task status before starting:**
@@ -984,15 +1048,22 @@ export function getDefaultSystemPrompt(promptId: string): SystemPromptConfig | u
 export interface AgentPoolState {
     totalAgents: number;
     agentNames: string[];
-    available: string[];
-    busy: Record<string, BusyAgentInfo>;
+    available: string[];  // Pool agents (idle)
+    allocated: Record<string, AllocatedAgentInfo>;  // On bench (waiting)
+    busy: Record<string, BusyAgentInfo>;  // Working on workflows
+}
+
+export interface AllocatedAgentInfo {
+    sessionId: string;
+    roleId: string;
+    allocatedAt: string;
+    requestedByWorkflow?: string;  // Which workflow is waiting for this agent
 }
 
 export interface BusyAgentInfo {
-    coordinatorId: string;
     sessionId: string;
-    roleId: string;  // References AgentRole.id
-    workflowId?: string;  // The specific workflow this agent is working on
+    roleId: string;
+    workflowId: string;  // REQUIRED - the workflow this agent is working on
     task?: string;
     startTime: string;
     processId?: number;
@@ -1002,8 +1073,7 @@ export interface BusyAgentInfo {
 export interface AgentStatus {
     name: string;
     roleId?: string;
-    status: 'available' | 'busy' | 'paused' | 'error';
-    coordinatorId?: string;
+    status: 'available' | 'allocated' | 'busy' | 'paused' | 'error';
     sessionId?: string;
     workflowId?: string;  // The specific workflow this agent is working on
     task?: string;

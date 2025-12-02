@@ -403,6 +403,51 @@ export const sessionStyles = `
     padding-left: 56px;
 }
 
+/* Agent Bench Section */
+.bench-section {
+    margin: 8px 0;
+}
+
+.nested-item.bench-header {
+    margin-bottom: 4px;
+}
+
+.bench-agents {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-left: 56px;
+}
+
+.bench-agent {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: rgba(99, 102, 241, 0.05);
+    border-radius: 4px;
+    font-size: 11px;
+    border-left-width: 3px;
+    border-left-style: solid;
+}
+
+.bench-agent .agent-name {
+    font-weight: 600;
+    color: var(--vscode-foreground);
+}
+
+.bench-agent .agent-role {
+    color: rgba(156, 163, 175, 0.8);
+    font-size: 10px;
+}
+
+.bench-agent .agent-status {
+    margin-left: auto;
+    color: #6366f1;
+    font-style: italic;
+    font-size: 10px;
+}
+
 /* Sub-item action buttons */
 .sub-item-actions {
     display: flex;

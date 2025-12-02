@@ -790,6 +790,56 @@ export class TaskManager {
             }
         }
 
+        // ========================================================================
+        // STAGE 1: ID FORMAT VALIDATION
+        // ========================================================================
+
+        // Validate taskId format - must be simple ID without underscores
+        if (taskId.includes('_')) {
+            return { 
+                success: false, 
+                error: `Invalid taskId "${taskId}": Use simple IDs like "T1", "T2", "T3" without underscores. The session prefix is added automatically. Do NOT pass "${taskId}", pass "${taskId.split('_').pop()}" instead.` 
+            };
+        }
+
+        // Validate sessionId format - must match ps_XXXXXX pattern
+        if (!sessionId.match(/^ps_\d{6}$/)) {
+            return { 
+                success: false, 
+                error: `Invalid sessionId "${sessionId}": Must match format "ps_XXXXXX" (e.g., "ps_000001")` 
+            };
+        }
+
+        // Validate dependency ID formats
+        for (const dep of dependencies) {
+            // Check for double-prefix error
+            if (dep.startsWith(`${sessionId}_${sessionId}_`)) {
+                return { 
+                    success: false, 
+                    error: `Invalid dependency "${dep}": Contains double session prefix. Use simple ID like "T1" or correct global ID like "${sessionId}_T1"` 
+                };
+            }
+            
+            // If dependency has underscore, validate it's from the same session
+            if (dep.includes('_')) {
+                if (!dep.startsWith(`${sessionId}_`)) {
+                    return { 
+                        success: false, 
+                        error: `Invalid dependency "${dep}": Cross-session dependencies not supported. All dependencies must be from session ${sessionId}` 
+                    };
+                }
+                
+                // Extract the task part and validate format
+                const taskPart = dep.slice(sessionId.length + 1);
+                if (taskPart.includes('_')) {
+                    return { 
+                        success: false, 
+                        error: `Invalid dependency "${dep}": Task ID portion "${taskPart}" contains underscores. Use format "${sessionId}_T1" not "${dep}"` 
+                    };
+                }
+            }
+        }
+
         const globalTaskId = `${sessionId}_${taskId}`;
         
         // Check if task already exists
@@ -802,12 +852,31 @@ export class TaskManager {
             dep.includes('_') ? dep : `${sessionId}_${dep}`
         );
         
-        // Check if dependencies exist (for non-error tasks)
+        // ========================================================================
+        // STAGE 2: DEPENDENCY EXISTENCE VALIDATION
+        // ========================================================================
+
+        // Check if dependencies exist - FAIL if missing (except for error tasks)
         if (sessionId !== ERROR_RESOLUTION_SESSION_ID) {
+            const missingDeps: string[] = [];
             for (const depId of globalDependencies) {
                 if (!this.tasks.has(depId)) {
-                    this.log(`Warning: Dependency ${depId} not found for task ${taskId}`);
+                    missingDeps.push(depId);
                 }
+            }
+            
+            if (missingDeps.length > 0) {
+                // Provide helpful error message
+                const depList = missingDeps.map(id => {
+                    // Show both formats for clarity
+                    const shortId = id.includes('_') ? id.split('_').pop() : id;
+                    return `"${shortId}" (${id})`;
+                }).join(', ');
+                
+                return { 
+                    success: false, 
+                    error: `Cannot create task ${taskId}: Required dependencies not found: ${depList}. Create dependencies first, or check for typos in --deps parameter.` 
+                };
             }
         }
         

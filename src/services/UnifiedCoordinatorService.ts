@@ -871,7 +871,7 @@ export class UnifiedCoordinatorService {
             broadcaster.poolChanged(
                 poolStatus.total,
                 poolStatus.available,
-                busyAgents.map(b => ({ name: b.name, coordinatorId: b.coordinatorId || '', roleId: b.roleId }))
+                busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId }))
             );
             console.log(`[UnifiedCoordinatorService] pool.changed broadcast complete`);
         } catch (e) {
@@ -911,51 +911,67 @@ export class UnifiedCoordinatorService {
         while (this.agentRequestQueue.length > 0) {
             const request = this.agentRequestQueue[0];
             
-            // Try to allocate an agent from the pool
-            const agents = this.agentPoolService.allocateAgents(request.workflowId, 1, request.roleId);
+            // Find session for this workflow
+            let sessionId = '';
+            for (const [sid, state] of this.sessions) {
+                if (state.workflows.has(request.workflowId)) {
+                    sessionId = sid;
+                    break;
+                }
+            }
             
-            if (agents.length > 0) {
-                // Remove request from queue
+            if (!sessionId) {
+                this.log(`Cannot allocate agent: workflow ${request.workflowId} not found`);
                 this.agentRequestQueue.shift();
+                continue;
+            }
+            
+            // Try to get agent from session bench first
+            const benchAgents = this.agentPoolService.getAgentsOnBench(sessionId)
+                .filter(a => a.roleId === request.roleId);
+            
+            let agentName: string | undefined;
+            
+            if (benchAgents.length > 0) {
+                // Use agent from bench
+                agentName = benchAgents[0].name;
+                this.agentPoolService.promoteAgentToBusy(agentName, request.workflowId, request.roleId);
+            } else {
+                // Allocate new agent to bench, then promote to busy
+                const allocated = this.agentPoolService.allocateAgents(
+                    sessionId, 
+                    1, 
+                    request.roleId, 
+                    request.workflowId
+                );
                 
-                const agentName = agents[0];
-                
-                // Find which session this workflow belongs to
-                let sessionId = '';
-                for (const [sid, state] of this.sessions) {
-                    if (state.workflows.has(request.workflowId)) {
-                        sessionId = sid;
-                        break;
-                    }
+                if (allocated.length === 0) {
+                    // No agents available
+                    break;
                 }
                 
-                // Update AgentPoolService with the correct sessionId and workflowId
-                // (allocateAgents initially sets sessionId to empty)
-                this.agentPoolService.updateAgentSession(agentName, { 
-                    sessionId: sessionId || '', 
-                    workflowId: request.workflowId 
-                });
-                
-                // Sync with TaskManager - register the agent with role
-                // Map the string roleId to the AgentRole type
-                const roleId = this.mapRoleIdToAgentRole(request.roleId);
-                taskManager.registerAgent(agentName, sessionId, '', roleId);
-                
-                // Fire allocation event (for terminal creation etc.)
-                this._onAgentAllocated.fire({
-                    agentName,
-                    sessionId,
-                    roleId: request.roleId,
-                    workflowId: request.workflowId
-                });
-                
-                // Fulfill the request
-                request.callback(agentName);
-                this.log(`Agent ${agentName} allocated for workflow ${request.workflowId} (role: ${request.roleId})`);
-            } else {
-                // No agents available, stop processing
-                break;
+                agentName = allocated[0];
+                this.agentPoolService.promoteAgentToBusy(agentName, request.workflowId, request.roleId);
             }
+            
+            // Remove from queue
+            this.agentRequestQueue.shift();
+            
+            // Sync with TaskManager
+            const roleId = this.mapRoleIdToAgentRole(request.roleId);
+            taskManager.registerAgent(agentName, sessionId, '', roleId);
+            
+            // Fire allocation event
+            this._onAgentAllocated.fire({
+                agentName,
+                sessionId,
+                roleId: request.roleId,
+                workflowId: request.workflowId
+            });
+            
+            // Fulfill request
+            request.callback(agentName);
+            this.log(`Agent ${agentName} promoted to busy for workflow ${request.workflowId}`);
         }
     }
     

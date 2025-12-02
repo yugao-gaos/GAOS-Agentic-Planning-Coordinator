@@ -62,6 +62,8 @@ export interface SessionInfo {
     isRevising: boolean;
     failedTasks: FailedTaskInfo[];
     sessionAgents: AgentInfo[];
+    benchAgents?: AgentInfo[];  // NEW: Agents on bench
+    benchCount?: number;  // NEW: Count of bench agents
 }
 
 export interface FailedTaskInfo {
@@ -74,9 +76,8 @@ export interface FailedTaskInfo {
 
 export interface AgentInfo {
     name: string;
-    status: 'available' | 'busy';
+    status: 'available' | 'allocated' | 'busy';  // Added 'allocated'
     roleId?: string;
-    coordinatorId?: string;
     workflowId?: string;  // The specific workflow this agent is working on
     roleColor?: string;
     workflowType?: string;

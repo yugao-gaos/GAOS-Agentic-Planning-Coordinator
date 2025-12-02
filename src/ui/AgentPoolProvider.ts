@@ -71,7 +71,7 @@ export class AgentPoolItem extends vscode.TreeItem {
             
             // Show role name in description if available
             const roleLabel = agentStatus.roleId ? ` [${agentStatus.roleId}]` : '';
-            this.description = `working${roleLabel} (${agentStatus.coordinatorId})`;
+            this.description = `working${roleLabel} (${agentStatus.workflowId})`;
             this.tooltip = this.getBusyTooltip(label, agentStatus);
             
             // Command to show terminal
@@ -90,8 +90,8 @@ export class AgentPoolItem extends vscode.TreeItem {
         if (status.roleId) {
             md.appendMarkdown(`**Role:** ${status.roleId}\n\n`);
         }
-        if (status.coordinatorId) {
-            md.appendMarkdown(`**Coordinator:** ${status.coordinatorId}\n\n`);
+        if (status.workflowId) {
+            md.appendMarkdown(`**Workflow:** ${status.workflowId}\n\n`);
         }
         if (status.sessionId) {
             md.appendMarkdown(`**Session:** ${status.sessionId}\n\n`);

@@ -340,7 +340,7 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                     <div class="sub-item-actions">${execInfo.buttons}</div>
                 </div>
                 
-                <!-- Coordinator children (Workflows + History + Failed Tasks) -->
+                <!-- Coordinator children (Workflows + Bench + History + Failed Tasks) -->
                 <div class="coordinator-children" data-coord-children="${session.id}">
                     <!-- Active Workflows (running first) -->
                     ${session.activeWorkflows && session.activeWorkflows.length > 0 ? `
@@ -351,6 +351,27 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                             <span class="nested-label">Active (${session.activeWorkflows.length})</span>
                         </div>
                         ${session.activeWorkflows.map(wf => renderWorkflowItem(wf, findAgentsForWorkflow(wf, session.sessionAgents || []))).join('')}
+                    ` : ''}
+                    
+                    <!-- Agent Bench (allocated but waiting) -->
+                    ${session.benchAgents && session.benchAgents.length > 0 ? `
+                        <div class="bench-section">
+                            <div class="nested-item bench-header">
+                                <div class="nested-icon" style="color: #6366f1;">
+                                    ⏸️
+                                </div>
+                                <span class="nested-label">Agent Bench (${session.benchCount} waiting)</span>
+                            </div>
+                            <div class="bench-agents">
+                                ${session.benchAgents.map(agent => `
+                                    <div class="bench-agent" style="border-left: 3px solid ${agent.roleColor}">
+                                        <span class="agent-name">${agent.name}</span>
+                                        <span class="agent-role">${agent.roleId}</span>
+                                        <span class="agent-status">waiting</span>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
                     ` : ''}
                     
                     <!-- Workflow History (completed, newest first) - collapsible -->

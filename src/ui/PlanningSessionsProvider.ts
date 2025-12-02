@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { PlanningSession, PlanStatus, ExecutionState } from '../types';
 import { ServiceLocator } from '../services/ServiceLocator';
+import { StateManager } from '../services/StateManager';
 
 /**
  * Async file existence check (replaces fs.existsSync)
@@ -66,7 +67,7 @@ export class PlanningSessionsProvider implements vscode.TreeDataProvider<Plannin
 
         // Return all planning sessions
         const sessions = this.stateManager.getAllPlanningSessions();
-        return sessions.map(session => new PlanningSessionItem(session));
+        return sessions.map((session: PlanningSession) => new PlanningSessionItem(session));
     }
 
     private async getSessionDetails(session: PlanningSession): Promise<PlanningSessionItem[]> {

@@ -530,8 +530,36 @@ export class StateManager {
             totalAgents: size,
             agentNames: agentNames,
             available: [...agentNames],
+            allocated: {},  // NEW: Agent bench
             busy: {}
         };
+    }
+
+    /**
+     * Migrate agent pool state from old format to new 3-state format
+     */
+    private migrateAgentPoolState(state: any): AgentPoolState {
+        // Add allocated field if missing
+        if (!state.allocated) {
+            state.allocated = {};
+        }
+        
+        // Remove coordinatorId from busy agents (legacy field)
+        if (state.busy) {
+            for (const agentInfo of Object.values(state.busy)) {
+                const agentInfoAny = agentInfo as any;
+                if ('coordinatorId' in agentInfoAny) {
+                    delete agentInfoAny.coordinatorId;
+                }
+                // Ensure workflowId is present (required field now)
+                if (!agentInfoAny.workflowId) {
+                    console.warn('[StateManager] Migrating busy agent without workflowId - setting to "unknown"');
+                    (agentInfo as any).workflowId = 'unknown';
+                }
+            }
+        }
+        
+        return state as AgentPoolState;
     }
 
     /**
@@ -611,7 +639,7 @@ export class StateManager {
         if (fs.existsSync(poolStatePath)) {
             try {
                 const data = JSON.parse(fs.readFileSync(poolStatePath, 'utf-8'));
-                this.agentPoolState = data;
+                this.agentPoolState = this.migrateAgentPoolState(data);
             } catch (e) {
                 console.error('Failed to load agent pool state:', e);
             }

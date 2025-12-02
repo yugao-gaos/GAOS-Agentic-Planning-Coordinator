@@ -1,6 +1,6 @@
 import { StateManager } from './StateManager';
 import { AgentRoleRegistry } from './AgentRoleRegistry';
-import { AgentPoolState, BusyAgentInfo, AgentStatus, AgentRole } from '../types';
+import { AgentPoolState, BusyAgentInfo, AllocatedAgentInfo, AgentStatus, AgentRole } from '../types';
 
 export class AgentPoolService {
     private stateManager: StateManager;
@@ -46,12 +46,11 @@ export class AgentPoolService {
         return [...this.stateManager.getAgentPoolState().available];
     }
 
-    getBusyAgents(): Array<{ name: string; roleId?: string; coordinatorId: string; sessionId: string; workflowId?: string; task?: string }> {
+    getBusyAgents(): Array<{ name: string; roleId?: string; sessionId: string; workflowId: string; task?: string }> {
         const state = this.stateManager.getAgentPoolState();
         return Object.entries(state.busy).map(([name, info]) => ({
             name,
             roleId: info.roleId,
-            coordinatorId: info.coordinatorId,
             sessionId: info.sessionId,
             workflowId: info.workflowId,
             task: info.task
@@ -61,13 +60,12 @@ export class AgentPoolService {
     /**
      * Get agents by their assigned role
      */
-    getAgentsByRole(roleId: string): Array<{ name: string; coordinatorId: string; sessionId: string; task?: string }> {
+    getAgentsByRole(roleId: string): Array<{ name: string; sessionId: string; task?: string }> {
         const state = this.stateManager.getAgentPoolState();
         return Object.entries(state.busy)
             .filter(([_, info]) => info.roleId === roleId)
             .map(([name, info]) => ({
                 name,
-                coordinatorId: info.coordinatorId,
                 sessionId: info.sessionId,
                 task: info.task
             }));
@@ -80,13 +78,22 @@ export class AgentPoolService {
             return { name, status: 'available' };
         }
         
+        const allocatedInfo = state.allocated?.[name];
+        if (allocatedInfo) {
+            return {
+                name,
+                roleId: allocatedInfo.roleId,
+                status: 'allocated',
+                sessionId: allocatedInfo.sessionId
+            };
+        }
+        
         const busyInfo = state.busy[name];
         if (busyInfo) {
             return {
                 name,
                 roleId: busyInfo.roleId,
                 status: 'busy',
-                coordinatorId: busyInfo.coordinatorId,
                 sessionId: busyInfo.sessionId,
                 workflowId: busyInfo.workflowId,
                 task: busyInfo.task,
@@ -103,13 +110,19 @@ export class AgentPoolService {
     // ========================================================================
 
     /**
-     * Allocate agents from the pool for a coordinator
-     * @param coordinatorId The coordinator requesting agents
+     * Allocate agents to session bench (not yet working)
+     * @param sessionId The session requesting agents
      * @param count Number of agents to allocate
-     * @param roleId Optional role ID to assign to the agents (default: 'engineer')
+     * @param roleId Role to assign
+     * @param requestingWorkflowId Optional: workflow that needs this agent
      * @returns Array of allocated agent names
      */
-    allocateAgents(coordinatorId: string, count: number, roleId: string = 'engineer'): string[] {
+    allocateAgents(
+        sessionId: string, 
+        count: number, 
+        roleId: string = 'engineer',
+        requestingWorkflowId?: string
+    ): string[] {
         // Validate role exists in registry
         if (!this.roleRegistry.getRole(roleId)) {
             console.warn(`[AgentPoolService] Unknown role: ${roleId}, defaulting to 'engineer'`);
@@ -133,17 +146,71 @@ export class AgentPoolService {
             const agent = state.available.shift();
             if (agent) {
                 allocated.push(agent);
-                state.busy[agent] = {
-                    coordinatorId,
-                    sessionId: '', // Will be set when session starts
+                state.allocated[agent] = {
+                    sessionId,
                     roleId,
-                    startTime: new Date().toISOString()
+                    allocatedAt: new Date().toISOString(),
+                    requestedByWorkflow: requestingWorkflowId
                 };
             }
         }
 
         this.stateManager.updateAgentPool(state);
         return allocated;
+    }
+
+    /**
+     * Promote agent from bench to busy (start working on workflow)
+     * @param agentName Agent to promote
+     * @param workflowId Workflow ID
+     * @param task Optional task description
+     * @returns true if successful
+     */
+    promoteAgentToBusy(agentName: string, workflowId: string, task?: string): boolean {
+        const state = this.stateManager.getAgentPoolState();
+        
+        const allocatedInfo = state.allocated?.[agentName];
+        if (!allocatedInfo) {
+            console.warn(`[AgentPoolService] Cannot promote ${agentName}: not on bench`);
+            return false;
+        }
+        
+        // Move from allocated to busy
+        delete state.allocated[agentName];
+        state.busy[agentName] = {
+            sessionId: allocatedInfo.sessionId,
+            roleId: allocatedInfo.roleId,
+            workflowId,
+            task,
+            startTime: new Date().toISOString()
+        };
+        
+        this.stateManager.updateAgentPool(state);
+        return true;
+    }
+
+    /**
+     * Demote agent from busy back to bench (workflow paused/waiting)
+     */
+    demoteAgentToBench(agentName: string): boolean {
+        const state = this.stateManager.getAgentPoolState();
+        
+        const busyInfo = state.busy[agentName];
+        if (!busyInfo) {
+            console.warn(`[AgentPoolService] Cannot demote ${agentName}: not busy`);
+            return false;
+        }
+        
+        // Move from busy back to allocated
+        delete state.busy[agentName];
+        state.allocated[agentName] = {
+            sessionId: busyInfo.sessionId,
+            roleId: busyInfo.roleId,
+            allocatedAt: new Date().toISOString()
+        };
+        
+        this.stateManager.updateAgentPool(state);
+        return true;
     }
 
     /**
@@ -154,11 +221,15 @@ export class AgentPoolService {
         const state = this.stateManager.getAgentPoolState();
 
         for (const name of agentNames) {
+            // Check both busy and allocated
             if (state.busy[name]) {
                 delete state.busy[name];
-                if (!state.available.includes(name)) {
-                    state.available.push(name);
-                }
+            } else if (state.allocated?.[name]) {
+                delete state.allocated[name];
+            }
+            
+            if (!state.available.includes(name)) {
+                state.available.push(name);
             }
         }
 
@@ -168,20 +239,34 @@ export class AgentPoolService {
     }
 
     /**
-     * Release all agents belonging to a coordinator
-     * @param coordinatorId The coordinator ID
+     * Release all agents belonging to a session
+     * @param sessionId The session ID
      */
-    releaseCoordinatorAgents(coordinatorId: string): string[] {
+    releaseSessionAgents(sessionId: string): string[] {
         const state = this.stateManager.getAgentPoolState();
         const released: string[] = [];
 
+        // Release busy agents
         for (const [name, info] of Object.entries(state.busy)) {
-            if (info.coordinatorId === coordinatorId) {
+            if (info.sessionId === sessionId) {
                 delete state.busy[name];
                 if (!state.available.includes(name)) {
                     state.available.push(name);
                 }
                 released.push(name);
+            }
+        }
+
+        // Release allocated agents
+        if (state.allocated) {
+            for (const [name, info] of Object.entries(state.allocated)) {
+                if (info.sessionId === sessionId) {
+                    delete state.allocated[name];
+                    if (!state.available.includes(name)) {
+                        state.available.push(name);
+                    }
+                    released.push(name);
+                }
             }
         }
 
@@ -221,9 +306,33 @@ export class AgentPoolService {
      * Allocate a single agent for a specific role
      * Returns the agent name or undefined if none available
      */
-    allocateAgentForRole(coordinatorId: string, roleId: string): string | undefined {
-        const allocated = this.allocateAgents(coordinatorId, 1, roleId);
+    allocateAgentForRole(sessionId: string, roleId: string): string | undefined {
+        const allocated = this.allocateAgents(sessionId, 1, roleId);
         return allocated.length > 0 ? allocated[0] : undefined;
+    }
+
+    /**
+     * Get agents on bench (allocated but not yet working)
+     */
+    getAgentsOnBench(sessionId?: string): Array<{ name: string; roleId: string; sessionId: string }> {
+        const state = this.stateManager.getAgentPoolState();
+        if (!state.allocated) {
+            return [];
+        }
+        return Object.entries(state.allocated)
+            .filter(([_, info]) => !sessionId || info.sessionId === sessionId)
+            .map(([name, info]) => ({
+                name,
+                roleId: info.roleId,
+                sessionId: info.sessionId
+            }));
+    }
+
+    /**
+     * Get count of agents on bench
+     */
+    getBenchCount(sessionId?: string): number {
+        return this.getAgentsOnBench(sessionId).length;
     }
 
     /**
@@ -270,6 +379,7 @@ export class AgentPoolService {
     getPoolSummary(): {
         total: number;
         available: number;
+        allocated: number;
         busy: number;
         byRole: Record<string, number>;
     } {
@@ -279,6 +389,7 @@ export class AgentPoolService {
         return {
             total: state.totalAgents,
             available: state.available.length,
+            allocated: state.allocated ? Object.keys(state.allocated).length : 0,
             busy: Object.keys(state.busy).length,
             byRole
         };
@@ -294,6 +405,11 @@ export class AgentPoolService {
         // Remove from busy if present
         if (state.busy[agentName]) {
             delete state.busy[agentName];
+        }
+        
+        // Remove from allocated if present
+        if (state.allocated?.[agentName]) {
+            delete state.allocated[agentName];
         }
         
         // Add to available if not already there

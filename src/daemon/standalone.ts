@@ -134,7 +134,7 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
             broadcaster.poolChanged(
                 poolStatus.total,
                 poolStatus.available,
-                busyAgents.map(b => ({ name: b.name, coordinatorId: b.coordinatorId || '', roleId: b.roleId }))
+                busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId }))
             );
         } catch (e) {
             console.error(`[Standalone] Error in onAgentAllocated handler:`, e);
@@ -146,7 +146,7 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
                 broadcaster.poolChanged(
                     poolStatus.total,
                     poolStatus.available,
-                    busyAgents.map(b => ({ name: b.name, coordinatorId: b.coordinatorId || '', roleId: b.roleId }))
+                    busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId }))
                 );
             } catch (e2) {
                 console.error(`[Standalone] Failed to broadcast pool.changed:`, e2);
@@ -174,7 +174,7 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
         broadcaster.poolChanged(
             poolStatus2.total,
             poolStatus2.available,
-            busyAgents2.map(b => ({ name: b.name, coordinatorId: b.coordinatorId || '', roleId: b.roleId }))
+            busyAgents2.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId }))
         );
     });
     
@@ -198,9 +198,7 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
     }
     
     // Initialize PlanningService
-    const planningService = new PlanningService(stateManager, coordinator, {
-        unityBestPracticesPath: config.unityBestPracticesPath
-    });
+    const planningService = new PlanningService(stateManager, coordinator, {});
     console.log('[Standalone] PlanningService initialized');
     
     // Initialize and start IdlePlanMonitor
@@ -220,7 +218,13 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
         agentPoolService: {
             getPoolStatus: () => agentPoolService.getPoolStatus(),
             getAvailableAgents: () => agentPoolService.getAvailableAgents(),
-            getBusyAgents: () => agentPoolService.getBusyAgents(),
+            getBusyAgents: () => agentPoolService.getBusyAgents().map(b => ({
+                name: b.name,
+                roleId: b.roleId,
+                coordinatorId: b.workflowId || '',
+                sessionId: b.sessionId,
+                task: b.task
+            })),
             getAllRoles: () => agentPoolService.getAllRoles(),
             getRole: (roleId: string) => agentPoolService.getRole(roleId),
             resizePool: (size: number) => agentPoolService.resizePool(size),
