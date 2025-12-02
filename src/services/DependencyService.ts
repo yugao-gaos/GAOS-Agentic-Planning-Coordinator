@@ -666,10 +666,9 @@ export class DependencyService {
     private async checkWorkingDirectories(): Promise<WorkspaceCheck> {
         const directories = [
             '_AiDevLog',
-            '_AiDevLog/Plans',
-            '_AiDevLog/Tasks',             // Global tasks storage
+            '_AiDevLog/Plans',              // Per-plan storage (includes per-plan tasks.json)
             '_AiDevLog/Logs',
-            '_AiDevLog/Logs/Coordinator',  // Global coordinator evaluation logs
+            '_AiDevLog/Logs/Coordinator',   // Global coordinator evaluation logs
             '_AiDevLog/Context',
             '_AiDevLog/Errors',
             '_AiDevLog/Docs',

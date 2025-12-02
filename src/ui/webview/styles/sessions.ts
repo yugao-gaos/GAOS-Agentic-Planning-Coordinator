@@ -295,7 +295,7 @@ export const sessionStyles = `
 }
 
 .history-more-btn {
-    padding: 2px 8px;
+    padding: 2px 12px;
     font-size: 10px;
     background: var(--vscode-button-secondaryBackground);
     color: var(--vscode-button-secondaryForeground);
@@ -304,6 +304,8 @@ export const sessionStyles = `
     cursor: pointer;
     opacity: 0.7;
     transition: opacity 0.15s ease, background 0.15s ease;
+    min-width: 100px;
+    text-align: center;
 }
 
 .history-more-btn:hover {

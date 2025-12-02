@@ -178,6 +178,7 @@ function renderWorkflowItem(wf: WorkflowInfo, agents: AgentInfo[]): string {
 
 /**
  * Render a completed workflow history item (simplified view).
+ * Note: Summaries are excluded from the preview and only shown in the full history page.
  */
 function renderHistoryItem(wf: WorkflowInfo): string {
     const typeInfo = WORKFLOW_TYPE_INFO[wf.type] || {
@@ -196,11 +197,6 @@ function renderHistoryItem(wf: WorkflowInfo): string {
         ? '<span style="color: #10b981;">✓</span>' 
         : '<span style="color: #f14c4c;">✗</span>';
     
-    // Include summary if available
-    const summaryLine = wf.summary 
-        ? `<div class="workflow-summary" style="font-size: 11px; opacity: 0.6; margin-left: 24px; margin-top: 2px;">${wf.summary}</div>`
-        : '';
-    
     return `
         <div class="nested-item level-3 history-item ${wf.status}">
             <div class="nested-icon ${typeInfo.class}" style="opacity: 0.6;">
@@ -209,7 +205,6 @@ function renderHistoryItem(wf: WorkflowInfo): string {
             <span class="nested-label" style="opacity: 0.7;">${label}</span>
             <span class="workflow-phase" style="font-size: 10px; opacity: 0.7;">${statusIcon} ${wf.phase}</span>
         </div>
-        ${summaryLine}
     `;
 }
 
@@ -393,13 +388,13 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                         </div>
                         <div class="history-children" data-history-children="${session.id}">
                             ${session.workflowHistory.slice(0, 5).map(wf => renderHistoryItem(wf)).join('')}
-                            ${session.workflowHistory.length > 5 ? `
                             <div class="nested-item level-3 history-more-container">
-                                <button class="history-more-btn" data-action="openFullHistory" data-session-id="${session.id}" title="View all ${session.workflowHistory.length} workflow history items">
-                                    + ${session.workflowHistory.length - 5} more
+                                <button class="history-more-btn" data-action="openFullHistory" data-session-id="${session.id}" title="View full workflow history">
+                                    ${session.workflowHistory.length > 5 
+                                        ? `${session.workflowHistory.length - 5} more - View Details` 
+                                        : 'View Details'}
                                 </button>
                             </div>
-                            ` : ''}
                         </div>
                     ` : ''}
                     

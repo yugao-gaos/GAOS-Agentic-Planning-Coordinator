@@ -13,6 +13,7 @@ import {
     DEFAULT_WORKFLOW_USER_SETTINGS
 } from '../types/workflow';
 import { WorkflowMetadata } from './workflows/IWorkflow';
+import { getFolderStructureManager } from './FolderStructureManager';
 
 // ============================================================================
 // Default Workflow Metadata (Single Source of Truth)
@@ -64,8 +65,8 @@ export const DEFAULT_WORKFLOW_METADATA: Record<WorkflowType, WorkflowMetadata> =
         name: 'Context Gathering',
         requiresUnity: false,
         coordinatorPrompt: `- 'context_gathering' - Gather and analyze context from folders/files
-   Use when: Before starting work on unfamiliar code, after repeated errors, or to build project knowledge
-   Input: targets (folders/files), focusAreas (optional), depth ('shallow'|'deep')
+   Use when: Run in parallel when building plans to get general understanding of the project, before starting work on unfamiliar task, after repeated errors. If you foresee tasks that need to build assets like prefab, scene, GUIs, run context gathering before the implementation workflow to help you understand what assets are available and how to choose them based on requirement.
+   Input: targets (folders/files), focusAreas (optional), depth ('shallow'|'deep'), taskId (optional - to associate context with a specific task)
    Output: Context summary written to _AiDevLog/Context/`
     }
 };
@@ -89,9 +90,16 @@ const WORKFLOW_SETTINGS_FILENAME = 'workflow_settings.json';
 
 /**
  * Get path to workflow settings config file
+ * Uses FolderStructureManager for customizable path
  */
 export function getWorkflowSettingsPath(workspaceRoot: string): string {
-    return path.join(workspaceRoot, '_AiDevLog', 'Config', WORKFLOW_SETTINGS_FILENAME);
+    try {
+        const folderStructure = getFolderStructureManager();
+        return path.join(folderStructure.getFolderPath('config'), WORKFLOW_SETTINGS_FILENAME);
+    } catch {
+        // Fallback to default if FolderStructureManager not initialized
+        return path.join(workspaceRoot, '_AiDevLog', 'Config', WORKFLOW_SETTINGS_FILENAME);
+    }
 }
 
 /**

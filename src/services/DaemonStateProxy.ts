@@ -366,6 +366,24 @@ export class DaemonStateProxy {
     }
 
     /**
+     * Get agents on bench (allocated but not busy)
+     */
+    async getAgentsOnBench(sessionId?: string): Promise<Array<{ name: string; roleId: string; sessionId: string }>> {
+        if (!this.vsCodeClient.isConnected()) {
+            return [];
+        }
+
+        try {
+            const response: { agents?: Array<{ name: string; roleId: string; sessionId: string }> } = 
+                await this.vsCodeClient.send('pool.bench', { sessionId });
+            return response.agents || [];
+        } catch (err) {
+            console.warn('[DaemonStateProxy] Failed to get bench agents from daemon:', err);
+            return [];
+        }
+    }
+
+    /**
      * Get agent status
      */
     async getAgentStatus(agentName: string): Promise<AgentStatus | undefined> {

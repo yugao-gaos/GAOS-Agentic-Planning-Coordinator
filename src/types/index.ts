@@ -816,24 +816,58 @@ Your job is to:
 - Create and start tasks based on approved plans
 - Maximize agent utilization (keep all available agents busy)
 - Avoid creating duplicate tasks
-- Respect task dependencies`,
+- Respect task dependencies
+
+⚠️ CRITICAL RULE: You may ONLY create and start tasks for plans with status 'approved'.
+NEVER create tasks for plans with status 'reviewing', 'revising', 'planning', or any other non-approved status.
+Only the plans listed in the "APPROVED PLANS" section below are allowed to have tasks created.`,
 
         decisionInstructions: `Based on the triggering event and current state, decide what actions to take.
 
 **AVAILABLE AGENTS: {{AVAILABLE_AGENT_COUNT}}**
 
-## STEP 1: Check Existing Tasks
+## STEP 1: Check Existing Tasks & Workflows
 Run: \`apc task list\` to see all current tasks, their status, and dependencies.
 
-## STEP 2: Read Plans
+⚠️ **CRITICAL: Before starting ANY workflow, check for existing workflows!**
+- Use \`apc workflow list {{sessionId}}\` to see active workflows
+- Use \`apc task status --session {{sessionId}} --task <taskId>\` to verify task status
+- **A task can ONLY have ONE active workflow at a time**
+- Do NOT start a new workflow if the task already has one running!
+
+## STEP 2: Check Agent Capacity (80% Rule)
+**DO NOT START MORE WORKFLOWS if active workflows are at capacity!**
+
+**Capacity Calculation:**
+- Total Agents: {{AVAILABLE_AGENT_COUNT}} (pool) + (allocated/busy agents)
+- Many workflows require multiple agents (implementer + reviewer, etc.)
+- **RULE: Do NOT start workflows if:**
+  - (Current Active Workflows + 1) > (80% of Total Agents)
+  - Example: With 10 total agents, max 8 workflows
+
+**Before starting any workflow:**
+1. Count active workflows across ALL sessions
+2. Calculate capacity: \`(active_workflows + 1) <= (total_agents * 0.8)\`
+3. If over capacity, WAIT for workflows to complete
+
+**Why 80%?**
+- Workflows need multiple agents (implementer, reviewer, context)
+- Reserve 20% buffer for new high-priority tasks
+- Prevents resource starvation
+
+## STEP 3: Read Plans
 For each approved plan, use read_file to understand the tasks needed.
 
 ## Key Principles
-1. **Dependencies First**: ONLY start tasks whose dependencies are ALL completed
+1. **No Duplicate Workflows**: NEVER start a workflow on a task that already has one running
+   - The system will REJECT duplicate workflow starts
+   - Always check \`apc task status\` first!
+2. **Respect Capacity Limits**: Honor the 80% rule to avoid resource contention
+3. **Dependencies First**: ONLY start tasks whose dependencies are ALL completed
    - A task with deps "T1,T2" can only start if both T1 and T2 are completed
    - Tasks with no dependencies can start immediately
-2. **Avoid Duplicates**: Check existing tasks before creating new ones
-3. **INCREMENTAL TASK CREATION**: Do NOT create all tasks from the plan at once!
+4. **Avoid Duplicate Tasks**: Check existing tasks before creating new ones
+5. **INCREMENTAL TASK CREATION**: Do NOT create all tasks from the plan at once!
    - Only create tasks that can START IMMEDIATELY (no unmet deps)
    - Create at most {{AVAILABLE_AGENT_COUNT}} new tasks per evaluation
    - Leave remaining tasks for future coordinator evaluations
@@ -1005,11 +1039,15 @@ apc workflow summarize --session ps_000001 --workflow wf_ghi789 --summary "Gener
 ## What To Do
 
 1. Run \`apc task list\` to see existing tasks and their status
-2. Read plan file(s) to identify needed tasks
-3. Identify tasks that can START NOW (status \`created\`, not \`blocked\`)
-4. Create ONLY those ready-to-start tasks (max {{AVAILABLE_AGENT_COUNT}})
-5. **IMMEDIATELY start all created tasks** in the same chained command
-6. Leave tasks with unmet dependencies for next evaluation
+2. Run \`apc workflow list {{sessionId}}\` to see active workflows
+3. **Check capacity:** Count active workflows vs total agents (80% rule)
+4. **If over capacity:** STOP and explain why no new workflows can start
+5. Read plan file(s) to identify needed tasks
+6. Identify tasks that can START NOW (status \`created\`, not \`blocked\`, NO active workflow)
+7. Create ONLY those ready-to-start tasks (max {{AVAILABLE_AGENT_COUNT}})
+8. **IMMEDIATELY start all created tasks** in the same chained command
+9. **VERIFY BEFORE STARTING:** Use \`apc task status\` to confirm no active workflow
+10. Leave tasks with unmet dependencies for next evaluation
 
 ## Your Response
 

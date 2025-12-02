@@ -281,8 +281,15 @@ export class CoordinatorAgent {
             const stateManager = ServiceLocator.resolve(StateManager);
             return stateManager.getGlobalCoordinatorLogsFolder();
         } catch {
-            // Fallback if StateManager not available
-            return path.join(this.workspaceRoot, '_AiDevLog', 'Logs', 'Coordinator');
+            // Fallback if StateManager not available - use default structure
+            const { getFolderStructureManager } = require('./FolderStructureManager');
+            try {
+                const folderStructure = getFolderStructureManager();
+                return path.join(folderStructure.getFolderPath('logs'), 'Coordinator');
+            } catch {
+                // Last resort fallback
+                return path.join(this.workspaceRoot, '_AiDevLog', 'Logs', 'Coordinator');
+            }
         }
     }
     
@@ -349,14 +356,19 @@ export class CoordinatorAgent {
         // Get dynamic workflow prompts from registry, with user overrides applied
         const workflowPrompts = this.workflowRegistry?.getCoordinatorPrompts(this.unityEnabled, userOverrides) || '';
         
-        // Replace template variables in decision instructions
+        // Calculate TOTAL agent count (available pool + busy agents)
+        // This is used for the 80% capacity rule
         const availableAgentCount = input.availableAgents?.length ?? 0;
+        const busyAgentCount = input.agentStatuses?.filter(a => a.status === 'busy').length ?? 0;
+        const totalAgentCount = availableAgentCount + busyAgentCount;
+        
+        // Replace template variables in decision instructions
         const decisionInstructions = promptConfig.decisionInstructions
             .replace('{{sessionId}}', input.sessionId)
             .replace('{{timestamp}}', String(Date.now()))
             .replace('{{WORKFLOW_SELECTION}}', workflowPrompts || 'No workflows registered')
             .replace('{{planPath}}', input.planPath || 'N/A')
-            .replace(/\{\{AVAILABLE_AGENT_COUNT\}\}/g, String(availableAgentCount));
+            .replace(/\{\{AVAILABLE_AGENT_COUNT\}\}/g, String(totalAgentCount));
         
         return `${promptConfig.roleIntro}
 

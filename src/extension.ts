@@ -369,7 +369,13 @@ ${failedData.clarityQuestion || failedData.lastError}
 
 Session: ${failedData.sessionId}
 Please help clarify, then use:
-  apc plan revise ${failedData.sessionId} "<your clarification>"`
+  apc plan revise ${failedData.sessionId} "<your clarification>"
+
+IMPORTANT - Status Polling Timing:
+After running "apc plan revise", the revision process takes about 80 seconds to complete.
+- Wait 80 seconds before checking status the first time
+- Then poll every 30 seconds: sleep 30 && apc plan status ${failedData.sessionId}
+- Do NOT poll more frequently - the multi-agent debate takes time!`
                 : `Task "${failedData.taskId}" failed after ${failedData.attempts} attempt(s).
 
 Error: ${failedData.lastError}
@@ -378,7 +384,13 @@ ${failedData.canRetry ? 'Can retry.' : 'Cannot retry (permanent error).'}
 
 Options:
 1. Revise plan: apc plan revise ${failedData.sessionId} "<feedback>"
-2. ${failedData.canRetry ? `Retry: apc task retry ${failedData.sessionId} ${failedData.taskId}` : 'Skip task via revision'}`;
+2. ${failedData.canRetry ? `Retry: apc task retry ${failedData.sessionId} ${failedData.taskId}` : 'Skip task via revision'}
+
+IMPORTANT - Status Polling Timing:
+If you revise the plan, the revision process takes about 80 seconds to complete.
+- Wait 80 seconds before checking status the first time
+- Then poll every 30 seconds: sleep 30 && apc plan status ${failedData.sessionId}
+- Do NOT poll more frequently - the multi-agent debate takes time!`;
 
             // Copy prompt to clipboard and open agent chat
             await vscode.env.clipboard.writeText(prompt);
@@ -456,6 +468,12 @@ Workflow:
 3. Summarize requirements and run: apc plan new "<summary>"
 4. Review with user: apc plan status <id>
 5. Approve: apc plan approve <id> (auto-starts execution)
+
+IMPORTANT - Status Polling Timing:
+After running "apc plan new", the planning process takes about 200 seconds to complete.
+- Wait 200 seconds before checking status the first time
+- Then poll every 60 seconds: sleep 60 && apc plan status <id>
+- Do NOT poll more frequently - the multi-agent debate takes time!
 
 Let's get started!`;
 
@@ -793,7 +811,13 @@ IMPORTANT: This is REVISION DISCUSSION, not direct editing.
 When revision requirements are clear, SUMMARIZE this conversation and run:
   apc plan revise ${sessionId} "<revision summary from conversation>"
 
-This will trigger the multi-agent debate to revise the plan.`;
+This will trigger the multi-agent debate to revise the plan.
+
+IMPORTANT - Status Polling Timing:
+After running "apc plan revise", the revision process takes about 80 seconds to complete.
+- Wait 80 seconds before checking status the first time
+- Then poll every 30 seconds: sleep 30 && apc plan status ${sessionId}
+- Do NOT poll more frequently - the multi-agent debate takes time!`;
 
             // Copy to clipboard and open agent chat
             await vscode.env.clipboard.writeText(revisionPrompt);

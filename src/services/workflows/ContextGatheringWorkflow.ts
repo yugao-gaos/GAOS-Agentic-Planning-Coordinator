@@ -15,6 +15,7 @@ import {
 import { AgentRunner, AgentRunOptions } from '../AgentBackend';
 import { AgentRole } from '../../types';
 import { ServiceLocator } from '../ServiceLocator';
+import { getFolderStructureManager } from '../FolderStructureManager';
 import {
     getAllPresets,
     getExtensionMap,
@@ -519,11 +520,18 @@ Focus on information that would help a developer quickly understand and work wit
     // =========================================================================
     
     private async executePersistPhase(): Promise<void> {
-        this.log(`💾 PHASE: PERSIST - Writing context to _AiDevLog/Context/`);
+        this.log(`💾 PHASE: PERSIST - Writing context to configured context folder`);
         
-        // Ensure context directory exists
+        // Ensure context directory exists - use FolderStructureManager
         const workspaceRoot = this.stateManager.getWorkspaceRoot();
-        const contextDir = path.join(workspaceRoot, '_AiDevLog', 'Context');
+        let contextDir: string;
+        try {
+            const folderStructure = getFolderStructureManager();
+            contextDir = folderStructure.getFolderPath('context');
+        } catch {
+            // Fallback if FolderStructureManager not initialized
+            contextDir = path.join(workspaceRoot, '_AiDevLog', 'Context');
+        }
         
         if (!fs.existsSync(contextDir)) {
             fs.mkdirSync(contextDir, { recursive: true });

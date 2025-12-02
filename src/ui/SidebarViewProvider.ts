@@ -524,13 +524,33 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                         workflowType,
                         currentPhase,
                         taskId,
-                        sessionId: s.id.substring(0, 8)
+                        sessionId: s.id
                     });
                 }
             }
             
-            // Collect agents on bench for this session (not yet available in daemon)
+            // Collect agents on bench for this session
             const sessionBench: AgentInfo[] = [];
+            const benchAgentsRaw = this.stateProxy 
+                ? await this.stateProxy.getAgentsOnBench(s.id)
+                : [];
+            for (const agent of benchAgentsRaw) {
+                let roleColor: string | undefined;
+                if (agent.roleId) {
+                    const role = this.stateProxy 
+                        ? await this.stateProxy.getRole(agent.roleId) 
+                        : undefined;
+                    roleColor = role?.color;
+                }
+                
+                sessionBench.push({
+                    name: agent.name,
+                    status: 'allocated',
+                    roleId: agent.roleId,
+                    roleColor: roleColor || '#6366f1',
+                    sessionId: s.id
+                });
+            }
             
             sessions.push({
                 id: s.id,
@@ -595,7 +615,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             // Search through sessions to find matching workflow using workflowId
             for (const session of sessions) {
                 if (agent.workflowId && agent.sessionId === session.id) {
-                    sessionId = session.id.substring(0, 8);
+                    sessionId = session.id;
                     
                     // Find matching workflow by workflowId ONLY (no role-based fallback)
                     if (agent.workflowId) {

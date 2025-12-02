@@ -297,13 +297,17 @@ export class PlanningSessionItem extends vscode.TreeItem {
                         this.description = '📋 ready for approval';
                     }
                     
-                    if (session.currentPlanPath) {
+                    if (session.currentPlanPath && fileExistsSync(session.currentPlanPath)) {
                         this.command = {
                             command: 'vscode.open',
                             title: 'Open Plan',
                             arguments: [vscode.Uri.file(session.currentPlanPath)]
                         };
                         this.tooltip = `Click to open: ${session.currentPlanPath}`;
+                    } else if (session.currentPlanPath) {
+                        // Plan path is set but file doesn't exist
+                        this.tooltip = `Plan file not found: ${session.currentPlanPath}`;
+                        this.description = this.description || '(file missing)';
                     }
                     break;
                     

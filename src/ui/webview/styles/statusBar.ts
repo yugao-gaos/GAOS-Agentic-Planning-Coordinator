@@ -144,11 +144,54 @@ export const statusBarStyles = `
     margin-left: auto;
 }
 
-/* Status bar wrapper for health warning */
+/* Status bar wrapper for health warning and Unity compact box */
 .status-bar-wrapper {
     display: flex;
     flex-direction: column;
     gap: 0;
+}
+
+/* Unity Compact Box */
+.unity-compact-box {
+    padding: 6px 12px;
+    background: var(--vscode-editor-background);
+    border: 1px solid var(--vscode-widget-border);
+    border-top: none;
+    border-radius: 0 0 6px 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 11px;
+}
+
+.unity-compact-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.unity-compact-badge {
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--vscode-badge-foreground);
+}
+
+.unity-compact-queue {
+    font-weight: 500;
+    color: var(--vscode-foreground);
+}
+
+.unity-compact-task {
+    display: flex;
+    align-items: center;
+}
+
+.unity-compact-current {
+    color: var(--vscode-charts-blue, #3b82f6);
+    font-weight: 600;
+    font-size: 11px;
 }
 
 /* Health warning banner */

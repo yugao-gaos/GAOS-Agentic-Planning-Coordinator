@@ -8,6 +8,7 @@ import { EventBroadcaster } from '../daemon/EventBroadcaster';
 import { ServiceLocator } from './ServiceLocator';
 import { atomicWriteFileSync } from './StateManager';
 import { getMemoryMonitor } from './MemoryMonitor';
+import { getFolderStructureManager } from './FolderStructureManager';
 
 // ============================================================================
 // Task Manager - Global Singleton for Cross-Plan Task Coordination
@@ -303,7 +304,7 @@ export class TaskManager {
     }
     
     // ========================================================================
-    // Task Persistence (Per-Session Storage: _AiDevLog/Plans/{sessionId}/tasks.json)
+    // Task Persistence (Per-Plan Storage: {workingDir}/{plans}/{sessionId}/tasks.json)
     // ========================================================================
     
     /**
@@ -430,13 +431,13 @@ export class TaskManager {
         
         if (cleaned > 0) {
             this.log(`Cleaned up ${cleaned} tasks from memory for session ${sessionId}`);
-            // Note: Tasks remain on disk at _AiDevLog/Plans/{sessionId}/tasks.json
+            // Note: Tasks remain on disk at {workingDir}/{plans}/{sessionId}/tasks.json
         }
     }
     
     /**
-     * Persist all tasks to per-session files
-     * Each session's tasks are saved to _AiDevLog/Plans/{sessionId}/tasks.json
+     * Persist all tasks to per-plan files
+     * Each session's tasks are saved to {workingDir}/{plans}/{sessionId}/tasks.json
      * This reduces memory footprint as completed sessions can be unloaded
      */
     private persistTasks(): void {
@@ -466,7 +467,7 @@ export class TaskManager {
     
     /**
      * Persist tasks for a specific session
-     * Saves to _AiDevLog/Plans/{sessionId}/tasks.json
+     * Saves to {workingDir}/{plans}/{sessionId}/tasks.json
      */
     private persistTasksForSession(sessionId: string, tasks?: ManagedTask[]): void {
         const stateManager = this.getStateManager();
@@ -505,7 +506,7 @@ export class TaskManager {
      * Tasks with invalid format are skipped (not loaded).
      * The coordinator will detect missing tasks and recreate them.
      * 
-     * Loads from per-plan storage: _AiDevLog/Plans/{sessionId}/tasks.json
+     * Loads from per-plan storage: {workingDir}/{plans}/{sessionId}/tasks.json
      */
     private loadPersistedTasks(): void {
         const stateManager = this.getStateManager();
@@ -515,10 +516,11 @@ export class TaskManager {
         }
         
         try {
-            // Get all session folders
-            const plansDir = path.join(stateManager.getWorkspaceRoot(), '_AiDevLog', 'Plans');
+            // Get all session folders from FolderStructureManager
+            const folderStructure = getFolderStructureManager();
+            const plansDir = folderStructure.getFolderPath('plans');
             if (!fs.existsSync(plansDir)) {
-                this.log('[INFO] No Plans directory found, starting fresh');
+                this.log('[INFO] No plans directory found, starting fresh');
                 return;
             }
             

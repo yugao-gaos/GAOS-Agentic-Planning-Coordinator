@@ -477,12 +477,13 @@ You MUST output your review in this EXACT format:
                 output: result.output
             };
         } finally {
-            // DON'T release planner agent - keep reserved for potential loop iterations
-            // Planner agent will be released by releaseAllAgents() when workflow ends
+            // Release analyst agents immediately - they're done
+            // Demote planner agent to bench - it may be needed again in the next iteration
             if (!isPlannerRole) {
                 this.releaseAgent(agentName);
             } else {
-                this.log(`Keeping planner agent ${agentName} reserved (idle but occupied)`);
+                this.demoteAgentToBench(agentName);
+                this.log(`Planner agent ${agentName} moved to bench (idle, waiting for potential next iteration)`);
             }
             
             // Don't delete log file - terminal may still be tailing it

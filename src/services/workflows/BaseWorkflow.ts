@@ -97,6 +97,7 @@ export abstract class BaseWorkflow implements IWorkflow {
     readonly onError = new TypedEventEmitter<Error>();
     readonly onAgentNeeded = new TypedEventEmitter<AgentRequest>();
     readonly onAgentReleased = new TypedEventEmitter<string>();
+    readonly onAgentDemotedToBench = new TypedEventEmitter<string>();
     
     // Task occupancy/conflict events
     readonly onTaskOccupancyDeclared = new TypedEventEmitter<TaskOccupancy>();
@@ -933,6 +934,22 @@ ${ctx.partialOutput.slice(-3000)}
             console.log(`[BaseWorkflow] onAgentReleased fired for ${agentName}`);
         } else {
             console.log(`[BaseWorkflow] Agent ${agentName} not in allocatedAgents, skipping release`);
+        }
+    }
+    
+    /**
+     * Demote agent to bench (allocated but idle, waiting for more work)
+     */
+    protected demoteAgentToBench(agentName: string): void {
+        const index = this.allocatedAgents.indexOf(agentName);
+        if (index >= 0) {
+            this.allocatedAgents.splice(index, 1);
+            this.log(`Agent demoted to bench: ${agentName}`);
+            console.log(`[BaseWorkflow] Firing onAgentDemotedToBench for ${agentName}`);
+            this.onAgentDemotedToBench.fire(agentName);
+            console.log(`[BaseWorkflow] onAgentDemotedToBench fired for ${agentName}`);
+        } else {
+            console.log(`[BaseWorkflow] Agent ${agentName} not in allocatedAgents, skipping demote`);
         }
     }
     

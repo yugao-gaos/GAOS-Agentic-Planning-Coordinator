@@ -25,7 +25,8 @@ export function getSidebarScript(): string {
         const agentBadge = document.getElementById('agentBadge');
         const unityBadge = document.getElementById('unityBadge');
         const unityQueue = document.getElementById('unityQueue');
-        const unitySection = document.getElementById('unitySection');
+        const unityCompactBox = document.getElementById('unityCompactBox');
+        const unityCurrentTask = document.getElementById('unityCurrentTask');
 
         // Button handlers
         document.getElementById('refreshBtn').onclick = () => vscode.postMessage({ type: 'refresh' });
@@ -354,28 +355,55 @@ export function getSidebarScript(): string {
             agentBadge.textContent = state.agentBadgeText || '0/0';
             attachAgentHandlers();
 
-            // Unity section
-            if (!state.unityEnabled) {
-                unitySection.style.display = 'none';
+            // Unity compact box
+            if (!state.unityEnabled || !state.unity) {
+                if (unityCompactBox) {
+                    unityCompactBox.style.display = 'none';
+                }
             } else {
-                unitySection.style.display = 'block';
+                if (unityCompactBox) {
+                    unityCompactBox.style.display = 'flex';
+                }
                 
-                if (state.unity) {
-                    unityBadge.textContent = state.unityBadgeText || 'Not Running';
+                if (state.unity && unityBadge) {
+                    unityBadge.textContent = state.unityBadgeText || 'Idle';
                     unityBadge.style.background = state.unityBadgeBackground || 'rgba(107, 114, 128, 0.3)';
                     
                     // Apply animation className
                     if (state.unityBadgeClassName) {
-                        unityBadge.className = 'section-badge unity-badge ' + state.unityBadgeClassName;
+                        unityBadge.className = 'unity-compact-badge ' + state.unityBadgeClassName;
                     } else {
-                        unityBadge.className = 'section-badge unity-badge';
-                    }
-                    
-                    if (unityQueue) {
-                        unityQueue.textContent = state.unity.queueLength + ' task' + (state.unity.queueLength !== 1 ? 's' : '');
-                        unityQueue.className = 'unity-value' + (state.unity.queueLength > 0 ? ' warning' : '');
+                        unityBadge.className = 'unity-compact-badge';
                     }
                 }
+                
+                if (state.unity && unityQueue) {
+                    unityQueue.textContent = state.unity.queueLength + ' task' + (state.unity.queueLength !== 1 ? 's' : '');
+                    unityQueue.className = 'unity-compact-queue' + (state.unity.queueLength > 0 ? ' warning' : '');
+                }
+                
+                // Update current task if element exists
+                if (state.unity && state.unity.currentTask && unityCurrentTask) {
+                    const taskType = formatTaskType(state.unity.currentTask.type);
+                    const phase = state.unity.currentTask.phase ? ' (' + state.unity.currentTask.phase + ')' : '';
+                    unityCurrentTask.innerHTML = '<span class="unity-compact-current">' + taskType + phase + '</span>';
+                    unityCurrentTask.style.display = 'flex';
+                } else if (unityCurrentTask) {
+                    unityCurrentTask.style.display = 'none';
+                }
+            }
+            
+            /**
+             * Format task type for display.
+             */
+            function formatTaskType(type) {
+                const typeMap = {
+                    'prep_editor': 'Compile',
+                    'test_editmode': 'Test (Edit)',
+                    'test_playmode': 'Test (Play)',
+                    'exec_editmode': 'Execute'
+                };
+                return typeMap[type] || type;
             }
         }
 

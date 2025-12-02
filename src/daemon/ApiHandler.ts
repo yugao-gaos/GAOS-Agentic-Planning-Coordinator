@@ -82,6 +82,7 @@ export interface IAgentPoolApi {
     getPoolStatus(): { total: number; available: string[]; busy: string[] };
     getAvailableAgents(): string[];
     getBusyAgents(): Array<{ name: string; roleId?: string; coordinatorId: string; sessionId: string; task?: string }>;
+    getAgentsOnBench(sessionId?: string): Array<{ name: string; roleId: string; sessionId: string }>;
     getAllRoles(): RoleData[];
     getRole(roleId: string): RoleData | undefined;
     resizePool(newSize: number): { added: string[]; removed: string[] };
@@ -175,9 +176,9 @@ export interface ICoordinatorApi {
  */
 export interface ITaskManagerApi {
     getProgressForSession(sessionId: string): { completed: number; pending: number; inProgress: number; failed: number; ready: number; total: number };
-    getTasksForSession(sessionId: string): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string }>;
-    getTask(globalTaskId: string): { id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string } | undefined;
-    getAllTasks(): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string }>;
+    getTasksForSession(sessionId: string): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string; currentWorkflow?: string }>;
+    getTask(globalTaskId: string): { id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string; currentWorkflow?: string } | undefined;
+    getAllTasks(): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string; currentWorkflow?: string }>;
     createTaskFromCli(params: { sessionId: string; taskId: string; description: string; dependencies?: string[]; taskType?: 'implementation' | 'error_fix'; priority?: number; errorText?: string }): { success: boolean; error?: string };
     completeTask(globalTaskId: string, summary?: string): void;
     updateTaskStage(globalTaskId: string, stage: string): void;
@@ -760,6 +761,18 @@ export class ApiHandler {
                 return { data: { role } };
             }
             
+            case 'bench': {
+                const sessionId = params.sessionId as string | undefined;
+                const agentPoolService = this.services.agentPoolService as IAgentPoolApi & { getAgentsOnBench?: (sessionId?: string) => Array<{ name: string; roleId: string; sessionId: string }> };
+                if (agentPoolService.getAgentsOnBench) {
+                    const agents = agentPoolService.getAgentsOnBench(sessionId);
+                    return { data: { agents } };
+                } else {
+                    // Fallback: return empty array if method doesn't exist
+                    return { data: { agents: [] } };
+                }
+            }
+            
             default:
                 throw new Error(`Unknown pool action: ${action}`);
         }
@@ -1153,12 +1166,13 @@ export class ApiHandler {
         globalId: string;
         description: string;
         status: string;
-        stage?: string;
         dependencies: string[];
         actualAgent?: string;
         filesModified?: string[];
         startedAt?: string;
         completedAt?: string;
+        currentWorkflow?: string;
+        workflowStatus?: string;
     } {
         const globalTaskId = `${sessionId}_${taskId}`;
         const task = this.services.taskManager!.getTask(globalTaskId);
@@ -1176,17 +1190,25 @@ export class ApiHandler {
             );
         }
         
+        // Get current workflow status if task has one
+        let workflowStatus: string | undefined;
+        if (task.currentWorkflow) {
+            const progress = this.services.coordinator.getWorkflowStatus(sessionId, task.currentWorkflow);
+            workflowStatus = progress?.status;
+        }
+        
         return {
             id: taskId,
             globalId: globalTaskId,
             description: task.description,
             status: task.status,
-            stage: task.stage,
             dependencies: task.dependencies,
             actualAgent: task.actualAgent,
             filesModified: task.filesModified,
             startedAt: task.startedAt,
-            completedAt: task.completedAt
+            completedAt: task.completedAt,
+            currentWorkflow: task.currentWorkflow,
+            workflowStatus
         };
     }
     

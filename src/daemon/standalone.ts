@@ -232,6 +232,7 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
                 sessionId: b.sessionId,
                 task: b.task
             })),
+            getAgentsOnBench: (sessionId?: string) => agentPoolService.getAgentsOnBench(sessionId),
             getAllRoles: () => agentPoolService.getAllRoles(),
             getRole: (roleId: string) => agentPoolService.getRole(roleId),
             resizePool: (size: number) => agentPoolService.resizePool(size),

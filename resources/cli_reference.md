@@ -318,7 +318,38 @@ apc plan cancel --id <session_id>
 apc workflow dispatch <sessionId> <type> [--input JSON]
 ```
 
-Types: `planning_new`, `planning_revision`, `task_implementation`, `error_resolution`
+Types: `planning_new`, `planning_revision`, `task_implementation`, `error_resolution`, `context_gathering`
+
+**Context Gathering Example:**
+```bash
+apc workflow dispatch ps_000001 context_gathering --input '{
+  "targets": ["Assets/Scripts/Combat", "Assets/Prefabs/Enemies"],
+  "depth": "shallow",
+  "focusAreas": ["enemy AI patterns", "combat system"],
+  "taskId": "T5"
+}'
+```
+
+**Input Parameters by Workflow Type:**
+
+- `context_gathering`:
+  - `targets` (string[]): Folders/files to analyze
+  - `depth` (string): 'shallow' (quick scan) or 'deep' (thorough)
+  - `focusAreas` (string[]): Optional specific areas to focus on
+  - `taskId` (string): Optional task ID to associate context with
+  - `outputName` (string): Optional output filename (defaults to 'context')
+  - `preset` (string): Optional preset to use (skips auto-detection)
+
+- `task_implementation`:
+  - `taskId` (string): Task ID from plan
+  - `taskDescription` (string): Task description
+  - `dependencies` (string[]): Dependency task IDs
+  - `planPath` (string): Path to plan file
+
+- `error_resolution`:
+  - `errors` (object[]): Array of error objects with id, message, file, line
+  - `coordinatorId` (string): Coordinator ID requesting fix
+  - `sourceWorkflowId` (string): Optional source workflow ID
 
 ### Get Workflow Status
 

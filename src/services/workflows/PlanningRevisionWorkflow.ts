@@ -528,12 +528,13 @@ ${this.analystOutput || 'No review available'}
                 output: result.output
             };
         } finally {
-            // DON'T release planner agent - keep reserved for the workflow
-            // Planner agent will be released by releaseAllAgents() when workflow ends
+            // Release analyst agents immediately - they're done
+            // Demote planner agent to bench - it will wait for analyst feedback and potential revision loop
             if (!isPlannerRole) {
                 this.releaseAgent(agentName);
             } else {
-                this.log(`Keeping planner agent ${agentName} reserved (idle but occupied)`);
+                this.demoteAgentToBench(agentName);
+                this.log(`Planner agent ${agentName} moved to bench (waiting for analyst feedback)`);
             }
             
             // Don't delete log file - terminal may still be tailing it

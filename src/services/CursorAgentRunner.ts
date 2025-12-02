@@ -117,8 +117,9 @@ export class CursorAgentRunner implements IAgentBackend {
         // Using cat to pipe prompt avoids escaping issues with complex prompts
         // Always use stream-json format - text mode doesn't produce capturable stdout
         // simpleMode affects how we PARSE the output, not the output format
+        // stdbuf -oL enables line-buffered output to prevent bash from buffering stdout
         const cursorFlags = `--model "${model}" -p --force --approve-mcps --output-format stream-json --stream-partial-output`;
-        const shellCmd = `cat "${promptFile}" | cursor agent ${cursorFlags} 2>&1; rm -f "${promptFile}"`;
+        const shellCmd = `cat "${promptFile}" | stdbuf -oL cursor agent ${cursorFlags} 2>&1; rm -f "${promptFile}"`;
         
         if (logFile) {
             this.appendToLog(logFile, `[DEBUG] Shell command: ${shellCmd}\n`);

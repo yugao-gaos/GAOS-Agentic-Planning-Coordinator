@@ -290,15 +290,16 @@ export class StateManager {
 
     /**
      * Get the base folder for a planning session
-     * Structure: _AiDevLog/Plans/{sessionId}/
+     * Structure: {workingDir}/{plans}/{sessionId}/
+     * Uses FolderStructureManager for customizable folder names
      */
     getPlanFolder(sessionId: string): string {
-        return path.join(this.workingDir, 'Plans', sessionId);
+        return path.join(this.workingDir, this.folderStructure.getFolder('plans'), sessionId);
     }
 
     /**
      * Get the plan file path for a session
-     * Structure: _AiDevLog/Plans/{sessionId}/plan.md
+     * Structure: {workingDir}/{plans}/{sessionId}/plan.md
      */
     getPlanFilePath(sessionId: string): string {
         return path.join(this.getPlanFolder(sessionId), 'plan.md');
@@ -306,7 +307,7 @@ export class StateManager {
 
     /**
      * Get the session state file path
-     * Structure: _AiDevLog/Plans/{sessionId}/session.json
+     * Structure: {workingDir}/{plans}/{sessionId}/session.json
      */
     getSessionFilePath(sessionId: string): string {
         return path.join(this.getPlanFolder(sessionId), 'session.json');
@@ -314,7 +315,7 @@ export class StateManager {
 
     /**
      * Get the backups folder for a session
-     * Structure: _AiDevLog/Plans/{sessionId}/backups/
+     * Structure: {workingDir}/{plans}/{sessionId}/backups/
      * 
      * Used for plan revision backups to keep plan folder clean.
      */
@@ -356,56 +357,16 @@ export class StateManager {
      * - Keeps per-session folders focused on session-specific data
      */
     getGlobalCoordinatorLogsFolder(): string {
-        return path.join(this.workingDir, 'Logs', 'Coordinator');
+        return path.join(this.folderStructure.getFolderPath('logs'), 'Coordinator');
     }
     
     // ========================================================================
-    // Global Tasks Paths (Tasks are global, not session-specific)
+    // Per-Plan Tasks Paths
     // ========================================================================
-    
-    /**
-     * Get the global tasks folder
-     * Structure: _AiDevLog/Tasks/
-     * 
-     * Tasks are stored globally because:
-     * - TaskManager manages ALL tasks across ALL sessions
-     * - Tasks need to persist across daemon restarts
-     * - Cross-session task dependencies and conflict detection require global view
-     */
-    getGlobalTasksFolder(): string {
-        return path.join(this.workingDir, 'Tasks');
-    }
-    
-    /**
-     * Get the global tasks file path
-     * Structure: _AiDevLog/Tasks/tasks.json
-     */
-    getGlobalTasksFilePath(): string {
-        return path.join(this.getGlobalTasksFolder(), 'tasks.json');
-    }
-    
-    /**
-     * Ensure global tasks directory exists
-     */
-    ensureGlobalTasksDirectory(): void {
-        const dir = this.getGlobalTasksFolder();
-        if (!fs.existsSync(dir)) {
-            fs.mkdirSync(dir, { recursive: true });
-        }
-    }
-
-    /**
-     * @deprecated Use getGlobalTasksFilePath() instead - tasks are now per-session
-     * Get the tasks file path for a session (per-session, legacy)
-     * Structure: _AiDevLog/Plans/{sessionId}/tasks.json
-     */
-    getTasksFilePath(sessionId: string): string {
-        return path.join(this.getPlanFolder(sessionId), 'tasks.json');
-    }
     
     /**
      * Get the session tasks folder
-     * Structure: _AiDevLog/Plans/{sessionId}/
+     * Structure: {workingDir}/{plans}/{sessionId}/
      */
     getSessionTasksFolder(sessionId: string): string {
         return this.getPlanFolder(sessionId);
@@ -413,7 +374,7 @@ export class StateManager {
     
     /**
      * Get the session tasks file path
-     * Structure: _AiDevLog/Plans/{sessionId}/tasks.json
+     * Structure: {workingDir}/{plans}/{sessionId}/tasks.json
      */
     getSessionTasksFilePath(sessionId: string): string {
         return path.join(this.getPlanFolder(sessionId), 'tasks.json');
@@ -663,7 +624,7 @@ export class StateManager {
 
         // Load planning sessions from plan folder structure
         // Only load non-completed sessions into memory to reduce memory footprint
-        const plansDir = path.join(this.workingDir, 'Plans');
+        const plansDir = this.folderStructure.getFolderPath('plans');
         if (fs.existsSync(plansDir)) {
             const planFolders = fs.readdirSync(plansDir, { withFileTypes: true })
                 .filter(d => d.isDirectory())
@@ -798,7 +759,7 @@ export class StateManager {
     getCompletedSessionIds(): string[] {
         const completedIds: string[] = [];
         try {
-            const plansDir = path.join(this.workingDir, 'Plans');
+            const plansDir = this.folderStructure.getFolderPath('plans');
             if (fs.existsSync(plansDir)) {
                 const planFolders = fs.readdirSync(plansDir, { withFileTypes: true })
                     .filter(d => d.isDirectory())
@@ -1218,67 +1179,6 @@ export class StateManager {
     }
 
     // ========================================================================
-    // Task Persistence Methods (DEPRECATED - Use TaskManager.persistTasks() instead)
-    // Tasks are now stored globally in _AiDevLog/Tasks/tasks.json
-    // These per-session methods are kept for backwards compatibility only
-    // ========================================================================
-    
-    /**
-     * @deprecated Use TaskManager.persistTasks() instead - tasks are now global
-     * Save tasks for a session to disk
-     * Structure: { sessionId, tasks: ManagedTask[], lastUpdated }
-     */
-    saveSessionTasks(sessionId: string, tasks: any[]): void {
-        this.ensurePlanDirectories(sessionId);
-        const filePath = this.getTasksFilePath(sessionId);
-        const data = {
-            sessionId,
-            tasks,
-            lastUpdated: new Date().toISOString()
-        };
-        atomicWriteFileSync(filePath, JSON.stringify(data, null, 2));
-    }
-    
-    /**
-     * @deprecated Use TaskManager.loadPersistedTasks() instead - tasks are now global
-     * Load tasks for a session from disk
-     * @returns Array of task objects, or null if no tasks file exists
-     */
-    loadSessionTasks(sessionId: string): any[] | null {
-        const filePath = this.getTasksFilePath(sessionId);
-        if (fs.existsSync(filePath)) {
-            try {
-                const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-                return data.tasks || null;
-            } catch (e) {
-                console.error(`Failed to load tasks for session ${sessionId}:`, e);
-            }
-        }
-        return null;
-    }
-    
-    /**
-     * Check if tasks file exists for a session
-     */
-    hasSessionTasks(sessionId: string): boolean {
-        return fs.existsSync(this.getTasksFilePath(sessionId));
-    }
-    
-    /**
-     * Delete tasks file for a session
-     */
-    deleteSessionTasks(sessionId: string): void {
-        const filePath = this.getTasksFilePath(sessionId);
-        if (fs.existsSync(filePath)) {
-            try {
-                fs.unlinkSync(filePath);
-            } catch (e) {
-                console.error(`Failed to delete tasks for session ${sessionId}:`, e);
-            }
-        }
-    }
-
-    // ========================================================================
     // Role Persistence Methods (.config/roles/)
     // ========================================================================
 
@@ -1559,7 +1459,7 @@ export class StateManager {
         let count = 1;
         
         // Scan all plan folders for engineer logs
-        const plansDir = path.join(this.workingDir, 'Plans');
+        const plansDir = this.folderStructure.getFolderPath('plans');
         if (fs.existsSync(plansDir)) {
             const pattern = new RegExp(`^${engineerName}_\\d{6}\\.log$`, 'i');
             
@@ -1596,7 +1496,7 @@ export class StateManager {
         // Find the highest existing session number
         let count = 0;
         
-        const plansDir = path.join(this.workingDir, 'Plans');
+        const plansDir = this.folderStructure.getFolderPath('plans');
         if (fs.existsSync(plansDir)) {
             const planFolders = fs.readdirSync(plansDir, { withFileTypes: true })
                 .filter(d => d.isDirectory())

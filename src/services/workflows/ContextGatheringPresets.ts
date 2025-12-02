@@ -6,6 +6,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { ContextGatheringPresetConfig, ContextPresetUserConfig } from '../../types/workflow';
+import { getFolderStructureManager } from '../FolderStructureManager';
 
 // ============================================================================
 // BUILT-IN PRESETS
@@ -498,13 +499,19 @@ export const DEFAULT_EXTENSION_MAP: Record<string, string> = {
 // ============================================================================
 
 const CONFIG_FILENAME = 'context_presets.json';
-const CONFIG_DIR = '_AiDevLog/Config';
 
 /**
  * Get the full path to the user config file
+ * Uses FolderStructureManager for customizable path
  */
 export function getConfigPath(workspaceRoot: string): string {
-    return path.join(workspaceRoot, CONFIG_DIR, CONFIG_FILENAME);
+    try {
+        const folderStructure = getFolderStructureManager();
+        return path.join(folderStructure.getFolderPath('config'), CONFIG_FILENAME);
+    } catch {
+        // Fallback if FolderStructureManager not initialized
+        return path.join(workspaceRoot, '_AiDevLog', 'Config', CONFIG_FILENAME);
+    }
 }
 
 // ============================================================================
@@ -512,7 +519,7 @@ export function getConfigPath(workspaceRoot: string): string {
 // ============================================================================
 
 /**
- * Load user configuration from _AiDevLog/Config/context_presets.json
+ * Load user configuration from configured config folder
  * Returns null if file doesn't exist or is invalid
  */
 export function loadUserConfig(workspaceRoot: string): ContextPresetUserConfig | null {
@@ -533,7 +540,7 @@ export function loadUserConfig(workspaceRoot: string): ContextPresetUserConfig |
 }
 
 /**
- * Save user configuration to _AiDevLog/Config/context_presets.json
+ * Save user configuration to configured config folder
  */
 export function saveUserConfig(workspaceRoot: string, config: ContextPresetUserConfig): boolean {
     const configPath = getConfigPath(workspaceRoot);

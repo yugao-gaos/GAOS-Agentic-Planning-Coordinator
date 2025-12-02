@@ -9,7 +9,6 @@ import {
     renderSessionsSection,
     renderAgentGrid,
     getAgentBadgeText,
-    renderUnityContent,
     getUnityBadgeInfo
 } from './components';
 import { SidebarState } from './types';
@@ -63,21 +62,6 @@ export function getSidebarHtml(initialState?: SidebarState, expandedSessionIds?:
     const agentBadgeText = initialState 
         ? getAgentBadgeText(initialState.agents) 
         : '0/0';
-    
-    const unityHtml = initialState && initialState.unityEnabled
-        ? renderUnityContent(initialState.unity)
-        : `
-            <div class="unity-row">
-                <span class="unity-label">Queue</span>
-                <span class="unity-value" id="unityQueue">0 tasks</span>
-            </div>
-        `;
-    
-    const unityBadgeInfo = initialState 
-        ? getUnityBadgeInfo(initialState.unity)
-        : { text: 'Not Running', background: 'rgba(107, 114, 128, 0.3)' };
-    
-    const unityDisplay = initialState && !initialState.unityEnabled ? 'none' : 'block';
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -89,8 +73,11 @@ ${getSidebarStyles()}
     </style>
 </head>
 <body>
-    <!-- Status Bar -->
-    ${renderStatusBar()}
+    <!-- Status Bar with Unity Compact Box -->
+    ${renderStatusBar(
+        initialState?.unity, 
+        initialState?.unityEnabled
+    )}
 
     <div class="main-content">
         <!-- Planning Sessions -->
@@ -124,19 +111,6 @@ ${getSidebarStyles()}
             </div>
             <div class="section-content" id="agentsContent">
                 ${agentsHtml}
-            </div>
-        </div>
-
-        <!-- Unity Control -->
-        <div class="section" style="flex-shrink: 0; display: ${unityDisplay};" id="unitySection">
-            <div class="section-header">
-                <span>Unity Control</span>
-                <span class="badge" id="unityBadge" style="background: ${unityBadgeInfo.background};">
-                    ${unityBadgeInfo.text}
-                </span>
-            </div>
-            <div class="unity-content" id="unityContent">
-                ${unityHtml}
             </div>
         </div>
     </div>

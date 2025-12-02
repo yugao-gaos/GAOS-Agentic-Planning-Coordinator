@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { getFolderStructureManager } from './FolderStructureManager';
 
 // ============================================================================
 // Plan Parser Types
@@ -514,9 +515,16 @@ export class PlanParser {
 
     /**
      * Get plan file path from session ID
+     * Uses FolderStructureManager for customizable path
      */
     static getPlanPath(workspaceRoot: string, sessionId: string): string {
-        return path.join(workspaceRoot, '_AiDevLog', 'Plans', `Plan_${sessionId}.md`);
+        try {
+            const folderStructure = getFolderStructureManager();
+            return path.join(folderStructure.getFolderPath('plans'), `Plan_${sessionId}.md`);
+        } catch {
+            // Fallback if FolderStructureManager not initialized
+            return path.join(workspaceRoot, '_AiDevLog', 'Plans', `Plan_${sessionId}.md`);
+        }
     }
 
     /**

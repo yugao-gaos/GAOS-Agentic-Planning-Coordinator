@@ -6,6 +6,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import { getFolderStructureManager } from './FolderStructureManager';
 
 export interface WorkflowHistoryEntry {
     id: string;
@@ -24,7 +25,14 @@ export class WorkflowHistoryService {
     private historyDir: string;
     
     constructor(workspaceRoot: string) {
-        this.historyDir = path.join(workspaceRoot, '_AiDevLog', 'History');
+        // Use FolderStructureManager for customizable path
+        try {
+            const folderStructure = getFolderStructureManager();
+            this.historyDir = folderStructure.getFolderPath('history');
+        } catch {
+            // Fallback to default if FolderStructureManager not initialized
+            this.historyDir = path.join(workspaceRoot, '_AiDevLog', 'History');
+        }
         if (!fs.existsSync(this.historyDir)) {
             fs.mkdirSync(this.historyDir, { recursive: true });
         }
@@ -94,6 +102,7 @@ export class WorkflowHistoryService {
         }
     }
 }
+
 
 
 

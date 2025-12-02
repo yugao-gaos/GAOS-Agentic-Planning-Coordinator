@@ -461,7 +461,8 @@ export class UnifiedCoordinatorService {
                 type: workflow.type,
                 status: progress.status,
                 phase: progress.phase,
-                percentage: progress.percentage
+                percentage: progress.percentage,
+                taskId: state.workflowToTaskMap.get(id) // Include task ID if this is a task workflow
             });
         }
         
@@ -586,6 +587,26 @@ export class UnifiedCoordinatorService {
         const task = taskManager.getTask(globalTaskId);
         if (!task) {
             throw new Error(`Task ${taskId} not found in session ${sessionId}`);
+        }
+        
+        // VALIDATION: Prevent duplicate workflows on same task
+        // A task can only have ONE active workflow at a time
+        if (task.currentWorkflow) {
+            // Check if the workflow is still active
+            const state = this.sessions.get(sessionId);
+            if (state) {
+                const existingWorkflow = state.workflows.get(task.currentWorkflow);
+                if (existingWorkflow) {
+                    const status = existingWorkflow.getStatus();
+                    if (status === 'running' || status === 'pending' || status === 'blocked' || status === 'paused') {
+                        throw new Error(
+                            `Task ${taskId} already has an active workflow (${task.currentWorkflow}, status: ${status}). ` +
+                            `Wait for it to complete before starting a new one. ` +
+                            `Use 'apc task status --session ${sessionId} --task ${taskId}' to check current status.`
+                        );
+                    }
+                }
+            }
         }
         
         // Get plan path
@@ -923,6 +944,35 @@ export class UnifiedCoordinatorService {
     }
     
     /**
+     * Handle agent demotion to bench from workflow
+     */
+    private handleAgentDemotedToBench(agentName: string): void {
+        console.log(`[UnifiedCoordinatorService] handleAgentDemotedToBench called for ${agentName}`);
+        
+        // Demote from busy to bench (allocated but not busy)
+        this.agentPoolService.demoteAgentToBench(agentName);
+        this.log(`Agent demoted to bench: ${agentName}`);
+        
+        // Broadcast pool change so UI updates immediately
+        try {
+            const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+            const poolStatus = this.agentPoolService.getPoolStatus();
+            const busyAgents = this.agentPoolService.getBusyAgents();
+            console.log(`[UnifiedCoordinatorService] Broadcasting pool.changed after bench demotion: available=${poolStatus.available.length}, busy=${busyAgents.length}`);
+            broadcaster.poolChanged(
+                poolStatus.total,
+                poolStatus.available,
+                busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId }))
+            );
+        } catch (e) {
+            console.error(`[UnifiedCoordinatorService] Failed to broadcast pool.changed:`, e);
+        }
+        
+        // Note: We don't trigger coordinator evaluation here because the agent is still
+        // allocated to the session and may be needed again soon (e.g., for plan revision loop)
+    }
+    
+    /**
      * Process the agent request queue
      */
     private processAgentQueue(): void {
@@ -1146,6 +1196,11 @@ export class UnifiedCoordinatorService {
         // Agent releases
         disposables.push(workflow.onAgentReleased.event((agentName) => {
             this.handleAgentReleased(agentName);
+        }));
+        
+        // Agent demoted to bench
+        disposables.push(workflow.onAgentDemotedToBench.event((agentName) => {
+            this.handleAgentDemotedToBench(agentName);
         }));
         
         // Task occupancy declared - inline delegation to TaskManager
@@ -1896,12 +1951,28 @@ export class UnifiedCoordinatorService {
      * 
      * Delegates to CoordinatorAgent which handles debouncing, event batching,
      * and evaluation. Decisions are executed asynchronously via callback.
+     * 
+     * IMPORTANT: Only triggers for approved sessions to prevent executing unapproved plans.
      */
     async triggerCoordinatorEvaluation(
         sessionId: string,
         eventType: CoordinatorEventType,
         payload: any
     ): Promise<CoordinatorDecision | null> {
+        // Verify session is approved before triggering coordinator
+        const session = this.stateManager.getPlanningSession(sessionId);
+        if (!session) {
+            this.log(`Cannot trigger coordinator: session ${sessionId} not found`);
+            return null;
+        }
+        
+        // CRITICAL: Only evaluate approved sessions
+        // Plans must be explicitly approved by user before execution can begin
+        if (session.status !== 'approved') {
+            this.log(`Skipping coordinator evaluation: session ${sessionId} is '${session.status}' (not 'approved')`);
+            return null;
+        }
+        
         // Ensure session exists
         if (!this.sessions.has(sessionId)) {
             this.initSession(sessionId);

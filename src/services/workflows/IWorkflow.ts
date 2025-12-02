@@ -137,6 +137,9 @@ export interface IWorkflow {
     /** Fired when workflow releases an agent */
     readonly onAgentReleased: TypedEventEmitter<string>;
     
+    /** Fired when workflow demotes an agent to bench (idle but allocated to session) */
+    readonly onAgentDemotedToBench: TypedEventEmitter<string>;
+    
     /** Fired when workflow declares task occupancy (coordinator subscribes) */
     readonly onTaskOccupancyDeclared: TypedEventEmitter<TaskOccupancy>;
     
