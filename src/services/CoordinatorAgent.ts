@@ -135,6 +135,13 @@ export class CoordinatorAgent {
         
         this.log(`Starting evaluation #${this.evaluationCount} for event: ${input.event.type}`);
         
+        // Check if cursor CLI is available
+        const isAvailable = await this.agentRunner.isAvailable();
+        if (!isAvailable) {
+            this.log(`[ERROR] Cursor CLI not available - coordinator cannot run`);
+            throw new Error('Cursor CLI not available. Make sure cursor is installed and in PATH.');
+        }
+        
         // Build the prompt with full context
         const prompt = this.buildPrompt(input);
         
@@ -145,6 +152,14 @@ export class CoordinatorAgent {
         // Save prompt to log file for debugging
         this.saveCoordinatorLog(input.sessionId, evalId, 'prompt', prompt);
         
+        // Set up log file for streaming output capture
+        const logDir = `${this.workspaceRoot}/_AiDevLog/Plans/${input.sessionId}/coordinators`;
+        if (!fs.existsSync(logDir)) {
+            fs.mkdirSync(logDir, { recursive: true });
+        }
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const logFile = `${logDir}/${timestamp}_${evalId}_stream.log`;
+        
         // Run the AI agent - it will call run_terminal_cmd directly
         const result = await this.agentRunner.run({
             id: evalId,
@@ -152,11 +167,16 @@ export class CoordinatorAgent {
             cwd: process.cwd(),
             model: this.config.model,
             timeoutMs: this.config.evaluationTimeout,
+            logFile,  // Capture streaming output
             onProgress: (msg) => this.log(`[eval] ${msg}`)
         });
         
-        // Save output to log file for debugging
-        this.saveCoordinatorLog(input.sessionId, evalId, 'output', result.output || '(no output)');
+        // Save parsed output to log file for debugging
+        // Note: result.output only contains parsed 'result' type messages, not raw JSON
+        this.saveCoordinatorLog(input.sessionId, evalId, 'output', 
+            result.output || '(no parsed output - check stream.log for raw output)');
+        
+        this.log(`[DEBUG] Coordinator stream log: ${logFile}`);
         
         // Debug logging: show raw output info
         const outputLength = result.output?.length || 0;
