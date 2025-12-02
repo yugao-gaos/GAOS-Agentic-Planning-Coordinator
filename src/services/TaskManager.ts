@@ -1,10 +1,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { OutputChannelManager } from './OutputChannelManager';
+import { StateManager } from './StateManager';
 import { FailedTask, TaskOccupancyEntry } from '../types';
 import { ErrorClassifier } from './workflows/ErrorClassifier';
 import { EventBroadcaster } from '../daemon/EventBroadcaster';
 import { ServiceLocator } from './ServiceLocator';
+import { atomicWriteFileSync } from './StateManager';
 
 // ============================================================================
 // Task Manager - Global Singleton for Cross-Plan Task Coordination
@@ -265,6 +267,110 @@ export class TaskManager {
     constructor() {
         this.outputManager = ServiceLocator.resolve(OutputChannelManager);
         this.log('Global TaskManager initialized');
+        
+        // Load persisted tasks on startup
+        this.loadPersistedTasks();
+    }
+    
+    // ========================================================================
+    // Task Persistence (Global Storage: _AiDevLog/Tasks/tasks.json)
+    // ========================================================================
+    
+    /**
+     * Get the StateManager instance for persistence operations
+     */
+    private getStateManager(): StateManager | null {
+        try {
+            return ServiceLocator.resolve(StateManager);
+        } catch {
+            this.log('[WARN] StateManager not available for task persistence');
+            return null;
+        }
+    }
+    
+    /**
+     * Persist all tasks to disk
+     * Called after any task modification (create, update, complete, etc.)
+     * 
+     * File structure: {
+     *   lastUpdated: ISO string,
+     *   taskCount: number,
+     *   tasks: ManagedTask[]
+     * }
+     */
+    private persistTasks(): void {
+        const stateManager = this.getStateManager();
+        if (!stateManager) return;
+        
+        try {
+            stateManager.ensureGlobalTasksDirectory();
+            const filePath = stateManager.getGlobalTasksFilePath();
+            
+            // Convert Map to array for JSON serialization
+            const tasksArray = Array.from(this.tasks.values());
+            
+            const data = {
+                lastUpdated: new Date().toISOString(),
+                taskCount: tasksArray.length,
+                tasks: tasksArray
+            };
+            
+            atomicWriteFileSync(filePath, JSON.stringify(data, null, 2));
+            this.log(`Persisted ${tasksArray.length} tasks to ${filePath}`);
+        } catch (err) {
+            this.log(`[ERROR] Failed to persist tasks: ${err}`);
+        }
+    }
+    
+    /**
+     * Load persisted tasks from disk on startup
+     * Restores tasks from previous daemon session
+     */
+    private loadPersistedTasks(): void {
+        const stateManager = this.getStateManager();
+        if (!stateManager) {
+            this.log('[INFO] StateManager not yet available, will load tasks later');
+            return;
+        }
+        
+        try {
+            const filePath = stateManager.getGlobalTasksFilePath();
+            
+            if (!fs.existsSync(filePath)) {
+                this.log('[INFO] No persisted tasks file found, starting fresh');
+                return;
+            }
+            
+            const content = fs.readFileSync(filePath, 'utf-8');
+            const data = JSON.parse(content);
+            
+            if (!data.tasks || !Array.isArray(data.tasks)) {
+                this.log('[WARN] Invalid tasks file format, starting fresh');
+                return;
+            }
+            
+            // Restore tasks to Map
+            for (const task of data.tasks) {
+                this.tasks.set(task.id, task);
+                
+                // Rebuild file index
+                if (task.filesModified && task.filesModified.length > 0) {
+                    this.addFilesToIndex(task.id, task.filesModified);
+                }
+            }
+            
+            this.log(`Loaded ${data.tasks.length} tasks from ${filePath} (last updated: ${data.lastUpdated})`);
+        } catch (err) {
+            this.log(`[ERROR] Failed to load persisted tasks: ${err}`);
+        }
+    }
+    
+    /**
+     * Reload tasks from disk (called after StateManager is initialized)
+     * Use this if TaskManager was created before StateManager was available
+     */
+    reloadPersistedTasks(): void {
+        this.loadPersistedTasks();
     }
     
     // ========================================================================
@@ -486,6 +592,9 @@ export class TaskManager {
         
         this.log(`Created task ${globalTaskId}: ${description.substring(0, 50)}...`);
         
+        // Persist tasks after creation
+        this.persistTasks();
+        
         return { success: true };
     }
     
@@ -509,6 +618,7 @@ export class TaskManager {
         }
         
         this.log(`Task ${taskId} started workflow ${workflowId}`);
+        this.persistTasks();
     }
     
     /**
@@ -547,6 +657,7 @@ export class TaskManager {
         
         this.onTaskCompletedCallback?.(task);
         this.log(`Task ${taskId} marked completed via CLI`);
+        this.persistTasks();
     }
     
     /**
@@ -712,6 +823,11 @@ export class TaskManager {
             });
         }
         
+        // Persist after pausing
+        if (pausedBySession.size > 0) {
+            this.persistTasks();
+        }
+        
         return pausedBySession;
     }
     
@@ -754,6 +870,11 @@ export class TaskManager {
                     }
                 }
             }
+        }
+        
+        // Persist after resuming
+        if (taskIds.length > 0) {
+            this.persistTasks();
         }
     }
 
@@ -1003,6 +1124,7 @@ export class TaskManager {
                 task.startedAt = new Date().toISOString();
             }
             this.log(`Task ${taskId} in progress`);
+            this.persistTasks();
         }
     }
 
@@ -1016,6 +1138,7 @@ export class TaskManager {
             task.actualAgent = undefined;
             task.currentWorkflow = undefined;
             this.log(`Task ${taskId} reset to created`);
+            this.persistTasks();
         }
     }
 
@@ -1055,6 +1178,7 @@ export class TaskManager {
         
         this.onTaskCompletedCallback?.(task);
         this.log(`Task ${taskId} completed`);
+        this.persistTasks();
     }
 
     /**
@@ -1078,6 +1202,7 @@ export class TaskManager {
         }
 
         this.log(`Task ${taskId} failed: ${reason || 'unknown'}`);
+        this.persistTasks();
     }
 
     // ========================================================================
@@ -1110,6 +1235,7 @@ export class TaskManager {
         }
 
         this.log(`Task ${taskId}: ${oldStatus} → ${newStatus}${reason ? ` (${reason})` : ''}`);
+        this.persistTasks();
     }
     
     /**

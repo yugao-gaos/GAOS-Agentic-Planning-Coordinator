@@ -596,8 +596,9 @@ export class DependencyService {
         const directories = [
             '_AiDevLog',
             '_AiDevLog/Plans',
+            '_AiDevLog/Tasks',             // Global tasks storage
             '_AiDevLog/Logs',
-            '_AiDevLog/Logs/engineers',
+            '_AiDevLog/Logs/Coordinator',  // Global coordinator evaluation logs
             '_AiDevLog/Context',
             '_AiDevLog/Errors',
             '_AiDevLog/Docs',

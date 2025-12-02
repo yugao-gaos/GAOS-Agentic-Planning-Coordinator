@@ -151,7 +151,7 @@ class FileLock {
  * Atomic file write - writes to temp file then renames (sync version)
  * This prevents partial writes from corrupting state
  */
-function atomicWriteFileSync(filePath: string, data: string): void {
+export function atomicWriteFileSync(filePath: string, data: string): void {
     const tempPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
     try {
         fs.writeFileSync(tempPath, data, { encoding: 'utf-8' });
@@ -331,11 +331,59 @@ export class StateManager {
     }
     
     /**
-     * Get the coordinator log file path
+     * Get the coordinator log file path (per-session workflow log)
      * Structure: _AiDevLog/Plans/{sessionId}/logs/coordinator.log
      */
     getCoordinatorLogPath(sessionId: string): string {
         return path.join(this.getLogsFolder(sessionId), 'coordinator.log');
+    }
+    
+    /**
+     * Get the global coordinator logs folder
+     * Structure: _AiDevLog/Logs/Coordinator/
+     * 
+     * Coordinator evaluation logs are global (not session-specific) because:
+     * - The coordinator manages tasks across ALL sessions
+     * - Evaluation logs should be easily accessible for debugging
+     * - Keeps per-session folders focused on session-specific data
+     */
+    getGlobalCoordinatorLogsFolder(): string {
+        return path.join(this.workingDir, 'Logs', 'Coordinator');
+    }
+    
+    // ========================================================================
+    // Global Tasks Paths (Tasks are global, not session-specific)
+    // ========================================================================
+    
+    /**
+     * Get the global tasks folder
+     * Structure: _AiDevLog/Tasks/
+     * 
+     * Tasks are stored globally because:
+     * - TaskManager manages ALL tasks across ALL sessions
+     * - Tasks need to persist across daemon restarts
+     * - Cross-session task dependencies and conflict detection require global view
+     */
+    getGlobalTasksFolder(): string {
+        return path.join(this.workingDir, 'Tasks');
+    }
+    
+    /**
+     * Get the global tasks file path
+     * Structure: _AiDevLog/Tasks/tasks.json
+     */
+    getGlobalTasksFilePath(): string {
+        return path.join(this.getGlobalTasksFolder(), 'tasks.json');
+    }
+    
+    /**
+     * Ensure global tasks directory exists
+     */
+    ensureGlobalTasksDirectory(): void {
+        const dir = this.getGlobalTasksFolder();
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
     }
 
     /**
@@ -355,7 +403,8 @@ export class StateManager {
     }
 
     /**
-     * Get the tasks file path for a session
+     * @deprecated Use getGlobalTasksFilePath() instead - tasks are now global
+     * Get the tasks file path for a session (per-session, legacy)
      * Structure: _AiDevLog/Plans/{sessionId}/tasks.json
      */
     getTasksFilePath(sessionId: string): string {
@@ -1064,10 +1113,13 @@ export class StateManager {
     }
 
     // ========================================================================
-    // Task Persistence Methods (Plans/{sessionId}/tasks.json)
+    // Task Persistence Methods (DEPRECATED - Use TaskManager.persistTasks() instead)
+    // Tasks are now stored globally in _AiDevLog/Tasks/tasks.json
+    // These per-session methods are kept for backwards compatibility only
     // ========================================================================
     
     /**
+     * @deprecated Use TaskManager.persistTasks() instead - tasks are now global
      * Save tasks for a session to disk
      * Structure: { sessionId, tasks: ManagedTask[], lastUpdated }
      */
@@ -1083,6 +1135,7 @@ export class StateManager {
     }
     
     /**
+     * @deprecated Use TaskManager.loadPersistedTasks() instead - tasks are now global
      * Load tasks for a session from disk
      * @returns Array of task objects, or null if no tasks file exists
      */

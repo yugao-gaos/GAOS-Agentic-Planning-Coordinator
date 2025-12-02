@@ -12,10 +12,12 @@
 // structured decisions that the UnifiedCoordinatorService executes.
 
 import * as fs from 'fs';
+import * as path from 'path';
 import { AgentRunner } from './AgentBackend';
 import { OutputChannelManager } from './OutputChannelManager';
 import { AgentRoleRegistry } from './AgentRoleRegistry';
 import { ServiceLocator } from './ServiceLocator';
+import { StateManager } from './StateManager';
 import {
     CoordinatorEvent,
     CoordinatorEventType,
@@ -153,12 +155,13 @@ export class CoordinatorAgent {
         this.saveCoordinatorLog(input.sessionId, evalId, 'prompt', prompt);
         
         // Set up log file for streaming output capture
-        const logDir = `${this.workspaceRoot}/_AiDevLog/Plans/${input.sessionId}/coordinators`;
+        // Use global coordinator logs folder since coordinator is global (not session-specific)
+        const logDir = this.getGlobalCoordinatorLogsFolder();
         if (!fs.existsSync(logDir)) {
             fs.mkdirSync(logDir, { recursive: true });
         }
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-        const logFile = `${logDir}/${timestamp}_${evalId}_stream.log`;
+        const logFile = path.join(logDir, `${timestamp}_${evalId}_stream.log`);
         
         // Run the AI agent - it will call run_terminal_cmd directly
         // Use simpleMode (no streaming JSON) for coordinator - cleaner output
@@ -208,18 +211,34 @@ export class CoordinatorAgent {
     }
     
     /**
+     * Get the global coordinator logs folder path
+     * Uses StateManager if available, falls back to direct path construction
+     */
+    private getGlobalCoordinatorLogsFolder(): string {
+        try {
+            const stateManager = ServiceLocator.resolve(StateManager);
+            return stateManager.getGlobalCoordinatorLogsFolder();
+        } catch {
+            // Fallback if StateManager not available
+            return path.join(this.workspaceRoot, '_AiDevLog', 'Logs', 'Coordinator');
+        }
+    }
+    
+    /**
      * Save coordinator prompt/output to log file for debugging
+     * Logs are saved to global folder: _AiDevLog/Logs/Coordinator/
      */
     private saveCoordinatorLog(sessionId: string, evalId: string, type: 'prompt' | 'output', content: string): void {
         try {
-            const logDir = `${this.workspaceRoot}/_AiDevLog/Plans/${sessionId}/coordinators`;
+            const logDir = this.getGlobalCoordinatorLogsFolder();
             if (!fs.existsSync(logDir)) {
                 fs.mkdirSync(logDir, { recursive: true });
             }
             
             const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            const filename = `${timestamp}_${evalId}_${type}.txt`;
-            const filepath = `${logDir}/${filename}`;
+            // Include sessionId in filename for reference, but store in global folder
+            const filename = `${timestamp}_${sessionId}_${evalId}_${type}.txt`;
+            const filepath = path.join(logDir, filename);
             
             fs.writeFileSync(filepath, content);
             this.log(`[DEBUG] Saved coordinator ${type} to: ${filepath}`);

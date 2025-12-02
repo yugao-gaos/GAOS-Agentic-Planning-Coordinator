@@ -322,6 +322,9 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                     ${execInfo.status ? `<span class="sub-item-badge ${execInfo.badgeClass}">${execInfo.status}</span>` : ''}
                     <div class="sub-item-spacer"></div>
                     ${getExecutionProgressText(session) ? `<span class="execution-progress-text">${getExecutionProgressText(session)}</span>` : ''}
+                    <button class="sub-item-btn deps-btn" data-action="openDependencyMap" title="View task dependency map">
+                        ${ICONS.deps}
+                    </button>
                     <div class="sub-item-actions">${execInfo.buttons}</div>
                 </div>
                 

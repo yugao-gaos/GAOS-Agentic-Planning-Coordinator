@@ -40,6 +40,9 @@ export const ICONS = {
     
     // Workflow
     workflow: `<svg viewBox="0 0 16 16"><path d="M2.5 2h11c.28 0 .5.22.5.5v11c0 .28-.22.5-.5.5h-11a.5.5 0 01-.5-.5v-11c0-.28.22-.5.5-.5zM3 3v10h10V3H3zm1 2h2v2H4V5zm3 0h5v1H7V5zm-3 3h2v2H4V8zm3 0h5v1H7V8z"/></svg>`,
+    
+    // Dependency Map
+    deps: `<svg viewBox="0 0 16 16"><path d="M2 2h3v3H2V2zm0 9h3v3H2v-3zm9-9h3v3h-3V2zm0 9h3v3h-3v-3zM3.5 5v2h2v1h-2v3H5v-3h1V7H5V5H3.5zm6 0v2h-2v1h2v3H11v-3h1V7h-1V5H9.5z"/></svg>`,
 } as const;
 
 export type IconName = keyof typeof ICONS;
