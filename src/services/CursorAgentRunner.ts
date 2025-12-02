@@ -115,15 +115,14 @@ export class CursorAgentRunner implements IAgentBackend {
 
         // Build the shell command
         // Using cat to pipe prompt avoids escaping issues with complex prompts
-        // Simple mode: text output for coordinator-style execution (just execute and return)
-        // Normal mode: streaming JSON output for workflows that need progress updates
-        const cursorFlags = simpleMode
-            ? `--model "${model}" -p --force --approve-mcps --output-format text`
-            : `--model "${model}" -p --force --approve-mcps --output-format stream-json --stream-partial-output`;
+        // Always use stream-json format - text mode doesn't produce capturable stdout
+        // simpleMode affects how we PARSE the output, not the output format
+        const cursorFlags = `--model "${model}" -p --force --approve-mcps --output-format stream-json --stream-partial-output`;
         const shellCmd = `cat "${promptFile}" | cursor agent ${cursorFlags} 2>&1; rm -f "${promptFile}"`;
         
         if (logFile) {
             this.appendToLog(logFile, `[DEBUG] Shell command: ${shellCmd}\n`);
+            this.appendToLog(logFile, `[DEBUG] simpleMode: ${simpleMode}\n`);
         }
 
         onProgress?.(`🚀 Starting cursor agent (${model})...`);
@@ -225,17 +224,19 @@ export class CursorAgentRunner implements IAgentBackend {
                     onProgress?.(`📊 Progress: ${chunkCount} chunks, ${Math.round(totalBytes / 1024)}KB`);
                 }
 
-                if (simpleMode) {
-                    // Simple mode: just collect raw output
-                    collectedOutput += text;
-                    onOutput?.(text, 'text');
-                    if (logFile) {
-                        this.appendToLog(logFile, text);
-                    }
-                } else {
-                    // Normal mode: Parse each line as JSON
-                    const lines = text.split('\n').filter((l: string) => l.trim());
-                    for (const line of lines) {
+                // Parse each line as JSON (stream-json format)
+                const lines = text.split('\n').filter((l: string) => l.trim());
+                for (const line of lines) {
+                    if (simpleMode) {
+                        // Simple mode: extract text from JSON but don't do plan extraction
+                        this.parseLineSimple(line, id, {
+                            onOutput,
+                            onProgress,
+                            logFile,
+                            collectedOutput: (text) => { collectedOutput += text; }
+                        });
+                    } else {
+                        // Normal mode: full parsing with plan extraction
                         this.parseLine(line, id, {
                             onOutput,
                             onProgress,
@@ -537,6 +538,149 @@ export class CursorAgentRunner implements IAgentBackend {
                 onOutput?.(trimmed, 'info');
                 if (logFile) {
                     this.appendToLog(logFile, `${C.cyan}ℹ️ ${trimmed}${C.reset}\n`);
+                }
+            }
+        }
+    }
+
+    /**
+     * Parse a line in simple mode - logs all activity but doesn't extract plans
+     * Used for coordinator which just needs to see what commands were executed
+     */
+    private parseLineSimple(
+        line: string,
+        runId: string,
+        handlers: {
+            onOutput?: (text: string, type: 'text' | 'thinking' | 'tool' | 'tool_result' | 'error' | 'info') => void;
+            onProgress?: (message: string) => void;
+            logFile?: string;
+            collectedOutput: (text: string) => void;
+        }
+    ): void {
+        const { onOutput, onProgress, logFile, collectedOutput } = handlers;
+        const C = this.COLORS;
+
+        try {
+            const parsed = JSON.parse(line);
+            const msgType = parsed?.type;
+
+            // Update activity tracking
+            const run = this.activeRuns.get(runId);
+            if (run) {
+                run.lastOutputTime = Date.now();
+                run.idleSpinnerIndex = 0;
+            }
+
+            // Thinking
+            if (msgType === 'thinking' && parsed?.text) {
+                const thinkText = parsed.text.substring(0, 150).replace(/\n/g, ' ');
+                onOutput?.(parsed.text, 'thinking');
+                if (logFile) {
+                    this.appendToLog(logFile, `${C.gray}💭 ${thinkText}...${C.reset}\n`);
+                }
+            }
+
+            // Assistant message - log text content and tool calls
+            else if (msgType === 'assistant' && parsed?.message?.content) {
+                for (const item of parsed.message.content) {
+                    if (item?.type === 'text' && item?.text) {
+                        onOutput?.(item.text, 'text');
+                        // Log text content (show what coordinator is thinking/saying)
+                        if (logFile) {
+                            // For cumulative streaming, only log new content
+                            if (run) {
+                                const newContent = item.text.substring(run.lastLoggedLength);
+                                if (newContent) {
+                                    this.appendToLog(logFile, newContent);
+                                    run.lastLoggedLength = item.text.length;
+                                }
+                            } else {
+                                this.appendToLog(logFile, item.text);
+                            }
+                        }
+                    } else if (item?.type === 'tool_use') {
+                        // Log tool calls with full input
+                        const toolName = item.name || 'unknown';
+                        const toolInput = item.input ? JSON.stringify(item.input, null, 2) : '';
+                        onOutput?.(`🔧 Tool: ${toolName}`, 'tool');
+                        onProgress?.(`🔧 Tool: ${toolName}`);
+                        if (logFile) {
+                            this.appendToLog(logFile, `\n${C.yellow}🔧 Tool: ${toolName}${C.reset}\n`);
+                            if (toolInput) {
+                                // For run_terminal_cmd, show the command
+                                if (toolName === 'run_terminal_cmd' && item.input?.command) {
+                                    this.appendToLog(logFile, `${C.cyan}$ ${item.input.command}${C.reset}\n`);
+                                } else {
+                                    this.appendToLog(logFile, `${C.gray}Input: ${toolInput.substring(0, 500)}${C.reset}\n`);
+                                }
+                            }
+                        }
+                    } else if (item?.type === 'tool_result') {
+                        const resultContent = item.content ? String(item.content) : '';
+                        const resultLen = resultContent.length;
+                        onOutput?.(`✓ Tool result (${resultLen} chars)`, 'tool_result');
+                        if (logFile) {
+                            // Show full result for command outputs
+                            const preview = resultLen < 1000 ? resultContent : `${resultContent.substring(0, 1000)}...(truncated)`;
+                            this.appendToLog(logFile, `${C.green}✓ Result:\n${preview}${C.reset}\n`);
+                        }
+                    }
+                }
+            }
+
+            // Tool use at top level
+            else if (msgType === 'tool_use' && parsed?.name) {
+                const toolInput = parsed.input ? JSON.stringify(parsed.input, null, 2) : '';
+                onOutput?.(`🔧 Tool: ${parsed.name}`, 'tool');
+                onProgress?.(`🔧 Tool: ${parsed.name}`);
+                if (logFile) {
+                    this.appendToLog(logFile, `\n${C.yellow}🔧 Tool: ${parsed.name}${C.reset}\n`);
+                    if (parsed.name === 'run_terminal_cmd' && parsed.input?.command) {
+                        this.appendToLog(logFile, `${C.cyan}$ ${parsed.input.command}${C.reset}\n`);
+                    } else if (toolInput) {
+                        this.appendToLog(logFile, `${C.gray}Input: ${toolInput.substring(0, 500)}${C.reset}\n`);
+                    }
+                }
+            }
+
+            // Tool result at top level
+            else if (msgType === 'tool_result') {
+                const resultContent = parsed.content ? String(parsed.content) : '';
+                onOutput?.('✓ Tool result received', 'tool_result');
+                if (logFile) {
+                    const preview = resultContent.length < 1000 ? resultContent : `${resultContent.substring(0, 1000)}...(truncated)`;
+                    this.appendToLog(logFile, `${C.green}✓ Result:\n${preview}${C.reset}\n`);
+                }
+            }
+
+            // Final result - this is what we collect for the return value
+            else if (msgType === 'result') {
+                if (parsed?.result) {
+                    collectedOutput(parsed.result);
+                    onOutput?.(parsed.result, 'text');
+                    onProgress?.(`📋 Final result (${parsed.result.length} chars)`);
+                    if (logFile) {
+                        this.appendToLog(logFile, `\n${C.bold}📋 Final Result:${C.reset}\n${parsed.result}`);
+                    }
+                }
+            }
+
+            // Error
+            else if (parsed?.error) {
+                onOutput?.(`❌ Error: ${parsed.error}`, 'error');
+                onProgress?.(`❌ Error: ${parsed.error}`);
+                if (logFile) {
+                    this.appendToLog(logFile, `\n${C.red}❌ Error: ${parsed.error}${C.reset}\n`);
+                }
+            }
+
+        } catch (parseErr) {
+            // Not JSON - log as-is
+            const trimmed = line.trim();
+            if (trimmed.length > 5) {
+                onOutput?.(trimmed, 'info');
+                if (logFile) {
+                    this.appendToLog(logFile, `${trimmed}\n`);
                 }
             }
         }
