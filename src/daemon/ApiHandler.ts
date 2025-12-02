@@ -159,9 +159,9 @@ export interface ICoordinatorApi {
  */
 export interface ITaskManagerApi {
     getProgressForSession(sessionId: string): { completed: number; pending: number; inProgress: number; failed: number; ready: number; total: number };
-    getTasksForSession(sessionId: string): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string }>;
-    getTask(globalTaskId: string): { id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string } | undefined;
-    getAllTasks(): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string }>;
+    getTasksForSession(sessionId: string): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string }>;
+    getTask(globalTaskId: string): { id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string } | undefined;
+    getAllTasks(): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string }>;
     createTaskFromCli(params: { sessionId: string; taskId: string; description: string; dependencies?: string[]; taskType?: 'implementation' | 'error_fix'; priority?: number; errorText?: string }): { success: boolean; error?: string };
     completeTask(globalTaskId: string, summary?: string): void;
     updateTaskStage(globalTaskId: string, stage: string): void;
@@ -870,6 +870,7 @@ export class ApiHandler {
                         status: t.status,
                         type: t.taskType,
                         dependencies: t.dependencies,
+                        dependents: t.dependents,
                         priority: t.priority
                     })),
                     message: `Found ${tasks.length} task(s)`

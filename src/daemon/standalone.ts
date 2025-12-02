@@ -59,6 +59,7 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
     
     const stateManager = new StateManager(stateManagerConfig);
     await stateManager.initialize();
+    ServiceLocator.register(StateManager, () => stateManager);
     console.log(`[Standalone] StateManager initialized with ${stateManager.getAllPlanningSessions().length} sessions`);
     
     // Initialize AgentRoleRegistry
