@@ -64,10 +64,8 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     private unityResult: { success: boolean; errors?: string[] } | null = null;
     private previousErrors: string[] = [];
     
-    // Assigned agents
-    private contextAgentName?: string;  // Used for both context gathering and delta updates
-    private engineerAgentName?: string;
-    private reviewerAgentName?: string;
+    // Note: Agent tracking now handled by BaseWorkflow.allocatedAgents array
+    // No need for phase-specific agent name variables
     
     private agentRunner: AgentRunner;
     
@@ -220,15 +218,13 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     private async executeContextPhase(): Promise<void> {
         this.log(`📂 PHASE: CONTEXT for task ${this.taskId}`);
         
-        // Request a context agent
-        this.contextAgentName = await this.requestAgent('context_gatherer');
-        
         const role = this.getRole('context_gatherer');
         const prompt = this.buildContextPrompt(role);
         
         this.log(`Running context gatherer (${role?.defaultModel || 'gemini-3-pro'})...`);
         
-        const result = await this.runAgentTask('context', prompt, role, this.contextAgentName);
+        // Agent is automatically allocated and released by runAgentTask
+        const result = await this.runAgentTask('context', prompt, role, undefined);
         
         if (result.success && result.output) {
             // Save context brief
@@ -247,11 +243,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             this.log(`⚠️ Context gathering failed, continuing without brief`);
         }
         
-        // Release context agent
-        if (this.contextAgentName) {
-            this.releaseAgent(this.contextAgentName);
-            this.contextAgentName = undefined;
-        }
+        // Note: Agent is automatically released by runAgentTask/runAgentTaskWithCallback
     }
     
     private async executeImplementPhase(): Promise<void> {
@@ -260,15 +252,12 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             : '';
         this.log(`\n🔧 PHASE: IMPLEMENT${iteration} for task ${this.taskId}`);
         
-        // Request an engineer agent
-        this.engineerAgentName = await this.requestAgent('engineer');
-        
         const role = this.getRole('engineer');
         const prompt = this.buildImplementPrompt(role);
         
         this.log(`Running engineer (${role?.defaultModel || 'sonnet-4.5'})...`);
         
-        // Use CLI callback for structured completion
+        // Agent is automatically allocated and released by runAgentTaskWithCallback
         const result = await this.runAgentTaskWithCallback(
             `implement_${this.taskId}`,
             prompt,
@@ -300,26 +289,19 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             }
         }
         
-        // Release engineer agent
-        if (this.engineerAgentName) {
-            this.releaseAgent(this.engineerAgentName);
-            this.engineerAgentName = undefined;
-        }
+        // Note: Agent is automatically released by runAgentTaskWithCallback's finally block
     }
     
     private async executeReviewPhase(): Promise<void> {
         this.reviewIterations++;
         this.log(`\n🔍 PHASE: REVIEW (iteration ${this.reviewIterations}) for task ${this.taskId}`);
         
-        // Request a reviewer agent
-        this.reviewerAgentName = await this.requestAgent('code_reviewer');
-        
         const role = this.getRole('code_reviewer');
         const prompt = this.buildReviewPrompt(role);
         
         this.log(`Running code reviewer (${role?.defaultModel || 'sonnet-4.5'})...`);
         
-        // Use CLI callback for structured completion
+        // Agent is automatically allocated and released by runAgentTaskWithCallback
         const result = await this.runAgentTaskWithCallback(
             `review_${this.taskId}`,
             prompt,
@@ -367,11 +349,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             }
         }
         
-        // Release reviewer agent
-        if (this.reviewerAgentName) {
-            this.releaseAgent(this.reviewerAgentName);
-            this.reviewerAgentName = undefined;
-        }
+        // Note: Agent is automatically released by runAgentTaskWithCallback's finally block
     }
     
     private async executeApprovalPhase(): Promise<void> {
@@ -394,15 +372,13 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     private async executeDeltaContextPhase(): Promise<void> {
         this.log(`\n📝 PHASE: DELTA CONTEXT for task ${this.taskId}`);
         
-        // Request a context gatherer agent (in delta mode)
-        this.contextAgentName = await this.requestAgent('context_gatherer');
-        
         const role = this.getRole('context_gatherer');
         const prompt = this.buildDeltaContextPrompt(role);
         
         this.log(`Running context gatherer in delta mode (${role?.defaultModel || 'gemini-3-pro'})...`);
         
-        const result = await this.runAgentTask('delta_context', prompt, role, this.contextAgentName);
+        // Agent is automatically allocated and released by runAgentTask
+        const result = await this.runAgentTask('delta_context', prompt, role, undefined);
         
         if (result.success) {
             this.log(`✓ Delta context updated`);
@@ -410,11 +386,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             this.log(`⚠️ Delta context update failed, continuing`);
         }
         
-        // Release context agent
-        if (this.contextAgentName) {
-            this.releaseAgent(this.contextAgentName);
-            this.contextAgentName = undefined;
-        }
+        // Note: Agent is automatically released by runAgentTask
     }
     
     private async executeUnityPhase(): Promise<void> {
@@ -431,10 +403,11 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         const operations: PipelineOperation[] = ['prep', 'test_editmode'];
         
         // Create task context
+        // Note: agentName no longer tracked at workflow level - use generic identifier
         const taskContext: PipelineTaskContext = {
             taskId: this.taskId,
             stage: `implementation_${this.id}`,
-            agentName: this.engineerAgentName || 'engineer',
+            agentName: 'engineer', // Generic identifier for Unity logs
             filesModified: [] // Could track from engineer output
         };
         
@@ -643,11 +616,15 @@ Keep updates concise and focused on what changed.`;
     // HELPER METHODS
     // =========================================================================
     
+    /**
+     * Legacy runAgentTask method for deprecated phases
+     * @deprecated Use runAgentTaskWithCallback for better structured results
+     */
     private async runAgentTask(
         taskId: string,
         prompt: string,
         role: AgentRole | undefined,
-        agentName?: string
+        _agentName?: string // Kept for API compatibility but unused
     ): Promise<{ success: boolean; output: string }> {
         const workspaceRoot = this.stateManager.getWorkspaceRoot();
         const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
@@ -656,8 +633,11 @@ Keep updates concise and focused on what changed.`;
             fs.mkdirSync(logDir, { recursive: true });
         }
         
+        // Request agent through normal allocation flow
+        const agentName = await this.requestAgent(role?.id || 'engineer');
+        
         // Use workflow ID + agent name for unique temp log file
-        const logFile = path.join(logDir, `${this.id}_${agentName || 'agent'}.log`);
+        const logFile = path.join(logDir, `${this.id}_${agentName}.log`);
         
         // Prepend continuation context if we were force-paused mid-agent
         let finalPrompt = prompt;
@@ -691,6 +671,9 @@ Keep updates concise and focused on what changed.`;
         } finally {
             // Clear the agent run ID when done
             this.currentAgentRunId = undefined;
+            
+            // Release agent back to pool
+            this.releaseAgent(agentName);
             
             // Clean up temp log file (streaming was for real-time terminal viewing)
             try {

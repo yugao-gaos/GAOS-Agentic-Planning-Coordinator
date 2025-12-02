@@ -19,6 +19,7 @@ import { AgentRoleRegistry } from './AgentRoleRegistry';
 import { ServiceLocator } from './ServiceLocator';
 import { StateManager } from './StateManager';
 import { TypedEventEmitter } from './TypedEventEmitter';
+import { EventBroadcaster } from '../daemon/EventBroadcaster';
 import {
     CoordinatorEvent,
     CoordinatorEventType,
@@ -84,6 +85,7 @@ const DEFAULT_DEBOUNCE_CONFIG: DebounceConfig = {
 export class CoordinatorAgent {
     private agentRunner: AgentRunner;
     private outputManager: OutputChannelManager;
+    private broadcaster: EventBroadcaster;
     private config: CoordinatorAgentConfig;
     private roleRegistry?: AgentRoleRegistry;
     private workflowRegistry?: import('./workflows').WorkflowRegistry;
@@ -110,6 +112,7 @@ export class CoordinatorAgent {
     constructor(config: Partial<CoordinatorAgentConfig> = {}, roleRegistry?: AgentRoleRegistry) {
         this.agentRunner = ServiceLocator.resolve(AgentRunner);
         this.outputManager = ServiceLocator.resolve(OutputChannelManager);
+        this.broadcaster = ServiceLocator.resolve(EventBroadcaster);
         this.config = { ...DEFAULT_COORDINATOR_CONFIG, ...config };
         this.roleRegistry = roleRegistry;
         this.debounceConfig = DEFAULT_DEBOUNCE_CONFIG;
@@ -172,7 +175,16 @@ export class CoordinatorAgent {
     private setState(newState: CoordinatorState): void {
         if (this.currentState !== newState) {
             this.currentState = newState;
-            this._onStateChanged.fire(this.getStatus());
+            const status = this.getStatus();
+            this._onStateChanged.fire(status);
+            
+            // Broadcast to all connected clients
+            this.broadcaster.coordinatorStatusChanged(
+                status.state,
+                status.pendingEvents,
+                status.evaluationCount,
+                status.lastEvaluation
+            );
         }
     }
 

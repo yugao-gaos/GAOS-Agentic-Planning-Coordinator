@@ -93,5 +93,11 @@ export interface UnityInfo {
     hasErrors: boolean;
     errorCount: number;
     queueLength: number;
+    status?: 'idle' | 'compiling' | 'testing' | 'playing' | 'error';
+    currentTask?: {
+        id: string;
+        type: string;
+        phase?: string;
+    };
 }
 

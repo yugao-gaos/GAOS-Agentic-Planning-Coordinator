@@ -1015,10 +1015,21 @@ export class ApiHandler {
                     }
                 }
                 
-                // Only 'created' status can be started (task is ready)
-                if (task.status !== 'created') {
-                    throw new Error(`Task ${taskId} cannot be started (status: ${task.status}). Only 'created' tasks can be started.`);
+                // Validate task can be started
+                if (task.status === 'blocked') {
+                    throw new Error(`Task ${taskId} is blocked by unmet dependencies`);
+                } else if (task.status === 'completed') {
+                    throw new Error(`Task ${taskId} is already completed`);
+                } else if (task.status === 'failed') {
+                    throw new Error(`Task ${taskId} has failed. Cannot restart failed tasks.`);
+                } else if (task.status === 'paused') {
+                    throw new Error(`Task ${taskId} is paused. Resume the task first.`);
+                } else if (task.status === 'in_progress') {
+                    // Task is in_progress, check if it's actually running or orphaned
+                    // For now, allow restart of in_progress tasks
+                    console.log(`[ApiHandler] Task ${taskId} is in_progress, allowing restart`);
                 }
+                // If status is 'created' or was recovered from orphaned 'in_progress', proceed
                 
                 // Check dependencies
                 const unmetDeps = task.dependencies.filter(depId => {

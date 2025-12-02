@@ -138,6 +138,36 @@ export const agentStyles = `
     opacity: 0.8;
 }
 
+/* Session line with icon - ensure session ID is not truncated */
+.agent-session-line {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    opacity: 0.6;
+    font-size: 10px;
+    /* Override truncation from agent-task-line */
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    word-break: break-all;
+}
+
+.session-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 10px;
+    height: 10px;
+    opacity: 0.7;
+    flex-shrink: 0;
+}
+
+.session-icon svg {
+    width: 10px;
+    height: 10px;
+    fill: currentColor;
+}
+
 .agent-stop-btn {
     margin-top: 4px;
     padding: 3px 6px;

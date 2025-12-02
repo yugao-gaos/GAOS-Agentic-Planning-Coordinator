@@ -46,8 +46,10 @@ function renderBusyAgent(agent: AgentInfo): string {
         workflowLine = agent.currentPhase;
     }
     
-    // Session line
-    const sessionLine = agent.sessionId ? `Session: ${agent.sessionId}` : '';
+    // Session line with icon instead of "Session:" label
+    const sessionLine = agent.sessionId 
+        ? `<span class="session-icon">${ICONS.document}</span>${agent.sessionId}` 
+        : '';
     
     return `
         <div class="agent-card busy" data-agent="${agent.name}" 
@@ -59,7 +61,7 @@ function renderBusyAgent(agent: AgentInfo): string {
             </div>
             <div class="agent-status-line" style="color: ${roleColor};">${statusLine}</div>
             ${workflowLine ? `<div class="agent-task-line">${workflowLine}</div>` : ''}
-            ${sessionLine ? `<div class="agent-task-line" style="opacity: 0.6; font-size: 10px;">${sessionLine}</div>` : ''}
+            ${sessionLine ? `<div class="agent-task-line agent-session-line">${sessionLine}</div>` : ''}
             <button class="agent-stop-btn" data-agent="${agent.name}">
                 ${ICONS.stop}
                 Stop

@@ -77,21 +77,65 @@ export const statusBarStyles = `
 
 .coordinator-dot.queuing {
     background: var(--vscode-list-warningForeground, #cca700);
-    animation: pulse 1.5s infinite;
+    animation: coordinator-pulse-subtle 2s infinite;
+    box-shadow: 0 0 4px rgba(204, 167, 0, 0.4);
 }
 
 .coordinator-dot.evaluating {
-    background: var(--vscode-charts-blue, #3b82f6);
-    animation: pulse 0.5s infinite;
+    background: var(--vscode-charts-purple, #a855f7);
+    animation: coordinator-pulse-active 1s infinite;
+    box-shadow: 0 0 6px rgba(168, 85, 247, 0.6);
 }
 
 .coordinator-dot.cooldown {
-    background: var(--vscode-testing-iconPassed, #73c991);
+    background: var(--vscode-charts-orange, #f97316);
+    animation: coordinator-pulse-slow 3s infinite;
+    box-shadow: 0 0 4px rgba(249, 115, 22, 0.4);
 }
 
 .coordinator-text {
     font-weight: 500;
     font-size: 12px;
+}
+
+/* Coordinator pulse animations */
+@keyframes coordinator-pulse-subtle {
+    0%, 100% {
+        opacity: 1;
+        transform: scale(1);
+        box-shadow: 0 0 4px rgba(204, 167, 0, 0.4);
+    }
+    50% {
+        opacity: 0.7;
+        transform: scale(1.1);
+        box-shadow: 0 0 8px rgba(204, 167, 0, 0.6);
+    }
+}
+
+@keyframes coordinator-pulse-active {
+    0%, 100% {
+        opacity: 1;
+        transform: scale(1);
+        box-shadow: 0 0 6px rgba(168, 85, 247, 0.6);
+    }
+    50% {
+        opacity: 0.8;
+        transform: scale(1.15);
+        box-shadow: 0 0 12px rgba(168, 85, 247, 0.8);
+    }
+}
+
+@keyframes coordinator-pulse-slow {
+    0%, 100% {
+        opacity: 1;
+        transform: scale(1);
+        box-shadow: 0 0 4px rgba(249, 115, 22, 0.4);
+    }
+    50% {
+        opacity: 0.8;
+        transform: scale(1.05);
+        box-shadow: 0 0 6px rgba(249, 115, 22, 0.5);
+    }
 }
 
 .actions {

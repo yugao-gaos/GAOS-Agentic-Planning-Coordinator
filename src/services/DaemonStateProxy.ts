@@ -100,12 +100,59 @@ export class DaemonStateProxy {
     private lastPingTime?: number;
     private currentHealthState: ConnectionHealthState = 'unknown';
     
+    // Cached status from events
+    private lastCoordinatorStatus?: CoordinatorStatusInfo;
+    private lastUnityStatus?: UnityStatus;
+    
     private readonly _onConnectionHealthChanged = new TypedEventEmitter<ConnectionHealthInfo>();
     readonly onConnectionHealthChanged = this._onConnectionHealthChanged.event;
 
     constructor(options: DaemonStateProxyOptions) {
         this.vsCodeClient = options.vsCodeClient;
         this.unityEnabled = options.unityEnabled ?? true;
+        
+        // Listen to coordinator and Unity status events
+        this.setupEventListeners();
+    }
+    
+    /**
+     * Set up event listeners for status updates
+     */
+    private setupEventListeners(): void {
+        // Listen for coordinator status changes
+        this.vsCodeClient.on('coordinator.statusChanged', (data: any) => {
+            this.lastCoordinatorStatus = {
+                state: data.state,
+                pendingEvents: data.pendingEvents,
+                lastEvaluation: data.lastEvaluation,
+                evaluationCount: data.evaluationCount
+            };
+        });
+        
+        // Listen for Unity status changes
+        this.vsCodeClient.on('unity.statusChanged', (data: any) => {
+            this.lastUnityStatus = {
+                connected: true,  // If we're receiving events, Unity is connected
+                isPlaying: data.isPlaying,
+                isCompiling: data.isCompiling,
+                hasErrors: data.hasErrors,
+                errorCount: data.errorCount,
+                queueLength: 0  // Will be updated by state queries
+            };
+        });
+        
+        // Listen for Unity pipeline events to update queue
+        this.vsCodeClient.on('unity.pipelineStarted', (data: any) => {
+            if (this.lastUnityStatus) {
+                this.lastUnityStatus.queueLength = (this.lastUnityStatus.queueLength || 0) + 1;
+            }
+        });
+        
+        this.vsCodeClient.on('unity.pipelineCompleted', (data: any) => {
+            if (this.lastUnityStatus && this.lastUnityStatus.queueLength > 0) {
+                this.lastUnityStatus.queueLength--;
+            }
+        });
     }
 
     // ========================================================================
@@ -451,6 +498,11 @@ export class DaemonStateProxy {
         if (!this.unityEnabled) {
             return undefined;
         }
+        
+        // Return cached status if available
+        if (this.lastUnityStatus) {
+            return this.lastUnityStatus;
+        }
 
         if (!this.vsCodeClient.isConnected()) {
             return undefined;
@@ -458,7 +510,7 @@ export class DaemonStateProxy {
 
         try {
             const response = await this.vsCodeClient.getUnityStatus();
-            return {
+            const status = {
                 connected: response.connected,
                 isPlaying: response.isPlaying,
                 isCompiling: response.isCompiling,
@@ -466,6 +518,8 @@ export class DaemonStateProxy {
                 errorCount: response.errorCount,
                 queueLength: response.queueLength
             };
+            this.lastUnityStatus = status;
+            return status;
         } catch (err) {
             console.warn('[DaemonStateProxy] Failed to get Unity status from daemon:', err);
             return undefined;
@@ -491,12 +545,20 @@ export class DaemonStateProxy {
      * Get coordinator status for UI display
      */
     async getCoordinatorStatus(): Promise<CoordinatorStatusInfo | undefined> {
+        // Return cached status if available
+        if (this.lastCoordinatorStatus) {
+            return this.lastCoordinatorStatus;
+        }
+        
         if (!this.vsCodeClient.isConnected()) {
             return undefined;
         }
 
         try {
             const response: { status?: CoordinatorStatusInfo } = await this.vsCodeClient.send('coordinator.status');
+            if (response.status) {
+                this.lastCoordinatorStatus = response.status;
+            }
             return response.status;
         } catch (err) {
             console.warn('[DaemonStateProxy] Failed to get coordinator status from daemon:', err);

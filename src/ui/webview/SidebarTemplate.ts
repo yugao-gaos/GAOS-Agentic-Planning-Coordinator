@@ -23,6 +23,7 @@ export interface ClientState extends SidebarState {
     agentBadgeText: string;
     unityBadgeText: string;
     unityBadgeBackground: string;
+    unityBadgeClassName?: string;
 }
 
 /**
@@ -36,6 +37,7 @@ export function buildClientState(state: SidebarState): ClientState {
         agentBadgeText: getAgentBadgeText(state.agents),
         unityBadgeText: unityBadgeInfo.text,
         unityBadgeBackground: unityBadgeInfo.background,
+        unityBadgeClassName: unityBadgeInfo.className,
     };
 }
 

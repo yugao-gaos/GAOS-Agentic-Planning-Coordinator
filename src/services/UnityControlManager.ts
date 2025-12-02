@@ -891,6 +891,30 @@ export class UnityControlManager {
      */
     private emitStatusUpdate(): void {
         this._onStatusChanged.fire(this.getState());
+        
+        // Broadcast Unity status to all clients
+        const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+        
+        // Determine overall status
+        let overallStatus: 'idle' | 'compiling' | 'testing' | 'playing' | 'error' = 'idle';
+        if (this.lastUnityStatus?.hasErrors) {
+            overallStatus = 'error';
+        } else if (this.lastUnityStatus?.isCompiling) {
+            overallStatus = 'compiling';
+        } else if (this.lastUnityStatus?.isPlaying) {
+            overallStatus = 'playing';
+        } else if (this.status === 'executing' || this.status === 'monitoring') {
+            overallStatus = 'testing';
+        }
+        
+        broadcaster.unityStatusChanged(
+            overallStatus,
+            this.lastUnityStatus?.isCompiling ?? false,
+            this.lastUnityStatus?.isPlaying ?? false,
+            this.lastUnityStatus?.isPaused ?? false,
+            this.lastUnityStatus?.hasErrors ?? false,
+            this.lastUnityStatus?.errorCount ?? 0
+        );
     }
 
     /**
@@ -1128,6 +1152,7 @@ export class UnityControlManager {
             this.onCompileComplete();
         }
 
+        // Emit status update (which includes broadcast)
         this.emitStatusUpdate();
     }
 

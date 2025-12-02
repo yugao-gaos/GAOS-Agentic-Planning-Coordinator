@@ -516,6 +516,24 @@ export class TaskManager {
                 // Persist to remove invalid tasks from file
                 this.persistTasks();
             }
+            
+            // Clean up orphaned in_progress tasks (daemon restart scenario)
+            let recoveredCount = 0;
+            for (const task of this.tasks.values()) {
+                if (task.status === 'in_progress' && !task.currentWorkflow) {
+                    // Task was in_progress but no workflow is running
+                    // This happens when daemon restarts while task was running
+                    this.log(`[RECOVERY] Resetting orphaned task ${task.id} from in_progress → created`);
+                    task.status = 'created';
+                    task.currentWorkflow = undefined;
+                    recoveredCount++;
+                }
+            }
+            
+            if (recoveredCount > 0) {
+                this.log(`Recovered ${recoveredCount} orphaned tasks`);
+                this.persistTasks(); // Save the cleaned state
+            }
         } catch (err) {
             this.log(`[ERROR] Failed to load persisted tasks: ${err}`);
         }

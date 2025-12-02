@@ -356,6 +356,13 @@ export function getSidebarScript(): string {
                     unityBadge.textContent = state.unityBadgeText || 'Not Running';
                     unityBadge.style.background = state.unityBadgeBackground || 'rgba(107, 114, 128, 0.3)';
                     
+                    // Apply animation className
+                    if (state.unityBadgeClassName) {
+                        unityBadge.className = 'section-badge unity-badge ' + state.unityBadgeClassName;
+                    } else {
+                        unityBadge.className = 'section-badge unity-badge';
+                    }
+                    
                     if (unityQueue) {
                         unityQueue.textContent = state.unity.queueLength + ' task' + (state.unity.queueLength !== 1 ? 's' : '');
                         unityQueue.className = 'unity-value' + (state.unity.queueLength > 0 ? ' warning' : '');
