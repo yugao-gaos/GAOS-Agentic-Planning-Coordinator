@@ -62,6 +62,11 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
     ServiceLocator.register(StateManager, () => stateManager);
     console.log(`[Standalone] StateManager initialized with ${stateManager.getAllPlanningSessions().length} sessions`);
     
+    // Reload persisted tasks now that StateManager is available
+    const taskManager = ServiceLocator.resolve(TaskManager);
+    taskManager.reloadPersistedTasks();
+    console.log(`[Standalone] TaskManager reloaded ${taskManager.getAllTasks().length} persisted tasks`);
+    
     // Initialize AgentRoleRegistry
     const roleRegistry = new AgentRoleRegistry(stateManager);
     // Unity features enabled by default (can be disabled via config or APC_ENABLE_UNITY=false)
