@@ -841,10 +841,28 @@ For each approved plan, use read_file to understand the tasks needed.
 ## Available Workflows
 {{WORKFLOW_SELECTION}}
 
+## ⚠️ CRITICAL: CLI Parameter Rules
+
+### Task ID Format
+- Use SIMPLE IDs: \`T1\`, \`T2\`, \`T3\`, etc.
+- Do NOT prefix with session ID (wrong: \`ps_000001_T1\`)
+- The system automatically scopes IDs to the session
+
+### Task Types (--type parameter)
+- \`implementation\` - For new features and enhancements
+- \`error_fix\` - For fixing bugs and errors
+- ❌ Do NOT use "bugfix", "bug_fix", "fix", or other variants
+
+### Task Status Lifecycle
+- \`created\` → Can be started with \`task start\`
+- \`blocked\` → Has unmet dependencies, CANNOT be started
+- \`in_progress\` → Currently running
+- \`completed\` / \`failed\` → Terminal states
+- Only tasks with status \`created\` can be started!
+
 ## Commands (use run_terminal_cmd tool)
 
 **IMPORTANT: Chain multiple commands with && for efficiency!**
-Each separate command has overhead. Chain related commands in a single run_terminal_cmd call.
 
 **List existing tasks:**
 \`\`\`bash
@@ -852,22 +870,28 @@ apc task list
 \`\`\`
 
 **Create AND Start tasks together:**
-Only create tasks you can start NOW. Create them, then immediately start them.
 \`\`\`bash
-apc task create --session <sessionId> --id T0 --desc "First task" --type implementation && \\
-apc task create --session <sessionId> --id T1 --desc "Second task (no deps, can start)" --type implementation && \\
-apc task start --session <sessionId> --id T0 --workflow task_implementation && \\
-apc task start --session <sessionId> --id T1 --workflow task_implementation
+apc task create --session ps_000001 --id T1 --desc "First task" --type implementation && \\
+apc task create --session ps_000001 --id T2 --desc "Second task" --type implementation && \\
+apc task start --session ps_000001 --id T1 --workflow task_implementation && \\
+apc task start --session ps_000001 --id T2 --workflow task_implementation
 \`\`\`
 
-**When dependencies are incomplete:**
-If a task depends on unfinished tasks, DON'T create it yet. Wait for dependencies to complete.
+**Create task with dependencies (will be blocked until deps complete):**
+\`\`\`bash
+apc task create --session ps_000001 --id T3 --desc "Depends on T1 and T2" --type implementation --deps T1,T2
+\`\`\`
+
+**Check task status before starting:**
+\`\`\`bash
+apc task status --session ps_000001 --id T1
+\`\`\`
 
 ## What To Do
 
 1. Run \`apc task list\` to see existing tasks and their status
 2. Read plan file(s) to identify needed tasks
-3. Identify tasks that can START NOW (no dependencies OR all dependencies completed)
+3. Identify tasks that can START NOW (status \`created\`, not \`blocked\`)
 4. Create ONLY those ready-to-start tasks (max {{AVAILABLE_AGENT_COUNT}})
 5. **IMMEDIATELY start all created tasks** in the same chained command
 6. Leave tasks with unmet dependencies for next evaluation

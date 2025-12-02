@@ -870,7 +870,34 @@ export class ApiHandler {
         }
         
         const sessionId = (params.session || params.sessionId) as string;
-        const taskId = (params.task || params.taskId || params.id) as string;
+        let taskId = (params.task || params.taskId || params.id) as string;
+        
+        // Normalize task ID: strip session prefix if coordinator mistakenly included it
+        // e.g., "ps_000001_T1" with session "ps_000001" → "T1"
+        if (taskId && sessionId && taskId.startsWith(`${sessionId}_`)) {
+            const normalizedId = taskId.slice(sessionId.length + 1);
+            console.log(`[ApiHandler] Normalized task ID: "${taskId}" → "${normalizedId}" (stripped session prefix)`);
+            taskId = normalizedId;
+        }
+        
+        // Helper to validate and normalize task type
+        const normalizeTaskType = (type: unknown): 'implementation' | 'error_fix' => {
+            const typeStr = String(type || 'implementation').toLowerCase();
+            // Map common mistakes to valid types
+            if (typeStr === 'bugfix' || typeStr === 'bug_fix' || typeStr === 'fix') {
+                console.log(`[ApiHandler] Normalized task type: "${type}" → "error_fix"`);
+                return 'error_fix';
+            }
+            if (typeStr === 'implementation' || typeStr === 'impl' || typeStr === 'feature') {
+                return 'implementation';
+            }
+            if (typeStr === 'error_fix') {
+                return 'error_fix';
+            }
+            // Default to implementation if unknown
+            console.log(`[ApiHandler] Unknown task type "${type}", defaulting to "implementation"`);
+            return 'implementation';
+        };
         
         switch (action) {
             case 'list': {
@@ -932,7 +959,7 @@ export class ApiHandler {
                     taskId,
                     description: (params.desc || params.description) as string,
                     dependencies: params.deps ? String(params.deps).split(',').filter(d => d.trim()) : [],
-                    taskType: (params.type as 'implementation' | 'error_fix') || 'implementation',
+                    taskType: normalizeTaskType(params.type),
                     priority: params.priority ? Number(params.priority) : 0,
                     errorText: params.errorText as string | undefined
                 });
