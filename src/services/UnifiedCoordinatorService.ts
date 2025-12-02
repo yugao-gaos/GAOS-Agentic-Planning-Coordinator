@@ -36,7 +36,7 @@ import {
     FailedTask,
     AgentCompletionSignal
 } from '../types/workflow';
-import { PlanCache } from './PlanCache';
+// PlanCache removed - tasks are now managed via TaskManager, not parsed from plan
 import { TaskManager, ERROR_RESOLUTION_SESSION_ID } from './TaskManager';
 import { EventBroadcaster } from '../daemon/EventBroadcaster';
 import { CoordinatorAgent } from './CoordinatorAgent';
@@ -1090,22 +1090,15 @@ export class UnifiedCoordinatorService {
         const state = this.sessions.get(sessionId);
         if (!state) return;
         
-        const session = this.stateManager.getPlanningSession(sessionId);
-        const planPath = session?.currentPlanPath;
+        // Get current task IDs from TaskManager (not legacy plan parsing)
+        // In the new architecture, tasks are created via CLI by the coordinator
+        const taskManager = ServiceLocator.resolve(TaskManager);
+        const currentTasks = taskManager.getTasksForSession(sessionId);
+        const currentTaskIds = new Set<string>(
+            currentTasks.map(t => t.id.replace(`${sessionId}_`, ''))  // Strip session prefix for matching
+        );
         
-        // Get the updated task list from the revised plan
-        let currentTaskIds = new Set<string>();
-        if (planPath) {
-            const planCache = ServiceLocator.resolve(PlanCache);
-            const plan = planCache.getPlan(planPath);
-            for (const tasks of Object.values(plan.engineerChecklists)) {
-                for (const task of tasks) {
-                    currentTaskIds.add(task.id);
-                }
-            }
-        }
-        
-        this.log(`\n📋 Resuming workflows after revision (${state.pausedForRevision.length} paused)`);
+        this.log(`\n📋 Resuming workflows after revision (${state.pausedForRevision.length} paused, ${currentTaskIds.size} tasks in TaskManager)`);
         
         // Resume or cancel paused workflows based on whether their tasks still exist
         for (const workflowId of state.pausedForRevision) {

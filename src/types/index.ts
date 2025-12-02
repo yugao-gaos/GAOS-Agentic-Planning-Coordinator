@@ -813,95 +813,59 @@ export const DefaultSystemPrompts: Record<string, Partial<SystemPromptConfig> & 
 
 Your job is to make intelligent decisions about task dispatch, workflow selection, and coordination based on the current situation.`,
 
-        decisionInstructions: `Based on the event, plan, history, and current state, decide what actions to take.
+        decisionInstructions: `Based on the triggering event, plan, history, and current state above, decide what actions to take.
 
-Consider:
-1. **Task Dependencies** - Only create/start tasks whose dependencies are complete
-2. **Workflow Selection** - Choose the appropriate workflow type (see available workflows below)
-3. **Task Creation** - Create tasks from plan when needed (not all at once)
-4. **Parallelization** - You CAN call multiple run_terminal_cmd in PARALLEL!
-5. **Error Grouping** - Group related errors into single tasks (same file, same error code)
-6. **Task Completion** - Mark tasks complete when all workflows for them succeed
+## Key Principles
+1. **For execution_started**: Read the plan and create initial tasks (2-4 at a time based on available agents)
+2. **Task Dependencies**: Only start tasks whose dependencies are complete
+3. **Parallelization**: Create/start multiple tasks in the same response to run them in parallel
+4. **Error Grouping**: Group related errors in same file into ONE task
 
 ## Available Workflows
 {{WORKFLOW_SELECTION}}
 
-## How to Execute Commands
+## Commands (use run_terminal_cmd tool)
 
-Use the \`run_terminal_cmd\` tool to execute APC commands directly:
-
-### Task Creation
-\`\`\`
-run_terminal_cmd command="apc task create --session {{sessionId}} --id T1 --desc \\"Create UserService\\" --deps T2,T3 --type implementation"
+**Create a task from the plan:**
+\`\`\`bash
+apc task create --session {{sessionId}} --id T1 --desc "Create UserService" --deps T2,T3 --type implementation
 \`\`\`
 
-### Start Workflow on Task  
-\`\`\`
-run_terminal_cmd command="apc task start --session {{sessionId}} --id T1 --workflow task_implementation"
-\`\`\`
-
-### Complete Task
-\`\`\`
-run_terminal_cmd command="apc task complete --session {{sessionId}} --id T1 --summary \\"Done\\""
+**Start workflow on a task:**
+\`\`\`bash
+apc task start --session {{sessionId}} --id T1 --workflow task_implementation
 \`\`\`
 
-### Fail Task
-\`\`\`
-run_terminal_cmd command="apc task fail --session {{sessionId}} --id T1 --reason \\"Could not resolve dependency\\""
-\`\`\`
-
-## IMPORTANT: Parallel Execution
-You can call MULTIPLE run_terminal_cmd tools at once! For example, to create 3 tasks in parallel:
-- Call run_terminal_cmd for task T1
-- Call run_terminal_cmd for task T2  
-- Call run_terminal_cmd for task T3
-All in the SAME response - they execute in parallel.
-
-## Error Task Grouping Rules
-When creating error tasks:
-- Group errors in the same file into ONE task
-- Group related errors (same missing type, same root cause) into ONE task
-- Include ALL related error messages in --error-text
-- Use descriptive --desc that covers the group
-
-Example (create and start error task):
-\`\`\`
-run_terminal_cmd command="apc task create --session {{sessionId}} --id ERR_001 --desc \\"Fix CS0246: Missing type UserService\\" --type error_fix --priority -1 --error-text \\"Foo.cs(10): CS0246\\nBar.cs(25): CS0246\\""
-run_terminal_cmd command="apc task start --session {{sessionId}} --id ERR_001 --workflow error_resolution"
+**Mark task complete:**
+\`\`\`bash
+apc task complete --session {{sessionId}} --id T1 --summary "Done"
 \`\`\`
 
-## Error Fix Continuity (IMPORTANT)
-Error resolution workflows fix code and request Unity recompile, then complete immediately.
-When Unity recompile finishes with remaining errors, you'll receive another unity_error event.
-
-For RETRY scenarios (same/similar errors after a fix attempt):
-1. Check decision history for previous error tasks on the same files
-2. Pass context to the new error task using --previous-attempts and --previous-summary
-3. After 3+ failed attempts, consider asking the user for clarification
-
-Example (retry after previous fix failed):
-\`\`\`
-run_terminal_cmd command="apc task create --session {{sessionId}} --id ERR_002 --desc \\"Fix remaining CS0246 errors (retry)\\" --type error_fix --priority -1 --error-text \\"Foo.cs(10): CS0246\\" --previous-attempts 1 --previous-summary \\"Added using statement but type still not found\\""
-run_terminal_cmd command="apc task start --session {{sessionId}} --id ERR_002 --workflow error_resolution"
+**Create and start error fix task:**
+\`\`\`bash
+apc task create --session {{sessionId}} --id ERR_001 --desc "Fix CS0246 errors" --type error_fix --priority -1 --error-text "Foo.cs(10): CS0246"
+apc task start --session {{sessionId}} --id ERR_001 --workflow error_resolution
 \`\`\`
 
-If errors persist after 3 attempts, ask the user:
-\`\`\`
-run_terminal_cmd command="apc question ask --session {{sessionId}} --text \\"Error CS0246 persists after 3 fix attempts. The missing type UserService cannot be found. Should I: (a) check if the assembly reference is missing, (b) create the type, or (c) skip this error?\\""
-\`\`\`
+## What To Do Now
 
-## Completion (REQUIRED)
-After executing your commands, provide your reasoning:
+Look at the TRIGGERING EVENT above and take appropriate action:
 
-REASONING: <Explain your decisions for the history log>
+- **execution_started**: Read the plan, identify tasks with no dependencies or satisfied dependencies, create and start 2-4 tasks based on available agents count.
+- **workflow_completed**: Check if dependent tasks can now start. Create and start next batch of tasks.
+- **workflow_failed**: Decide if task should be retried or marked failed.
+- **unity_error**: Create error_fix tasks and start error_resolution workflows.
+- **agent_available**: Check if there are ready tasks waiting for agents, start them.
+
+## Your Response
+
+1. Execute the needed apc commands using run_terminal_cmd
+2. At the end, provide:
+
+REASONING: <Brief explanation of your decisions>
 CONFIDENCE: <0.0-1.0>
 
-Then signal completion:
-\`\`\`
-run_terminal_cmd command="apc agent complete --session {{sessionId}} --workflow coordinator --stage coordinator_decision --result decision"
-\`\`\`
-
-Now analyze the situation and execute the appropriate commands using run_terminal_cmd:`
+Now analyze and execute:`
     },
     
     unity_polling: {

@@ -258,6 +258,44 @@ export const sessionStyles = `
     display: block;
 }
 
+/* History expand/collapse */
+.history-header {
+    cursor: pointer;
+}
+
+.history-header:hover {
+    background: var(--vscode-list-hoverBackground);
+}
+
+.history-expand {
+    width: 14px;
+    height: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.15s ease;
+    flex-shrink: 0;
+}
+
+.history-expand svg {
+    width: 10px;
+    height: 10px;
+    fill: currentColor;
+    opacity: 0.6;
+}
+
+.history-header.expanded .history-expand {
+    transform: rotate(90deg);
+}
+
+.history-children {
+    display: none;
+}
+
+.history-children.expanded {
+    display: block;
+}
+
 /* Nested items under coordinator (Level 2) */
 .nested-item {
     display: flex;

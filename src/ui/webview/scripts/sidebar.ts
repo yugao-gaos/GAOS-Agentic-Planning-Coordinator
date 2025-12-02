@@ -12,6 +12,7 @@ export function getSidebarScript(): string {
         const vscode = acquireVsCodeApi();
         let expandedSessions = new Set();
         let expandedCoordinators = new Set();
+        let expandedHistories = new Set();
 
         // Element references
         const statusDot = document.getElementById('statusDot');
@@ -121,6 +122,21 @@ export function getSidebarScript(): string {
         }
 
         /**
+         * Reapply expanded state to history foldouts after HTML update.
+         * This preserves the user's expand/collapse choices for history sections.
+         */
+        function reapplyHistoryExpandedState() {
+            expandedHistories.forEach(historyId => {
+                const header = sessionsContent.querySelector('.history-header[data-history-toggle="' + historyId + '"]');
+                if (header) {
+                    const children = document.querySelector('[data-history-children="' + historyId + '"]');
+                    header.classList.add('expanded');
+                    if (children) children.classList.add('expanded');
+                }
+            });
+        }
+
+        /**
          * Attach event handlers to session items.
          */
         function attachSessionHandlers() {
@@ -203,6 +219,26 @@ export function getSidebarScript(): string {
                     }
                 };
             });
+            
+            // History expand/collapse handlers
+            sessionsContent.querySelectorAll('.history-header[data-history-toggle]').forEach(header => {
+                header.onclick = (e) => {
+                    e.stopPropagation();
+                    
+                    const historyId = header.dataset.historyToggle;
+                    const children = document.querySelector('[data-history-children="' + historyId + '"]');
+                    
+                    if (expandedHistories.has(historyId)) {
+                        expandedHistories.delete(historyId);
+                        header.classList.remove('expanded');
+                        if (children) children.classList.remove('expanded');
+                    } else {
+                        expandedHistories.add(historyId);
+                        header.classList.add('expanded');
+                        if (children) children.classList.add('expanded');
+                    }
+                };
+            });
         }
 
         /**
@@ -254,9 +290,10 @@ export function getSidebarScript(): string {
             // Sessions - use pre-rendered HTML from server
             if (state.sessionsHtml) {
                 sessionsContent.innerHTML = state.sessionsHtml;
-                // Reapply expanded state to sessions and coordinators
+                // Reapply expanded state to sessions, coordinators, and histories
                 reapplyExpandedState();
                 reapplyCoordinatorExpandedState();
+                reapplyHistoryExpandedState();
                 attachSessionHandlers();
             }
 

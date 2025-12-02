@@ -152,9 +152,16 @@ export class CoordinatorAgent {
             onProgress: (msg) => this.log(`[eval] ${msg}`)
         });
         
+        // Debug logging: show raw output info
+        const outputLength = result.output?.length || 0;
+        const outputPreview = result.output?.substring(0, 500) || '(empty)';
+        this.log(`[DEBUG] AI response: success=${result.success}, exitCode=${result.exitCode}, outputLength=${outputLength}`);
+        this.log(`[DEBUG] Output preview:\n${outputPreview}${outputLength > 500 ? '\n...(truncated)' : ''}`);
+        
         if (!result.success) {
             const error = result.error || 'Unknown error';
             this.log(`Evaluation failed: ${error}`);
+            this.log(`[DEBUG] Full error output: ${result.output?.substring(0, 1000) || '(none)'}`);
             throw new Error(`Coordinator AI evaluation failed: ${error}`);
         }
         
@@ -163,6 +170,11 @@ export class CoordinatorAgent {
         const decision = this.parseDecision(result.output, input);
         
         this.log(`Evaluation complete. Reasoning: ${decision.reasoning.substring(0, 100)}...`);
+        
+        // Log if no reasoning was extracted (helps debug AI output format issues)
+        if (decision.reasoning === 'No reasoning provided') {
+            this.log(`[WARN] No REASONING section found in AI output. Expected format: "REASONING: <text>"`);
+        }
         
         return decision;
     }

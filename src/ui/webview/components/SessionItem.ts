@@ -338,16 +338,21 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                         ${session.activeWorkflows.map(wf => renderWorkflowItem(wf, findAgentsForWorkflow(wf, session.sessionAgents || []))).join('')}
                     ` : ''}
                     
-                    <!-- Workflow History (completed, newest first) -->
+                    <!-- Workflow History (completed, newest first) - collapsible -->
                     ${session.workflowHistory && session.workflowHistory.length > 0 ? `
-                        <div class="nested-item">
+                        <div class="nested-item history-header" data-history-toggle="${session.id}">
+                            <div class="history-expand">
+                                ${ICONS.chevronRight}
+                            </div>
                             <div class="nested-icon" style="color: #6b7280;">
                                 ${ICONS.list}
                             </div>
                             <span class="nested-label" style="opacity: 0.7;">History (${session.workflowHistory.length})</span>
                         </div>
-                        ${session.workflowHistory.slice(0, 5).map(wf => renderHistoryItem(wf)).join('')}
-                        ${session.workflowHistory.length > 5 ? `<div class="nested-item level-3" style="opacity: 0.5; font-size: 10px;">+ ${session.workflowHistory.length - 5} more</div>` : ''}
+                        <div class="history-children" data-history-children="${session.id}">
+                            ${session.workflowHistory.slice(0, 5).map(wf => renderHistoryItem(wf)).join('')}
+                            ${session.workflowHistory.length > 5 ? `<div class="nested-item level-3" style="opacity: 0.5; font-size: 10px;">+ ${session.workflowHistory.length - 5} more</div>` : ''}
+                        </div>
                     ` : ''}
                     
                     <!-- Failed Tasks -->
