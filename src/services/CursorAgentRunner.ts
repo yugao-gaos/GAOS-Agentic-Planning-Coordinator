@@ -115,12 +115,16 @@ export class CursorAgentRunner implements IAgentBackend {
 
         // Build the shell command
         // Using cat to pipe prompt avoids escaping issues with complex prompts
-        // Simple mode: minimal flags for coordinator-style execution (just execute and return)
+        // Simple mode: text output for coordinator-style execution (just execute and return)
         // Normal mode: streaming JSON output for workflows that need progress updates
         const cursorFlags = simpleMode
-            ? `--model "${model}" -p --force --approve-mcps`
+            ? `--model "${model}" -p --force --approve-mcps --output-format text`
             : `--model "${model}" -p --force --approve-mcps --output-format stream-json --stream-partial-output`;
         const shellCmd = `cat "${promptFile}" | cursor agent ${cursorFlags} 2>&1; rm -f "${promptFile}"`;
+        
+        if (logFile) {
+            this.appendToLog(logFile, `[DEBUG] Shell command: ${shellCmd}\n`);
+        }
 
         onProgress?.(`🚀 Starting cursor agent (${model})...`);
         if (logFile) {
@@ -203,6 +207,11 @@ export class CursorAgentRunner implements IAgentBackend {
                 const text = data.toString();
                 chunkCount++;
                 totalBytes += text.length;
+
+                // Debug: log first chunk to see what we're getting
+                if (chunkCount === 1 && logFile) {
+                    this.appendToLog(logFile, `[DEBUG] First stdout chunk (${text.length} bytes): ${text.substring(0, 200)}\n`);
+                }
 
                 // Update activity tracking
                 const run = this.activeRuns.get(id);
@@ -292,6 +301,10 @@ export class CursorAgentRunner implements IAgentBackend {
                     this.appendToLog(logFile, `${color}${C.bold}${statusIcon} ${statusText}: ${new Date().toISOString()}${C.reset}\n`);
                     this.appendToLog(logFile, `${C.gray}Exit code: ${code}${C.reset}\n`);
                     this.appendToLog(logFile, `${C.gray}Duration: ${Math.round(duration / 1000)}s${C.reset}\n`);
+                    this.appendToLog(logFile, `${C.gray}Collected output length: ${collectedOutput.length} chars${C.reset}\n`);
+                    if (collectedOutput.length > 0) {
+                        this.appendToLog(logFile, `${C.gray}Output preview: ${collectedOutput.substring(0, 500)}${C.reset}\n`);
+                    }
                 }
 
                 resolve({
