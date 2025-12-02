@@ -17,7 +17,7 @@ export function renderStatusBar(): string {
                         <span class="status-text" id="statusText">Checking...</span>
                     </div>
                 </div>
-                <div class="coordinator-info" id="coordinatorInfo">
+                <div class="coordinator-info" id="coordinatorInfo" title="Click to open latest coordinator log">
                     <span class="status-label">Coordinator</span>
                     <div class="status-value">
                         <div class="coordinator-dot idle" id="coordinatorDot"></div>

@@ -211,6 +211,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                         sessionId: data.sessionId 
                     });
                     break;
+                case 'openCoordinatorLog':
+                    this.openLatestCoordinatorLog();
+                    break;
             }
         });
 
@@ -695,6 +698,65 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
      */
     public clearWorkflowTracking(workflowId: string): void {
         this.trackedWorkflows.delete(workflowId);
+    }
+    
+    /**
+     * Open the latest coordinator log file from the global coordinator logs folder.
+     * Files are named with timestamp prefix, so sorting alphabetically gives us the latest.
+     */
+    private async openLatestCoordinatorLog(): Promise<void> {
+        try {
+            if (!this.stateProxy) {
+                vscode.window.showWarningMessage('State proxy not available.');
+                return;
+            }
+            
+            // Get the workspace root to construct the log path
+            const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            if (!workspaceRoot) {
+                vscode.window.showWarningMessage('No workspace folder found.');
+                return;
+            }
+            
+            const logDir = require('path').join(workspaceRoot, '_AiDevLog', 'Logs', 'Coordinator');
+            const fs = require('fs');
+            
+            // Check if the log directory exists
+            if (!fs.existsSync(logDir)) {
+                vscode.window.showInformationMessage('No coordinator logs found yet. Logs will appear after the coordinator runs.');
+                return;
+            }
+            
+            // Get all .txt and .log files, sorted by name (newest first due to timestamp prefix)
+            const files = fs.readdirSync(logDir)
+                .filter((f: string) => f.endsWith('.txt') || f.endsWith('.log'))
+                .sort()
+                .reverse();
+            
+            if (files.length === 0) {
+                vscode.window.showInformationMessage('No coordinator logs found yet. Logs will appear after the coordinator runs.');
+                return;
+            }
+            
+            // Get the latest output file (prefer output over prompt)
+            let latestFile = files.find((f: string) => f.includes('_output.txt'));
+            if (!latestFile) {
+                // If no output file, try to find stream log
+                latestFile = files.find((f: string) => f.endsWith('.log'));
+            }
+            if (!latestFile) {
+                // Fallback to any file
+                latestFile = files[0];
+            }
+            
+            const latestPath = require('path').join(logDir, latestFile);
+            const uri = vscode.Uri.file(latestPath);
+            await vscode.window.showTextDocument(uri, { preview: false });
+            
+        } catch (err) {
+            console.error('[SidebarViewProvider] Failed to open coordinator log:', err);
+            vscode.window.showErrorMessage(`Failed to open coordinator log: ${err}`);
+        }
     }
 
     /**

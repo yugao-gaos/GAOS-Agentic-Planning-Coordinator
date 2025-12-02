@@ -271,6 +271,26 @@ export class EventBroadcaster extends EventEmitter implements IEventBroadcaster 
     }
     
     /**
+     * Unsubscribe all clients from a specific session
+     * Call when a session completes to free memory
+     */
+    unsubscribeSession(sessionId: string): void {
+        const clients = this.sessionClients.get(sessionId);
+        if (clients) {
+            for (const clientId of clients) {
+                this.clientSubscriptions.get(clientId)?.delete(sessionId);
+                // Clean up empty client entries
+                if (this.clientSubscriptions.get(clientId)?.size === 0) {
+                    this.clientSubscriptions.delete(clientId);
+                }
+            }
+            clients.clear();
+            this.sessionClients.delete(sessionId);
+            this.stats.sessionSubscriptions = new Map(this.sessionClients);
+        }
+    }
+    
+    /**
      * Clean up orphaned session subscriptions
      * Removes session entries that have no clients subscribed
      * Should be called periodically to prevent memory leaks

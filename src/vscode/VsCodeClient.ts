@@ -52,12 +52,19 @@ export class VsCodeClient extends BaseApcClient {
     }> = new Map();
     private static readonly CACHE_TTL_MS = 5000; // 5 seconds
     
+    // Periodic cache cleanup timer
+    private cacheCleanupTimer: NodeJS.Timeout | null = null;
+    private static readonly CACHE_CLEANUP_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+    
     constructor(options: VsCodeClientOptions = {}) {
         super({
             ...options,
             clientId: options.clientId || 'vscode-client'
         });
         this.showNotifications = options.showNotifications ?? true;
+        
+        // Start periodic cache cleanup
+        this.startCacheCleanup();
     }
     
     /**
@@ -143,7 +150,11 @@ export class VsCodeClient extends BaseApcClient {
     /**
      * Disconnect from the daemon
      */
+    /**
+     * Disconnect from the daemon
+     */
     disconnect(): void {
+        this.stopCacheCleanup();
         if (this.ws) {
             this.ws.close(1000, 'Client disconnect');
             this.ws = null;
@@ -647,6 +658,38 @@ export class VsCodeClient extends BaseApcClient {
             if (key.includes(workflowId)) {
                 this.workflowStatusCache.delete(key);
             }
+        }
+    }
+    
+    /**
+     * Start periodic cache cleanup to remove stale entries
+     */
+    private startCacheCleanup(): void {
+        this.cacheCleanupTimer = setInterval(() => {
+            const now = Date.now();
+            let cleanedCount = 0;
+            
+            for (const [key, cached] of this.workflowStatusCache) {
+                // Remove entries older than 1 hour
+                if (now - cached.timestamp > 60 * 60 * 1000) {
+                    this.workflowStatusCache.delete(key);
+                    cleanedCount++;
+                }
+            }
+            
+            if (cleanedCount > 0) {
+                console.log(`[VsCodeClient] Cleaned up ${cleanedCount} stale cache entries`);
+            }
+        }, VsCodeClient.CACHE_CLEANUP_INTERVAL_MS);
+    }
+    
+    /**
+     * Stop periodic cache cleanup
+     */
+    private stopCacheCleanup(): void {
+        if (this.cacheCleanupTimer) {
+            clearInterval(this.cacheCleanupTimer);
+            this.cacheCleanupTimer = null;
         }
     }
 }

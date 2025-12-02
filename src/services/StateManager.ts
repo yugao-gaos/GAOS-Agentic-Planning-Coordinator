@@ -395,11 +395,27 @@ export class StateManager {
     }
 
     /**
-     * @deprecated Use getGlobalTasksFilePath() instead - tasks are now global
+     * @deprecated Use getGlobalTasksFilePath() instead - tasks are now per-session
      * Get the tasks file path for a session (per-session, legacy)
      * Structure: _AiDevLog/Plans/{sessionId}/tasks.json
      */
     getTasksFilePath(sessionId: string): string {
+        return path.join(this.getPlanFolder(sessionId), 'tasks.json');
+    }
+    
+    /**
+     * Get the session tasks folder
+     * Structure: _AiDevLog/Plans/{sessionId}/
+     */
+    getSessionTasksFolder(sessionId: string): string {
+        return this.getPlanFolder(sessionId);
+    }
+    
+    /**
+     * Get the session tasks file path
+     * Structure: _AiDevLog/Plans/{sessionId}/tasks.json
+     */
+    getSessionTasksFilePath(sessionId: string): string {
         return path.join(this.getPlanFolder(sessionId), 'tasks.json');
     }
 
@@ -646,6 +662,7 @@ export class StateManager {
         }
 
         // Load planning sessions from plan folder structure
+        // Only load non-completed sessions into memory to reduce memory footprint
         const plansDir = path.join(this.workingDir, 'Plans');
         if (fs.existsSync(plansDir)) {
             const planFolders = fs.readdirSync(plansDir, { withFileTypes: true })
@@ -654,6 +671,8 @@ export class StateManager {
 
             console.log(`StateManager: Found plan folders: ${planFolders.join(', ')}`);
 
+            let loadedCount = 0;
+            let skippedCount = 0;
             for (const sessionId of planFolders) {
                 const planFolder = path.join(plansDir, sessionId);
                 
@@ -662,13 +681,22 @@ export class StateManager {
                 if (fs.existsSync(sessionFile)) {
                 try {
                         const data = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'));
-                    this.planningSessions.set(data.id, data);
-                        console.log(`StateManager: Loaded session ${data.id}`);
+                        
+                        // Only load non-completed sessions into memory
+                        if (data.status !== 'completed') {
+                            this.planningSessions.set(data.id, data);
+                            loadedCount++;
+                            console.log(`StateManager: Loaded session ${data.id} (${data.status})`);
+                        } else {
+                            skippedCount++;
+                            console.log(`StateManager: Skipped completed session ${data.id} (stays on disk)`);
+                        }
                 } catch (e) {
                         console.error(`Failed to load planning session ${sessionId}:`, e);
             }
         }
             }
+            console.log(`StateManager: Loaded ${loadedCount} active sessions, skipped ${skippedCount} completed sessions`);
         }
     }
 
@@ -736,7 +764,64 @@ export class StateManager {
     }
 
     getPlanningSession(id: string): PlanningSession | undefined {
-        return this.planningSessions.get(id);
+        // Check memory first
+        const inMemory = this.planningSessions.get(id);
+        if (inMemory) {
+            return inMemory;
+        }
+        
+        // If not in memory, try loading from disk (for completed sessions)
+        return this.loadSessionFromDisk(id);
+    }
+    
+    /**
+     * Load a specific session from disk without adding to memory
+     * Used for completed sessions that aren't kept in memory
+     */
+    loadSessionFromDisk(sessionId: string): PlanningSession | undefined {
+        try {
+            const sessionFile = path.join(this.getPlanFolder(sessionId), 'session.json');
+            if (fs.existsSync(sessionFile)) {
+                const data = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'));
+                return data as PlanningSession;
+            }
+        } catch (e) {
+            console.error(`Failed to load session ${sessionId} from disk:`, e);
+        }
+        return undefined;
+    }
+    
+    /**
+     * Get list of completed session IDs from disk
+     * Used by UI to show history without loading all sessions into memory
+     */
+    getCompletedSessionIds(): string[] {
+        const completedIds: string[] = [];
+        try {
+            const plansDir = path.join(this.workingDir, 'Plans');
+            if (fs.existsSync(plansDir)) {
+                const planFolders = fs.readdirSync(plansDir, { withFileTypes: true })
+                    .filter(d => d.isDirectory())
+                    .map(d => d.name);
+                
+                for (const sessionId of planFolders) {
+                    const sessionFile = path.join(plansDir, sessionId, 'session.json');
+                    if (fs.existsSync(sessionFile)) {
+                        try {
+                            const data = JSON.parse(fs.readFileSync(sessionFile, 'utf-8'));
+                            if (data.status === 'completed') {
+                                completedIds.push(sessionId);
+                            }
+                        } catch (e) {
+                            // Skip invalid session files
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('Failed to get completed session IDs:', e);
+        }
+        return completedIds;
     }
 
     getAllPlanningSessions(): PlanningSession[] {

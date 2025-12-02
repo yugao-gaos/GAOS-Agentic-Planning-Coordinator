@@ -47,6 +47,14 @@ export function getSidebarScript(): string {
                 vscode.postMessage({ type: 'showMissing' });
             }
         };
+        
+        // Coordinator info click handler - open latest log
+        const coordinatorInfo = document.getElementById('coordinatorInfo');
+        if (coordinatorInfo) {
+            coordinatorInfo.onclick = () => {
+                vscode.postMessage({ type: 'openCoordinatorLog' });
+            };
+        }
 
         /**
          * Escape HTML special characters.

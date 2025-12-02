@@ -84,6 +84,10 @@ interface SessionState {
     // === Archived Workflows ===
     archivedWorkflows: Map<string, ArchivedWorkflow>;  // Lightweight workflow metadata after cleanup
     
+    // === Event Listener Cleanup ===
+    // Track event listener disposables to prevent memory leaks
+    workflowDisposables: Map<string, Array<{ dispose: () => void }>>;
+    
     // === Revision State Tracking ===
     // Used when planning_revision workflow pauses other workflows
     isRevising: boolean;
@@ -272,6 +276,7 @@ export class UnifiedCoordinatorService {
     
     /**
      * Perform periodic cleanup across all sessions
+     * Runs every 5 minutes to free memory from completed workflows and sessions
      */
     private performPeriodicCleanup(): void {
         let totalWorkflowsCleaned = 0;
@@ -289,6 +294,14 @@ export class UnifiedCoordinatorService {
         const beforeSessionCount = this.sessions.size;
         this.cleanupCompletedSessions(4 * 60 * 60 * 1000); // 4 hours for periodic cleanup
         totalSessionsCleaned = beforeSessionCount - this.sessions.size;
+        
+        // Clean up orphaned session subscriptions from EventBroadcaster
+        try {
+            const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+            broadcaster.cleanupOrphanedSessions();
+        } catch (e) {
+            // Broadcaster may not be available in some contexts
+        }
         
         // Clean up stale completion signals
         this.cleanupStaleCompletionSignals();
@@ -358,6 +371,9 @@ export class UnifiedCoordinatorService {
             
             // Archived workflows (lightweight metadata after cleanup)
             archivedWorkflows: new Map(),
+            
+            // Event listener disposables for cleanup
+            workflowDisposables: new Map(),
             
             // Revision state tracking
             isRevising: false,
@@ -862,6 +878,10 @@ export class UnifiedCoordinatorService {
         this.agentPoolService.releaseAgents([agentName]);
         this.log(`Agent released: ${agentName}`);
         
+        // Clean up terminal for this agent to free resources
+        // Note: Terminal cleanup is handled by the terminal manager if available
+        // In headless mode, there are no terminals to clean up
+        
         // Broadcast pool change so UI updates immediately
         try {
             const broadcaster = ServiceLocator.resolve(EventBroadcaster);
@@ -1100,45 +1120,54 @@ export class UnifiedCoordinatorService {
     
     /**
      * Subscribe to workflow events
+     * Store disposables for proper cleanup to prevent memory leaks
      */
     private subscribeToWorkflow(workflow: IWorkflow, sessionId: string): void {
+        const state = this.sessions.get(sessionId);
+        if (!state) return;
+        
+        const disposables: Array<{ dispose: () => void }> = [];
+        
         // Progress updates
-        workflow.onProgress.event((progress) => {
+        disposables.push(workflow.onProgress.event((progress) => {
             this._onWorkflowProgress.fire(progress);
-        });
+        }));
         
         // Completion
-        workflow.onComplete.event(async (result) => {
+        disposables.push(workflow.onComplete.event(async (result) => {
             await this.handleWorkflowComplete(sessionId, workflow.id, result);
-        });
+        }));
         
         // Agent requests
-        workflow.onAgentNeeded.event((request) => {
+        disposables.push(workflow.onAgentNeeded.event((request) => {
             this.handleAgentRequest(request);
-        });
+        }));
         
         // Agent releases
-        workflow.onAgentReleased.event((agentName) => {
+        disposables.push(workflow.onAgentReleased.event((agentName) => {
             this.handleAgentReleased(agentName);
-        });
+        }));
         
         // Task occupancy declared - inline delegation to TaskManager
-        workflow.onTaskOccupancyDeclared.event((occupancy) => {
+        disposables.push(workflow.onTaskOccupancyDeclared.event((occupancy) => {
             const taskManager = ServiceLocator.resolve(TaskManager);
             taskManager.declareTaskOccupancy(workflow.id, occupancy.taskIds, occupancy.type, occupancy.reason);
-        });
+        }));
         
         // Task occupancy released - inline delegation + resume waiting workflows
-        workflow.onTaskOccupancyReleased.event((taskIds) => {
+        disposables.push(workflow.onTaskOccupancyReleased.event((taskIds) => {
             const taskManager = ServiceLocator.resolve(TaskManager);
             taskManager.releaseTaskOccupancy(workflow.id, taskIds);
             this.resumeWaitingWorkflows(sessionId, taskIds);
-        });
+        }));
         
         // Task conflicts declared - complex handling
-        workflow.onTaskConflictDeclared.event((conflict) => {
+        disposables.push(workflow.onTaskConflictDeclared.event((conflict) => {
             this.handleTaskConflictDeclared(sessionId, workflow.id, conflict);
-        });
+        }));
+        
+        // Store disposables for cleanup
+        state.workflowDisposables.set(workflow.id, disposables);
     }
     
     /**
@@ -1279,9 +1308,22 @@ export class UnifiedCoordinatorService {
         // Clean up old completed workflows to prevent memory growth
         this.cleanupCompletedWorkflows(sessionId);
         
-        // If session is complete, check if it should be cleaned up from memory
+        // If session is complete, cleanup and unsubscribe
         const session = this.stateManager.getPlanningSession(sessionId);
         if (session?.status === 'completed') {
+            // Unsubscribe all clients from this completed session
+            try {
+                const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+                broadcaster.unsubscribeSession(sessionId);
+                broadcaster.cleanupOrphanedSessions();
+            } catch (e) {
+                // Broadcaster may not be available in some contexts
+            }
+            
+            // Clean up tasks for this session from memory
+            const taskManager = ServiceLocator.resolve(TaskManager);
+            taskManager.cleanupSessionTasks(sessionId);
+            
             // Schedule session cleanup (not immediate to allow inspection)
             setTimeout(() => {
                 this.cleanupCompletedSessions();
@@ -1555,12 +1597,12 @@ export class UnifiedCoordinatorService {
         
         let cleaned = 0;
         const now = Date.now();
-        const MAX_AGE_MS = 60 * 60 * 1000; // 1 hour
+        const MAX_AGE_MS = 5 * 60 * 1000; // 5 minutes (reduced from 1 hour for faster cleanup)
         
         for (const [workflowId, workflow] of state.workflows) {
             const status = workflow.getStatus();
             if (status === 'completed' || status === 'cancelled' || status === 'failed') {
-                // Check age - only cleanup if completed more than an hour ago
+                // Check age - only cleanup if completed more than 5 minutes ago
                 // This keeps recent completions available for inspection
                 const progress = workflow.getProgress();
                 const completedAt = new Date(progress.updatedAt).getTime();
@@ -1579,7 +1621,16 @@ export class UnifiedCoordinatorService {
                     
                     state.archivedWorkflows.set(workflowId, archived);
                     
-                    // Dispose workflow before removing to clean up event listeners
+                    // Dispose event listeners first to prevent memory leaks
+                    const disposables = state.workflowDisposables.get(workflowId);
+                    if (disposables) {
+                        for (const disposable of disposables) {
+                            disposable.dispose();
+                        }
+                        state.workflowDisposables.delete(workflowId);
+                    }
+                    
+                    // Dispose workflow before removing to clean up internal state
                     workflow.dispose();
                     state.workflows.delete(workflowId);
                     cleaned++;
@@ -2091,6 +2142,14 @@ export class UnifiedCoordinatorService {
         for (const sessionId of sessionsToRemove) {
             const state = this.sessions.get(sessionId);
             if (state) {
+                // Dispose all event listeners first
+                for (const [workflowId, disposables] of state.workflowDisposables) {
+                    for (const disposable of disposables) {
+                        disposable.dispose();
+                    }
+                }
+                state.workflowDisposables.clear();
+                
                 // Dispose all workflows
                 for (const workflow of state.workflows.values()) {
                     workflow.dispose();
@@ -2240,6 +2299,15 @@ export class UnifiedCoordinatorService {
         
         // Cancel all active workflows
         for (const [sessionId, state] of this.sessions) {
+            // Dispose event listeners first to prevent memory leaks
+            for (const [workflowId, disposables] of state.workflowDisposables) {
+                for (const disposable of disposables) {
+                    disposable.dispose();
+                }
+            }
+            state.workflowDisposables.clear();
+            
+            // Dispose workflows
             for (const workflow of state.workflows.values()) {
                 workflow.dispose();
             }

@@ -304,6 +304,10 @@ export async function activate(context: vscode.ExtensionContext) {
                 if (completionData.workflowId && sidebarProvider) {
                     sidebarProvider.clearWorkflowTracking(completionData.workflowId);
                 }
+                // Clear workflow from client cache to prevent memory leaks
+                if (completionData.workflowId) {
+                    vsCodeClient.clearWorkflowCache(completionData.workflowId);
+                }
                 sidebarProvider?.refresh();
             })
         );

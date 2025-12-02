@@ -303,7 +303,7 @@ export class TaskManager {
     }
     
     // ========================================================================
-    // Task Persistence (Global Storage: _AiDevLog/Tasks/tasks.json)
+    // Task Persistence (Per-Session Storage: _AiDevLog/Plans/{sessionId}/tasks.json)
     // ========================================================================
     
     /**
@@ -394,14 +394,15 @@ export class TaskManager {
     }
     
     /**
-     * Force cleanup of all completed tasks for a specific session
-     * Useful when a session is explicitly closed
+     * Clean up all tasks for a session from memory
+     * Called when a session completes to free memory
+     * Task files remain on disk for history/dependency views
      */
     cleanupSessionTasks(sessionId: string): void {
         let cleaned = 0;
         
         for (const [taskId, task] of this.tasks.entries()) {
-            if (task.sessionId === sessionId && task.status === 'completed') {
+            if (task.sessionId === sessionId) {
                 this.tasks.delete(taskId);
                 
                 // Remove from file index
@@ -416,53 +417,90 @@ export class TaskManager {
                     }
                 }
                 
+                // Remove from agent context
+                for (const [agentName, context] of this.agentTaskContext.entries()) {
+                    if (context.currentTaskId === taskId) {
+                        this.agentTaskContext.delete(agentName);
+                    }
+                }
+                
                 cleaned++;
             }
         }
         
         if (cleaned > 0) {
-            this.log(`Cleaned up ${cleaned} completed tasks for session ${sessionId}`);
-            this.persistTasks();
+            this.log(`Cleaned up ${cleaned} tasks from memory for session ${sessionId}`);
+            // Note: Tasks remain on disk at _AiDevLog/Plans/{sessionId}/tasks.json
         }
     }
     
     /**
-     * Persist all tasks to disk
-     * Called after any task modification (create, update, complete, etc.)
-     * 
-     * File structure: {
-     *   lastUpdated: ISO string,
-     *   taskCount: number,
-     *   tasks: ManagedTask[]
-     * }
+     * Persist all tasks to per-session files
+     * Each session's tasks are saved to _AiDevLog/Plans/{sessionId}/tasks.json
+     * This reduces memory footprint as completed sessions can be unloaded
      */
     private persistTasks(): void {
         const stateManager = this.getStateManager();
         if (!stateManager) return;
         
         try {
-            stateManager.ensureGlobalTasksDirectory();
-            const filePath = stateManager.getGlobalTasksFilePath();
+            // Group tasks by session
+            const tasksBySession = new Map<string, ManagedTask[]>();
+            for (const task of this.tasks.values()) {
+                if (!tasksBySession.has(task.sessionId)) {
+                    tasksBySession.set(task.sessionId, []);
+                }
+                tasksBySession.get(task.sessionId)!.push(task);
+            }
             
-            // Convert Map to array for JSON serialization
-            const tasksArray = Array.from(this.tasks.values());
+            // Save each session's tasks separately
+            for (const [sessionId, tasks] of tasksBySession) {
+                this.persistTasksForSession(sessionId, tasks);
+            }
             
-            const data = {
-                lastUpdated: new Date().toISOString(),
-                taskCount: tasksArray.length,
-                tasks: tasksArray
-            };
-            
-            atomicWriteFileSync(filePath, JSON.stringify(data, null, 2));
-            this.log(`Persisted ${tasksArray.length} tasks to ${filePath}`);
+            this.log(`Persisted ${this.tasks.size} tasks across ${tasksBySession.size} sessions`);
         } catch (err) {
             this.log(`[ERROR] Failed to persist tasks: ${err}`);
         }
     }
     
     /**
+     * Persist tasks for a specific session
+     * Saves to _AiDevLog/Plans/{sessionId}/tasks.json
+     */
+    private persistTasksForSession(sessionId: string, tasks?: ManagedTask[]): void {
+        const stateManager = this.getStateManager();
+        if (!stateManager) return;
+        
+        try {
+            // Get tasks for this session if not provided
+            if (!tasks) {
+                tasks = Array.from(this.tasks.values()).filter(t => t.sessionId === sessionId);
+            }
+            
+            const sessionFolder = stateManager.getSessionTasksFolder(sessionId);
+            if (!fs.existsSync(sessionFolder)) {
+                fs.mkdirSync(sessionFolder, { recursive: true });
+            }
+            
+            const filePath = stateManager.getSessionTasksFilePath(sessionId);
+            
+            const data = {
+                sessionId,
+                lastUpdated: new Date().toISOString(),
+                taskCount: tasks.length,
+                tasks: tasks
+            };
+            
+            atomicWriteFileSync(filePath, JSON.stringify(data, null, 2));
+        } catch (err) {
+            this.log(`[ERROR] Failed to persist tasks for session ${sessionId}: ${err}`);
+        }
+    }
+    
+    /**
      * Load persisted tasks from disk on startup
-     * Restores tasks from previous daemon session
+     * Only loads tasks for active (non-completed) sessions to reduce memory usage
      * 
      * Tasks with invalid format are skipped (not loaded).
      * The coordinator will detect missing tasks and recreate them.
@@ -475,54 +513,79 @@ export class TaskManager {
         }
         
         try {
-            const filePath = stateManager.getGlobalTasksFilePath();
-            
-            if (!fs.existsSync(filePath)) {
-                this.log('[INFO] No persisted tasks file found, starting fresh');
+            // Get all session folders
+            const plansDir = path.join(stateManager.getWorkspaceRoot(), '_AiDevLog', 'Plans');
+            if (!fs.existsSync(plansDir)) {
+                this.log('[INFO] No Plans directory found, starting fresh');
                 return;
             }
             
-            const content = fs.readFileSync(filePath, 'utf-8');
-            const data = JSON.parse(content);
+            const sessionFolders = fs.readdirSync(plansDir, { withFileTypes: true })
+                .filter(d => d.isDirectory())
+                .map(d => d.name);
             
-            if (!data.tasks || !Array.isArray(data.tasks)) {
-                this.log('[WARN] Invalid tasks file format, starting fresh');
-                return;
-            }
+            let totalLoaded = 0;
+            let totalSkipped = 0;
+            let sessionsLoaded = 0;
             
-            // Restore tasks to Map, skipping invalid ones
-            let loadedCount = 0;
-            let skippedCount = 0;
-            for (const task of data.tasks) {
-                const validation = this.validateTaskFormat(task);
-                if (!validation.valid) {
-                    this.log(`[SKIP] Task ${task.id}: ${validation.reason}`);
-                    skippedCount++;
+            for (const sessionId of sessionFolders) {
+                // Check if session is completed
+                const session = stateManager.getPlanningSession(sessionId);
+                if (session?.status === 'completed') {
+                    // Skip loading tasks for completed sessions
                     continue;
                 }
                 
-                this.tasks.set(task.id, task);
-                loadedCount++;
+                // Load tasks for this active session
+                const filePath = stateManager.getSessionTasksFilePath(sessionId);
+                if (!fs.existsSync(filePath)) {
+                    continue;
+                }
                 
-                // Rebuild file index
-                if (task.filesModified && task.filesModified.length > 0) {
-                    this.addFilesToIndex(task.id, task.filesModified);
+                const content = fs.readFileSync(filePath, 'utf-8');
+                const data = JSON.parse(content);
+                
+                if (!data.tasks || !Array.isArray(data.tasks)) {
+                    this.log(`[WARN] Invalid tasks file format for session ${sessionId}`);
+                    continue;
+                }
+                
+                let sessionLoadedCount = 0;
+                let sessionSkippedCount = 0;
+                
+                for (const task of data.tasks) {
+                    const validation = this.validateTaskFormat(task);
+                    if (!validation.valid) {
+                        this.log(`[SKIP] Task ${task.id}: ${validation.reason}`);
+                        sessionSkippedCount++;
+                        continue;
+                    }
+                    
+                    this.tasks.set(task.id, task);
+                    sessionLoadedCount++;
+                    
+                    // Rebuild file index
+                    if (task.filesModified && task.filesModified.length > 0) {
+                        this.addFilesToIndex(task.id, task.filesModified);
+                    }
+                }
+                
+                if (sessionLoadedCount > 0) {
+                    totalLoaded += sessionLoadedCount;
+                    totalSkipped += sessionSkippedCount;
+                    sessionsLoaded++;
                 }
             }
             
-            this.log(`Loaded ${loadedCount} tasks from ${filePath} (last updated: ${data.lastUpdated})`);
-            if (skippedCount > 0) {
-                this.log(`[WARN] Skipped ${skippedCount} tasks with invalid format - coordinator will recreate them`);
-                // Persist to remove invalid tasks from file
-                this.persistTasks();
+            this.log(`Loaded ${totalLoaded} tasks from ${sessionsLoaded} active sessions`);
+            if (totalSkipped > 0) {
+                this.log(`[WARN] Skipped ${totalSkipped} tasks with invalid format`);
             }
             
             // Clean up orphaned in_progress tasks (daemon restart scenario)
             let recoveredCount = 0;
             for (const task of this.tasks.values()) {
                 if (task.status === 'in_progress' && !task.currentWorkflow) {
-                    // Task was in_progress but no workflow is running
-                    // This happens when daemon restarts while task was running
                     this.log(`[RECOVERY] Resetting orphaned task ${task.id} from in_progress → created`);
                     task.status = 'created';
                     task.currentWorkflow = undefined;
