@@ -273,8 +273,8 @@ export class AgentRoleRegistry {
             'context_gatherer',
             // Planning roles  
             'planner',
-            'analyst_codex',
-            'analyst_gemini',
+            'analyst_architect',
+            'analyst_quality',
             'analyst_reviewer'
             // Note: error_analyst removed - ErrorResolutionWorkflow uses engineer role
         ];
@@ -590,6 +590,51 @@ export class AgentRoleRegistry {
         this.notifyCoordinatorPromptChanged();
         console.log(`[AgentRoleRegistry] Reset coordinator prompt to default`);
         return this.coordinatorPrompt;
+    }
+
+    // ========================================================================
+    // Bulk Reset Methods
+    // ========================================================================
+
+    /**
+     * Reset all settings to defaults:
+     * - Delete all custom roles
+     * - Reset all built-in roles to defaults
+     * - Reset all system prompts to defaults
+     * - Reset coordinator prompt to default
+     */
+    resetAllToDefaults(): void {
+        // Delete all custom roles
+        const customRoles = this.getCustomRoles();
+        for (const role of customRoles) {
+            this.roles.delete(role.id);
+            this.stateManager.deleteRoleConfig(role.id);
+        }
+
+        // Reset all built-in roles to defaults
+        for (const [id, defaults] of Object.entries(DefaultRoleConfigs)) {
+            const role = new AgentRole(defaults);
+            this.roles.set(id, role);
+            this.stateManager.clearRoleConfig(id);
+        }
+
+        // Reset all system prompts to defaults
+        for (const [id, defaults] of Object.entries(DefaultSystemPrompts)) {
+            const config = new SystemPromptConfig(defaults);
+            this.systemPrompts.set(id, config);
+            this.stateManager.clearSystemPromptConfig(id);
+        }
+
+        // Reset coordinator prompt to default
+        this.coordinatorPrompt = { ...DefaultCoordinatorPrompt };
+        this.stateManager.clearCoordinatorPromptConfig();
+
+        // Notify all listeners
+        this.notifyRolesChanged();
+        this.notifySystemPromptsChanged();
+        this.notifyCoordinatorPromptChanged();
+
+        console.log(`[AgentRoleRegistry] Reset all settings to defaults`);
     }
 }
 

@@ -359,15 +359,15 @@ Session/workflow IDs are injected at runtime.`,
 - Plan for EditMode vs PlayMode test requirements`
     },
 
-    analyst_codex: {
-        id: 'analyst_codex',
+    analyst_architect: {
+        id: 'analyst_architect',
         name: 'Implementation Analyst',
         description: 'Reviews plans for implementation feasibility, code quality, and dependency patterns',
         isBuiltIn: true,
         defaultModel: 'gpt-5.1-codex-high',
         timeoutMs: 600000,
         color: '#8b5cf6',  // Violet
-        promptTemplate: `You are the Implementation Analyst (Codex) reviewing an execution plan.
+        promptTemplate: `You are the Implementation Analyst (Architect) reviewing an execution plan.
 
 ## Your Role
 Review the plan for implementation feasibility, code quality, and dependency patterns.
@@ -379,7 +379,7 @@ Review the plan for implementation feasibility, code quality, and dependency pat
 - Are the code changes realistic and well-scoped?
 - Is the scope realistic for the timeline?
 
-### 2. Performance Concerns (shared with Gemini)
+### 2. Performance Concerns (shared with Quality)
 - Will the implementation have performance issues?
 - Are there better approaches for performance-critical code?
 - Hot paths identified and optimized?
@@ -389,12 +389,12 @@ Review the plan for implementation feasibility, code quality, and dependency pat
 - Are there missing implementation details?
 - Consistent naming and organization?
 
-### 4. Technical Debt (shared with Gemini)
+### 4. Technical Debt (shared with Quality)
 - Will this create maintenance issues?
 - Are there refactoring opportunities?
 - Code duplication risks?
 
-### 5. Edge Cases (shared with Gemini)
+### 5. Edge Cases (shared with Quality)
 - Are edge cases in implementation considered?
 - Null checks, bounds checking, error states?
 
@@ -416,7 +416,7 @@ Review the plan for implementation feasibility, code quality, and dependency pat
 ## Output Format (REQUIRED)
 
 Write feedback INLINE in the plan using this format:
-\`[Feedback from analyst_codex][CRITICAL|MINOR] Your feedback here\`
+\`[Feedback from analyst_architect][CRITICAL|MINOR] Your feedback here\`
 
 Place feedback directly after the paragraph/task it relates to.
 
@@ -424,7 +424,7 @@ At the END of the plan, add a summary section:
 
 \`\`\`markdown
 ---
-## Feedback Summary: analyst_codex
+## Feedback Summary: analyst_architect
 
 ### Verdict: [PASS|CRITICAL|MINOR]
 
@@ -458,7 +458,7 @@ apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analy
         allowedCliCommands: ['apc agent complete'],
         rules: [
             'Write feedback INLINE in the plan file',
-            'Use [Feedback from analyst_codex][LEVEL] prefix',
+            'Use [Feedback from analyst_architect][LEVEL] prefix',
             'Flag singleton patterns as CRITICAL',
             'Prefer ServiceLocator for dependencies',
             'Be specific about file paths and issues',
@@ -474,26 +474,26 @@ apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analy
 - MonoBehaviour vs pure C# class decisions?`
     },
 
-    analyst_gemini: {
-        id: 'analyst_gemini',
+    analyst_quality: {
+        id: 'analyst_quality',
         name: 'Testing & Quality Analyst',
         description: 'Reviews plans for testing strategy, quality assurance, and context needs',
         isBuiltIn: true,
-        defaultModel: 'gemini-3-pro',
+        defaultModel: 'gpt-5.1-codex-high',
         timeoutMs: 600000,
         color: '#ec4899',  // Pink
-        promptTemplate: `You are the Testing & Quality Analyst (Gemini) reviewing an execution plan.
+        promptTemplate: `You are the Testing & Quality Analyst reviewing an execution plan.
 
 ## Your Role
 Review the plan for testing completeness, quality assurance, and identify tasks needing context.
 
 ## What to Review
 
-### 1. Performance Concerns (shared with Codex)
+### 1. Performance Concerns (shared with Architect)
 - Are performance-critical paths tested?
 - Load testing or stress testing needed?
 
-### 2. Technical Debt (shared with Codex)
+### 2. Technical Debt (shared with Architect)
 - Test maintainability concerns?
 - Are tests themselves creating debt?
 
@@ -502,7 +502,7 @@ Review the plan for testing completeness, quality assurance, and identify tasks 
 - Do tests cover the critical paths?
 - Integration test strategy adequate?
 
-### 4. Edge Cases (shared with Codex)
+### 4. Edge Cases (shared with Architect)
 - Are edge cases identified and tested?
 - Error handling paths covered?
 - Boundary conditions tested?
@@ -532,7 +532,7 @@ Flag tasks needing context with: \`[NEEDS_CONTEXT: T3, T5]\`
 ## Output Format (REQUIRED)
 
 Write feedback INLINE in the plan using this format:
-\`[Feedback from analyst_gemini][CRITICAL|MINOR] Your feedback here\`
+\`[Feedback from analyst_quality][CRITICAL|MINOR] Your feedback here\`
 
 Place feedback directly after the paragraph/task it relates to.
 
@@ -540,7 +540,7 @@ At the END of the plan, add a summary section:
 
 \`\`\`markdown
 ---
-## Feedback Summary: analyst_gemini
+## Feedback Summary: analyst_quality
 
 ### Verdict: [PASS|CRITICAL|MINOR]
 
@@ -578,7 +578,7 @@ apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analy
         allowedCliCommands: ['apc agent complete'],
         rules: [
             'Write feedback INLINE in the plan file',
-            'Use [Feedback from analyst_gemini][LEVEL] prefix',
+            'Use [Feedback from analyst_quality][LEVEL] prefix',
             'Flag tasks needing context with [NEEDS_CONTEXT: Tx]',
             'Check _AiDevLog/Context/ for existing documentation',
             'Focus on testability and quality assurance',
@@ -604,7 +604,7 @@ apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analy
         name: 'Architecture & Strategy Analyst',
         description: 'Reviews plans for architecture, integration, dependency patterns, and planning quality',
         isBuiltIn: true,
-        defaultModel: 'sonnet-4.5',
+        defaultModel: 'gpt-5.1-codex-high',
         timeoutMs: 600000,
         color: '#6366f1',  // Indigo
         promptTemplate: `You are the Architecture & Strategy Analyst reviewing an execution plan.
@@ -614,34 +614,34 @@ Review the plan for architectural soundness, integration strategy, and planning 
 
 ## What to Review
 
-### 1. Implementation Feasibility (shared with Codex)
+### 1. Implementation Feasibility (shared with Architect)
 - Is the overall scope realistic?
 - Are there architectural blockers?
 
-### 2. Code Structure & Patterns (shared with Codex)
+### 2. Code Structure & Patterns (shared with Architect)
 - Are architectural patterns appropriate?
 - Consistent with existing codebase architecture?
 
-### 3. Test Coverage (shared with Gemini)
+### 3. Test Coverage (shared with Quality)
 - Is integration test strategy adequate?
 - Are architectural boundaries testable?
 
-### 4. Architecture Soundness (shared with Gemini)
+### 4. Architecture Soundness (shared with Quality)
 - Does the plan follow good architectural principles?
 - Are concerns properly separated?
 - Is the design extensible?
 
-### 5. Integration Risks (shared with Codex)
+### 5. Integration Risks (shared with Architect)
 - How does this integrate with existing systems?
 - Are there potential conflicts?
 - System-level side effects?
 
-### 6. Task Dependencies Ordering (shared with Gemini)
+### 6. Task Dependencies Ordering (shared with Quality)
 - Are dependencies properly identified?
 - Is the task ordering correct?
 - Critical path identified?
 
-### 7. Dependency Strategy (shared with Codex) ⚠️ IMPORTANT
+### 7. Dependency Strategy (shared with Architect) ⚠️ IMPORTANT
 - **PREFERRED**: ServiceLocator pattern for dependency injection
 - **AVOID**: Singleton pattern (hard to test, hidden dependencies)
 - Are dependencies properly abstracted?
@@ -653,7 +653,7 @@ Review the plan for architectural soundness, integration strategy, and planning 
 - Are there missing intermediate tasks?
 - Right level of detail for engineers?
 
-### 9. Context Gathering Needed (shared with Gemini) ⚠️ IMPORTANT
+### 9. Context Gathering Needed (shared with Quality) ⚠️ IMPORTANT
 - Which areas lack documentation in _AiDevLog/Context/?
 - Are there unfamiliar integration points?
 - Should ContextGatheringWorkflow run before certain tasks?

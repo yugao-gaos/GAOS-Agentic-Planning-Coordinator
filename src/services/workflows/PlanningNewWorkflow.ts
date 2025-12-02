@@ -51,6 +51,9 @@ export class PlanningNewWorkflow extends BaseWorkflow {
     private minorSuggestions: string[] = [];
     private forcedFinalize: boolean = false;
     
+    // Reserved planner agent - kept for the entire workflow (not released between phases)
+    private plannerAgentName: string | undefined;
+    
     private agentRunner: AgentRunner;
     
     constructor(config: WorkflowConfig, services: WorkflowServices) {
@@ -157,10 +160,16 @@ export class PlanningNewWorkflow extends BaseWorkflow {
         
         this.log(`Running planner - ${mode.toUpperCase()} mode (${role?.defaultModel || 'opus-4.5'})...`);
         
-        const result = await this.runAgentTask('planner', prompt, role);
+        // Stream plan content directly to plan file (commentary goes to log)
+        const result = await this.runAgentTask('planner', prompt, role, true);
         
-        if (result.success && result.output) {
-            fs.writeFileSync(this.planPath, result.output);
+        if (result.success) {
+            // Plan was streamed to file; verify it exists
+            if (!fs.existsSync(this.planPath)) {
+                // Fallback: extract from output if streaming didn't produce plan
+                const planContent = this.extractPlanFromOutput(result.output);
+                fs.writeFileSync(this.planPath, planContent);
+            }
             this.log(`✓ Plan ${mode === 'create' ? 'created' : 'updated'}`);
         } else {
             throw new Error(`Planner ${mode} task failed`);
@@ -170,15 +179,18 @@ export class PlanningNewWorkflow extends BaseWorkflow {
     private async executeAnalystsPhase(): Promise<void> {
         this.log('');
         this.log('🔍 PHASE: ANALYST REVIEWS (parallel)');
+        this.log(`Starting ${3} analysts: analyst_architect, analyst_quality, analyst_reviewer`);
         
         this.analystOutputs = {};
         
-        const analystRoles = ['analyst_codex', 'analyst_gemini', 'analyst_reviewer'];
+        const analystRoles = ['analyst_architect', 'analyst_quality', 'analyst_reviewer'];
         
         // Run all analysts in parallel
+        const startTime = Date.now();
         await Promise.all(
             analystRoles.map(roleId => this.runAnalystTask(roleId))
         );
+        this.log(`All analysts completed in ${Date.now() - startTime}ms`);
         
         // Parse results
         this.parseAnalystResults();
@@ -194,8 +206,8 @@ export class PlanningNewWorkflow extends BaseWorkflow {
         if (this.hasCriticalIssues() && this.iteration < PlanningNewWorkflow.MAX_ITERATIONS) {
             this.log('');
             this.log(`⚠️ Critical issues found - looping back to planner (iteration ${this.iteration + 1})`);
-            // Move phase index back to planner phase (index 1)
-            this.phaseIndex = 0; // Will be incremented to 1 (planner) by runPhases
+            // Move phase index back so it becomes 0 (planner) after runPhases increments
+            this.phaseIndex = -1; // Will be incremented to 0 (planner) by runPhases
         } else if (this.hasCriticalIssues()) {
             this.log('');
             this.log('⚠️ Max iterations reached with unresolved critical issues');
@@ -215,10 +227,16 @@ export class PlanningNewWorkflow extends BaseWorkflow {
         
         this.log('Running planner finalization...');
         
-        const result = await this.runAgentTask('planner_finalize', prompt, role);
+        // Stream finalized plan directly to plan file
+        const result = await this.runAgentTask('planner_finalize', prompt, role, true);
         
-        if (result.success && result.output) {
-            fs.writeFileSync(this.planPath, result.output);
+        if (result.success) {
+            // Plan was streamed to file; verify it exists
+            if (!fs.existsSync(this.planPath)) {
+                // Fallback: extract from output if streaming didn't produce plan
+                const planContent = this.extractPlanFromOutput(result.output);
+                fs.writeFileSync(this.planPath, planContent);
+            }
             this.log('✓ Plan finalized');
         }
         
@@ -287,6 +305,13 @@ Write your findings in markdown format.`;
             ? fs.readFileSync(this.contextPath, 'utf-8') 
             : '';
         
+        // Load the plan template
+        let planTemplate = '';
+        const templatePath = path.join(this.stateManager.getWorkspaceRoot(), 'resources/templates/skeleton_plan.md');
+        if (fs.existsSync(templatePath)) {
+            planTemplate = fs.readFileSync(templatePath, 'utf-8');
+        }
+        
         if (mode === 'create') {
             modeInstructions = `## Mode: CREATE
 You are creating the initial plan.
@@ -297,7 +322,12 @@ ${this.requirement}
 ### Project Context
 ${contextContent}
 
-Create a detailed task breakdown with:
+${planTemplate ? `### Plan Template (USE THIS STRUCTURE)
+\`\`\`markdown
+${planTemplate}
+\`\`\`
+
+Follow the template structure above. Replace {{PLACEHOLDERS}} with actual content.` : `Create a detailed task breakdown with:
 - [ ] **T{N}**: Task description | Deps: dependencies | Engineer: TBD
 
 Include sections for:
@@ -305,7 +335,7 @@ Include sections for:
 2. Task Breakdown (with checkboxes)
 3. Dependencies
 4. Risk Assessment
-5. Engineer Allocation`;
+5. Engineer Allocation`}`;
         } else {
             modeInstructions = `## Mode: UPDATE
 You are updating the plan based on analyst feedback.
@@ -327,8 +357,17 @@ ${this.formatAnalystFeedback()}
 
 ${modeInstructions}
 
-## Output
-Provide the COMPLETE plan in markdown format with proper task checkbox format.`;
+## Output Instructions
+Write the complete plan to this EXACT file path:
+\`${this.planPath}\`
+
+Use the write tool to save the plan. The plan should be a markdown file starting with "# [Project Name] Plan".
+
+Include these sections:
+1. Overview
+2. Task Breakdown (using checkbox format: - [ ] **T{N}**: Description | Deps: X | Engineer: TBD)
+3. Dependencies
+4. Risk Assessment`;
     }
     
     private buildFinalizationPrompt(forced: boolean, role: AgentRole | undefined): string {
@@ -358,8 +397,11 @@ ${warnings}
 4. Clean up any formatting issues
 ${forced ? '5. Add a WARNINGS section noting unresolved critical issues' : ''}
 
-## Output
-Provide the FINAL plan in markdown format.`;
+## Output Instructions
+Write the finalized plan to this EXACT file path:
+\`${this.planPath}\`
+
+Use the write tool to save the plan. Update the status to "READY FOR REVIEW".`;
     }
     
     private buildAnalystPrompt(roleId: string, role: AgentRole | undefined): string {
@@ -416,22 +458,39 @@ You MUST output your review in this EXACT format:
     private async runAgentTask(
         taskId: string,
         prompt: string,
-        role: AgentRole | undefined
+        role: AgentRole | undefined,
+        streamToPlanFile: boolean = false
     ): Promise<{ success: boolean; output: string }> {
-        // Request an agent from the pool for planning role
         const roleId = role?.id || 'planner';
-        const agentName = await this.requestAgent(roleId);
+        const isPlannerRole = roleId === 'planner';
+        
+        // For planner role, reuse the same agent across iterations (don't release between phases)
+        let agentName: string;
+        if (isPlannerRole && this.plannerAgentName) {
+            // Reuse existing planner agent (already in allocatedAgents)
+            agentName = this.plannerAgentName;
+            this.log(`Reusing reserved planner agent: ${agentName}`);
+        } else {
+            // Request a new agent from the pool
+            agentName = await this.requestAgent(roleId);
+            
+            // Remember the planner agent for reuse across iterations
+            if (isPlannerRole) {
+                this.plannerAgentName = agentName;
+            }
+        }
+        
+        const workspaceRoot = this.stateManager.getWorkspaceRoot();
+        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
+        
+        if (!fs.existsSync(logDir)) {
+            fs.mkdirSync(logDir, { recursive: true });
+        }
+        
+        // Use workflow ID + agent name for unique temp log file
+        const logFile = path.join(logDir, `${this.id}_${agentName}.log`);
         
         try {
-            const workspaceRoot = this.stateManager.getWorkspaceRoot();
-            const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs');
-            
-            if (!fs.existsSync(logDir)) {
-                fs.mkdirSync(logDir, { recursive: true });
-            }
-            
-            const logFile = path.join(logDir, `${taskId}_${Date.now()}.log`);
-            
             // Prepend continuation context if we were paused mid-task
             const continuationPrompt = this.getContinuationPrompt();
             const fullPrompt = continuationPrompt 
@@ -449,6 +508,7 @@ You MUST output your review in this EXACT format:
                 cwd: workspaceRoot,
                 model: role?.defaultModel || 'sonnet-4.5',
                 logFile,
+                planFile: streamToPlanFile ? this.planPath : undefined,
                 timeoutMs: role?.timeoutMs || 600000,
                 onProgress: (msg) => this.log(`  ${msg}`)
             };
@@ -465,16 +525,34 @@ You MUST output your review in this EXACT format:
                 output: result.output
             };
         } finally {
-            // Always release the agent back to the pool
-            this.releaseAgent(agentName);
+            // DON'T release planner agent - keep reserved for potential loop iterations
+            // Planner agent will be released by releaseAllAgents() when workflow ends
+            if (!isPlannerRole) {
+                this.releaseAgent(agentName);
+            } else {
+                this.log(`Keeping planner agent ${agentName} reserved (idle but occupied)`);
+            }
+            
+            // Don't delete log file - terminal may still be tailing it
+            // Log files are cleaned up when session ends
         }
     }
     
     private async runAnalystTask(roleId: string): Promise<void> {
         const role = this.getRole(roleId);
+        
+        if (!role) {
+            this.log(`❌ ${roleId} - role not found in registry!`);
+            this.analystResults[roleId] = 'critical';
+            this.analystOutputs[roleId] = `### Review Result: CRITICAL\n\n#### Critical Issues\n- Role ${roleId} not found in registry\n`;
+            this.criticalIssues.push(`[${roleId}] Role configuration missing from registry`);
+            this.analystUsedCallback.add(roleId);
+            return;
+        }
+        
         const prompt = this.buildAnalystPrompt(roleId, role);
         
-        this.log(`Running ${roleId} (${role?.defaultModel || 'sonnet-4.5'})...`);
+        this.log(`🚀 Starting ${roleId} (model: ${role?.defaultModel || 'sonnet-4.5'})...`);
         
         // Use CLI callback for structured completion
         const result = await this.runAgentTaskWithCallback(
@@ -517,10 +595,13 @@ You MUST output your review in this EXACT format:
                 this.analystOutputs[roleId] = result.rawOutput;
                 this.log(`✓ ${roleId} complete via output (will parse)`);
             } else {
-                this.log(`⚠️ ${roleId} failed`);
-                this.analystOutputs[roleId] = '### Review Result: PASS\n\n#### Critical Issues\n- None\n';
-                this.analystResults[roleId] = 'pass';
-                this.analystUsedCallback.add(roleId); // Mark as handled so we don't parse
+                // Analyst failed - log the error but DON'T silently pass
+                // Mark as critical so it gets attention
+                this.log(`❌ ${roleId} FAILED - marking as CRITICAL (requires investigation)`);
+                this.analystOutputs[roleId] = `### Review Result: CRITICAL\n\n#### Critical Issues\n- Analyst ${roleId} failed to complete review\n- Error: ${result.payload?.error || 'Unknown error'}\n\n#### Minor Suggestions\n- None\n`;
+                this.analystResults[roleId] = 'critical';
+                this.criticalIssues.push(`[${roleId}] Analyst failed to run - check agent pool and role configuration`);
+                this.analystUsedCallback.add(roleId);
             }
         }
     }
@@ -592,6 +673,53 @@ You MUST output your review in this EXACT format:
         );
         
         fs.writeFileSync(this.planPath, content);
+    }
+    
+    /**
+     * Extract the actual plan content from agent output.
+     * Agents often include reasoning/commentary before the plan - this extracts just the plan.
+     */
+    private extractPlanFromOutput(output: string): string {
+        // Look for the start of actual plan content using common patterns
+        const planStartPatterns = [
+            // Plan title headers
+            /^(#\s+[^\n]*(?:Plan|Migration|Implementation|Execution)[^\n]*)/mi,
+            // Metadata line at start of plan
+            /^(\*\*Project:\*\*)/mi,
+            // Horizontal rule followed by header (common wrapper)
+            /^(---\s*\n+#)/m,
+            // Overview section
+            /^(##\s+Overview)/mi,
+            // Document metadata block
+            /^(>\s*\*\*[A-Z])/m,
+        ];
+        
+        for (const pattern of planStartPatterns) {
+            const match = output.match(pattern);
+            if (match && match.index !== undefined) {
+                const extracted = output.substring(match.index);
+                // Verify we extracted something substantial (at least 100 chars)
+                if (extracted.length > 100) {
+                    return extracted;
+                }
+            }
+        }
+        
+        // Fallback: If output starts with commentary (lowercase sentence), 
+        // try to find where the plan actually starts
+        if (/^[a-z]/.test(output.trim())) {
+            // Look for first markdown header
+            const headerMatch = output.match(/^(#+ .+)/m);
+            if (headerMatch && headerMatch.index !== undefined && headerMatch.index > 0) {
+                const extracted = output.substring(headerMatch.index);
+                if (extracted.length > 100) {
+                    return extracted;
+                }
+            }
+        }
+        
+        // Last resort: return as-is
+        return output;
     }
 }
 

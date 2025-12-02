@@ -22,7 +22,7 @@ export interface StateManagerConfig {
     workspaceRoot: string;
     /** Working directory relative to workspace (default: '_AiDevLog') */
     workingDirectory?: string;
-    /** Agent pool size (default: 5) */
+    /** Agent pool size (default: 10) */
     agentPoolSize?: number;
     /** Default AI backend (default: 'cursor') */
     defaultBackend?: 'cursor' | 'claude-code' | 'codex';
@@ -235,7 +235,7 @@ export class StateManager {
         
         // Use provided values or defaults
         const workingDirectory = config.workingDirectory || '_AiDevLog';
-        const agentPoolSize = config.agentPoolSize ?? 5;
+        const agentPoolSize = config.agentPoolSize ?? 10;
         const defaultBackend = config.defaultBackend || 'cursor';
         
         this.workingDir = path.join(this.workspaceRoot, workingDirectory);
@@ -931,8 +931,9 @@ export class StateManager {
     }
     
     /**
-     * Save coordinator history to disk
+     * Save coordinator history to disk (async, non-blocking)
      * Called after each coordinator decision to persist the history
+     * Uses queued writes to avoid blocking the event loop.
      * 
      * @param sessionId Session ID
      * @param history Array of coordinator history entries
@@ -948,7 +949,9 @@ export class StateManager {
             history
         };
         
-        atomicWriteFileSync(filePath, JSON.stringify(data, null, 2));
+        // Use queued async write to avoid blocking the event loop
+        this.queueWrite(filePath, JSON.stringify(data, null, 2))
+            .catch(e => console.error(`Failed to save coordinator history for ${sessionId}:`, e));
     }
     
     /**
@@ -984,6 +987,78 @@ export class StateManager {
                 fs.unlinkSync(filePath);
             } catch (e) {
                 console.error(`Failed to delete coordinator history for session ${sessionId}:`, e);
+            }
+        }
+    }
+
+    // ========================================================================
+    // Workflow History Persistence (Plans/{sessionId}/workflow_history.json)
+    // ========================================================================
+    
+    /**
+     * Get the path to workflow history file for a session
+     */
+    getWorkflowHistoryPath(sessionId: string): string {
+        return path.join(this.getPlanFolder(sessionId), 'workflow_history.json');
+    }
+    
+    /**
+     * Save workflow history to disk (async, non-blocking)
+     * Called after each workflow completion to persist the history
+     * Uses queued writes to avoid blocking the event loop.
+     * 
+     * @param sessionId Session ID
+     * @param history Array of completed workflow summaries
+     */
+    saveWorkflowHistory(sessionId: string, history: any[]): void {
+        this.ensurePlanDirectories(sessionId);
+        const filePath = this.getWorkflowHistoryPath(sessionId);
+        
+        const data = {
+            sessionId,
+            lastUpdated: new Date().toISOString(),
+            entryCount: history.length,
+            history
+        };
+        
+        // Use queued async write to avoid blocking the event loop
+        this.queueWrite(filePath, JSON.stringify(data, null, 2))
+            .catch(e => console.error(`Failed to save workflow history for ${sessionId}:`, e));
+    }
+    
+    /**
+     * Load workflow history from disk
+     * Called during session initialization to restore completed workflow history
+     * 
+     * @param sessionId Session ID
+     * @returns Array of completed workflow summaries, or empty array if not found
+     */
+    loadWorkflowHistory(sessionId: string): any[] {
+        const filePath = this.getWorkflowHistoryPath(sessionId);
+        
+        if (!fs.existsSync(filePath)) {
+            return [];
+        }
+        
+        try {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+            return data.history || [];
+        } catch (e) {
+            console.error(`Failed to load workflow history for session ${sessionId}:`, e);
+            return [];
+        }
+    }
+    
+    /**
+     * Delete workflow history for a session
+     */
+    deleteWorkflowHistory(sessionId: string): void {
+        const filePath = this.getWorkflowHistoryPath(sessionId);
+        if (fs.existsSync(filePath)) {
+            try {
+                fs.unlinkSync(filePath);
+            } catch (e) {
+                console.error(`Failed to delete workflow history for session ${sessionId}:`, e);
             }
         }
     }

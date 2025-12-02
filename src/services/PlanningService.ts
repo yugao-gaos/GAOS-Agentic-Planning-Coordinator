@@ -29,6 +29,9 @@ export class PlanningService extends EventEmitter {
     private outputManager: OutputChannelManager;
     private config: PlanningServiceConfig;
     
+    // Track session-specific subscriptions for cleanup
+    private sessionSubscriptions: Map<string, Array<{ dispose: () => void }>> = new Map();
+    
     /**
      * Create a new PlanningService
      * 
@@ -577,12 +580,13 @@ export class PlanningService extends EventEmitter {
             this.stateManager.savePlanningSession(session);
             this.notifyChange();
             
-            // Subscribe to workflow progress for UI updates
-            this.coordinator.onWorkflowProgress((progress) => {
+            // Subscribe to workflow progress for UI updates (track for cleanup)
+            const progressDisposable = this.coordinator.onWorkflowProgress((progress) => {
                 if (progress.workflowId) {
                     this.updateSessionFromWorkflowProgress(sessionId);
                 }
             });
+            this.trackSessionSubscription(sessionId, progressDisposable);
             
             this.writeProgress(sessionId, 'EXECUTION', '═'.repeat(60));
             this.writeProgress(sessionId, 'EXECUTION', '🚀 EXECUTION STARTED');
@@ -980,6 +984,9 @@ export class PlanningService extends EventEmitter {
             if (state && state.activeWorkflows.size > 0) {
                 await this.coordinator.cancelSession(sessionId);
             }
+            
+            // Clean up session-specific subscriptions
+            this.cleanupSessionSubscriptions(sessionId);
 
             // Delete the plan folder
             const planFolder = this.stateManager.getPlanFolder(sessionId);
@@ -1002,9 +1009,44 @@ export class PlanningService extends EventEmitter {
     }
     
     /**
+     * Track a session-specific subscription for cleanup
+     */
+    private trackSessionSubscription(sessionId: string, disposable: { dispose: () => void }): void {
+        let subs = this.sessionSubscriptions.get(sessionId);
+        if (!subs) {
+            subs = [];
+            this.sessionSubscriptions.set(sessionId, subs);
+        }
+        subs.push(disposable);
+    }
+    
+    /**
+     * Clean up subscriptions for a specific session
+     */
+    private cleanupSessionSubscriptions(sessionId: string): void {
+        const subs = this.sessionSubscriptions.get(sessionId);
+        if (subs) {
+            for (const sub of subs) {
+                try {
+                    sub.dispose();
+                } catch (e) {
+                    // Ignore cleanup errors
+                }
+            }
+            this.sessionSubscriptions.delete(sessionId);
+        }
+    }
+    
+    /**
      * Dispose resources
      */
     dispose(): void {
+        // Clean up all session subscriptions
+        for (const sessionId of this.sessionSubscriptions.keys()) {
+            this.cleanupSessionSubscriptions(sessionId);
+        }
+        this.sessionSubscriptions.clear();
+        
         this.removeAllListeners();
         console.log('PlanningService disposed');
     }

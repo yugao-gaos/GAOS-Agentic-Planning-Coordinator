@@ -11,6 +11,7 @@ export function getSidebarScript(): string {
     return `
         const vscode = acquireVsCodeApi();
         let expandedSessions = new Set();
+        let expandedCoordinators = new Set();
 
         // Element references
         const statusDot = document.getElementById('statusDot');
@@ -105,6 +106,21 @@ export function getSidebarScript(): string {
         }
 
         /**
+         * Reapply expanded state to coordinator/execution foldouts after HTML update.
+         * This preserves the user's expand/collapse choices for execution sections.
+         */
+        function reapplyCoordinatorExpandedState() {
+            expandedCoordinators.forEach(coordId => {
+                const header = sessionsContent.querySelector('.coordinator-header[data-coord-toggle="' + coordId + '"]');
+                if (header) {
+                    const children = document.querySelector('[data-coord-children="' + coordId + '"]');
+                    header.classList.add('expanded');
+                    if (children) children.classList.add('expanded');
+                }
+            });
+        }
+
+        /**
          * Attach event handlers to session items.
          */
         function attachSessionHandlers() {
@@ -143,14 +159,18 @@ export function getSidebarScript(): string {
                     
                     if (action === 'openPlan') {
                         const planPath = item.dataset.planPath;
-                        if (planPath) {
-                            vscode.postMessage({ type: 'openPlan', planPath });
-                        }
+                        // Always send the message with sessionId so extension can look up plan path if needed
+                        vscode.postMessage({ type: 'openPlan', planPath, sessionId });
                     } else if (action === 'openProgressLog') {
                         // Check for progressPath on element first, then fall back to session's progress log
                         const progressPath = el.dataset.progressPath || item.querySelector('.session-body')?.dataset.progressLog;
                         if (progressPath) {
                             vscode.postMessage({ type: 'openProgressLog', progressLogPath: progressPath });
+                        }
+                    } else if (action === 'openWorkflowLog') {
+                        const workflowLog = el.dataset.workflowLog;
+                        if (workflowLog) {
+                            vscode.postMessage({ type: 'openWorkflowLog', logPath: workflowLog });
                         }
                     } else if (action === 'retryTask') {
                         const taskId = el.dataset.taskId;
@@ -172,10 +192,12 @@ export function getSidebarScript(): string {
                     const coordId = header.dataset.coordToggle;
                     const children = document.querySelector('[data-coord-children="' + coordId + '"]');
                     
-                    if (header.classList.contains('expanded')) {
+                    if (expandedCoordinators.has(coordId)) {
+                        expandedCoordinators.delete(coordId);
                         header.classList.remove('expanded');
                         if (children) children.classList.remove('expanded');
                     } else {
+                        expandedCoordinators.add(coordId);
                         header.classList.add('expanded');
                         if (children) children.classList.add('expanded');
                     }
@@ -232,8 +254,9 @@ export function getSidebarScript(): string {
             // Sessions - use pre-rendered HTML from server
             if (state.sessionsHtml) {
                 sessionsContent.innerHTML = state.sessionsHtml;
-                // Reapply expanded state to sessions
+                // Reapply expanded state to sessions and coordinators
                 reapplyExpandedState();
+                reapplyCoordinatorExpandedState();
                 attachSessionHandlers();
             }
 

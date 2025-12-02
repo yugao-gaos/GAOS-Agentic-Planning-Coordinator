@@ -20,6 +20,10 @@ export class TerminalManager implements ITerminalManager {
     private coordinatorTerminals: Map<string, CoordinatorTerminal> = new Map();
     private agentOutputChannels: Map<string, vscode.OutputChannel> = new Map();
     private disposables: vscode.Disposable[] = [];
+    
+    // Debounce map to prevent duplicate streaming commands (agentName -> timestamp)
+    private lastStreamingStart: Map<string, number> = new Map();
+    private static readonly STREAMING_DEBOUNCE_MS = 2000; // 2 seconds
 
     constructor() {
         // Listen for terminal close events
@@ -48,22 +52,56 @@ export class TerminalManager implements ITerminalManager {
         workspaceRoot: string
     ): vscode.Terminal {
         const terminalName = `🔧 ${agentName}`;
+        const now = Date.now();
+        
+        // Log every call to help debug duplicate events
+        console.log(`[TerminalManager] createAgentTerminal called for ${agentName} at ${now}`);
+        console.log(`[TerminalManager]   sessionId=${sessionId}, logFile=${logFile?.substring(logFile.lastIndexOf('/') + 1)}`);
+        
+        // Debounce: skip if we recently started streaming for this agent
+        const lastStart = this.lastStreamingStart.get(agentName);
+        if (lastStart && (now - lastStart) < TerminalManager.STREAMING_DEBOUNCE_MS) {
+            console.log(`[TerminalManager] DEBOUNCE: Skipping duplicate for ${agentName} (last: ${now - lastStart}ms ago)`);
+            const existing = this.agentTerminals.get(agentName);
+            if (existing && this.isTerminalAlive(existing.terminal)) {
+                return existing.terminal;
+            }
+            console.log(`[TerminalManager] DEBOUNCE: But terminal not alive, will recreate`);
+        }
         
         // Check if terminal already exists and is still valid
         const existing = this.agentTerminals.get(agentName);
-        if (existing && this.isTerminalAlive(existing.terminal)) {
+        const terminalAlive = existing ? this.isTerminalAlive(existing.terminal) : false;
+        console.log(`[TerminalManager]   existing=${!!existing}, isAlive=${terminalAlive}, window.terminals.length=${vscode.window.terminals.length}`);
+        
+        if (existing && terminalAlive) {
+            console.log(`[TerminalManager]   REUSING existing terminal for ${agentName}`);
             // Update the stored info in case sessionId/logFile changed
             existing.sessionId = sessionId;
             existing.logFile = logFile;
             existing.terminal.show();
+            
+            // Restart tailing with the new log file
+            // Use mkdir -p to ensure directory exists
+            if (logFile) {
+                this.lastStreamingStart.set(agentName, now);
+                existing.terminal.sendText(
+                    `pkill -INT -f "tail -f.*${path.basename(logFile)}" 2>/dev/null; ` +
+                    `mkdir -p "$(dirname '${logFile}')" 2>/dev/null; ` +
+                    `printf "\\n🔴 Streaming: ${logFile}\\n\\n"; ` +
+                    `touch "${logFile}" && tail -f "${logFile}"`
+                );
+            }
             return existing.terminal;
         }
 
         // If existing terminal is dead, dispose it first
         if (existing) {
+            console.log(`[TerminalManager]   Cleaning up dead terminal reference for ${agentName}`);
             this.agentTerminals.delete(agentName);
         }
 
+        console.log(`[TerminalManager]   CREATING new terminal for ${agentName}`);
         // Create new terminal with proper agent name
         const terminal = vscode.window.createTerminal({
             name: terminalName,
@@ -86,6 +124,18 @@ export class TerminalManager implements ITerminalManager {
             terminal.show(false); // false = don't take focus
         }
 
+        // Start tailing the log file immediately if provided
+        // This ensures the terminal shows streaming output from the start
+        // Use mkdir -p to create the directory if it doesn't exist (workflow may not have created it yet)
+        if (logFile) {
+            this.lastStreamingStart.set(agentName, Date.now());
+            terminal.sendText(
+                `mkdir -p "$(dirname '${logFile}')" 2>/dev/null; ` +
+                `printf "\\n🔴 Streaming: ${logFile}\\n\\n"; ` +
+                `touch "${logFile}" && tail -f "${logFile}"`
+            );
+        }
+
         return terminal;
     }
 
@@ -104,8 +154,13 @@ export class TerminalManager implements ITerminalManager {
             return;
         }
 
-        // Ensure log file exists, show current content, then start tailing
-        agentTerminal.terminal.sendText(`touch "${agentTerminal.logFile}" && cat "${agentTerminal.logFile}" 2>/dev/null; echo "--- Live stream started ---"; tail -f "${agentTerminal.logFile}"`);
+        // Kill existing tail, show current content, then start fresh tail - all in one command
+        agentTerminal.terminal.sendText(
+            `pkill -INT -f "tail -f.*${path.basename(agentTerminal.logFile)}" 2>/dev/null; ` +
+            `cat "${agentTerminal.logFile}" 2>/dev/null; ` +
+            `printf "\\n--- Live stream started ---\\n"; ` +
+            `tail -f "${agentTerminal.logFile}"`
+        );
     }
     
     /**
@@ -127,12 +182,16 @@ export class TerminalManager implements ITerminalManager {
             return;
         }
 
-        // Clear terminal and start tailing the log file
-        agentTerminal.terminal.sendText('clear');
-        agentTerminal.terminal.sendText(`echo "🔴 Live streaming output from: ${logFile}"`);
-        agentTerminal.terminal.sendText(`echo ""`);
-        // Touch to create file if it doesn't exist, then tail with -f for continuous streaming
-        agentTerminal.terminal.sendText(`touch "${logFile}" && tail -f "${logFile}"`);
+        // Kill any existing tail, clear, show header, then start fresh tail - all in one command
+        // Using pkill to kill any tail process in this terminal's process group
+        // Use mkdir -p to ensure directory exists
+        agentTerminal.terminal.sendText(
+            `pkill -INT -f "tail -f.*${path.basename(logFile)}" 2>/dev/null; ` +
+            `mkdir -p "$(dirname '${logFile}')" 2>/dev/null; ` +
+            `clear; ` +
+            `printf "\\n🔴 Streaming: ${logFile}\\n\\n"; ` +
+            `touch "${logFile}" && tail -f "${logFile}"`
+        );
         agentTerminal.terminal.show();
     }
 
@@ -175,10 +234,14 @@ export class TerminalManager implements ITerminalManager {
             agentTerminal.terminal.show();
             // Ensure tailing is started if we have a log file
             if (agentTerminal.logFile) {
-                // Check if tail is already running by sending a harmless command
-                // Actually, just restart tail to ensure it's running
-                agentTerminal.terminal.sendText(`echo "📄 Streaming from: ${agentTerminal.logFile}"`);
-                agentTerminal.terminal.sendText(`touch "${agentTerminal.logFile}" && tail -f "${agentTerminal.logFile}"`);
+                // Kill existing tail, then restart - all in one command
+                // Use mkdir -p to ensure directory exists
+                agentTerminal.terminal.sendText(
+                    `pkill -INT -f "tail -f.*${path.basename(agentTerminal.logFile)}" 2>/dev/null; ` +
+                    `mkdir -p "$(dirname '${agentTerminal.logFile}')" 2>/dev/null; ` +
+                    `printf "\\n📄 Streaming: ${agentTerminal.logFile}\\n\\n"; ` +
+                    `touch "${agentTerminal.logFile}" && tail -f "${agentTerminal.logFile}"`
+                );
             }
             return true;
         }
@@ -199,9 +262,13 @@ export class TerminalManager implements ITerminalManager {
 
             terminal.show();
             // Only tail if log file path exists
+            // Use mkdir -p to ensure directory exists
             if (agentTerminal.logFile) {
-                terminal.sendText(`echo "📄 Reconnecting to log file..."`);
-                terminal.sendText(`touch "${agentTerminal.logFile}" && tail -f "${agentTerminal.logFile}"`);
+                terminal.sendText(
+                    `mkdir -p "$(dirname '${agentTerminal.logFile}')" 2>/dev/null; ` +
+                    `printf "\\n📄 Reconnecting to: ${agentTerminal.logFile}\\n\\n"; ` +
+                    `touch "${agentTerminal.logFile}" && tail -f "${agentTerminal.logFile}"`
+                );
             }
             return true;
         }
@@ -325,9 +392,13 @@ export class TerminalManager implements ITerminalManager {
             return;
         }
 
-        // Ensure log file exists, show existing content, then tail
-        // Use touch to create if missing, cat to show existing, then tail -f
-        coordTerminal.terminal.sendText(`touch "${coordTerminal.logFile}" && cat "${coordTerminal.logFile}" 2>/dev/null; echo "--- Live stream started ---"; tail -f "${coordTerminal.logFile}"`);
+        // Kill existing tail, show existing content, then start fresh tail - all in one command
+        coordTerminal.terminal.sendText(
+            `pkill -INT -f "tail -f.*${path.basename(coordTerminal.logFile)}" 2>/dev/null; ` +
+            `cat "${coordTerminal.logFile}" 2>/dev/null; ` +
+            `printf "\\n--- Live stream started ---\\n"; ` +
+            `tail -f "${coordTerminal.logFile}"`
+        );
     }
 
     /**
@@ -367,8 +438,11 @@ export class TerminalManager implements ITerminalManager {
 
             terminal.show();
             if (coordTerminal.logFile) {
-                terminal.sendText(`echo "📄 Reconnecting to coordinator log..."`);
-                terminal.sendText(`tail -f "${coordTerminal.logFile}"`);
+                terminal.sendText(
+                    `mkdir -p "$(dirname '${coordTerminal.logFile}')" 2>/dev/null; ` +
+                    `printf "\\n📄 Reconnecting to: ${coordTerminal.logFile}\\n\\n"; ` +
+                    `touch "${coordTerminal.logFile}" && tail -f "${coordTerminal.logFile}"`
+                );
             }
             return true;
         }

@@ -426,8 +426,64 @@ case "$COMMAND" in
                 response=$(send_ws_command "agent.release" "{\"agentName\": \"$AGENT\"}")
                 display_response "$response"
                 ;;
+            complete|c)
+                # Parse named parameters: --session, --workflow, --stage, --task, --result, --data
+                SESSION=""
+                WORKFLOW=""
+                STAGE=""
+                TASK=""
+                RESULT=""
+                DATA="{}"
+                
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        --session|-s)
+                            SESSION="$2"
+                            shift 2
+                            ;;
+                        --workflow|-w)
+                            WORKFLOW="$2"
+                            shift 2
+                            ;;
+                        --stage)
+                            STAGE="$2"
+                            shift 2
+                            ;;
+                        --task|-t)
+                            TASK="$2"
+                            shift 2
+                            ;;
+                        --result|-r)
+                            RESULT="$2"
+                            shift 2
+                            ;;
+                        --data|-d)
+                            DATA="$2"
+                            shift 2
+                            ;;
+                        *)
+                            shift
+                            ;;
+                    esac
+                done
+                
+                if [[ -z "$SESSION" ]] || [[ -z "$WORKFLOW" ]] || [[ -z "$STAGE" ]] || [[ -z "$RESULT" ]]; then
+                    echo -e "${RED}Usage: apc agent complete --session <id> --workflow <id> --stage <stage> --result <result> [--task <id>] [--data '<json>']${RESET}"
+                    exit 1
+                fi
+                
+                # Build params JSON (include task if provided)
+                if [[ -n "$TASK" ]]; then
+                    PARAMS="{\"session\": \"$SESSION\", \"workflow\": \"$WORKFLOW\", \"stage\": \"$STAGE\", \"task\": \"$TASK\", \"result\": \"$RESULT\", \"data\": $DATA}"
+                else
+                    PARAMS="{\"session\": \"$SESSION\", \"workflow\": \"$WORKFLOW\", \"stage\": \"$STAGE\", \"result\": \"$RESULT\", \"data\": $DATA}"
+                fi
+                
+                response=$(send_ws_command "agent.complete" "$PARAMS")
+                display_response "$response"
+                ;;
             *)
-                echo -e "${YELLOW}Usage: apc agent [pool|roles|release]${RESET}"
+                echo -e "${YELLOW}Usage: apc agent [pool|roles|release|complete]${RESET}"
                 ;;
         esac
         ;;

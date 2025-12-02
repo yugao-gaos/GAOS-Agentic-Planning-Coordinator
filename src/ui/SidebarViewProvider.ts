@@ -199,14 +199,30 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     vscode.commands.executeCommand('agenticPlanning.showAgentTerminal', data.agentName);
                     break;
                 case 'openPlan':
-                    if (data.planPath) {
-                        const uri = vscode.Uri.file(data.planPath);
-                        vscode.window.showTextDocument(uri);
+                    {
+                        let planPath = data.planPath;
+                        // If planPath not provided directly, try to look it up from session
+                        if (!planPath && data.sessionId) {
+                            const session = this.stateManager?.getPlanningSession(data.sessionId);
+                            planPath = session?.currentPlanPath;
+                        }
+                        if (planPath) {
+                            const uri = vscode.Uri.file(planPath);
+                            vscode.window.showTextDocument(uri);
+                        } else {
+                            vscode.window.showWarningMessage('No plan file available for this session yet.');
+                        }
                     }
                     break;
                 case 'openProgressLog':
                     if (data.progressLogPath) {
                         const uri = vscode.Uri.file(data.progressLogPath);
+                        vscode.window.showTextDocument(uri);
+                    }
+                    break;
+                case 'openWorkflowLog':
+                    if (data.logPath) {
+                        const uri = vscode.Uri.file(data.logPath);
                         vscode.window.showTextDocument(uri);
                     }
                     break;
@@ -228,6 +244,14 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         // Start periodic refresh with adaptive interval
         // Fast (1s) when system not ready, slow (30s) when ready
         this.startPeriodicRefresh();
+        
+        // Handle visibility changes - refresh when sidebar becomes visible again
+        webviewView.onDidChangeVisibility(() => {
+            if (webviewView.visible) {
+                // Sidebar became visible - refresh immediately to show latest state
+                this.refresh();
+            }
+        });
         
         webviewView.onDidDispose(() => {
             this.stopPeriodicRefresh();
@@ -361,7 +385,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                             totalPhases: progress.totalPhases,
                             percentage: progress.percentage,
                             startedAt: progress.startedAt,
-                            taskId
+                            taskId,
+                            logPath: progress.logPath
                         });
                         
                         // Count task workflows

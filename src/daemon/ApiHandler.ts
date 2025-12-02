@@ -738,7 +738,7 @@ export class ApiHandler {
      * Handle agent completion signal from CLI callback
      */
     private agentComplete(params: Record<string, unknown>): { data?: unknown; message?: string } {
-        const { session, workflow, stage, result, data } = params;
+        const { session, workflow, stage, result, data, task } = params;
         
         // Validate required params
         if (!session) {
@@ -764,12 +764,13 @@ export class ApiHandler {
             }
         }
         
-        // Build signal
+        // Build signal (include taskId if provided for parallel task support)
         const signal: AgentCompletionSignal = {
             sessionId: session as string,
             workflowId: workflow as string,
             stage: stage as AgentStage,
             result: result as AgentStageResult,
+            taskId: task as string | undefined,
             payload
         };
         
@@ -777,9 +778,9 @@ export class ApiHandler {
         const delivered = this.services.coordinator.signalAgentCompletion(signal);
         
         return {
-            data: { sessionId: session, workflowId: workflow, stage, result, delivered },
+            data: { sessionId: session, workflowId: workflow, stage, result, task, delivered },
             message: delivered 
-                ? `Completion signaled: ${stage} → ${result}` 
+                ? `Completion signaled: ${stage}${task ? '/' + task : ''} → ${result}` 
                 : `Signal sent but no workflow waiting`
         };
     }

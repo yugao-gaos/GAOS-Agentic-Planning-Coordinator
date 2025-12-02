@@ -296,19 +296,20 @@ export class ContextGatheringWorkflow extends BaseWorkflow {
         // Request an agent from the pool
         const agentName = await this.requestAgent('context_gatherer');
         
+        const role = this.getRole('context_gatherer');
+        const prompt = this.buildGatherPrompt(preset, files, role);
+        
+        const workspaceRoot = this.stateManager.getWorkspaceRoot();
+        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
+        
+        if (!fs.existsSync(logDir)) {
+            fs.mkdirSync(logDir, { recursive: true });
+        }
+        
+        // Use workflow ID + agent name for unique temp log file
+        const logFile = path.join(logDir, `${this.id}_${agentName}.log`);
+        
         try {
-            const role = this.getRole('context_gatherer');
-            const prompt = this.buildGatherPrompt(preset, files, role);
-            
-            const workspaceRoot = this.stateManager.getWorkspaceRoot();
-            const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs');
-            
-            if (!fs.existsSync(logDir)) {
-                fs.mkdirSync(logDir, { recursive: true });
-            }
-            
-            const logFile = path.join(logDir, `context_${presetId}_${Date.now()}.log`);
-            
             const options: AgentRunOptions = {
                 id: `context_${this.sessionId}_${presetId}`,
                 prompt,
@@ -339,6 +340,13 @@ export class ContextGatheringWorkflow extends BaseWorkflow {
         } finally {
             // Always release the agent back to the pool
             this.releaseAgent(agentName);
+            
+            // Clean up temp log file (streaming was for real-time terminal viewing)
+            try {
+                if (fs.existsSync(logFile)) {
+                    fs.unlinkSync(logFile);
+                }
+            } catch { /* ignore cleanup errors */ }
         }
     }
     
@@ -421,19 +429,20 @@ ${result.output}
         // Request an agent for summarization
         const agentName = await this.requestAgent('context_gatherer');
         
+        const role = this.getRole('context_gatherer');
+        const prompt = this.buildSummarizePrompt(role);
+        
+        const workspaceRoot = this.stateManager.getWorkspaceRoot();
+        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
+        
+        if (!fs.existsSync(logDir)) {
+            fs.mkdirSync(logDir, { recursive: true });
+        }
+        
+        // Use workflow ID + agent name for unique temp log file
+        const logFile = path.join(logDir, `${this.id}_${agentName}.log`);
+        
         try {
-            const role = this.getRole('context_gatherer');
-            const prompt = this.buildSummarizePrompt(role);
-            
-            const workspaceRoot = this.stateManager.getWorkspaceRoot();
-            const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs');
-            
-            if (!fs.existsSync(logDir)) {
-                fs.mkdirSync(logDir, { recursive: true });
-            }
-            
-            const logFile = path.join(logDir, `context_summarize_${Date.now()}.log`);
-            
             const options: AgentRunOptions = {
                 id: `context_${this.sessionId}_summarize`,
                 prompt,
@@ -460,6 +469,13 @@ ${result.output}
             this.log(`⚠️ Summarization error, using combined output directly`);
         } finally {
             this.releaseAgent(agentName);
+            
+            // Clean up temp log file (streaming was for real-time terminal viewing)
+            try {
+                if (fs.existsSync(logFile)) {
+                    fs.unlinkSync(logFile);
+                }
+            } catch { /* ignore cleanup errors */ }
         }
     }
     

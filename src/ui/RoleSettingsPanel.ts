@@ -149,6 +149,15 @@ export class RoleSettingsPanel {
             case 'resetCoordinatorPrompt':
                 await this.resetCoordinatorPrompt();
                 break;
+            case 'exportConfig':
+                await this.exportConfig();
+                break;
+            case 'importConfig':
+                await this.importConfig();
+                break;
+            case 'resetAll':
+                await this.resetAllSettings();
+                break;
             case 'refresh':
                 this.updateWebviewContent();
                 break;
@@ -377,6 +386,109 @@ export class RoleSettingsPanel {
     }
 
     /**
+     * Export all config to clipboard
+     */
+    private async exportConfig(): Promise<void> {
+        try {
+            const exportData = {
+                roles: this.cachedRoles.filter(r => !r.isBuiltIn), // Only custom roles
+                systemPrompts: this.cachedSystemPrompts,
+                coordinatorPrompt: this.cachedCoordinatorPrompt
+            };
+            await vscode.env.clipboard.writeText(JSON.stringify(exportData, null, 2));
+            vscode.window.showInformationMessage('Agent settings copied to clipboard');
+        } catch (e: any) {
+            vscode.window.showErrorMessage(`Failed to export: ${e.message}`);
+        }
+    }
+
+    /**
+     * Import config from clipboard
+     */
+    private async importConfig(): Promise<void> {
+        const clipboardText = await vscode.env.clipboard.readText();
+        
+        try {
+            const importData = JSON.parse(clipboardText);
+            
+            const confirm = await vscode.window.showWarningMessage(
+                'Import agent settings from clipboard? This will merge with your current settings.',
+                { modal: true },
+                'Import'
+            );
+
+            if (confirm === 'Import') {
+                // Import custom roles
+                if (importData.roles && Array.isArray(importData.roles)) {
+                    for (const role of importData.roles) {
+                        if (!role.isBuiltIn) {
+                            if (this.vsCodeClient) {
+                                await this.vsCodeClient.send('roles.create', { role });
+                            } else if (this.registry) {
+                                this.registry.createCustomRole(role);
+                            }
+                        }
+                    }
+                }
+                
+                // Import system prompts
+                if (importData.systemPrompts && Array.isArray(importData.systemPrompts)) {
+                    for (const prompt of importData.systemPrompts) {
+                        if (this.vsCodeClient) {
+                            await this.vsCodeClient.send('prompts.update', { prompt });
+                        } else if (this.registry) {
+                            const config = SystemPromptConfig.fromJSON(prompt);
+                            this.registry.updateSystemPrompt(config);
+                        }
+                    }
+                }
+                
+                // Import coordinator prompt
+                if (importData.coordinatorPrompt) {
+                    if (this.vsCodeClient) {
+                        await this.vsCodeClient.send('prompts.updateCoordinator', { config: importData.coordinatorPrompt });
+                    } else if (this.registry) {
+                        this.registry.updateCoordinatorPrompt(importData.coordinatorPrompt);
+                    }
+                }
+                
+                vscode.window.showInformationMessage('Agent settings imported successfully');
+                this.updateWebviewContent();
+            }
+        } catch (e: any) {
+            vscode.window.showErrorMessage(`Invalid config JSON: ${e.message}`);
+        }
+    }
+
+    /**
+     * Reset all settings to defaults
+     */
+    private async resetAllSettings(): Promise<void> {
+        const confirm = await vscode.window.showWarningMessage(
+            'Reset all agent settings to defaults? Custom roles will be deleted and all prompts will be reset.',
+            { modal: true },
+            'Reset All'
+        );
+
+        if (confirm === 'Reset All') {
+            try {
+                if (this.vsCodeClient) {
+                    // Daemon mode - reset via API
+                    await this.vsCodeClient.send('roles.resetAll', {});
+                } else if (this.registry) {
+                    // Local registry mode - reset all
+                    this.registry.resetAllToDefaults();
+                }
+                
+                vscode.window.showInformationMessage('All agent settings reset to defaults');
+                this.updateWebviewContent();
+            } catch (e: any) {
+                vscode.window.showErrorMessage(`Failed to reset: ${e.message}`);
+            }
+        }
+    }
+
+    /**
      * Update the webview content
      */
     private async updateWebviewContent(): Promise<void> {
@@ -438,28 +550,23 @@ export class RoleSettingsPanel {
             coordinatorPrompt = DefaultCoordinatorPrompt;
         }
 
-        // Generate tabs HTML with sections
-        // Note: Use local `roles` array instead of this.registry since registry may be null in daemon mode
-        const roleTabsHtml = roleIds.map(id => {
+        // Build sidebar tabs data
+        const roleTabsData = roleIds.map(id => {
             const role = roles.find(r => r.id === id);
-            if (!role) return '';
-            const icon = role.isBuiltIn ? '🔧' : '✨';
-            return `<button class="tab" data-type="role" data-id="${role.id}">${icon} ${role.name}</button>`;
-        }).filter(Boolean).join('') + '<button class="tab tab-add" data-type="role" data-id="__new__">+ Add Role</button>';
-
-        // System prompts tab: Coordinator first, then other system prompts
-        const coordinatorTabHtml = `<button class="tab" data-type="coordinator" data-id="coordinator">🎯 Coordinator Agent</button>`;
-        const otherSystemTabsHtml = systemPromptIds.map(id => {
-            const prompt = systemPrompts.find(p => p.id === id);
-            if (!prompt) return '';
-            const categoryIcons: Record<string, string> = { execution: '🎯', planning: '📋', utility: '⚙️' };
-            const icon = categoryIcons[prompt.category] || '📝';
-            return `<button class="tab" data-type="system" data-id="${prompt.id}">${icon} ${prompt.name}</button>`;
-        }).filter(Boolean).join('');
-        const systemTabsHtml = coordinatorTabHtml + otherSystemTabsHtml;
+            if (!role) return null;
+            return { type: 'role', id: role.id, name: role.name, isBuiltIn: role.isBuiltIn };
+        }).filter(Boolean);
+        
+        const systemTabsData = [
+            { type: 'coordinator', id: 'coordinator', name: 'Coordinator Agent', category: 'system' },
+            ...systemPromptIds.map(id => {
+                const prompt = systemPrompts.find(p => p.id === id);
+                if (!prompt) return null;
+                return { type: 'system', id: prompt.id, name: prompt.name, category: prompt.category };
+            }).filter(Boolean)
+        ];
 
         // Generate data as JSON for JavaScript
-        // In daemon mode, roles/systemPrompts are already plain objects; in local mode, they may be class instances
         const rolesJson = JSON.stringify(roles.map(r => typeof r.toJSON === 'function' ? r.toJSON() : r));
         const systemPromptsJson = JSON.stringify(systemPrompts.map(p => typeof p.toJSON === 'function' ? p.toJSON() : p));
         const coordinatorPromptJson = JSON.stringify(coordinatorPrompt);
@@ -474,6 +581,8 @@ export class RoleSettingsPanel {
             )
         );
         const defaultCoordinatorPromptJson = JSON.stringify(DefaultCoordinatorPrompt);
+        const roleTabsDataJson = JSON.stringify(roleTabsData);
+        const systemTabsDataJson = JSON.stringify(systemTabsData);
 
         return `<!DOCTYPE html>
 <html lang="en">
@@ -495,13 +604,11 @@ export class RoleSettingsPanel {
             --button-hover: var(--vscode-button-hoverBackground);
             --tab-active: var(--vscode-tab-activeBackground);
             --tab-inactive: var(--vscode-tab-inactiveBackground);
-            --error-color: var(--vscode-errorForeground);
+            --success-color: var(--vscode-terminal-ansiGreen);
             --warning-color: var(--vscode-editorWarning-foreground);
         }
         
-        * {
-            box-sizing: border-box;
-        }
+        * { box-sizing: border-box; }
         
         body {
             font-family: var(--vscode-font-family);
@@ -512,100 +619,159 @@ export class RoleSettingsPanel {
             padding: 20px;
         }
         
-        h1 {
-            margin: 0 0 20px 0;
-            font-size: 1.5em;
-            font-weight: 500;
+        h1 { margin: 0 0 20px 0; font-size: 1.5em; font-weight: 500; }
+        h2 { margin: 24px 0 12px 0; font-size: 1.1em; font-weight: 500; opacity: 0.8; }
+        h3 { margin: 16px 0 8px 0; font-size: 1em; font-weight: 500; }
+        
+        .header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
         }
         
-        h2 {
-            margin: 24px 0 12px 0;
-            font-size: 1.1em;
-            font-weight: 500;
-            color: var(--fg-color);
-            opacity: 0.8;
+        .header-actions {
+            display: flex;
+            gap: 8px;
         }
         
-        .tabs-section {
-            margin-bottom: 8px;
+        /* Vertical sidebar layout */
+        .layout {
+            display: flex;
+            gap: 20px;
         }
         
-        .tabs-section-label {
+        .sidebar {
+            width: 220px;
+            flex-shrink: 0;
+        }
+        
+        .sidebar-section {
+            margin-bottom: 20px;
+        }
+        
+        .sidebar-section-label {
             font-size: 0.75em;
             text-transform: uppercase;
             letter-spacing: 0.5px;
             opacity: 0.6;
-            margin-bottom: 4px;
-            padding-left: 2px;
-        }
-        
-        .tabs {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 2px;
-            border-bottom: 1px solid var(--border-color);
             margin-bottom: 8px;
+            padding-left: 4px;
         }
         
-        .tab {
-            padding: 8px 16px;
-            background: var(--tab-inactive);
+        .sidebar-tabs {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+            border-right: 1px solid var(--border-color);
+            padding-right: 12px;
+        }
+        
+        .sidebar-tab {
+            padding: 10px 14px;
+            background: transparent;
             border: none;
-            border-bottom: 2px solid transparent;
+            border-left: 3px solid transparent;
             color: var(--fg-color);
             cursor: pointer;
             font-size: inherit;
             font-family: inherit;
+            text-align: left;
             opacity: 0.7;
+            border-radius: 0 4px 4px 0;
         }
         
-        .tab:hover {
+        .sidebar-tab:hover {
             opacity: 1;
+            background: var(--input-bg);
         }
         
-        .tab.active {
+        .sidebar-tab.active {
+            opacity: 1;
             background: var(--tab-active);
-            border-bottom-color: var(--button-bg);
-            opacity: 1;
+            border-left-color: var(--button-bg);
         }
         
-        .tab-add {
+        .sidebar-tab .tab-name {
+            font-weight: 500;
+        }
+        
+        .sidebar-tab .tab-type {
+            font-size: 0.8em;
+            opacity: 0.6;
+            margin-top: 2px;
+        }
+        
+        .sidebar-tab.tab-add {
             opacity: 0.5;
+            font-style: italic;
         }
         
-        .tab-content {
-            display: none;
+        .main-content {
+            flex: 1;
+            min-width: 0;
         }
         
-        .tab-content.active {
-            display: block;
+        .section {
+            background: var(--input-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 16px;
+            margin-bottom: 16px;
         }
+        
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        
+        .section-title {
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .badge {
+            font-size: 0.75em;
+            padding: 2px 6px;
+            border-radius: 3px;
+            background: var(--border-color);
+        }
+        
+        .badge.builtin { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
+        .badge.custom { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
+        .badge.execution { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
+        .badge.planning { background: rgba(251, 191, 36, 0.2); color: #fbbf24; }
+        .badge.utility { background: rgba(100, 100, 100, 0.2); opacity: 0.7; }
+        .badge.system { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
         
         .form-group {
-            margin-bottom: 16px;
+            margin-bottom: 12px;
         }
         
         .form-group label {
             display: block;
             margin-bottom: 4px;
-            font-weight: 500;
+            font-size: 0.9em;
+            opacity: 0.8;
         }
         
         .form-group .hint {
             font-size: 0.85em;
-            opacity: 0.7;
-            margin-top: 2px;
+            opacity: 0.6;
+            margin-top: 4px;
         }
         
-        input[type="text"],
-        input[type="number"],
-        select,
-        textarea {
+        input, textarea, select {
             width: 100%;
             padding: 8px;
-            background: var(--input-bg);
+            background: var(--bg-color);
             color: var(--input-fg);
             border: 1px solid var(--input-border);
+            border-radius: 4px;
             font-family: inherit;
             font-size: inherit;
         }
@@ -615,28 +781,16 @@ export class RoleSettingsPanel {
             resize: vertical;
         }
         
-        textarea.prompt-template {
-            min-height: 300px;
+        textarea.prompt-large {
+            min-height: 200px;
             font-family: var(--vscode-editor-font-family, monospace);
             font-size: 0.9em;
         }
         
-        .checkbox-group {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        
-        .checkbox-group input {
-            width: auto;
-        }
-        
-        .button-row {
-            display: flex;
-            gap: 10px;
-            margin-top: 20px;
-            padding-top: 20px;
-            border-top: 1px solid var(--border-color);
+        textarea.prompt-xlarge {
+            min-height: 350px;
+            font-family: var(--vscode-editor-font-family, monospace);
+            font-size: 0.9em;
         }
         
         button {
@@ -644,105 +798,86 @@ export class RoleSettingsPanel {
             background: var(--button-bg);
             color: var(--button-fg);
             border: none;
+            border-radius: 4px;
             cursor: pointer;
-            font-family: inherit;
             font-size: inherit;
+            font-family: inherit;
         }
         
-        button:hover {
-            background: var(--button-hover);
-        }
-        
+        button:hover { background: var(--button-hover); }
         button.secondary {
             background: transparent;
             border: 1px solid var(--border-color);
             color: var(--fg-color);
         }
-        
         button.danger {
-            background: var(--error-color);
+            background: rgba(239, 68, 68, 0.2);
+            color: #f87171;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
         }
         
-        .section {
-            margin-bottom: 24px;
-            padding-bottom: 16px;
-            border-bottom: 1px solid var(--border-color);
-        }
-        
-        .section h3 {
-            margin: 0 0 12px 0;
-            font-size: 1.1em;
-            font-weight: 500;
-        }
-        
-        .array-input {
+        .button-row {
             display: flex;
-            flex-direction: column;
-            gap: 4px;
-        }
-        
-        .array-input textarea {
-            min-height: 60px;
+            gap: 8px;
+            margin-top: 12px;
         }
         
         .role-id-display {
             font-family: var(--vscode-editor-font-family, monospace);
-            background: var(--input-bg);
-            padding: 4px 8px;
-            border-radius: 4px;
-            opacity: 0.7;
+            font-size: 0.85em;
+            opacity: 0.6;
+            margin-top: 4px;
         }
         
-        .builtin-badge {
-            display: inline-block;
-            background: var(--button-bg);
-            color: var(--button-fg);
-            padding: 2px 8px;
-            border-radius: 10px;
-            font-size: 0.8em;
-            margin-left: 10px;
-        }
-        
-        .category-badge {
-            display: inline-block;
-            background: var(--input-bg);
-            padding: 2px 8px;
-            border-radius: 10px;
-            font-size: 0.8em;
-            margin-left: 10px;
-            opacity: 0.8;
+        .subsection {
+            margin-top: 20px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border-color);
         }
     </style>
 </head>
 <body>
-    <h1>🤖 Agent Settings</h1>
-    
-    <div class="tabs-section">
-        <div class="tabs-section-label">Agent Roles</div>
-        <div class="tabs">
-            ${roleTabsHtml}
+    <div class="header-row">
+        <h1>🤖 Agent Role Settings</h1>
+        <div class="header-actions">
+            <button class="secondary" onclick="exportConfig()">Export</button>
+            <button class="secondary" onclick="importConfig()">Import</button>
+            <button class="danger" onclick="resetAll()">Reset All</button>
         </div>
     </div>
     
-    <div class="tabs-section">
-        <div class="tabs-section-label">System Prompts</div>
-        <div class="tabs">
-            ${systemTabsHtml}
+    <div class="layout">
+        <div class="sidebar">
+            <div class="sidebar-section">
+                <div class="sidebar-section-label">Agent Roles</div>
+                <div class="sidebar-tabs" id="role-tabs"></div>
+            </div>
+            <div class="sidebar-section">
+                <div class="sidebar-section-label">System Prompts</div>
+                <div class="sidebar-tabs" id="system-tabs"></div>
+            </div>
         </div>
+        
+        <div class="main-content" id="main-content"></div>
     </div>
-    
-    <div id="content"></div>
     
     <script>
         const vscode = acquireVsCodeApi();
+        
+        // Data
         const roles = ${rolesJson};
         const systemPrompts = ${systemPromptsJson};
         const coordinatorPrompt = ${coordinatorPromptJson};
         const defaults = ${defaultsJson};
         const defaultSystemPrompts = ${defaultSystemPromptsJson};
         const defaultCoordinatorPrompt = ${defaultCoordinatorPromptJson};
+        const roleTabsData = ${roleTabsDataJson};
+        const systemTabsData = ${systemTabsDataJson};
         
-        // Track which type and id is active
+        // Track active selection
         let activeType = 'role';
         let activeId = roles.length > 0 ? roles[0].id : '__new__';
         
@@ -754,35 +889,70 @@ export class RoleSettingsPanel {
             return systemPrompts.find(p => p.id === id);
         }
         
+        // Render sidebar tabs
+        function renderSidebarTabs() {
+            // Role tabs
+            const roleContainer = document.getElementById('role-tabs');
+            roleContainer.innerHTML = roleTabsData.map(tab => \`
+                <button class="sidebar-tab \${activeType === 'role' && activeId === tab.id ? 'active' : ''}" 
+                        data-type="role" data-id="\${tab.id}">
+                    <div class="tab-name">\${tab.isBuiltIn ? '🔧' : '✨'} \${tab.name}</div>
+                    <div class="tab-type">\${tab.id}</div>
+                </button>
+            \`).join('') + \`
+                <button class="sidebar-tab tab-add \${activeType === 'role' && activeId === '__new__' ? 'active' : ''}" 
+                        data-type="role" data-id="__new__">
+                    <div class="tab-name">+ Add Custom Role</div>
+                </button>
+            \`;
+            
+            // System prompt tabs
+            const systemContainer = document.getElementById('system-tabs');
+            systemContainer.innerHTML = systemTabsData.map(tab => {
+                const icons = { coordinator: '🎯', system: '🎯', execution: '🎯', planning: '📋', utility: '⚙️' };
+                const icon = icons[tab.category] || '📝';
+                return \`
+                    <button class="sidebar-tab \${activeType === tab.type && activeId === tab.id ? 'active' : ''}" 
+                            data-type="\${tab.type}" data-id="\${tab.id}">
+                        <div class="tab-name">\${icon} \${tab.name}</div>
+                        <div class="tab-type">\${tab.id}</div>
+                    </button>
+                \`;
+            }).join('');
+            
+            // Attach click handlers
+            document.querySelectorAll('.sidebar-tab').forEach(tab => {
+                tab.onclick = () => {
+                    activeType = tab.dataset.type;
+                    activeId = tab.dataset.id;
+                    renderSidebarTabs();
+                    renderContent();
+                };
+            });
+        }
+        
+        // Render main content
         function renderContent() {
-            const content = document.getElementById('content');
+            const container = document.getElementById('main-content');
             
             if (activeType === 'role') {
                 if (activeId === '__new__') {
-                    content.innerHTML = renderNewRoleForm();
+                    container.innerHTML = renderNewRoleForm();
                 } else {
                     const role = getRoleById(activeId);
                     if (role) {
-                        content.innerHTML = renderRoleForm(role);
+                        container.innerHTML = renderRoleForm(role);
                     }
                 }
             } else if (activeType === 'coordinator') {
-                content.innerHTML = renderCoordinatorForm();
+                container.innerHTML = renderCoordinatorForm();
             } else if (activeType === 'system') {
                 const prompt = getSystemPromptById(activeId);
                 if (prompt) {
-                    content.innerHTML = renderSystemPromptForm(prompt);
+                    container.innerHTML = renderSystemPromptForm(prompt);
                 }
             }
             
-            // Update active tab
-            document.querySelectorAll('.tab').forEach(tab => {
-                const tabType = tab.dataset.type;
-                const tabId = tab.dataset.id;
-                tab.classList.toggle('active', tabType === activeType && tabId === activeId);
-            });
-            
-            // Attach event listeners
             attachFormListeners();
         }
         
@@ -792,11 +962,14 @@ export class RoleSettingsPanel {
             
             return \`
                 <div class="section">
-                    <h3>
-                        \${role.name}
-                        \${isBuiltIn ? '<span class="builtin-badge">Built-in</span>' : ''}
-                    </h3>
-                    <p class="role-id-display">ID: \${role.id}</p>
+                    <div class="section-header">
+                        <div class="section-title">
+                            \${role.name}
+                            \${isBuiltIn ? '<span class="badge builtin">Built-in</span>' : '<span class="badge custom">Custom</span>'}
+                        </div>
+                    </div>
+                    <p style="opacity: 0.8; margin: 0;">\${role.description || 'No description provided'}</p>
+                    <div class="role-id-display">ID: \${role.id}</div>
                 </div>
                 
                 <form id="roleForm">
@@ -804,7 +977,9 @@ export class RoleSettingsPanel {
                     <input type="hidden" name="isBuiltIn" value="\${role.isBuiltIn}">
                     
                     <div class="section">
-                        <h3>Basic Settings</h3>
+                        <div class="section-header">
+                            <div class="section-title">Basic Settings</div>
+                        </div>
                         
                         <div class="form-group">
                             <label for="name">Name</label>
@@ -834,7 +1009,9 @@ export class RoleSettingsPanel {
                     </div>
                     
                     <div class="section">
-                        <h3>Permissions</h3>
+                        <div class="section-header">
+                            <div class="section-title">Permissions</div>
+                        </div>
                         
                         <div class="form-group">
                             <label for="allowedMcpTools">Allowed MCP Tools</label>
@@ -850,7 +1027,9 @@ export class RoleSettingsPanel {
                     </div>
                     
                     <div class="section">
-                        <h3>Context</h3>
+                        <div class="section-header">
+                            <div class="section-title">Context</div>
+                        </div>
                         
                         <div class="form-group">
                             <label for="rules">Rules</label>
@@ -866,19 +1045,21 @@ export class RoleSettingsPanel {
                     </div>
                     
                     <div class="section">
-                        <h3>Prompt Template</h3>
+                        <div class="section-header">
+                            <div class="section-title">Prompt Template</div>
+                        </div>
                         
                         <div class="form-group">
                             <label for="promptTemplate">System Prompt</label>
-                            <textarea id="promptTemplate" name="promptTemplate" class="prompt-template" placeholder="Optional custom prompt template">\${escapeHtml(role.promptTemplate)}</textarea>
+                            <textarea id="promptTemplate" name="promptTemplate" class="prompt-large" placeholder="Optional custom prompt template">\${escapeHtml(role.promptTemplate)}</textarea>
                             <div class="hint">Leave empty to use the default prompt for this role</div>
                         </div>
-                    </div>
-                    
-                    <div class="button-row">
-                        <button type="submit">Save Changes</button>
-                        \${isBuiltIn && hasDefault ? '<button type="button" class="secondary" onclick="resetRole()">Reset to Default</button>' : ''}
-                        \${!isBuiltIn ? '<button type="button" class="danger" onclick="deleteRole()">Delete Role</button>' : ''}
+                        
+                        <div class="button-row">
+                            <button type="submit">Save Changes</button>
+                            \${isBuiltIn && hasDefault ? '<button type="button" class="secondary" onclick="resetRole()">Reset to Default</button>' : ''}
+                            \${!isBuiltIn ? '<button type="button" class="danger" onclick="deleteRole()">Delete Role</button>' : ''}
+                        </div>
                     </div>
                 </form>
             \`;
@@ -887,15 +1068,19 @@ export class RoleSettingsPanel {
         function renderNewRoleForm() {
             return \`
                 <div class="section">
-                    <h3>Create New Role</h3>
-                    <p>Define a custom agent role with specific settings and permissions.</p>
+                    <div class="section-header">
+                        <div class="section-title">Create New Role</div>
+                    </div>
+                    <p style="opacity: 0.8; margin: 0;">Define a custom agent role with specific settings and permissions.</p>
                 </div>
                 
                 <form id="roleForm">
                     <input type="hidden" name="isBuiltIn" value="false">
                     
                     <div class="section">
-                        <h3>Basic Settings</h3>
+                        <div class="section-header">
+                            <div class="section-title">Basic Settings</div>
+                        </div>
                         
                         <div class="form-group">
                             <label for="id">Role ID</label>
@@ -931,7 +1116,9 @@ export class RoleSettingsPanel {
                     </div>
                     
                     <div class="section">
-                        <h3>Permissions</h3>
+                        <div class="section-header">
+                            <div class="section-title">Permissions</div>
+                        </div>
                         
                         <div class="form-group">
                             <label for="allowedMcpTools">Allowed MCP Tools</label>
@@ -947,7 +1134,9 @@ export class RoleSettingsPanel {
                     </div>
                     
                     <div class="section">
-                        <h3>Context</h3>
+                        <div class="section-header">
+                            <div class="section-title">Context</div>
+                        </div>
                         
                         <div class="form-group">
                             <label for="rules">Rules</label>
@@ -961,16 +1150,18 @@ export class RoleSettingsPanel {
                     </div>
                     
                     <div class="section">
-                        <h3>Prompt Template</h3>
+                        <div class="section-header">
+                            <div class="section-title">Prompt Template</div>
+                        </div>
                         
                         <div class="form-group">
                             <label for="promptTemplate">System Prompt</label>
-                            <textarea id="promptTemplate" name="promptTemplate" class="prompt-template" placeholder="Optional custom prompt template"></textarea>
+                            <textarea id="promptTemplate" name="promptTemplate" class="prompt-large" placeholder="Optional custom prompt template"></textarea>
                         </div>
-                    </div>
-                    
-                    <div class="button-row">
-                        <button type="submit">Create Role</button>
+                        
+                        <div class="button-row">
+                            <button type="submit">Create Role</button>
+                        </div>
                     </div>
                 </form>
             \`;
@@ -982,12 +1173,14 @@ export class RoleSettingsPanel {
             
             return \`
                 <div class="section">
-                    <h3>
-                        \${prompt.name}
-                        <span class="category-badge">\${categoryLabels[prompt.category] || prompt.category}</span>
-                    </h3>
-                    <p>\${prompt.description}</p>
-                    <p class="role-id-display">ID: \${prompt.id}</p>
+                    <div class="section-header">
+                        <div class="section-title">
+                            \${prompt.name}
+                            <span class="badge \${prompt.category}">\${categoryLabels[prompt.category] || prompt.category}</span>
+                        </div>
+                    </div>
+                    <p style="opacity: 0.8; margin: 0;">\${prompt.description}</p>
+                    <div class="role-id-display">ID: \${prompt.id}</div>
                 </div>
                 
                 <form id="systemPromptForm">
@@ -995,7 +1188,9 @@ export class RoleSettingsPanel {
                     <input type="hidden" name="category" value="\${prompt.category}">
                     
                     <div class="section">
-                        <h3>Settings</h3>
+                        <div class="section-header">
+                            <div class="section-title">Settings</div>
+                        </div>
                         
                         <div class="form-group">
                             <label for="name">Display Name</label>
@@ -1020,18 +1215,20 @@ export class RoleSettingsPanel {
                     </div>
                     
                     <div class="section">
-                        <h3>System Prompt</h3>
+                        <div class="section-header">
+                            <div class="section-title">System Prompt</div>
+                        </div>
                         
                         <div class="form-group">
                             <label for="promptTemplate">Prompt Template</label>
-                            <textarea id="promptTemplate" name="promptTemplate" class="prompt-template">\${escapeHtml(prompt.promptTemplate)}</textarea>
+                            <textarea id="promptTemplate" name="promptTemplate" class="prompt-xlarge">\${escapeHtml(prompt.promptTemplate)}</textarea>
                             <div class="hint">This is the base system prompt for this agent. Scenario-specific context will be added at runtime.</div>
                         </div>
-                    </div>
-                    
-                    <div class="button-row">
-                        <button type="submit">Save Changes</button>
-                        \${hasDefault ? '<button type="button" class="secondary" onclick="resetSystemPrompt()">Reset to Default</button>' : ''}
+                        
+                        <div class="button-row">
+                            <button type="submit">Save Changes</button>
+                            \${hasDefault ? '<button type="button" class="secondary" onclick="resetSystemPrompt()">Reset to Default</button>' : ''}
+                        </div>
                     </div>
                 </form>
             \`;
@@ -1042,12 +1239,14 @@ export class RoleSettingsPanel {
             
             return \`
                 <div class="section">
-                    <h3>
-                        🎯 Coordinator Agent
-                        <span class="category-badge">System</span>
-                    </h3>
-                    <p>\${config.description}</p>
-                    <p class="role-id-display">ID: \${config.id}</p>
+                    <div class="section-header">
+                        <div class="section-title">
+                            Coordinator Agent
+                            <span class="badge system">System</span>
+                        </div>
+                    </div>
+                    <p style="opacity: 0.8; margin: 0;">\${config.description}</p>
+                    <div class="role-id-display">ID: \${config.id}</div>
                     <p class="hint" style="margin-top: 8px;">
                         <strong>Note:</strong> The Coordinator Agent makes high-level decisions about task dispatch, 
                         workflow selection, and user interaction. Its prompt has two configurable parts (roleIntro and 
@@ -1057,7 +1256,9 @@ export class RoleSettingsPanel {
                 
                 <form id="coordinatorForm">
                     <div class="section">
-                        <h3>Settings</h3>
+                        <div class="section-header">
+                            <div class="section-title">Settings</div>
+                        </div>
                         
                         <div class="form-group">
                             <label for="coordinatorName">Display Name</label>
@@ -1082,31 +1283,38 @@ export class RoleSettingsPanel {
                     </div>
                     
                     <div class="section">
-                        <h3>Role Introduction</h3>
+                        <div class="section-header">
+                            <div class="section-title">Role Introduction</div>
+                        </div>
+                        
                         <div class="form-group">
                             <label for="roleIntro">Introduction Prompt</label>
-                            <textarea id="roleIntro" name="roleIntro" class="prompt-template">\${escapeHtml(config.roleIntro)}</textarea>
+                            <textarea id="roleIntro" name="roleIntro" class="prompt-large">\${escapeHtml(config.roleIntro)}</textarea>
                             <div class="hint">This sets the context and identity for the Coordinator Agent. It appears at the start of the prompt.</div>
                         </div>
                     </div>
                     
                     <div class="section">
-                        <h3>Decision Instructions</h3>
+                        <div class="section-header">
+                            <div class="section-title">Decision Instructions</div>
+                        </div>
+                        
                         <div class="form-group">
                             <label for="decisionInstructions">Decision Making Instructions</label>
-                            <textarea id="decisionInstructions" name="decisionInstructions" class="prompt-template" style="min-height: 400px;">\${escapeHtml(config.decisionInstructions)}</textarea>
+                            <textarea id="decisionInstructions" name="decisionInstructions" class="prompt-xlarge">\${escapeHtml(config.decisionInstructions)}</textarea>
                             <div class="hint">These instructions guide how the Coordinator makes decisions. Runtime context (tasks, events, agents) is injected between the introduction and these instructions.</div>
                         </div>
-                    </div>
-                    
-                    <div class="button-row">
-                        <button type="submit">Save Changes</button>
-                        <button type="button" class="secondary" onclick="resetCoordinatorPrompt()">Reset to Default</button>
+                        
+                        <div class="button-row">
+                            <button type="submit">Save Changes</button>
+                            <button type="button" class="secondary" onclick="resetCoordinatorPrompt()">Reset to Default</button>
+                        </div>
                     </div>
                 </form>
             \`;
         }
         
+        // Utility functions
         function escapeHtml(str) {
             if (!str) return '';
             return str
@@ -1181,29 +1389,6 @@ export class RoleSettingsPanel {
             };
         }
         
-        function saveRole() {
-            const data = getRoleFormData();
-            
-            if (activeId === '__new__') {
-                vscode.postMessage({ command: 'create', role: data });
-            } else {
-                vscode.postMessage({ command: 'save', role: data });
-            }
-        }
-        
-        function saveSystemPrompt() {
-            const data = getSystemPromptFormData();
-            vscode.postMessage({ command: 'saveSystemPrompt', prompt: data });
-        }
-        
-        function resetRole() {
-            vscode.postMessage({ command: 'reset', roleId: activeId });
-        }
-        
-        function resetSystemPrompt() {
-            vscode.postMessage({ command: 'resetSystemPrompt', promptId: activeId });
-        }
-        
         function getCoordinatorFormData() {
             const form = document.getElementById('coordinatorForm');
             const formData = new FormData(form);
@@ -1218,9 +1403,32 @@ export class RoleSettingsPanel {
             };
         }
         
+        // Actions
+        function saveRole() {
+            const data = getRoleFormData();
+            if (activeId === '__new__') {
+                vscode.postMessage({ command: 'create', role: data });
+            } else {
+                vscode.postMessage({ command: 'save', role: data });
+            }
+        }
+        
+        function saveSystemPrompt() {
+            const data = getSystemPromptFormData();
+            vscode.postMessage({ command: 'saveSystemPrompt', prompt: data });
+        }
+        
         function saveCoordinatorPrompt() {
             const data = getCoordinatorFormData();
             vscode.postMessage({ command: 'saveCoordinatorPrompt', config: data });
+        }
+        
+        function resetRole() {
+            vscode.postMessage({ command: 'reset', roleId: activeId });
+        }
+        
+        function resetSystemPrompt() {
+            vscode.postMessage({ command: 'resetSystemPrompt', promptId: activeId });
         }
         
         function resetCoordinatorPrompt() {
@@ -1231,16 +1439,20 @@ export class RoleSettingsPanel {
             vscode.postMessage({ command: 'delete', roleId: activeId });
         }
         
-        // Tab click handling
-        document.querySelectorAll('.tab').forEach(tab => {
-            tab.addEventListener('click', () => {
-                activeType = tab.dataset.type;
-                activeId = tab.dataset.id;
-                renderContent();
-            });
-        });
+        function exportConfig() {
+            vscode.postMessage({ command: 'exportConfig' });
+        }
+        
+        function importConfig() {
+            vscode.postMessage({ command: 'importConfig' });
+        }
+        
+        function resetAll() {
+            vscode.postMessage({ command: 'resetAll' });
+        }
         
         // Initial render
+        renderSidebarTabs();
         renderContent();
     </script>
 </body>

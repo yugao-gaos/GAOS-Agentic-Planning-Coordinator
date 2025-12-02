@@ -49,6 +49,7 @@ export interface WorkflowProgress {
     startedAt: string;
     updatedAt: string;
     estimatedRemaining?: number; // Milliseconds
+    logPath?: string;        // Path to workflow log file
 }
 
 /**
@@ -308,6 +309,9 @@ export interface AgentCompletionSignal {
     
     /** Result of the stage */
     result: AgentStageResult;
+    
+    /** Optional task ID for parallel tasks within the same workflow/stage */
+    taskId?: string;
     
     /** Structured payload with stage-specific data */
     payload?: AgentCompletionPayload;

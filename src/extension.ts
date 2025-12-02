@@ -21,6 +21,9 @@ let daemonManager: DaemonManager;
 let vsCodeClient: VsCodeClient;
 let daemonStateProxy: DaemonStateProxy;
 
+// Track event subscriptions for cleanup (prevents duplicate handlers on hot reload)
+let eventSubscriptions: Array<() => void> = [];
+
 /**
  * Open agent chat in Cursor/VS Code, paste clipboard content, and send.
  * Uses platform-specific automation (AppleScript, PowerShell, xdotool).
@@ -188,37 +191,58 @@ export async function activate(context: vscode.ExtensionContext) {
         // Pass proxy to providers
         sidebarProvider.setStateProxy(daemonStateProxy);
         
-        // Subscribe to events for UI updates
-        vsCodeClient.subscribe('session.created', () => {
-            sidebarProvider?.refresh();
-        });
+        // Clean up any existing event subscriptions (prevents duplicates on hot reload)
+        for (const unsubscribe of eventSubscriptions) {
+            try {
+                unsubscribe();
+            } catch (e) {
+                // Ignore cleanup errors
+            }
+        }
+        eventSubscriptions = [];
         
-        vsCodeClient.subscribe('session.updated', () => {
-            sidebarProvider?.refresh();
-        });
+        // Subscribe to events for UI updates (store unsubscribe functions for cleanup)
+        eventSubscriptions.push(
+            vsCodeClient.subscribe('session.created', () => {
+                sidebarProvider?.refresh();
+            })
+        );
+        
+        eventSubscriptions.push(
+            vsCodeClient.subscribe('session.updated', () => {
+                sidebarProvider?.refresh();
+            })
+        );
         
         // Create agent terminal when an agent is allocated
-        vsCodeClient.subscribe('agent.allocated', (data: unknown) => {
-            const allocData = data as { agentName: string; sessionId: string; roleId: string; logFile?: string };
-            if (allocData.agentName && allocData.sessionId) {
-                terminalManager.createAgentTerminal(
-                    allocData.agentName,
-                    allocData.sessionId,
-                    allocData.logFile || '',
-                    workspaceRoot
-                );
-            }
-        });
+        eventSubscriptions.push(
+            vsCodeClient.subscribe('agent.allocated', (data: unknown) => {
+                console.log(`[APC Extension] agent.allocated event received:`, JSON.stringify(data));
+                const allocData = data as { agentName: string; sessionId: string; roleId: string; logFile?: string };
+                if (allocData.agentName && allocData.sessionId) {
+                    terminalManager.createAgentTerminal(
+                        allocData.agentName,
+                        allocData.sessionId,
+                        allocData.logFile || '',
+                        workspaceRoot
+                    );
+                }
+            })
+        );
         
-        vsCodeClient.subscribe('pool.changed', () => {
-            sidebarProvider?.refresh();
-        });
+        eventSubscriptions.push(
+            vsCodeClient.subscribe('pool.changed', () => {
+                sidebarProvider?.refresh();
+            })
+        );
         
         // Subscribe to disconnection events to update UI
-        vsCodeClient.subscribe('disconnected', () => {
-            console.log('[APC] Daemon disconnected, refreshing UI');
-            sidebarProvider?.refresh();
-        });
+        eventSubscriptions.push(
+            vsCodeClient.subscribe('disconnected', () => {
+                console.log('[APC] Daemon disconnected, refreshing UI');
+                sidebarProvider?.refresh();
+            })
+        );
         
     } catch (daemonError) {
         console.error('Agentic Planning: Failed to connect to daemon:', daemonError);
@@ -243,7 +267,7 @@ export async function activate(context: vscode.ExtensionContext) {
     
     // Listen for task.failedFinal events to open agent chat for user intervention
     const broadcaster = ServiceLocator.resolve(EventBroadcaster);
-    broadcaster.on('task.failedFinal', async (data: TaskFailedFinalEventData) => {
+    const taskFailedHandler = async (data: TaskFailedFinalEventData) => {
         const isNeedsClarity = data.errorType === 'needs_clarity';
         
         const prompt = isNeedsClarity 
@@ -278,7 +302,10 @@ Options:
                 vscode.window.showInformationMessage('Check the agent chat for details and next steps.');
             }
         });
-    });
+    };
+    broadcaster.on('task.failedFinal', taskFailedHandler);
+    // Track for cleanup (EventEmitter style - need to store handler reference)
+    eventSubscriptions.push(() => broadcaster.removeListener('task.failedFinal', taskFailedHandler));
 
     console.log('[APC] Step 6: Registering webview provider...');
     context.subscriptions.push(
@@ -681,7 +708,7 @@ This will trigger the multi-agent debate to revise the plan.`;
         
         vscode.commands.registerCommand('agenticPlanning.refreshAgentPool', async () => {
             // Sync pool size with settings via daemon
-            const configSize = vscode.workspace.getConfiguration('agenticPlanning').get<number>('agentPoolSize', 5);
+            const configSize = vscode.workspace.getConfiguration('agenticPlanning').get<number>('agentPoolSize', 10);
             const poolStatus = await daemonStateProxy.getPoolStatus();
             
             if (configSize !== poolStatus.total) {
@@ -916,7 +943,7 @@ This will trigger the multi-agent debate to revise the plan.`;
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration(async e => {
             if (e.affectsConfiguration('agenticPlanning.agentPoolSize')) {
-                const newSize = vscode.workspace.getConfiguration('agenticPlanning').get<number>('agentPoolSize', 5);
+                const newSize = vscode.workspace.getConfiguration('agenticPlanning').get<number>('agentPoolSize', 10);
                 const result = await vsCodeClient.resizePool(newSize);
                 if (result.success) {
                     if (result.added && result.added.length > 0) {
@@ -937,6 +964,17 @@ This will trigger the multi-agent debate to revise the plan.`;
 
 export async function deactivate() {
     console.log('Agentic Planning Coordinator deactivating...');
+    
+    // Clean up event subscriptions first (prevents memory leaks and duplicate handlers)
+    console.log(`Cleaning up ${eventSubscriptions.length} event subscriptions`);
+    for (const unsubscribe of eventSubscriptions) {
+        try {
+            unsubscribe();
+        } catch (e) {
+            // Ignore cleanup errors
+        }
+    }
+    eventSubscriptions = [];
     
     // Disconnect from daemon (but don't stop it - CLI may still need it)
     if (vsCodeClient) {

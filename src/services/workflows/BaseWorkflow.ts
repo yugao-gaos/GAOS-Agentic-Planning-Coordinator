@@ -2,6 +2,9 @@
 // BaseWorkflow - Abstract base class for all workflow implementations
 // ============================================================================
 
+import * as path from 'path';
+import * as fs from 'fs';
+import * as os from 'os';
 import { TypedEventEmitter } from '../TypedEventEmitter';
 import { IWorkflow, WorkflowServices, TaskOccupancy, TaskConflict } from './IWorkflow';
 import { 
@@ -125,6 +128,13 @@ export abstract class BaseWorkflow implements IWorkflow {
     private forcePauseRequested: boolean = false;
     
     // ========================================================================
+    // Logging
+    // ========================================================================
+    
+    /** Path to persistent workflow log file (logs/{workflow_id}.log) */
+    protected workflowLogPath: string | undefined;
+    
+    // ========================================================================
     // Injected Services
     // ========================================================================
     
@@ -150,6 +160,58 @@ export abstract class BaseWorkflow implements IWorkflow {
     static readonly requiresUnity: boolean = false;
     
     // ========================================================================
+    // APC CLI Path Resolution
+    // ========================================================================
+    
+    /** Cached absolute path to apc CLI */
+    private static _apcPath: string | null = null;
+    
+    /**
+     * Get the absolute path to the apc CLI command.
+     * 
+     * Checks in order:
+     * 1. ~/.local/bin/apc (standard install location)
+     * 2. /usr/local/bin/apc (alternative location)
+     * 3. Falls back to 'apc' (relies on PATH)
+     * 
+     * Result is cached for performance.
+     */
+    protected static getApcPath(): string {
+        if (BaseWorkflow._apcPath !== null) {
+            return BaseWorkflow._apcPath;
+        }
+        
+        // Check standard locations
+        const homeBinPath = path.join(os.homedir(), '.local', 'bin', 'apc');
+        const usrLocalPath = '/usr/local/bin/apc';
+        
+        if (fs.existsSync(homeBinPath)) {
+            BaseWorkflow._apcPath = homeBinPath;
+            console.log(`[BaseWorkflow] Using apc at: ${homeBinPath}`);
+            return homeBinPath;
+        }
+        
+        if (fs.existsSync(usrLocalPath)) {
+            BaseWorkflow._apcPath = usrLocalPath;
+            console.log(`[BaseWorkflow] Using apc at: ${usrLocalPath}`);
+            return usrLocalPath;
+        }
+        
+        // Fall back to PATH-based lookup
+        console.log('[BaseWorkflow] apc not found at standard locations, using PATH-based lookup');
+        BaseWorkflow._apcPath = 'apc';
+        return 'apc';
+    }
+    
+    /**
+     * Get the apc command for use in prompts.
+     * Returns absolute path if available, otherwise 'apc'.
+     */
+    protected get apcCommand(): string {
+        return BaseWorkflow.getApcPath();
+    }
+    
+    // ========================================================================
     // Constructor
     // ========================================================================
     
@@ -166,6 +228,30 @@ export abstract class BaseWorkflow implements IWorkflow {
         this.unityManager = services.unityManager;
         this.outputManager = services.outputManager;
         this.unityEnabled = services.unityEnabled;
+        
+        // Initialize workflow log file (persistent)
+        this.initializeWorkflowLog();
+    }
+    
+    /**
+     * Initialize the persistent workflow log file
+     */
+    private initializeWorkflowLog(): void {
+        try {
+            const planFolder = this.stateManager.getPlanFolder(this.sessionId);
+            if (planFolder) {
+                const logDir = path.join(planFolder, 'logs');
+                if (!fs.existsSync(logDir)) {
+                    fs.mkdirSync(logDir, { recursive: true });
+                }
+                this.workflowLogPath = path.join(logDir, `${this.id}.log`);
+                // Write header
+                const header = `=== Workflow Log: ${this.type} ===\nID: ${this.id}\nSession: ${this.sessionId}\nStarted: ${new Date().toISOString()}\n${'='.repeat(50)}\n\n`;
+                fs.writeFileSync(this.workflowLogPath, header);
+            }
+        } catch {
+            // Silently ignore log initialization errors
+        }
     }
     
     // ========================================================================
@@ -211,7 +297,8 @@ export abstract class BaseWorkflow implements IWorkflow {
             startedAt: this.startTime > 0 
                 ? new Date(this.startTime).toISOString() 
                 : '',
-            updatedAt: new Date().toISOString()
+            updatedAt: new Date().toISOString(),
+            logPath: this.workflowLogPath
         };
     }
     
@@ -736,10 +823,28 @@ ${ctx.partialOutput.slice(-3000)}
     
     /**
      * Log message with workflow context
+     * Writes to both Output panel and persistent workflow log file
      */
     protected log(message: string): void {
         const prefix = `WF:${this.id.substring(0, 12)}`;
         this.outputManager.log(prefix, message);
+        
+        // Also write to persistent workflow log file
+        if (this.workflowLogPath) {
+            try {
+                const timestamp = new Date().toISOString();
+                fs.appendFileSync(this.workflowLogPath, `[${timestamp}] ${message}\n`);
+            } catch {
+                // Silently ignore file write errors
+            }
+        }
+    }
+    
+    /**
+     * Get the workflow log file path (for UI to open)
+     */
+    getWorkflowLogPath(): string | undefined {
+        return this.workflowLogPath;
     }
     
     /**
@@ -771,7 +876,11 @@ ${ctx.partialOutput.slice(-3000)}
         if (index >= 0) {
             this.allocatedAgents.splice(index, 1);
             this.log(`Agent released: ${agentName}`);
+            console.log(`[BaseWorkflow] Firing onAgentReleased for ${agentName}`);
             this.onAgentReleased.fire(agentName);
+            console.log(`[BaseWorkflow] onAgentReleased fired for ${agentName}`);
+        } else {
+            console.log(`[BaseWorkflow] Agent ${agentName} not in allocatedAgents, skipping release`);
         }
     }
     
@@ -888,38 +997,54 @@ ${ctx.partialOutput.slice(-3000)}
         const timeout = options.timeout ?? role?.timeoutMs ?? 600000;
         
         this.log(`Starting agent task [${taskId}] with CLI callback (stage: ${options.expectedStage})`);
+        this.log(`  Requesting agent for role: ${roleId}...`);
         
-        // Inject CLI callback instructions into prompt
+        // Request an agent from the pool (this triggers agent.allocated event)
+        const agentName = await this.requestAgent(roleId);
+        this.log(`  Agent ${agentName} allocated for ${roleId}`);
+        
+        // Inject CLI callback instructions into prompt (include taskId for parallel task support)
         const enhancedPrompt = this.injectCliCallbackInstructions(
             prompt,
             options.expectedStage,
-            roleId
+            roleId,
+            taskId
         );
         
         // Start the agent process
         const runId = `${this.id}_${taskId}_${Date.now()}`;
         this.currentAgentRunId = runId;
         
+        // Set up log file for streaming - temp file with agent name
+        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
+        if (!fs.existsSync(logDir)) {
+            fs.mkdirSync(logDir, { recursive: true });
+        }
+        const logFile = path.join(logDir, `${this.id}_${agentName}.log`);
+        
         const agentPromise = agentRunner.run({
             id: runId,
             prompt: enhancedPrompt,
             model: options.model ?? role?.defaultModel ?? 'claude-sonnet',
             cwd: options.cwd ?? process.cwd(),
+            logFile,
             timeoutMs: timeout,
             onProgress: (msg) => this.log(`  ${msg}`),
             metadata: {
                 roleId,
                 coordinatorId: this.id,
                 sessionId: this.sessionId,
-                taskId
+                taskId,
+                agentName
             }
         });
         
-        // Wait for CLI callback from coordinator
+        // Wait for CLI callback from coordinator (include taskId for parallel task support)
         const callbackPromise = coordinator.waitForAgentCompletion(
             this.id,
             options.expectedStage,
-            timeout
+            timeout,
+            taskId
         );
         
         try {
@@ -952,8 +1077,8 @@ ${ctx.partialOutput.slice(-3000)}
                 const processResult = result.result;
                 this.log(`Agent [${taskId}] process exited without CLI callback (legacy mode)`);
                 
-                // Cancel the pending callback wait
-                coordinator.cancelPendingSignal(this.id, options.expectedStage);
+                // Cancel the pending callback wait (include taskId for parallel task support)
+                coordinator.cancelPendingSignal(this.id, options.expectedStage, taskId);
                 
                 // If process failed, we treat it as failed
                 if (!processResult.success) {
@@ -977,8 +1102,8 @@ ${ctx.partialOutput.slice(-3000)}
         } catch (error) {
             this.currentAgentRunId = undefined;
             
-            // Timeout or other error
-            coordinator.cancelPendingSignal(this.id, options.expectedStage);
+            // Timeout or other error (include taskId for parallel task support)
+            coordinator.cancelPendingSignal(this.id, options.expectedStage, taskId);
             await agentRunner.stop(runId).catch(() => {});
             
             const errorMessage = error instanceof Error ? error.message : String(error);
@@ -990,6 +1115,9 @@ ${ctx.partialOutput.slice(-3000)}
                 payload: { error: errorMessage },
                 fromCallback: false
             };
+        } finally {
+            // Always release the agent back to the pool
+            this.releaseAgent(agentName);
         }
     }
     
@@ -998,14 +1126,26 @@ ${ctx.partialOutput.slice(-3000)}
      * 
      * This adds standardized instructions at the end of the prompt telling
      * the agent how to signal completion via CLI.
+     * 
+     * @param prompt The original prompt
+     * @param stage The agent stage
+     * @param roleId The role ID
+     * @param taskId Optional task ID for parallel task support
      */
     private injectCliCallbackInstructions(
         prompt: string,
         stage: AgentStage,
-        roleId: string
+        roleId: string,
+        taskId?: string
     ): string {
         // Get stage-specific result options and payload schema
-        const { resultOptions, payloadSchema, examples } = this.getStageCallbackInfo(stage);
+        const { resultOptions, payloadSchema, examples } = this.getStageCallbackInfo(stage, taskId);
+        
+        // Include --task parameter if taskId is provided (for parallel tasks)
+        const taskParam = taskId ? `    --task ${taskId} \\\n` : '';
+        
+        // Get absolute path to apc CLI for reliable execution
+        const apc = this.apcCommand;
         
         const callbackInstructions = `
 
@@ -1016,11 +1156,11 @@ This is REQUIRED - the workflow cannot proceed without it.
 
 ### Command Format
 \`\`\`bash
-apc agent complete \\
+${apc} agent complete \\
     --session ${this.sessionId} \\
     --workflow ${this.id} \\
     --stage ${stage} \\
-    --result <RESULT> \\
+${taskParam}    --result <RESULT> \\
     --data '<JSON_PAYLOAD>'
 \`\`\`
 
@@ -1036,7 +1176,7 @@ ${payloadSchema}
 ${examples}
 
 ### Retry on Failure
-If the \`apc\` command fails (e.g., network error, daemon not running):
+If the command fails (e.g., network error, daemon not running):
 1. Wait 2 seconds
 2. Retry the command up to 3 times
 3. If still failing, output the error and exit
@@ -1052,12 +1192,20 @@ If the \`apc\` command fails (e.g., network error, daemon not running):
     
     /**
      * Get stage-specific callback information for prompt injection
+     * 
+     * @param stage The agent stage
+     * @param taskId Optional task ID for parallel task support
      */
-    private getStageCallbackInfo(stage: AgentStage): {
+    private getStageCallbackInfo(stage: AgentStage, taskId?: string): {
         resultOptions: string[];
         payloadSchema: string;
         examples: string;
     } {
+        // Include --task parameter in examples if taskId is provided
+        const taskParam = taskId ? ` --task ${taskId}` : '';
+        // Use absolute path to apc CLI
+        const apc = this.apcCommand;
+        
         switch (stage) {
             case 'implementation':
                 return {
@@ -1068,10 +1216,10 @@ If the \`apc\` command fails (e.g., network error, daemon not running):
 }`,
                     examples: `
 # Success with modified files
-apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage implementation --result success --data '{"files":["Assets/Scripts/Player.cs","Assets/Scripts/Enemy.cs"]}'
+${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage implementation${taskParam} --result success --data '{"files":["Assets/Scripts/Player.cs","Assets/Scripts/Enemy.cs"]}'
 
 # Failed with error
-apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage implementation --result failed --data '{"error":"Could not find the specified interface to implement"}'
+${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage implementation${taskParam} --result failed --data '{"error":"Could not find the specified interface to implement"}'
 `
                 };
                 
@@ -1084,10 +1232,10 @@ apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage imp
 }`,
                     examples: `
 # Approved
-apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage review --result approved --data '{}'
+${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage review${taskParam} --result approved --data '{}'
 
 # Changes requested
-apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage review --result changes_requested --data '{"feedback":"Missing null checks in ProcessInput method","files":["Assets/Scripts/InputHandler.cs"]}'
+${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage review${taskParam} --result changes_requested --data '{"feedback":"Missing null checks in ProcessInput method","files":["Assets/Scripts/InputHandler.cs"]}'
 `
                 };
                 
@@ -1100,10 +1248,10 @@ apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage rev
 }`,
                     examples: `
 # Pass
-apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage analysis --result pass --data '{"suggestions":["Consider adding unit tests"]}'
+${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage analysis${taskParam} --result pass --data '{"suggestions":["Consider adding unit tests"]}'
 
 # Critical issues
-apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage analysis --result critical --data '{"issues":["Plan misses authentication requirement","No error handling strategy"]}'
+${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage analysis${taskParam} --result critical --data '{"issues":["Plan misses authentication requirement","No error handling strategy"]}'
 `
                 };
                 
@@ -1117,7 +1265,7 @@ apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage ana
   "relatedTask": "T1" // Optional: related task ID
 }`,
                     examples: `
-apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage error_analysis --result complete --data '{"rootCause":"Missing using directive for UnityEngine.UI","affectedFiles":["Assets/Scripts/UI/MenuController.cs"],"suggestedFix":"Add using UnityEngine.UI at the top of the file"}'
+${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage error_analysis${taskParam} --result complete --data '{"rootCause":"Missing using directive for UnityEngine.UI","affectedFiles":["Assets/Scripts/UI/MenuController.cs"],"suggestedFix":"Add using UnityEngine.UI at the top of the file"}'
 `
                 };
                 
@@ -1130,7 +1278,7 @@ apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage err
   "message": "Optional summary"
 }`,
                     examples: `
-apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage ${stage} --result success --data '{"briefPath":"_AiDevLog/Context/task_context_T1.md"}'
+${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage ${stage}${taskParam} --result success --data '{"briefPath":"_AiDevLog/Context/task_context_T1.md"}'
 `
                 };
                 
@@ -1141,7 +1289,7 @@ apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage ${s
   "message": "Summary of finalization"
 }`,
                     examples: `
-apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage finalize --result success --data '{"message":"Plan finalized and saved"}'
+${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage finalize${taskParam} --result success --data '{"message":"Plan finalized and saved"}'
 `
                 };
                 
@@ -1154,7 +1302,7 @@ apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage fin
   "error": "Error message if failed"
 }`,
                     examples: `
-apc agent complete --session ${this.sessionId} --workflow ${this.id} --stage ${stage} --result success --data '{"message":"Task completed"}'
+${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage ${stage}${taskParam} --result success --data '{"message":"Task completed"}'
 `
                 };
         }

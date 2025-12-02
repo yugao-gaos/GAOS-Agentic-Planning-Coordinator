@@ -46,8 +46,8 @@ export const ROLE_WORKFLOW_MAP: Record<string, string[]> = {
     // Planning phase roles
     'context_gatherer': ['planning_new', 'task_implementation', 'context_gathering'],
     'planner': ['planning_new', 'planning_revision'],
-    'analyst_codex': ['planning_new', 'planning_revision'],
-    'analyst_gemini': ['planning_new'],
+    'analyst_architect': ['planning_new', 'planning_revision'],
+    'analyst_quality': ['planning_new'],
     'analyst_reviewer': ['planning_new'],
     
     // Execution phase roles

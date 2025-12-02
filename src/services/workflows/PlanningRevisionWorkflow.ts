@@ -50,6 +50,9 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
     private affectedTaskIds: string[] = [];
     private isGlobalRevision: boolean = false;
     
+    // Reserved planner agent - kept for the entire workflow (not released between phases)
+    private plannerAgentName: string | undefined;
+    
     private agentRunner: AgentRunner;
     
     constructor(config: WorkflowConfig, services: WorkflowServices) {
@@ -231,14 +234,20 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
         
         this.log(`Running planner revision (${role?.defaultModel || 'opus-4.5'})...`);
         
-        const result = await this.runAgentTask('planner_revise', prompt, role);
+        // Backup current plan BEFORE streaming starts (streaming will overwrite)
+        const backupPath = this.planPath.replace('.md', `_backup_${Date.now()}.md`);
+        fs.copyFileSync(this.planPath, backupPath);
         
-        if (result.success && result.output) {
-            // Backup current plan before overwriting
-            const backupPath = this.planPath.replace('.md', `_backup_${Date.now()}.md`);
-            fs.copyFileSync(this.planPath, backupPath);
-            
-            fs.writeFileSync(this.planPath, result.output);
+        // Stream revised plan directly to plan file (commentary goes to log)
+        const result = await this.runAgentTask('planner_revise', prompt, role, true);
+        
+        if (result.success) {
+            // Plan was streamed to file; verify it exists
+            if (!fs.existsSync(this.planPath)) {
+                // Fallback: extract from output if streaming didn't produce plan
+                const planContent = this.extractPlanFromOutput(result.output);
+                fs.writeFileSync(this.planPath, planContent);
+            }
             this.log('✓ Plan revised');
         } else {
             throw new Error('Planner revision task failed');
@@ -249,16 +258,16 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
         this.log('');
         this.log('🔍 PHASE: CODEX REVIEW');
         
-        const role = this.getRole('analyst_codex');
+        const role = this.getRole('analyst_architect');
         const prompt = this.buildReviewPrompt(role);
         
-        this.log(`Running analyst_codex (${role?.defaultModel || 'sonnet-4.5'})...`);
+        this.log(`Running analyst_architect (${role?.defaultModel || 'gpt-5.1-codex-high'})...`);
         
         // Use CLI callback for structured completion
         const result = await this.runAgentTaskWithCallback(
-            'analyst_codex_review',
+            'analyst_architect_review',
             prompt,
-            'analyst_codex',
+            'analyst_architect',
             {
                 expectedStage: 'analysis',
                 timeout: role?.timeoutMs || 300000,
@@ -290,9 +299,10 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
                     : this.analystVerdict === 'critical' ? '❌' : '⚠️';
                 this.log(`${icon} Codex verdict via output parsing: ${this.analystVerdict.toUpperCase()}`);
             } else {
-                this.log('⚠️ Codex review failed, treating as pass');
-                this.analystVerdict = 'pass';
-                this.analystOutput = '';
+                // Analyst failed - DON'T silently pass, mark as critical
+                this.log('❌ Codex review FAILED - marking as CRITICAL (requires investigation)');
+                this.analystVerdict = 'critical';
+                this.analystOutput = `### Review Result: CRITICAL\n\n#### Critical Issues\n- Codex analyst failed to complete review\n- Error: ${result.payload?.error || 'Unknown error'}\n\n#### Minor Suggestions\n- None\n`;
             }
         }
     }
@@ -306,10 +316,16 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
         
         this.log('Running planner finalization...');
         
-        const result = await this.runAgentTask('planner_finalize', prompt, role);
+        // Stream finalized plan directly to plan file
+        const result = await this.runAgentTask('planner_finalize', prompt, role, true);
         
-        if (result.success && result.output) {
-            fs.writeFileSync(this.planPath, result.output);
+        if (result.success) {
+            // Plan was streamed to file; verify it exists
+            if (!fs.existsSync(this.planPath)) {
+                // Fallback: extract from output if streaming didn't produce plan
+                const planContent = this.extractPlanFromOutput(result.output);
+                fs.writeFileSync(this.planPath, planContent);
+            }
             this.log('✓ Revision finalized');
         }
         
@@ -374,13 +390,16 @@ ${this.userFeedback}
 3. Update affected tasks and dependencies
 4. Keep task IDs consistent where possible (only change if necessary)
 
-## Output
-Provide the COMPLETE revised plan in markdown format with proper task checkbox format.`;
+## Output Instructions
+Write the revised plan to this EXACT file path:
+\`${this.planPath}\`
+
+Use the write tool to save the plan.`;
     }
     
     private buildReviewPrompt(role: AgentRole | undefined): string {
         if (!role?.promptTemplate) {
-            throw new Error('Missing prompt template for analyst_codex role');
+            throw new Error('Missing prompt template for analyst_architect role');
         }
         const basePrompt = role.promptTemplate;
         
@@ -443,8 +462,11 @@ ${this.analystOutput || 'No review available'}
 3. Update the status to "READY FOR REVIEW (Revised)"
 4. Clean up any formatting issues
 
-## Output
-Provide the FINAL revised plan in markdown format.`;
+## Output Instructions
+Write the finalized plan to this EXACT file path:
+\`${this.planPath}\`
+
+Use the write tool to save the plan. Update the status to "READY FOR REVIEW".`;
     }
     
     // =========================================================================
@@ -454,22 +476,39 @@ Provide the FINAL revised plan in markdown format.`;
     private async runAgentTask(
         taskId: string,
         prompt: string,
-        role: AgentRole | undefined
+        role: AgentRole | undefined,
+        streamToPlanFile: boolean = false
     ): Promise<{ success: boolean; output: string }> {
-        // Request an agent from the pool
         const roleId = role?.id || 'planner';
-        const agentName = await this.requestAgent(roleId);
+        const isPlannerRole = roleId === 'planner';
+        
+        // For planner role, reuse the same agent across phases (don't release between phases)
+        let agentName: string;
+        if (isPlannerRole && this.plannerAgentName) {
+            // Reuse existing planner agent (already in allocatedAgents)
+            agentName = this.plannerAgentName;
+            this.log(`Reusing reserved planner agent: ${agentName}`);
+        } else {
+            // Request a new agent from the pool
+            agentName = await this.requestAgent(roleId);
+            
+            // Remember the planner agent for reuse across phases
+            if (isPlannerRole) {
+                this.plannerAgentName = agentName;
+            }
+        }
+        
+        const workspaceRoot = this.stateManager.getWorkspaceRoot();
+        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
+        
+        if (!fs.existsSync(logDir)) {
+            fs.mkdirSync(logDir, { recursive: true });
+        }
+        
+        // Use workflow ID + agent name for unique temp log file
+        const logFile = path.join(logDir, `${this.id}_${agentName}.log`);
         
         try {
-            const workspaceRoot = this.stateManager.getWorkspaceRoot();
-            const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs');
-            
-            if (!fs.existsSync(logDir)) {
-                fs.mkdirSync(logDir, { recursive: true });
-            }
-            
-            const logFile = path.join(logDir, `${taskId}_${Date.now()}.log`);
-            
             // Prepend continuation context if we were paused mid-task
             const continuationPrompt = this.getContinuationPrompt();
             const fullPrompt = continuationPrompt 
@@ -487,6 +526,7 @@ Provide the FINAL revised plan in markdown format.`;
                 cwd: workspaceRoot,
                 model: role?.defaultModel || 'sonnet-4.5',
                 logFile,
+                planFile: streamToPlanFile ? this.planPath : undefined,
                 timeoutMs: role?.timeoutMs || 600000,
                 onProgress: (msg) => this.log(`  ${msg}`)
             };
@@ -503,8 +543,16 @@ Provide the FINAL revised plan in markdown format.`;
                 output: result.output
             };
         } finally {
-            // Always release the agent back to the pool
-            this.releaseAgent(agentName);
+            // DON'T release planner agent - keep reserved for the workflow
+            // Planner agent will be released by releaseAllAgents() when workflow ends
+            if (!isPlannerRole) {
+                this.releaseAgent(agentName);
+            } else {
+                this.log(`Keeping planner agent ${agentName} reserved (idle but occupied)`);
+            }
+            
+            // Don't delete log file - terminal may still be tailing it
+            // Log files are cleaned up when session ends
         }
     }
     
@@ -515,6 +563,53 @@ Provide the FINAL revised plan in markdown format.`;
         this.analystVerdict = verdictMatch 
             ? verdictMatch[1].toLowerCase() as AnalystVerdict 
             : 'pass';
+    }
+    
+    /**
+     * Extract the actual plan content from agent output.
+     * Agents often include reasoning/commentary before the plan - this extracts just the plan.
+     */
+    private extractPlanFromOutput(output: string): string {
+        // Look for the start of actual plan content using common patterns
+        const planStartPatterns = [
+            // Plan title headers
+            /^(#\s+[^\n]*(?:Plan|Migration|Implementation|Execution)[^\n]*)/mi,
+            // Metadata line at start of plan
+            /^(\*\*Project:\*\*)/mi,
+            // Horizontal rule followed by header (common wrapper)
+            /^(---\s*\n+#)/m,
+            // Overview section
+            /^(##\s+Overview)/mi,
+            // Document metadata block
+            /^(>\s*\*\*[A-Z])/m,
+        ];
+        
+        for (const pattern of planStartPatterns) {
+            const match = output.match(pattern);
+            if (match && match.index !== undefined) {
+                const extracted = output.substring(match.index);
+                // Verify we extracted something substantial (at least 100 chars)
+                if (extracted.length > 100) {
+                    return extracted;
+                }
+            }
+        }
+        
+        // Fallback: If output starts with commentary (lowercase sentence), 
+        // try to find where the plan actually starts
+        if (/^[a-z]/.test(output.trim())) {
+            // Look for first markdown header
+            const headerMatch = output.match(/^(#+ .+)/m);
+            if (headerMatch && headerMatch.index !== undefined && headerMatch.index > 0) {
+                const extracted = output.substring(headerMatch.index);
+                if (extracted.length > 100) {
+                    return extracted;
+                }
+            }
+        }
+        
+        // Last resort: return as-is
+        return output;
     }
     
     private updatePlanStatus(): void {

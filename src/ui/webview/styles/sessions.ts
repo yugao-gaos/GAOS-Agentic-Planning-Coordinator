@@ -144,15 +144,24 @@ export const sessionStyles = `
     display: block;
 }
 
-/* Sub-items within session */
+/* ===== TREE INDENTATION SYSTEM =====
+ * Level 0: Session header (chevron + dot + title)
+ * Level 1: Sub-items (icon column aligned at 24px from left)
+ * Level 2: Nested items under expandable (icon at 40px)
+ * Level 3: Deep nested items like workflow history items (icon at 56px)
+ */
+
+/* Sub-items within session (Level 1) */
 .sub-item {
     display: flex;
     align-items: center;
-    padding: 6px 8px 6px 28px;
+    padding: 5px 8px;
+    padding-left: 24px;  /* Align icon column with content after header chevron */
     font-size: 11px;
     border-bottom: 1px solid var(--vscode-widget-border);
-    gap: 8px;
+    gap: 6px;
     cursor: pointer;
+    min-height: 26px;
 }
 
 .sub-item:hover {
@@ -168,6 +177,9 @@ export const sessionStyles = `
     height: 14px;
     opacity: 0.7;
     flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
 }
 
 .sub-item-icon svg {
@@ -211,6 +223,11 @@ export const sessionStyles = `
     50% { opacity: 0.7; transform: scale(1.05); }
 }
 
+/* Expandable sub-item with chevron */
+.sub-item.expandable {
+    padding-left: 8px;  /* Reset padding for items with chevron */
+}
+
 /* Coordinator expand/collapse */
 .sub-item-expand {
     width: 16px;
@@ -220,13 +237,13 @@ export const sessionStyles = `
     justify-content: center;
     transition: transform 0.15s ease;
     flex-shrink: 0;
-    margin-right: 4px;
 }
 
 .sub-item-expand svg {
     width: 10px;
     height: 10px;
     fill: currentColor;
+    opacity: 0.6;
 }
 
 .coordinator-header.expanded .sub-item-expand {
@@ -235,20 +252,21 @@ export const sessionStyles = `
 
 .coordinator-children {
     display: none;
-    padding-left: 12px;
 }
 
 .coordinator-children.expanded {
     display: block;
 }
 
-/* Nested items under coordinator */
+/* Nested items under coordinator (Level 2) */
 .nested-item {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 6px 8px 6px 32px;
+    gap: 6px;
+    padding: 4px 8px;
+    padding-left: 40px;  /* Indent from level 1 */
     font-size: 11px;
+    min-height: 24px;
 }
 
 .nested-icon {
@@ -257,6 +275,7 @@ export const sessionStyles = `
     display: flex;
     align-items: center;
     justify-content: center;
+    flex-shrink: 0;
 }
 
 .nested-icon svg {
@@ -311,6 +330,11 @@ export const sessionStyles = `
 
 .failed-header {
     margin-top: 4px;
+}
+
+/* Deep nested items (Level 3) - e.g., workflow history items */
+.nested-item.level-3 {
+    padding-left: 56px;
 }
 
 /* Sub-item action buttons */
@@ -386,7 +410,7 @@ export const sessionStyles = `
     .sub-item {
         flex-wrap: wrap;
         gap: 4px;
-        padding: 6px 8px 6px 20px;
+        padding: 6px 8px 6px 12px;
     }
     
     .sub-item-label {
@@ -416,8 +440,8 @@ export const sessionStyles = `
     .workflow-item {
         flex-wrap: wrap;
         gap: 4px;
-        padding: 5px 8px 5px 36px;
-        margin-left: 24px;
+        padding: 5px 8px 5px 24px;
+        margin-left: 0;
     }
     
     .workflow-info {

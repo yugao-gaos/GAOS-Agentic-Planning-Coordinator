@@ -22,6 +22,8 @@ export interface WorkflowInfo {
     percentage: number;
     startedAt: string;
     taskId?: string;
+    /** Path to workflow log file */
+    logPath?: string;
 }
 
 export interface SessionInfo {

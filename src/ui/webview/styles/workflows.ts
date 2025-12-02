@@ -2,15 +2,16 @@
  * Workflow item styles.
  */
 export const workflowStyles = `
-/* Workflow items under coordinator */
+/* Workflow items under coordinator (Level 3 indentation) */
 .workflow-item {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 5px 8px 5px 48px;
+    gap: 6px;
+    padding: 4px 8px;
+    padding-left: 56px;  /* Level 3 indentation to align with history items */
     font-size: 10px;
     border-left: 2px solid rgba(0, 122, 204, 0.3);
-    margin-left: 32px;
+    margin-left: 0;
 }
 
 .workflow-item.running {

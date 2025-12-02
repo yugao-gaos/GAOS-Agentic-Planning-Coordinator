@@ -756,8 +756,8 @@ export class UnifiedCoordinatorService {
             'context_gatherer': 'context',
             'code_reviewer': 'reviewer',
             'planner': 'engineer',  // Planner uses engineer role for tracking
-            'analyst_codex': 'reviewer',
-            'analyst_gemini': 'reviewer',
+            'analyst_architect': 'reviewer',
+            'analyst_quality': 'reviewer',
             'analyst_reviewer': 'reviewer'
         };
         return mapping[roleId] || 'engineer';

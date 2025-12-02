@@ -130,7 +130,7 @@ function renderWorkflowItem(wf: WorkflowInfo, agent?: AgentInfo): string {
     const agentBadge = agent ? `<span class="workflow-agent" style="color: ${agent.roleColor || '#f97316'};">${agent.name}</span>` : '';
     
     return `
-        <div class="workflow-item ${wf.status}" data-action="openProgressLog" title="Click to view progress log" style="cursor: pointer;">
+        <div class="workflow-item ${wf.status}" data-action="openWorkflowLog" data-workflow-log="${wf.logPath || ''}" title="Click to view workflow log" style="cursor: pointer;">
             <div class="workflow-type-icon ${typeInfo.class}">
                 ${typeInfo.icon}
             </div>
@@ -169,14 +169,12 @@ function renderHistoryItem(wf: WorkflowInfo): string {
         : '<span style="color: #f14c4c;">✗</span>';
     
     return `
-        <div class="workflow-item history ${wf.status}" style="opacity: 0.7;">
-            <div class="workflow-type-icon ${typeInfo.class}" style="opacity: 0.6;">
+        <div class="nested-item level-3 history-item ${wf.status}">
+            <div class="nested-icon ${typeInfo.class}" style="opacity: 0.6;">
                 ${typeInfo.icon}
             </div>
-            <div class="workflow-info">
-                <span class="workflow-type-label">${label}</span>
-                <span class="workflow-phase">${statusIcon} ${wf.phase}</span>
-            </div>
+            <span class="nested-label" style="opacity: 0.7;">${label}</span>
+            <span class="workflow-phase" style="font-size: 10px; opacity: 0.7;">${statusIcon} ${wf.phase}</span>
         </div>
     `;
 }
@@ -215,7 +213,7 @@ function renderFailedTasks(failedTasks: FailedTaskInfo[]): string {
             <span class="nested-label" style="color: #f14c4c;">Failed Tasks (${failedTasks.length})</span>
         </div>
         ${failedTasks.map(ft => `
-            <div class="nested-item nested-failed" style="padding-left: 48px;">
+            <div class="nested-item level-3 nested-failed">
                 <span class="nested-label" title="${escapeHtml(ft.lastError)}">
                     ${ft.taskId}: ${escapeHtml(ft.description.substring(0, 30))}...
                 </span>
@@ -306,7 +304,7 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                 ` : ''}
                 
                 <!-- Coordinator sub-item (expandable) -->
-                <div class="sub-item coordinator-header" data-coord-toggle="${session.id}">
+                <div class="sub-item expandable coordinator-header" data-coord-toggle="${session.id}">
                     <div class="sub-item-expand">
                         ${ICONS.chevronRight}
                     </div>
@@ -333,14 +331,14 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                     
                     <!-- Workflow History (completed, newest first) -->
                     ${session.workflowHistory && session.workflowHistory.length > 0 ? `
-                        <div class="nested-item" style="margin-top: 8px;">
+                        <div class="nested-item">
                             <div class="nested-icon" style="color: #6b7280;">
                                 ${ICONS.list}
                             </div>
                             <span class="nested-label" style="opacity: 0.7;">History (${session.workflowHistory.length})</span>
                         </div>
                         ${session.workflowHistory.slice(0, 5).map(wf => renderHistoryItem(wf)).join('')}
-                        ${session.workflowHistory.length > 5 ? `<div class="nested-item" style="opacity: 0.5; font-size: 10px; padding-left: 32px;">+ ${session.workflowHistory.length - 5} more</div>` : ''}
+                        ${session.workflowHistory.length > 5 ? `<div class="nested-item level-3" style="opacity: 0.5; font-size: 10px;">+ ${session.workflowHistory.length - 5} more</div>` : ''}
                     ` : ''}
                     
                     <!-- Failed Tasks -->

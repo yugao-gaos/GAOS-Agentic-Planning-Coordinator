@@ -228,7 +228,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         
         this.log(`Running context gatherer (${role?.defaultModel || 'gemini-3-pro'})...`);
         
-        const result = await this.runAgentTask('context', prompt, role);
+        const result = await this.runAgentTask('context', prompt, role, this.contextAgentName);
         
         if (result.success && result.output) {
             // Save context brief
@@ -380,8 +380,8 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         if (this.reviewResult === 'changes_requested') {
             if (this.reviewIterations < TaskImplementationWorkflow.MAX_REVIEW_ITERATIONS) {
                 this.log(`Changes requested - looping back to implement (iteration ${this.reviewIterations + 1})`);
-                // Loop back to implement phase (index 1)
-                this.phaseIndex = 0; // Will be incremented to 1
+                // Loop back to implement phase (index 0) - set to -1 since runPhases increments
+                this.phaseIndex = -1; // Will be incremented to 0 (implement)
             } else {
                 this.log(`⚠️ Max review iterations reached, proceeding despite changes`);
                 this.reviewResult = 'approved';
@@ -402,7 +402,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         
         this.log(`Running context gatherer in delta mode (${role?.defaultModel || 'gemini-3-pro'})...`);
         
-        const result = await this.runAgentTask('delta_context', prompt, role);
+        const result = await this.runAgentTask('delta_context', prompt, role, this.contextAgentName);
         
         if (result.success) {
             this.log(`✓ Delta context updated`);
@@ -654,16 +654,18 @@ Keep updates concise and focused on what changed.`;
     private async runAgentTask(
         taskId: string,
         prompt: string,
-        role: AgentRole | undefined
+        role: AgentRole | undefined,
+        agentName?: string
     ): Promise<{ success: boolean; output: string }> {
         const workspaceRoot = this.stateManager.getWorkspaceRoot();
-        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs');
+        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
         
         if (!fs.existsSync(logDir)) {
             fs.mkdirSync(logDir, { recursive: true });
         }
         
-        const logFile = path.join(logDir, `${this.taskId}_${taskId}_${Date.now()}.log`);
+        // Use workflow ID + agent name for unique temp log file
+        const logFile = path.join(logDir, `${this.id}_${agentName || 'agent'}.log`);
         
         // Prepend continuation context if we were force-paused mid-agent
         let finalPrompt = prompt;
@@ -697,6 +699,13 @@ Keep updates concise and focused on what changed.`;
         } finally {
             // Clear the agent run ID when done
             this.currentAgentRunId = undefined;
+            
+            // Clean up temp log file (streaming was for real-time terminal viewing)
+            try {
+                if (fs.existsSync(logFile)) {
+                    fs.unlinkSync(logFile);
+                }
+            } catch { /* ignore cleanup errors */ }
         }
     }
     

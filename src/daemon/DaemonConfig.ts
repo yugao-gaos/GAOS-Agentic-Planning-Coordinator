@@ -56,7 +56,7 @@ export interface CoreConfig {
  */
 export const DEFAULT_CONFIG: Omit<CoreConfig, 'workspaceRoot'> = {
     workingDirectory: '_AiDevLog',
-    agentPoolSize: 5,
+    agentPoolSize: 10,
     defaultBackend: 'cursor',
     useIterativePlanning: true,
     stateUpdateInterval: 5000,

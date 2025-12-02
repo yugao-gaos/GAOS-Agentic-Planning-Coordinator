@@ -29,8 +29,10 @@ export interface AgentRunOptions {
     cwd: string;
     /** Model to use (default: sonnet-4.5) */
     model?: string;
-    /** Log file path to write output */
+    /** Log file path to write streaming output (commentary, reasoning, tool calls) */
     logFile?: string;
+    /** Plan file path to stream plan content to (markdown starting with #) */
+    planFile?: string;
     /** Timeout in milliseconds (default: 30 minutes) */
     timeoutMs?: number;
     /** Callback for streaming output */
@@ -58,7 +60,20 @@ export class CursorAgentRunner implements IAgentBackend {
         proc: ChildProcess;
         startTime: number;
         collectedOutput: string;
+        lastLoggedLength: number;  // Track cumulative commentary logged to avoid duplication
+        lastPlanLength: number;    // Track cumulative plan content written
+        planStartIndex: number;    // Index where plan content starts (-1 if not found)
+        lastOutputTime: number;    // Timestamp of last output (for idle detection)
+        idleInterval?: NodeJS.Timeout;  // Interval for idle indicator
+        idleSpinnerIndex: number;  // Current spinner frame index
     }> = new Map();
+    
+    // Track runs that were intentionally stopped (so we don't log them as failures)
+    private stoppedIntentionally: Set<string> = new Set();
+    
+    // Spinner animation frames for idle indicator
+    private static readonly SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    private static readonly IDLE_THRESHOLD_MS = 5000;  // 5 seconds
 
     constructor() {
         this.processManager = ServiceLocator.resolve(ProcessManager);
@@ -74,6 +89,7 @@ export class CursorAgentRunner implements IAgentBackend {
             cwd,
             model = 'sonnet-4.5',
             logFile,
+            planFile,
             timeoutMs = 30 * 60 * 1000,  // 30 minutes default
             onOutput,
             onProgress,
@@ -120,7 +136,38 @@ export class CursorAgentRunner implements IAgentBackend {
                 onProgress?.(`📡 Process started (PID: ${proc.pid})`);
             }
 
-            this.activeRuns.set(id, { proc, startTime, collectedOutput: '' });
+            const runEntry = {
+                proc,
+                startTime,
+                collectedOutput: '',
+                lastLoggedLength: 0,
+                lastPlanLength: 0,
+                planStartIndex: -1,
+                lastOutputTime: Date.now(),
+                idleInterval: undefined as NodeJS.Timeout | undefined,
+                idleSpinnerIndex: 0
+            };
+            this.activeRuns.set(id, runEntry);
+            
+            // Set up idle indicator interval (check every second)
+            if (logFile) {
+                runEntry.idleInterval = setInterval(() => {
+                    const run = this.activeRuns.get(id);
+                    if (!run) return;
+                    
+                    const idleTime = Date.now() - run.lastOutputTime;
+                    if (idleTime >= CursorAgentRunner.IDLE_THRESHOLD_MS) {
+                        // Show animated spinner
+                        const frame = CursorAgentRunner.SPINNER_FRAMES[run.idleSpinnerIndex % CursorAgentRunner.SPINNER_FRAMES.length];
+                        run.idleSpinnerIndex++;
+                        
+                        // Use ANSI escape to overwrite the same line
+                        // \r moves cursor to start of line, \x1B[K clears to end of line
+                        const seconds = Math.floor(idleTime / 1000);
+                        this.appendToLog(logFile, `\r\x1B[K${this.COLORS.gray}${frame} Working... (${seconds}s)${this.COLORS.reset}`);
+                    }
+                }, 1000);
+            }
 
             // Register the externally-spawned process with ProcessManager for tracking
             // This ensures the process can be found by killStuckProcesses() and killOrphanCursorAgents()
@@ -163,10 +210,11 @@ export class CursorAgentRunner implements IAgentBackend {
                 // Parse each line as JSON
                 const lines = text.split('\n').filter((l: string) => l.trim());
                 for (const line of lines) {
-                    this.parseLine(line, {
+                    this.parseLine(line, id, {
                         onOutput,
                         onProgress,
                         logFile,
+                        planFile,
                         collectedOutput: (text) => { collectedOutput += text; }
                     });
                 }
@@ -189,6 +237,11 @@ export class CursorAgentRunner implements IAgentBackend {
                 exitCode = code;
                 const duration = Date.now() - startTime;
 
+                // Clear idle interval before deleting from activeRuns
+                const exitingRun = this.activeRuns.get(id);
+                if (exitingRun?.idleInterval) {
+                    clearInterval(exitingRun.idleInterval);
+                }
                 this.activeRuns.delete(id);
                 
                 // Clean up temp prompt file (in case shell didn't delete it)
@@ -200,15 +253,25 @@ export class CursorAgentRunner implements IAgentBackend {
                     // Ignore cleanup errors
                 }
 
-                const success = code === 0 && !error;
+                // Check if this was an intentional stop (e.g., after CLI callback completed)
+                const wasStoppedIntentionally = this.stoppedIntentionally.has(id);
+                if (wasStoppedIntentionally) {
+                    this.stoppedIntentionally.delete(id);  // Clean up
+                }
+
+                // Success if: clean exit (code 0), OR intentionally stopped (CLI callback completed)
+                const success = (code === 0 && !error) || wasStoppedIntentionally;
                 const statusIcon = success ? '✅' : '❌';
-                onProgress?.(`${statusIcon} Agent finished (exit code: ${code}, duration: ${Math.round(duration / 1000)}s)`);
+                const statusText = wasStoppedIntentionally 
+                    ? 'Agent work completed successfully' 
+                    : `Agent finished (exit code: ${code})`;
+                onProgress?.(`${statusIcon} ${statusText}, duration: ${Math.round(duration / 1000)}s`);
 
                 if (logFile) {
                     const C = this.COLORS;
                     const color = success ? C.green : C.red;
                     this.appendToLog(logFile, `\n\n${C.gray}---${C.reset}\n`);
-                    this.appendToLog(logFile, `${color}${C.bold}${statusIcon} Agent finished: ${new Date().toISOString()}${C.reset}\n`);
+                    this.appendToLog(logFile, `${color}${C.bold}${statusIcon} ${statusText}: ${new Date().toISOString()}${C.reset}\n`);
                     this.appendToLog(logFile, `${C.gray}Exit code: ${code}${C.reset}\n`);
                     this.appendToLog(logFile, `${C.gray}Duration: ${Math.round(duration / 1000)}s${C.reset}\n`);
                 }
@@ -227,6 +290,11 @@ export class CursorAgentRunner implements IAgentBackend {
                 error = err.message;
                 onOutput?.(err.message, 'error');
                 
+                // Clear idle interval before deleting from activeRuns
+                const errorRun = this.activeRuns.get(id);
+                if (errorRun?.idleInterval) {
+                    clearInterval(errorRun.idleInterval);
+                }
                 this.activeRuns.delete(id);
                 
                 // Clean up temp prompt file
@@ -262,17 +330,22 @@ export class CursorAgentRunner implements IAgentBackend {
 
     /**
      * Parse a single line of cursor agent output
+     * @param line The JSON line to parse
+     * @param runId The ID of the current run (for delta tracking)
+     * @param handlers Output handlers
      */
     private parseLine(
         line: string,
+        runId: string,
         handlers: {
             onOutput?: (text: string, type: 'text' | 'thinking' | 'tool' | 'tool_result' | 'error' | 'info') => void;
             onProgress?: (message: string) => void;
             logFile?: string;
+            planFile?: string;
             collectedOutput: (text: string) => void;
         }
     ): void {
-        const { onOutput, onProgress, logFile, collectedOutput } = handlers;
+        const { onOutput, onProgress, logFile, planFile, collectedOutput } = handlers;
         const C = this.COLORS;
 
         try {
@@ -293,18 +366,70 @@ export class CursorAgentRunner implements IAgentBackend {
             }
 
             // Format 2: type="assistant" with message.content[0].text
-            // NOTE: With --stream-partial-output, assistant messages contain CUMULATIVE text
-            // (each message includes all previous text). Do NOT collect here to avoid duplication.
-            // Only use for progress display. Final output comes from type="result".
+            // NOTE: With --stream-partial-output, assistant messages contain CUMULATIVE text.
+            // We split content into:
+            //   - Commentary (before plan starts) → log file
+            //   - Plan content (starting from first # header) → plan file
             else if (msgType === 'assistant' && parsed?.message?.content) {
                 for (const item of parsed.message.content) {
                     if (item?.type === 'text' && item?.text) {
                         // Don't collect partial outputs - they accumulate and cause duplication
                         // collectedOutput is only called for type="result" (final output)
                         onOutput?.(item.text, 'text');
-                        // Write text content to log for debugging (but not to collectedOutput)
-                        if (logFile) {
-                            this.appendToLog(logFile, item.text);
+                        
+                        const run = this.activeRuns.get(runId);
+                        if (run) {
+                            // Update last output time for idle detection
+                            run.lastOutputTime = Date.now();
+                            run.idleSpinnerIndex = 0;  // Reset spinner
+                            
+                            // Find where plan content starts (first markdown header)
+                            if (run.planStartIndex === -1) {
+                                const planMatch = item.text.match(/^#\s+.+/m);
+                                if (planMatch && planMatch.index !== undefined) {
+                                    run.planStartIndex = planMatch.index;
+                                }
+                            }
+                            
+                            const planStart = run.planStartIndex;
+                            
+                            if (planStart === -1) {
+                                // No plan content yet - all goes to log
+                                if (logFile) {
+                                    const newContent = item.text.substring(run.lastLoggedLength);
+                                    if (newContent) {
+                                        this.appendToLog(logFile, newContent);
+                                        run.lastLoggedLength = item.text.length;
+                                    }
+                                }
+                            } else {
+                                // Split: commentary (before planStart) → log, plan content → planFile
+                                const commentaryPart = item.text.substring(0, planStart);
+                                const planPart = item.text.substring(planStart);
+                                
+                                // Write delta of commentary to log
+                                if (logFile && run.lastLoggedLength < commentaryPart.length) {
+                                    const newCommentary = commentaryPart.substring(run.lastLoggedLength);
+                                    if (newCommentary) {
+                                        this.appendToLog(logFile, newCommentary);
+                                    }
+                                    run.lastLoggedLength = commentaryPart.length;
+                                }
+                                
+                                // Write delta of plan content to plan file
+                                if (planFile && planPart.length > 0) {
+                                    const planDelta = planPart.substring(run.lastPlanLength);
+                                    if (planDelta) {
+                                        // If this is the first plan content, truncate the file
+                                        if (run.lastPlanLength === 0) {
+                                            fs.writeFileSync(planFile, planDelta);
+                                        } else {
+                                            fs.appendFileSync(planFile, planDelta);
+                                        }
+                                        run.lastPlanLength = planPart.length;
+                                    }
+                                }
+                            }
                         }
                         
                         // Show progress for meaningful content
@@ -388,6 +513,7 @@ export class CursorAgentRunner implements IAgentBackend {
 
     /**
      * Stop a running agent by ID
+     * Marks the agent as intentionally stopped so exit handler shows success
      */
     async stop(id: string): Promise<boolean> {
         const run = this.activeRuns.get(id);
@@ -395,6 +521,9 @@ export class CursorAgentRunner implements IAgentBackend {
             return false;
         }
 
+        // Mark as intentionally stopped before killing
+        // This tells the exit handler to show success instead of failure
+        this.stoppedIntentionally.add(id);
         this.killProcess(id, run.proc);
         return true;
     }
@@ -512,6 +641,12 @@ export class CursorAgentRunner implements IAgentBackend {
     }
 
     private killProcess(id: string, proc: ChildProcess): void {
+        // Clear idle interval before killing
+        const run = this.activeRuns.get(id);
+        if (run?.idleInterval) {
+            clearInterval(run.idleInterval);
+        }
+        
         try {
             if (proc.pid && process.platform !== 'win32') {
                 // Kill the entire process group
