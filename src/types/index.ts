@@ -813,59 +813,40 @@ export const DefaultSystemPrompts: Record<string, Partial<SystemPromptConfig> & 
 
 Your job is to make intelligent decisions about task dispatch, workflow selection, and coordination based on the current situation.`,
 
-        decisionInstructions: `Based on the triggering event, plan, history, and current state above, decide what actions to take.
+        decisionInstructions: `Based on the triggering event, current state, and plan, decide what actions to take.
+
+## FIRST: Read the Plan
+Use read_file to read the plan at: {{planPath}}
+Look for the Task Breakdown table to identify tasks and their dependencies.
 
 ## Key Principles
-1. **For execution_started**: Read the plan and create initial tasks (2-4 at a time based on available agents)
-2. **Task Dependencies**: Only start tasks whose dependencies are complete
-3. **Parallelization**: Create/start multiple tasks in the same response to run them in parallel
-4. **Error Grouping**: Group related errors in same file into ONE task
+1. **Task Dependencies**: Only start tasks whose dependencies are complete
+2. **Parallelization**: Create/start 2-4 tasks at a time based on available agents
+3. **Error Grouping**: Group related errors in same file into ONE task
 
 ## Available Workflows
 {{WORKFLOW_SELECTION}}
 
 ## Commands (use run_terminal_cmd tool)
 
-**Create a task from the plan:**
-\`\`\`bash
-apc task create --session {{sessionId}} --id T1 --desc "Create UserService" --deps T2,T3 --type implementation
-\`\`\`
+**Create task:** \`apc task create --session {{sessionId}} --id T1 --desc "Task description" --type implementation\`
+**Start task:** \`apc task start --session {{sessionId}} --id T1 --workflow task_implementation\`
+**With dependencies:** \`apc task create --session {{sessionId}} --id T2 --desc "..." --deps T1 --type implementation\`
 
-**Start workflow on a task:**
-\`\`\`bash
-apc task start --session {{sessionId}} --id T1 --workflow task_implementation
-\`\`\`
+## What To Do
 
-**Mark task complete:**
-\`\`\`bash
-apc task complete --session {{sessionId}} --id T1 --summary "Done"
-\`\`\`
-
-**Create and start error fix task:**
-\`\`\`bash
-apc task create --session {{sessionId}} --id ERR_001 --desc "Fix CS0246 errors" --type error_fix --priority -1 --error-text "Foo.cs(10): CS0246"
-apc task start --session {{sessionId}} --id ERR_001 --workflow error_resolution
-\`\`\`
-
-## What To Do Now
-
-Look at the TRIGGERING EVENT above and take appropriate action:
-
-- **execution_started**: Read the plan, identify tasks with no dependencies or satisfied dependencies, create and start 2-4 tasks based on available agents count.
-- **workflow_completed**: Check if dependent tasks can now start. Create and start next batch of tasks.
-- **workflow_failed**: Decide if task should be retried or marked failed.
-- **unity_error**: Create error_fix tasks and start error_resolution workflows.
-- **agent_available**: Check if there are ready tasks waiting for agents, start them.
+1. **Read the plan file** to understand the tasks
+2. **Look at TRIGGERING EVENT** to know what happened
+3. **Create and start tasks** that are ready (no blocking dependencies)
 
 ## Your Response
 
-1. Execute the needed apc commands using run_terminal_cmd
-2. At the end, provide:
+After executing commands, provide:
 
-REASONING: <Brief explanation of your decisions>
+REASONING: <Brief explanation>
 CONFIDENCE: <0.0-1.0>
 
-Now analyze and execute:`
+Now read the plan and execute:`
     },
     
     unity_polling: {

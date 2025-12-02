@@ -237,7 +237,6 @@ export class CoordinatorAgent {
      * 3. decisionInstructions (configurable) - Decision guidelines and output format
      */
     private buildPrompt(input: CoordinatorInput): string {
-        const planContent = this.getPlanContent(input);
         const historySection = this.formatHistory(input.history);
         const tasksSection = this.formatTasks(input.tasks);
         const workflowsSection = this.formatWorkflows(input.activeWorkflows);
@@ -257,7 +256,8 @@ export class CoordinatorAgent {
         const decisionInstructions = promptConfig.decisionInstructions
             .replace('{{sessionId}}', input.sessionId)
             .replace('{{timestamp}}', String(Date.now()))
-            .replace('{{WORKFLOW_SELECTION}}', workflowPrompts || 'No workflows registered');
+            .replace('{{WORKFLOW_SELECTION}}', workflowPrompts || 'No workflows registered')
+            .replace('{{planPath}}', input.planPath || 'N/A');
         
         return `${promptConfig.roleIntro}
 
@@ -272,8 +272,9 @@ THE PLAN
 ═══════════════════════════════════════════════════════════════════════════════
 
 Requirement: ${input.planRequirement}
+Plan File: ${input.planPath || 'N/A'}
 
-${planContent}
+**Read the plan file using read_file tool to see task breakdown.**
 
 ═══════════════════════════════════════════════════════════════════════════════
 DECISION HISTORY (${input.history.length} previous evaluations)
