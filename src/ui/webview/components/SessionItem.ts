@@ -8,26 +8,36 @@ import { escapeHtml } from '../helpers';
 /**
  * Workflow type configuration for icons and labels.
  */
-const WORKFLOW_TYPE_INFO: Record<string, { icon: string; class: string; label: string }> = {
+const WORKFLOW_TYPE_INFO: Record<string, { icon: string; class: string; label: string; shortLabel: string }> = {
     'planning_new': {
         icon: ICONS.planning,
         class: 'planning',
-        label: 'Planning'
+        label: 'Planning',
+        shortLabel: 'planning'
     },
     'planning_revision': {
         icon: ICONS.revision,
         class: 'planning',
-        label: 'Revision'
+        label: 'Revision',
+        shortLabel: 'revision'
     },
     'task_implementation': {
         icon: ICONS.task,
         class: 'task',
-        label: 'Task'  // Will be overridden with taskId if available
+        label: 'Task',
+        shortLabel: 'impl'
     },
     'error_resolution': {
         icon: ICONS.error,
         class: 'error',
-        label: 'Error Fix'
+        label: 'Error Fix',
+        shortLabel: 'error_fix'
+    },
+    'context_gathering': {
+        icon: ICONS.document,
+        class: 'context',
+        label: 'Context',
+        shortLabel: 'context'
     }
 };
 
@@ -118,12 +128,14 @@ function renderWorkflowItem(wf: WorkflowInfo, agents: AgentInfo[]): string {
     const typeInfo = WORKFLOW_TYPE_INFO[wf.type] || {
         icon: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/></svg>',
         class: '',
-        label: wf.type
+        label: wf.type,
+        shortLabel: wf.type
     };
     
-    // Use taskId as label for task workflows
-    const label = wf.type === 'task_implementation' && wf.taskId 
-        ? wf.taskId 
+    // Build label: "taskId workflow_type" for task workflows, just "workflow_type" otherwise
+    // e.g., "T1 impl" or "T2 error_fix" or "Planning"
+    const label = wf.taskId 
+        ? `${wf.taskId} ${typeInfo.shortLabel}`
         : typeInfo.label;
     
     // Build agent badges for all agents working on this workflow
@@ -164,12 +176,13 @@ function renderHistoryItem(wf: WorkflowInfo): string {
     const typeInfo = WORKFLOW_TYPE_INFO[wf.type] || {
         icon: '<svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/></svg>',
         class: '',
-        label: wf.type
+        label: wf.type,
+        shortLabel: wf.type
     };
     
-    // Use taskId as label for task workflows
-    const label = wf.type === 'task_implementation' && wf.taskId 
-        ? wf.taskId 
+    // Build label: "taskId workflow_type" for task workflows, just "workflow_type" otherwise
+    const label = wf.taskId 
+        ? `${wf.taskId} ${typeInfo.shortLabel}`
         : typeInfo.label;
     
     const statusIcon = wf.status === 'completed' 
@@ -194,7 +207,14 @@ function renderHistoryItem(wf: WorkflowInfo): string {
 function findAgentsForWorkflow(wf: WorkflowInfo, agents: AgentInfo[]): AgentInfo[] {
     if (!agents || agents.length === 0) return [];
     
-    // Map workflow types to roles that could be working on them
+    // First, try to match by workflowId (preferred - exact match)
+    const workflowIdMatches = agents.filter(a => a.workflowId && a.workflowId === wf.id);
+    if (workflowIdMatches.length > 0) {
+        return workflowIdMatches;
+    }
+    
+    // Fall back to role-based matching only if no workflowId matches found
+    // (for backwards compatibility during transitions)
     const rolesForType: Record<string, string[]> = {
         'planning_new': ['planner', 'analyst_architect', 'analyst_quality'],
         'planning_revision': ['planner', 'analyst_architect', 'analyst_quality', 'analyst_reviewer'],

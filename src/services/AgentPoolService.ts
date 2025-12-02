@@ -46,13 +46,14 @@ export class AgentPoolService {
         return [...this.stateManager.getAgentPoolState().available];
     }
 
-    getBusyAgents(): Array<{ name: string; roleId?: string; coordinatorId: string; sessionId: string; task?: string }> {
+    getBusyAgents(): Array<{ name: string; roleId?: string; coordinatorId: string; sessionId: string; workflowId?: string; task?: string }> {
         const state = this.stateManager.getAgentPoolState();
         return Object.entries(state.busy).map(([name, info]) => ({
             name,
             roleId: info.roleId,
             coordinatorId: info.coordinatorId,
             sessionId: info.sessionId,
+            workflowId: info.workflowId,
             task: info.task
         }));
     }
@@ -87,6 +88,7 @@ export class AgentPoolService {
                 status: 'busy',
                 coordinatorId: busyInfo.coordinatorId,
                 sessionId: busyInfo.sessionId,
+                workflowId: busyInfo.workflowId,
                 task: busyInfo.task,
                 logFile: busyInfo.logFile,
                 processId: busyInfo.processId

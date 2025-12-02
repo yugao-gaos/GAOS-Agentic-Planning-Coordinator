@@ -94,7 +94,7 @@ export class DependencyMapPanel {
         // Create new panel
         const panel = vscode.window.createWebviewPanel(
             'apcDependencyMap',
-            `Task Dependencies - ${sessionId.substring(0, 8)}`,
+            `Task Dependencies - ${sessionId}`,
             column || vscode.ViewColumn.One,
             {
                 enableScripts: true,
@@ -136,16 +136,22 @@ export class DependencyMapPanel {
         let tasks: ManagedTask[] = [];
         let allTasks: ManagedTask[] = [];
 
+        console.log(`[DependencyMapPanel] getTasks() called for sessionId: ${this.sessionId}`);
+
         if (this.vsCodeClient) {
             try {
                 // Get tasks for this session
+                console.log(`[DependencyMapPanel] Querying daemon for tasks with sessionId: ${this.sessionId}`);
                 const response = await this.vsCodeClient.send<{ data: ManagedTask[] }>('task.list', { sessionId: this.sessionId });
                 tasks = response.data || [];
+                console.log(`[DependencyMapPanel] Daemon returned ${tasks.length} tasks for session ${this.sessionId}`);
                 
                 // If no tasks for this session, get all tasks to check other sessions
                 if (tasks.length === 0) {
+                    console.log(`[DependencyMapPanel] No tasks found, fetching all tasks to check other sessions`);
                     const allResponse = await this.vsCodeClient.send<{ data: ManagedTask[] }>('task.list', {});
                     allTasks = allResponse.data || [];
+                    console.log(`[DependencyMapPanel] Found ${allTasks.length} total tasks across all sessions`);
                 }
             } catch (err) {
                 console.error('[DependencyMapPanel] Failed to fetch tasks from daemon:', err);
@@ -155,11 +161,14 @@ export class DependencyMapPanel {
         // Fallback to local TaskManager
         if (tasks.length === 0) {
             try {
+                console.log(`[DependencyMapPanel] Falling back to local TaskManager`);
                 const taskManager = ServiceLocator.resolve(TaskManager);
                 tasks = taskManager.getTasksForSession(this.sessionId);
+                console.log(`[DependencyMapPanel] TaskManager returned ${tasks.length} tasks for session ${this.sessionId}`);
                 
                 if (tasks.length === 0) {
                     allTasks = taskManager.getAllTasks();
+                    console.log(`[DependencyMapPanel] TaskManager has ${allTasks.length} total tasks across all sessions`);
                 }
             } catch (err) {
                 console.error('[DependencyMapPanel] TaskManager not available:', err);
@@ -262,11 +271,17 @@ export class DependencyMapPanel {
      * Update the webview content
      */
     private async updateWebviewContent(): Promise<void> {
+        console.log(`[DependencyMapPanel] Fetching tasks for session: ${this.sessionId}`);
         const { tasks, otherSessionsInfo } = await this.getTasks();
         const layoutedTasks = this.calculateLayout(tasks);
         
+        console.log(`[DependencyMapPanel] Found ${tasks.length} tasks for session ${this.sessionId}`);
+        if (tasks.length === 0 && otherSessionsInfo && otherSessionsInfo.length > 0) {
+            console.log(`[DependencyMapPanel] Other sessions with tasks:`, otherSessionsInfo);
+        }
+        
         // Update panel title
-        this.panel.title = `Task Dependencies - ${this.sessionId.substring(0, 8)} (${tasks.length} tasks)`;
+        this.panel.title = `Task Dependencies - ${this.sessionId} (${tasks.length} tasks)`;
         
         this.panel.webview.html = this.getWebviewContent(layoutedTasks, otherSessionsInfo);
     }

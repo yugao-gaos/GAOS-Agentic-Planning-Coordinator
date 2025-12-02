@@ -73,6 +73,7 @@ export interface AgentInfo {
     status: 'available' | 'busy';
     roleId?: string;
     coordinatorId?: string;
+    workflowId?: string;  // The specific workflow this agent is working on
     roleColor?: string;
     workflowType?: string;
     currentPhase?: string;

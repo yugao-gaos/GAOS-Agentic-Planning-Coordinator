@@ -273,6 +273,46 @@ export interface UnityStatusChangedEventData {
 }
 
 /**
+ * Unity pipeline started event data
+ */
+export interface UnityPipelineStartedEventData {
+    pipelineId: string;
+    sessionId?: string;
+    operations: string[];
+    tasksInvolved: Array<{ taskId: string; description: string }>;
+    startedAt: string;
+}
+
+/**
+ * Unity pipeline progress event data
+ */
+export interface UnityPipelineProgressEventData {
+    pipelineId: string;
+    sessionId?: string;
+    currentStep: number;
+    totalSteps: number;
+    currentOperation: string;
+    percentage: number;
+    timestamp: string;
+}
+
+/**
+ * Unity pipeline completed event data
+ */
+export interface UnityPipelineCompletedEventData {
+    pipelineId: string;
+    sessionId?: string;
+    success: boolean;
+    failedAtStep?: string;
+    operations: string[];
+    errors: Array<{ message: string; source?: string }>;
+    testFailures: Array<{ test: string; message: string }>;
+    tasksInvolved: Array<{ taskId: string; description: string }>;
+    duration: number;
+    completedAt: string;
+}
+
+/**
  * Daemon ready event data
  */
 export interface DaemonReadyEventData {
@@ -412,6 +452,9 @@ export interface ApcEventMap {
     'unity.taskCompleted': UnityTaskCompletedEventData;
     'unity.taskFailed': UnityTaskCompletedEventData;
     'unity.statusChanged': UnityStatusChangedEventData;
+    'unity.pipelineStarted': UnityPipelineStartedEventData;
+    'unity.pipelineProgress': UnityPipelineProgressEventData;
+    'unity.pipelineCompleted': UnityPipelineCompletedEventData;
     
     // System events
     'daemon.ready': DaemonReadyEventData;

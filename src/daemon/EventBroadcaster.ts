@@ -420,6 +420,74 @@ export class EventBroadcaster extends EventEmitter implements IEventBroadcaster 
     }
     
     /**
+     * Broadcast Unity pipeline started
+     */
+    unityPipelineStarted(
+        pipelineId: string,
+        operations: string[],
+        tasksInvolved: Array<{ taskId: string; description: string }>,
+        sessionId?: string
+    ): void {
+        this.broadcast('unity.pipelineStarted', {
+            pipelineId,
+            sessionId,
+            operations,
+            tasksInvolved,
+            startedAt: new Date().toISOString()
+        }, sessionId);
+    }
+    
+    /**
+     * Broadcast Unity pipeline progress
+     */
+    unityPipelineProgress(
+        pipelineId: string,
+        currentStep: number,
+        totalSteps: number,
+        currentOperation: string,
+        sessionId?: string
+    ): void {
+        const percentage = Math.round((currentStep / totalSteps) * 100);
+        this.broadcast('unity.pipelineProgress', {
+            pipelineId,
+            sessionId,
+            currentStep,
+            totalSteps,
+            currentOperation,
+            percentage,
+            timestamp: new Date().toISOString()
+        }, sessionId);
+    }
+    
+    /**
+     * Broadcast Unity pipeline completed
+     */
+    unityPipelineCompleted(
+        pipelineId: string,
+        success: boolean,
+        operations: string[],
+        errors: Array<{ message: string; source?: string }>,
+        testFailures: Array<{ test: string; message: string }>,
+        tasksInvolved: Array<{ taskId: string; description: string }>,
+        duration: number,
+        failedAtStep?: string,
+        sessionId?: string
+    ): void {
+        this.broadcast('unity.pipelineCompleted', {
+            pipelineId,
+            sessionId,
+            success,
+            failedAtStep,
+            operations,
+            errors,
+            testFailures,
+            tasksInvolved,
+            duration,
+            completedAt: new Date().toISOString()
+        }, sessionId);
+    }
+    
+    /**
      * Broadcast error
      */
     error(code: string, message: string, details?: any): void {

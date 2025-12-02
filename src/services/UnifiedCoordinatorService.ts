@@ -810,11 +810,12 @@ export class UnifiedCoordinatorService {
                     }
                 }
                 
-                // Update AgentPoolService with the correct sessionId
+                // Update AgentPoolService with the correct sessionId and workflowId
                 // (allocateAgents initially sets sessionId to empty)
-                if (sessionId) {
-                    this.agentPoolService.updateAgentSession(agentName, { sessionId });
-                }
+                this.agentPoolService.updateAgentSession(agentName, { 
+                    sessionId: sessionId || '', 
+                    workflowId: request.workflowId 
+                });
                 
                 // Sync with TaskManager - register the agent with role
                 // Map the string roleId to the AgentRole type

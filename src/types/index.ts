@@ -143,10 +143,11 @@ Session/workflow IDs are injected at runtime. Your FILES_MODIFIED section will b
         // Unity-specific additions (applied when Unity features enabled)
         unityPromptAddendum: `
 ## Unity Integration
-- Use MCP tools for reading: mcp_unityMCP_read_console, mcp_unityMCP_manage_asset (search/get_info)
+- Use MCP tools for asset info: mcp_unityMCP_manage_asset (search/get_info)
+- Do NOT check compilation errors with read_console - the Unity pipeline handles that after your work
 - Do NOT run Unity tests directly - use 'apc agent complete --unity' to queue them
-- The coordinator will redeploy you if tests fail`,
-        unityMcpTools: ['mcp_unityMCP_read_console', 'mcp_unityMCP_manage_asset', 'mcp_unityMCP_manage_scene', 'mcp_unityMCP_manage_gameobject'],
+- The coordinator will redeploy you if compilation or tests fail`,
+        unityMcpTools: ['mcp_unityMCP_manage_asset', 'mcp_unityMCP_manage_scene', 'mcp_unityMCP_manage_gameobject'],
         unityRules: [
             'DO NOT call mcp_unityMCP_run_tests - use apc agent complete --unity'
         ]
@@ -161,7 +162,7 @@ Session/workflow IDs are injected at runtime. Your FILES_MODIFIED section will b
         name: 'Code Reviewer',
         description: 'Reviews engineer code before build/test pipeline',
         isBuiltIn: true,
-        defaultModel: 'opus-4.5',
+        defaultModel: 'gpt-5.1-codex-high',
         timeoutMs: 600000,
         color: '#a855f7',  // Purple
         promptTemplate: `You are a Code Reviewer checking an engineer's implementation before it goes to build/testing.
@@ -860,7 +861,21 @@ For each approved plan, use read_file to understand the tasks needed.
 - \`completed\` / \`failed\` → Terminal states
 - Only tasks with status \`created\` can be started!
 
-## Commands (use run_terminal_cmd tool)
+## Available Task Commands (use run_terminal_cmd tool)
+
+⚠️ **ONLY these task commands exist. Do NOT invent commands like \`task update\` - they will fail!**
+
+| Command | Purpose |
+|---------|---------|
+| \`apc task list\` | List all tasks and their status |
+| \`apc task create\` | Create a new task |
+| \`apc task start\` | Start a workflow for a task |
+| \`apc task status\` | Get status of a specific task |
+| \`apc task complete\` | Mark a task as completed |
+| \`apc task fail\` | Mark a task as failed |
+
+❌ **Commands that DO NOT exist:** \`task update\`, \`task modify\`, \`task edit\`
+   Task stages are updated automatically by workflows - you don't need to update them manually.
 
 **IMPORTANT: Chain multiple commands with && for efficiency!**
 
@@ -885,6 +900,11 @@ apc task create --session ps_000001 --id T3 --desc "Depends on T1 and T2" --type
 **Check task status before starting:**
 \`\`\`bash
 apc task status --session ps_000001 --id T1
+\`\`\`
+
+**Mark task complete (after workflow finishes):**
+\`\`\`bash
+apc task complete --session ps_000001 --id T1
 \`\`\`
 
 ## What To Do
@@ -972,6 +992,7 @@ export interface BusyAgentInfo {
     coordinatorId: string;
     sessionId: string;
     roleId: string;  // References AgentRole.id
+    workflowId?: string;  // The specific workflow this agent is working on
     task?: string;
     startTime: string;
     processId?: number;
@@ -984,6 +1005,7 @@ export interface AgentStatus {
     status: 'available' | 'busy' | 'paused' | 'error';
     coordinatorId?: string;
     sessionId?: string;
+    workflowId?: string;  // The specific workflow this agent is working on
     task?: string;
     logFile?: string;
     processId?: number;

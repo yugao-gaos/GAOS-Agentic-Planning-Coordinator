@@ -26,6 +26,7 @@ import { AgentRoleRegistry } from './AgentRoleRegistry';
 import { TaskManager, ERROR_RESOLUTION_SESSION_ID } from './TaskManager';
 import { UnifiedCoordinatorService } from './UnifiedCoordinatorService';
 import { ServiceLocator } from './ServiceLocator';
+import { EventBroadcaster } from '../daemon/EventBroadcaster';
 
 // ============================================================================
 // Unity Control Manager - Background Service
@@ -1407,10 +1408,25 @@ Begin polling now. First poll:`;
         this.currentPipeline = this.pipelineQueue.shift()!;
         this.currentPipeline.status = 'running';
         this.currentPipeline.startedAt = new Date().toISOString();
+        const pipelineStartTime = Date.now();
         this.status = 'executing';
         this.emitStatusUpdate();
 
         this.log(`Starting pipeline ${this.currentPipeline.id}: ${this.currentPipeline.operations.join(' → ')}`);
+
+        // Broadcast pipeline started event to all clients
+        try {
+            const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+            broadcaster.unityPipelineStarted(
+                this.currentPipeline.id,
+                this.currentPipeline.operations,
+                this.currentPipeline.tasksInvolved,
+                this.currentPipeline.coordinatorId
+            );
+        } catch (e) {
+            // Broadcaster may not be available in some contexts
+            console.warn('[UnityControlManager] Failed to broadcast pipeline start:', e);
+        }
 
         // Execute each operation in sequence
         let allSuccess = true;
@@ -1422,6 +1438,20 @@ Begin polling now. First poll:`;
             this.emitStatusUpdate();
 
             this.log(`Pipeline step ${i + 1}/${this.currentPipeline.operations.length}: ${operation}`);
+
+            // Broadcast progress
+            try {
+                const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+                broadcaster.unityPipelineProgress(
+                    this.currentPipeline.id,
+                    i + 1,
+                    this.currentPipeline.operations.length,
+                    operation,
+                    this.currentPipeline.coordinatorId
+                );
+            } catch (e) {
+                console.warn('[UnityControlManager] Failed to broadcast pipeline progress:', e);
+            }
 
             const stepResult = await this.executePipelineStep(operation);
             this.currentPipeline.stepResults.push(stepResult);
@@ -1437,6 +1467,7 @@ Begin polling now. First poll:`;
         // Complete the pipeline
         this.currentPipeline.status = allSuccess ? 'completed' : 'failed';
         this.currentPipeline.completedAt = new Date().toISOString();
+        const duration = Date.now() - pipelineStartTime;
 
         // Build result for coordinator
         const result: PipelineResult = {
@@ -1452,7 +1483,7 @@ Begin polling now. First poll:`;
         this.log(`Pipeline ${this.currentPipeline.id} ${allSuccess ? 'completed' : 'failed'}`);
 
         // Notify coordinator (and handle errors if any)
-        await this.notifyPipelineComplete(result);
+        await this.notifyPipelineComplete(result, duration);
 
         // Reset state
         this.currentPipeline = null;
@@ -1615,8 +1646,8 @@ Begin polling now. First poll:`;
     /**
      * Notify coordinator of pipeline completion
      */
-    private async notifyPipelineComplete(result: PipelineResult): Promise<void> {
-        // Fire event
+    private async notifyPipelineComplete(result: PipelineResult, duration: number): Promise<void> {
+        // Fire callback
         if (this.onPipelineCompleteCallback) {
             this.onPipelineCompleteCallback(result);
         }
@@ -1628,6 +1659,33 @@ Begin polling now. First poll:`;
         this.log(`   Errors: ${result.allErrors.length}`);
         this.log(`   Test failures: ${result.allTestFailures.length}`);
         this.log(`   Tasks involved: ${result.tasksInvolved.map(t => t.taskId).join(', ')}`);
+
+        // Broadcast pipeline completed event to all clients
+        try {
+            const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+            
+            // Extract session ID from coordinator ID (if it's a session)
+            const sessionId = result.tasksInvolved[0] && this.currentPipeline 
+                ? this.currentPipeline.coordinatorId 
+                : undefined;
+            
+            broadcaster.unityPipelineCompleted(
+                result.pipelineId,
+                result.success,
+                this.currentPipeline?.operations || [],
+                result.allErrors,
+                result.allTestFailures,
+                result.tasksInvolved,
+                duration,
+                result.failedAtStep || undefined,
+                sessionId
+            );
+            
+            this.log(`✓ Broadcast pipeline completion to all clients`);
+        } catch (e) {
+            // Broadcaster may not be available in some contexts
+            console.warn('[UnityControlManager] Failed to broadcast pipeline completion:', e);
+        }
 
         // If there are errors, route them to global error handling
         if (result.allErrors.length > 0) {

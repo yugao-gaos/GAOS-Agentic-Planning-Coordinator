@@ -513,16 +513,34 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     let workflowType: string | undefined;
                     let currentPhase: string | undefined;
                     let taskId: string | undefined;
+                    let matchedWorkflowId: string | undefined;
                     
-                    // Match agent to workflow by role using shared constant
+                    // Match agent to workflow by workflowId (preferred) or fall back to role matching
                     for (const wf of activeWorkflows) {
                         if (wf.status === 'running') {
-                            const possibleWorkflows = ROLE_WORKFLOW_MAP[agent.roleId || ''] || [];
-                            if (possibleWorkflows.includes(wf.type)) {
+                            // Prefer direct workflowId match if available
+                            if (agent.workflowId && agent.workflowId === wf.id) {
                                 workflowType = wf.type;
                                 currentPhase = wf.phase;
                                 taskId = wf.taskId;
+                                matchedWorkflowId = wf.id;
                                 break;
+                            }
+                        }
+                    }
+                    
+                    // Fall back to role-based matching only if no workflowId match
+                    if (!matchedWorkflowId) {
+                        for (const wf of activeWorkflows) {
+                            if (wf.status === 'running') {
+                                const possibleWorkflows = ROLE_WORKFLOW_MAP[agent.roleId || ''] || [];
+                                if (possibleWorkflows.includes(wf.type)) {
+                                    workflowType = wf.type;
+                                    currentPhase = wf.phase;
+                                    taskId = wf.taskId;
+                                    matchedWorkflowId = wf.id;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -532,6 +550,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                         status: 'busy',
                         roleId: agent.roleId,
                         coordinatorId: agent.coordinatorId,
+                        workflowId: agent.workflowId || matchedWorkflowId,
                         roleColor: roleColor || '#f97316',
                         workflowType,
                         currentPhase,
