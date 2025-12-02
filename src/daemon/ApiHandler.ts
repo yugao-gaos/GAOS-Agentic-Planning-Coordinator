@@ -139,6 +139,10 @@ export interface ICoordinatorApi {
     
     // Agent CLI callback support
     signalAgentCompletion(signal: AgentCompletionSignal): boolean;
+    
+    // Coordinator evaluation trigger
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    triggerCoordinatorEvaluation(sessionId: string, eventType: string, payload: any): Promise<any>;
 }
 
 /**
@@ -313,6 +317,9 @@ export class ApiHandler {
             
             case 'roles':
                 return this.handleRoles(action, params);
+            
+            case 'coordinator':
+                return this.handleCoordinator(action, params);
             
             default:
                 throw new Error(`Unknown command category: ${category}`);
@@ -1059,6 +1066,44 @@ export class ApiHandler {
             
             default:
                 throw new Error(`Unknown roles action: ${action}`);
+        }
+    }
+    
+    // ========================================================================
+    // Coordinator Handler
+    // ========================================================================
+    
+    private async handleCoordinator(action: string, params: Record<string, unknown>): Promise<{ data?: unknown; message?: string }> {
+        switch (action) {
+            case 'evaluate': {
+                const sessionId = params.sessionId as string;
+                const reason = params.reason as string || 'manual_evaluation';
+                
+                if (!sessionId) {
+                    throw new Error('Missing sessionId parameter');
+                }
+                
+                // Verify session exists and is approved
+                const session = this.services.stateManager.getPlanningSession(sessionId);
+                if (!session) {
+                    throw new Error(`Session ${sessionId} not found`);
+                }
+                if (session.status !== 'approved') {
+                    return { message: `Session ${sessionId} is not in approved state (current: ${session.status})` };
+                }
+                
+                // Trigger coordinator evaluation
+                await this.services.coordinator.triggerCoordinatorEvaluation(
+                    sessionId,
+                    'manual_evaluation',
+                    { type: 'manual_evaluation', reason }
+                );
+                
+                return { message: `Coordinator evaluation triggered for ${sessionId}: ${reason}` };
+            }
+            
+            default:
+                throw new Error(`Unknown coordinator action: ${action}`);
         }
     }
     

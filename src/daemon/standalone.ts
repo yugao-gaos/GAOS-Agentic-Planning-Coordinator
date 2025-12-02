@@ -213,7 +213,9 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
             cancelSession: (sessionId: string) => coordinator.cancelSession(sessionId),
             startExecution: (sessionId: string) => coordinator.startExecution(sessionId),
             getFailedTasks: (sessionId: string) => coordinator.getFailedTasks(sessionId),
-            signalAgentCompletion: (signal: any) => coordinator.signalAgentCompletion(signal)
+            signalAgentCompletion: (signal: any) => coordinator.signalAgentCompletion(signal),
+            triggerCoordinatorEvaluation: (sessionId: string, eventType: string, payload: any) => 
+                coordinator.triggerCoordinatorEvaluation(sessionId, eventType as any, payload)
         },
         planningService: {
             listPlanningSessions: () => planningService.listPlanningSessions(),

@@ -478,6 +478,23 @@ export class VsCodeClient extends BaseApcClient {
     async executeMcpCommand(tool: string, args: any): Promise<any> {
         return this.send('mcp.execute', { tool, args });
     }
+    
+    // ========================================================================
+    // Coordinator
+    // ========================================================================
+    
+    /**
+     * Request coordinator evaluation for a session
+     * Used when UI detects idle approved plan with available agents
+     */
+    async requestCoordinatorEvaluation(sessionId: string, reason: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('coordinator.evaluate', { sessionId, reason });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
 }
 
 

@@ -359,4 +359,19 @@ export class DaemonStateProxy {
             return undefined;
         }
     }
+    
+    // ========================================================================
+    // Coordinator
+    // ========================================================================
+    
+    /**
+     * Request coordinator evaluation for a session
+     * Used when UI detects idle approved plan with available agents
+     */
+    async requestCoordinatorEvaluation(sessionId: string, reason: string): Promise<{ success: boolean; error?: string }> {
+        if (!this.vsCodeClient.isConnected()) {
+            return { success: false, error: 'Daemon not connected' };
+        }
+        return this.vsCodeClient.requestCoordinatorEvaluation(sessionId, reason);
+    }
 }
