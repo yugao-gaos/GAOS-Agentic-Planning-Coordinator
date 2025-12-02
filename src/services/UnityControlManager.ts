@@ -1420,7 +1420,7 @@ Begin polling now. First poll:`;
             broadcaster.unityPipelineStarted(
                 this.currentPipeline.id,
                 this.currentPipeline.operations,
-                this.currentPipeline.tasksInvolved,
+                this.currentPipeline.tasksInvolved.map(t => ({ taskId: t.taskId, description: t.stage })),
                 this.currentPipeline.coordinatorId
             );
         } catch (e) {
@@ -1674,8 +1674,8 @@ Begin polling now. First poll:`;
                 result.success,
                 this.currentPipeline?.operations || [],
                 result.allErrors,
-                result.allTestFailures,
-                result.tasksInvolved,
+                result.allTestFailures.map(t => ({ test: t.testName, message: t.message || '' })),
+                result.tasksInvolved.map(t => ({ taskId: t.taskId, description: t.stage })),
                 duration,
                 result.failedAtStep || undefined,
                 sessionId

@@ -6,6 +6,7 @@ import { AgentPoolProvider } from './ui/AgentPoolProvider';
 import { RoleSettingsPanel } from './ui/RoleSettingsPanel';
 import { WorkflowSettingsPanel } from './ui/WorkflowSettingsPanel';
 import { DependencyMapPanel } from './ui/DependencyMapPanel';
+import { HistoryViewPanel } from './ui/HistoryViewPanel';
 import { SidebarViewProvider } from './ui/SidebarViewProvider';
 import { AgentRunner, AgentBackendType } from './services/AgentBackend';
 import { EventBroadcaster } from './daemon/EventBroadcaster';
@@ -24,6 +25,24 @@ let daemonStateProxy: DaemonStateProxy;
 
 // Track event subscriptions for cleanup (prevents duplicate handlers on hot reload)
 let eventSubscriptions: Array<() => void> = [];
+
+// Global daemon client singleton to prevent duplicate connections
+let globalVsCodeClient: VsCodeClient | null = null;
+
+function getOrCreateDaemonClient(port: number): VsCodeClient {
+    if (globalVsCodeClient && globalVsCodeClient.isConnected()) {
+        console.log('[APC] Reusing existing daemon connection');
+        return globalVsCodeClient;
+    }
+    
+    console.log('[APC] Creating new daemon connection');
+    globalVsCodeClient = new VsCodeClient({ 
+        clientId: `vscode-${process.pid}`, // Include process PID
+        url: `ws://127.0.0.1:${port}`
+    });
+    
+    return globalVsCodeClient;
+}
 
 /**
  * Open agent chat in Cursor/VS Code, paste clipboard content, and send.
@@ -141,12 +160,8 @@ export async function activate(context: vscode.ExtensionContext) {
         const daemonResult = await daemonManager.ensureDaemonRunning();
         console.log(`[APC] Step 5b: Daemon on port ${daemonResult.port} (wasStarted: ${daemonResult.wasStarted}, isExternal: ${daemonResult.isExternal})`);
         
-        // Create and connect VS Code client
-        vsCodeClient = new VsCodeClient({
-            url: `ws://127.0.0.1:${daemonResult.port}`,
-            clientId: 'vscode-extension',
-            autoReconnect: true
-        });
+        // Create and connect VS Code client using singleton
+        vsCodeClient = getOrCreateDaemonClient(daemonResult.port);
         
         // Set up notification callbacks
         vsCodeClient.setNotificationCallbacks({
@@ -252,8 +267,21 @@ export async function activate(context: vscode.ExtensionContext) {
         
         // Subscribe to workflow completion events to update UI
         eventSubscriptions.push(
-            vsCodeClient.subscribe('workflow.completed', () => {
+            vsCodeClient.subscribe('workflow.completed', (data: unknown) => {
                 console.log('[APC] Workflow completed, refreshing UI');
+                const completionData = data as { workflowId: string };
+                // Remove from tracked workflows to prevent stale queries
+                if (completionData.workflowId && sidebarProvider) {
+                    sidebarProvider.clearWorkflowTracking(completionData.workflowId);
+                }
+                sidebarProvider?.refresh();
+            })
+        );
+        
+        // Subscribe to workflow cleanup events
+        eventSubscriptions.push(
+            vsCodeClient.subscribe('workflows.cleaned', () => {
+                console.log('[APC] Workflows cleaned up, refreshing UI');
                 sidebarProvider?.refresh();
             })
         );
@@ -578,6 +606,32 @@ Let's get started!`;
             }
             
             DependencyMapPanel.show(sessionId, context.extensionUri, vsCodeClient);
+        }),
+        
+        // History view command - shows all workflow history for a session
+        vscode.commands.registerCommand('agenticPlanning.openHistoryView', async (args?: { sessionId?: string }) => {
+            let sessionId = args?.sessionId;
+            
+            if (!sessionId) {
+                // No session specified - show picker
+                const sessions = await daemonStateProxy.getPlanningSessions();
+                if (sessions.length === 0) {
+                    vscode.window.showWarningMessage('No planning sessions available.');
+                    return;
+                }
+                const selected = await vscode.window.showQuickPick(
+                    sessions.map(s => ({ 
+                        label: s.id.substring(0, 8), 
+                        description: s.requirement.substring(0, 50) + '...',
+                        session: s 
+                    })),
+                    { placeHolder: 'Select a session to view workflow history' }
+                );
+                if (!selected) return;
+                sessionId = selected.session.id;
+            }
+            
+            HistoryViewPanel.show(sessionId, context.extensionUri, vsCodeClient);
         }),
 
         // Refresh commands for tree views

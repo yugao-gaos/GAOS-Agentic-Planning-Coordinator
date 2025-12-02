@@ -397,7 +397,7 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
     // ========================================================================
     
     protected generateRequestId(): string {
-        return `${this.options.clientId}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+        return `${this.options.clientId}_${process.pid}_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
     }
     
     protected delay(ms: number): Promise<void> {

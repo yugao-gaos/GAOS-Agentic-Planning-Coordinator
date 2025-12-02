@@ -7,6 +7,7 @@ import { ErrorClassifier } from './workflows/ErrorClassifier';
 import { EventBroadcaster } from '../daemon/EventBroadcaster';
 import { ServiceLocator } from './ServiceLocator';
 import { atomicWriteFileSync } from './StateManager';
+import { getMemoryMonitor } from './MemoryMonitor';
 
 // ============================================================================
 // Task Manager - Global Singleton for Cross-Plan Task Coordination
@@ -264,12 +265,31 @@ export class TaskManager {
     private onAgentIdleCallback?: (agent: AgentAssignment) => void;
     private onTasksPausedCallback?: (notification: PausedTaskNotification) => void;
 
+    // Configuration for task retention
+    private readonly COMPLETED_TASK_RETENTION_HOURS = 48; // Keep completed tasks for 48 hours
+    private readonly FAILED_TASK_RETENTION_DAYS = 7;      // Keep failed tasks for 7 days
+    private cleanupTimerId: NodeJS.Timeout | null = null;
+    
     constructor() {
         this.outputManager = ServiceLocator.resolve(OutputChannelManager);
         this.log('Global TaskManager initialized');
         
         // Load persisted tasks on startup
         this.loadPersistedTasks();
+        
+        // Register with memory monitor
+        const memMonitor = getMemoryMonitor();
+        memMonitor.registerService('TaskManager', () => ({
+            taskCount: this.tasks.size,
+            agentCount: this.agents.size,
+            sessionCount: this.sessions.size,
+            fileIndexSize: this.fileToTaskIndex.size,
+            occupancyCount: this.taskOccupancy.size,
+            failedTaskCount: this.failedTasks.size
+        }));
+        
+        // Start periodic cleanup (every hour)
+        this.startPeriodicCleanup();
     }
     
     // ========================================================================
@@ -285,6 +305,114 @@ export class TaskManager {
         } catch {
             this.log('[WARN] StateManager not available for task persistence');
             return null;
+        }
+    }
+    
+    /**
+     * Start periodic cleanup of old tasks
+     */
+    private startPeriodicCleanup(): void {
+        // Run cleanup every hour
+        this.cleanupTimerId = setInterval(() => {
+            this.cleanupOldTasks();
+        }, 60 * 60 * 1000); // 1 hour
+        
+        // Also run once immediately
+        setTimeout(() => this.cleanupOldTasks(), 60 * 1000); // After 1 minute
+    }
+    
+    /**
+     * Stop periodic cleanup
+     */
+    private stopPeriodicCleanup(): void {
+        if (this.cleanupTimerId) {
+            clearInterval(this.cleanupTimerId);
+            this.cleanupTimerId = null;
+        }
+    }
+    
+    /**
+     * Clean up old completed and failed tasks to prevent memory growth
+     */
+    private cleanupOldTasks(): void {
+        const now = Date.now();
+        const completedRetentionMs = this.COMPLETED_TASK_RETENTION_HOURS * 60 * 60 * 1000;
+        const failedRetentionMs = this.FAILED_TASK_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+        
+        let completedCleaned = 0;
+        let failedCleaned = 0;
+        
+        // Clean up old completed tasks
+        for (const [taskId, task] of this.tasks.entries()) {
+            if (task.status === 'completed' && task.completedAt) {
+                const completedAt = new Date(task.completedAt).getTime();
+                if (now - completedAt > completedRetentionMs) {
+                    // Remove from task map
+                    this.tasks.delete(taskId);
+                    
+                    // Remove from file index
+                    for (const file of task.filesModified) {
+                        const normalizedFile = this.normalizeFilename(file);
+                        const taskSet = this.fileToTaskIndex.get(normalizedFile);
+                        if (taskSet) {
+                            taskSet.delete(taskId);
+                            if (taskSet.size === 0) {
+                                this.fileToTaskIndex.delete(normalizedFile);
+                            }
+                        }
+                    }
+                    
+                    completedCleaned++;
+                }
+            }
+        }
+        
+        // Clean up old failed tasks
+        for (const [key, failedTask] of this.failedTasks.entries()) {
+            const failedAt = new Date(failedTask.failedAt).getTime();
+            if (now - failedAt > failedRetentionMs) {
+                this.failedTasks.delete(key);
+                failedCleaned++;
+            }
+        }
+        
+        if (completedCleaned > 0 || failedCleaned > 0) {
+            this.log(`Cleanup: removed ${completedCleaned} completed tasks (>${this.COMPLETED_TASK_RETENTION_HOURS}h old), ${failedCleaned} failed tasks (>${this.FAILED_TASK_RETENTION_DAYS}d old)`);
+            // Persist after cleanup
+            this.persistTasks();
+        }
+    }
+    
+    /**
+     * Force cleanup of all completed tasks for a specific session
+     * Useful when a session is explicitly closed
+     */
+    cleanupSessionTasks(sessionId: string): void {
+        let cleaned = 0;
+        
+        for (const [taskId, task] of this.tasks.entries()) {
+            if (task.sessionId === sessionId && task.status === 'completed') {
+                this.tasks.delete(taskId);
+                
+                // Remove from file index
+                for (const file of task.filesModified) {
+                    const normalizedFile = this.normalizeFilename(file);
+                    const taskSet = this.fileToTaskIndex.get(normalizedFile);
+                    if (taskSet) {
+                        taskSet.delete(taskId);
+                        if (taskSet.size === 0) {
+                            this.fileToTaskIndex.delete(normalizedFile);
+                        }
+                    }
+                }
+                
+                cleaned++;
+            }
+        }
+        
+        if (cleaned > 0) {
+            this.log(`Cleaned up ${cleaned} completed tasks for session ${sessionId}`);
+            this.persistTasks();
         }
     }
     
@@ -460,11 +588,18 @@ export class TaskManager {
     }
     
     /**
+     * Normalize a filename for conflict detection (extracts basename)
+     */
+    private normalizeFilename(file: string): string {
+        return path.basename(file);
+    }
+    
+    /**
      * Add files to the index for a task (used when adding new files)
      */
     private addFilesToIndex(taskId: string, files: string[]): void {
         for (const file of files) {
-            const basename = path.basename(file);
+            const basename = this.normalizeFilename(file);
             let taskIds = this.fileToTaskIndex.get(basename);
             if (!taskIds) {
                 taskIds = new Set();

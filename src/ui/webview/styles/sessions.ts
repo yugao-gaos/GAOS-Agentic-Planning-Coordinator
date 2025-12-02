@@ -288,6 +288,34 @@ export const sessionStyles = `
     transform: rotate(90deg);
 }
 
+.history-more-container {
+    display: flex;
+    justify-content: flex-end;
+    padding: 4px 8px 4px 0;
+}
+
+.history-more-btn {
+    padding: 2px 8px;
+    font-size: 10px;
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    border: none;
+    border-radius: 3px;
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.history-more-btn:hover {
+    opacity: 1;
+    background: var(--vscode-button-secondaryHoverBackground);
+}
+
+.history-more-btn:active {
+    transform: scale(0.95);
+}
+
+
 .history-children {
     display: none;
 }

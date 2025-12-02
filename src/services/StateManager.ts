@@ -9,6 +9,7 @@ import {
     PlanInfo,
     GlobalSettings
 } from '../types';
+import { getMemoryMonitor } from './MemoryMonitor';
 
 /**
  * Configuration interface for StateManager initialization.
@@ -261,6 +262,14 @@ export class StateManager {
         };
 
         this.agentPoolState = this.createDefaultAgentPool(this.extensionState.globalSettings.agentPoolSize);
+        
+        // Register with memory monitor
+        const memMonitor = getMemoryMonitor();
+        memMonitor.registerService('StateManager', () => ({
+            sessionCount: this.planningSessions.size,
+            pendingWrites: this.pendingWrites.size,
+            agentPoolSize: this.agentPoolState.totalAgents
+        }));
     }
 
     /**

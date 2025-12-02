@@ -635,10 +635,36 @@ case "$COMMAND" in
                 display_response "$response"
                 ;;
             status|st)
-                SESSION="${1:-}"
-                TASK_ID="${2:-}"
+                # Support both positional and named parameters
+                SESSION=""
+                TASK_ID=""
+                
+                # Check if using named parameters
+                if [[ "$1" == "--session" ]] || [[ "$1" == "-s" ]]; then
+                    while [[ $# -gt 0 ]]; do
+                        case "$1" in
+                            --session|-s)
+                                SESSION="$2"
+                                shift 2
+                                ;;
+                            --id|-i|--task|-t)
+                                TASK_ID="$2"
+                                shift 2
+                                ;;
+                            *)
+                                shift
+                                ;;
+                        esac
+                    done
+                else
+                    # Positional parameters
+                    SESSION="${1:-}"
+                    TASK_ID="${2:-}"
+                fi
+                
                 if [[ -z "$SESSION" ]] || [[ -z "$TASK_ID" ]]; then
                     echo -e "${RED}Usage: apc task status <session_id> <task_id>${RESET}"
+                    echo -e "${RED}   or: apc task status --session <id> --task <task_id>${RESET}"
                     exit 1
                 fi
                 response=$(send_ws_command "task.status" "{\"session\": \"$SESSION\", \"task\": \"$TASK_ID\"}")

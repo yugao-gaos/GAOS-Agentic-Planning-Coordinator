@@ -13,6 +13,7 @@ import { EventEmitter } from 'events';
 import { ApcEvent, ApcEventType, createEvent } from '../client/Protocol';
 import { ApcEventMap } from '../client/ClientEvents';
 import { ServiceLocator } from '../services/ServiceLocator';
+import { getMemoryMonitor } from '../services/MemoryMonitor';
 
 // ============================================================================
 // Event Broadcaster Interface
@@ -116,6 +117,15 @@ export class EventBroadcaster extends EventEmitter implements IEventBroadcaster 
     constructor() {
         super();
         this.setMaxListeners(100); // Allow many listeners for services
+        
+        // Register with memory monitor
+        const memMonitor = getMemoryMonitor();
+        memMonitor.registerService('EventBroadcaster', () => ({
+            handlerCount: this.broadcastHandlers.length,
+            clientSubscriptions: this.clientSubscriptions.size,
+            sessionClients: this.sessionClients.size,
+            totalBroadcasts: this.stats.totalBroadcasts
+        }));
     }
     
     // ========================================================================
@@ -248,13 +258,35 @@ export class EventBroadcaster extends EventEmitter implements IEventBroadcaster 
         if (sessions) {
             for (const sessionId of sessions) {
                 this.sessionClients.get(sessionId)?.delete(clientId);
+                // Clean up empty session entries to prevent memory leaks
                 if (this.sessionClients.get(sessionId)?.size === 0) {
                     this.sessionClients.delete(sessionId);
                 }
             }
+            // Clear the set to release memory
+            sessions.clear();
         }
         this.clientSubscriptions.delete(clientId);
         this.stats.sessionSubscriptions = new Map(this.sessionClients);
+    }
+    
+    /**
+     * Clean up orphaned session subscriptions
+     * Removes session entries that have no clients subscribed
+     * Should be called periodically to prevent memory leaks
+     */
+    cleanupOrphanedSessions(): void {
+        let cleanedCount = 0;
+        for (const [sessionId, clients] of this.sessionClients.entries()) {
+            if (clients.size === 0) {
+                this.sessionClients.delete(sessionId);
+                cleanedCount++;
+            }
+        }
+        if (cleanedCount > 0) {
+            this.stats.sessionSubscriptions = new Map(this.sessionClients);
+            console.log(`[EventBroadcaster] Cleaned up ${cleanedCount} orphaned session subscriptions`);
+        }
     }
     
     // ========================================================================
@@ -277,6 +309,14 @@ export class EventBroadcaster extends EventEmitter implements IEventBroadcaster 
         if (index !== -1) {
             this.broadcastHandlers.splice(index, 1);
         }
+    }
+    
+    /**
+     * Remove all broadcast handlers
+     * Call this when shutting down to prevent memory leaks
+     */
+    clearBroadcastHandlers(): void {
+        this.broadcastHandlers = [];
     }
     
     // ========================================================================
@@ -526,6 +566,12 @@ export class EventBroadcaster extends EventEmitter implements IEventBroadcaster 
         this.broadcastHandlers = [];
         this.clientSubscriptions.clear();
         this.sessionClients.clear();
+        // Reset stats to release memory
+        this.stats = {
+            totalBroadcasts: 0,
+            eventCounts: {},
+            sessionSubscriptions: new Map()
+        };
     }
 }
 

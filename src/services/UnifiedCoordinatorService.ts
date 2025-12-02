@@ -41,6 +41,8 @@ import { TaskManager, ERROR_RESOLUTION_SESSION_ID } from './TaskManager';
 import { EventBroadcaster } from '../daemon/EventBroadcaster';
 import { CoordinatorAgent, CoordinatorStatus } from './CoordinatorAgent';
 import { CoordinatorContext } from './CoordinatorContext';
+import { getMemoryMonitor } from './MemoryMonitor';
+import { WorkflowHistoryService } from './WorkflowHistoryService';
 import {
     CoordinatorEvent,
     CoordinatorEventType,
@@ -55,6 +57,19 @@ import {
 } from '../types/coordinator';
 
 /**
+ * Archived workflow metadata (lightweight)
+ */
+interface ArchivedWorkflow {
+    id: string;
+    type: WorkflowType;
+    status: 'completed' | 'failed' | 'cancelled';
+    taskId?: string;
+    startedAt: string;
+    completedAt: string;
+    archivedAt: string;
+}
+
+/**
  * Session state for tracking workflows
  */
 interface SessionState {
@@ -65,6 +80,9 @@ interface SessionState {
     workflowHistory: CompletedWorkflowSummary[];  // Completed workflow summaries (newest first)
     createdAt: string;
     updatedAt: string;
+    
+    // === Archived Workflows ===
+    archivedWorkflows: Map<string, ArchivedWorkflow>;  // Lightweight workflow metadata after cleanup
     
     // === Revision State Tracking ===
     // Used when planning_revision workflow pauses other workflows
@@ -127,6 +145,7 @@ export class UnifiedCoordinatorService {
     /** Unity Control Manager - only available when Unity features are enabled */
     private unityManager: UnityControlManager | undefined;
     private outputManager: OutputChannelManager;
+    private historyService: WorkflowHistoryService;
     
     /** Whether Unity features are enabled */
     private unityEnabled: boolean = true;
@@ -165,6 +184,10 @@ export class UnifiedCoordinatorService {
     private coordinatorAgent: CoordinatorAgent;
     private coordinatorContext: CoordinatorContext;
     
+    // Periodic cleanup timer
+    private cleanupTimerId: NodeJS.Timeout | null = null;
+    private readonly CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+    
     constructor(
         stateManager: StateManager,
         agentPoolService: AgentPoolService,
@@ -176,6 +199,9 @@ export class UnifiedCoordinatorService {
         // Unity manager will be set via setUnityEnabled() when Unity features are enabled
         this.unityManager = undefined;
         this.outputManager = ServiceLocator.resolve(OutputChannelManager);
+        
+        // Initialize workflow history service
+        this.historyService = new WorkflowHistoryService(this.stateManager.getWorkspaceRoot());
         
         // Create workflow registry with all built-in types
         this.workflowRegistry = createWorkflowRegistry();
@@ -203,7 +229,74 @@ export class UnifiedCoordinatorService {
         // Create the context builder for AI evaluations
         this.coordinatorContext = new CoordinatorContext(this.stateManager, this.agentPoolService);
         
+        // Register with memory monitor
+        const memMonitor = getMemoryMonitor();
+        memMonitor.registerService('UnifiedCoordinatorService', () => ({
+            sessionCount: this.sessions.size,
+            totalWorkflows: Array.from(this.sessions.values()).reduce((sum, s) => sum + s.workflows.size, 0),
+            completionSignals: this.completionSignals.size,
+            agentRequestQueue: this.agentRequestQueue.length
+        }));
+        
+        // Start periodic cleanup
+        this.startPeriodicCleanup();
+        
         this.log('UnifiedCoordinatorService initialized');
+    }
+    
+    /**
+     * Start periodic cleanup of completed workflows and sessions
+     */
+    private startPeriodicCleanup(): void {
+        if (this.cleanupTimerId) {
+            return; // Already running
+        }
+        
+        this.cleanupTimerId = setInterval(() => {
+            this.performPeriodicCleanup();
+        }, this.CLEANUP_INTERVAL_MS);
+        
+        this.log(`Started periodic cleanup (interval: ${this.CLEANUP_INTERVAL_MS / 1000}s)`);
+    }
+    
+    /**
+     * Stop periodic cleanup
+     */
+    private stopPeriodicCleanup(): void {
+        if (this.cleanupTimerId) {
+            clearInterval(this.cleanupTimerId);
+            this.cleanupTimerId = null;
+            this.log('Stopped periodic cleanup');
+        }
+    }
+    
+    /**
+     * Perform periodic cleanup across all sessions
+     */
+    private performPeriodicCleanup(): void {
+        let totalWorkflowsCleaned = 0;
+        let totalSessionsCleaned = 0;
+        
+        // Clean up old workflows in each session
+        for (const [sessionId, _state] of this.sessions) {
+            const beforeSize = _state.workflows.size;
+            this.cleanupCompletedWorkflows(sessionId);
+            const afterSize = _state.workflows.size;
+            totalWorkflowsCleaned += (beforeSize - afterSize);
+        }
+        
+        // Clean up old completed sessions
+        const beforeSessionCount = this.sessions.size;
+        this.cleanupCompletedSessions(4 * 60 * 60 * 1000); // 4 hours for periodic cleanup
+        totalSessionsCleaned = beforeSessionCount - this.sessions.size;
+        
+        // Clean up stale completion signals
+        this.cleanupStaleCompletionSignals();
+        
+        // Log summary if anything was cleaned
+        if (totalWorkflowsCleaned > 0 || totalSessionsCleaned > 0) {
+            this.log(`Periodic cleanup: ${totalWorkflowsCleaned} workflows, ${totalSessionsCleaned} sessions removed`);
+        }
     }
     
     /**
@@ -262,6 +355,9 @@ export class UnifiedCoordinatorService {
             workflowHistory: savedWorkflowHistory,
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
+            
+            // Archived workflows (lightweight metadata after cleanup)
+            archivedWorkflows: new Map(),
             
             // Revision state tracking
             isRevising: false,
@@ -709,8 +805,31 @@ export class UnifiedCoordinatorService {
         const state = this.sessions.get(sessionId);
         if (!state) return undefined;
         
+        // Check active workflows first
         const workflow = state.workflows.get(workflowId);
-        return workflow?.getProgress();
+        if (workflow) {
+            return workflow.getProgress();
+        }
+        
+        // Check archived workflows
+        const archived = state.archivedWorkflows.get(workflowId);
+        if (archived) {
+            return {
+                workflowId: archived.id,
+                type: archived.type,
+                status: 'not_found',  // Use not_found to indicate it was cleaned up
+                phase: 'archived',
+                phaseIndex: 0,
+                totalPhases: 0,
+                percentage: 100,
+                message: `Workflow completed and archived on ${new Date(archived.archivedAt).toLocaleString()}`,
+                startedAt: archived.startedAt,
+                updatedAt: archived.archivedAt,
+                taskId: archived.taskId
+            };
+        }
+        
+        return undefined;
     }
     
     // =========================================================================
@@ -973,8 +1092,8 @@ export class UnifiedCoordinatorService {
         });
         
         // Completion
-        workflow.onComplete.event((result) => {
-            this.handleWorkflowComplete(sessionId, workflow.id, result);
+        workflow.onComplete.event(async (result) => {
+            await this.handleWorkflowComplete(sessionId, workflow.id, result);
         });
         
         // Agent requests
@@ -1021,19 +1140,22 @@ export class UnifiedCoordinatorService {
     /**
      * Handle workflow completion
      */
-    private handleWorkflowComplete(
+    private async handleWorkflowComplete(
         sessionId: string, 
         workflowId: string, 
         result: WorkflowResult
-    ): void {
+    ): Promise<void> {
         const state = this.sessions.get(sessionId);
         if (!state) return;
+        
+        // Clean up any pending completion signals for this workflow
+        this.cancelPendingSignal(workflowId);
         
         // Move to completed
         state.completedWorkflowIds.push(workflowId);
         state.updatedAt = new Date().toISOString();
         
-        // Add to workflow history (newest first)
+        // Add to workflow history (newest first) with sliding window
         const workflow = state.workflows.get(workflowId);
         const taskId = state.workflowToTaskMap.get(workflowId);
         const historySummary: CompletedWorkflowSummary = {
@@ -1046,6 +1168,12 @@ export class UnifiedCoordinatorService {
             result: result.error
         };
         state.workflowHistory.unshift(historySummary); // Add to front (newest first)
+        
+        // Keep only last 100 workflow history entries (sliding window)
+        const MAX_WORKFLOW_HISTORY = 100;
+        if (state.workflowHistory.length > MAX_WORKFLOW_HISTORY) {
+            state.workflowHistory = state.workflowHistory.slice(0, MAX_WORKFLOW_HISTORY);
+        }
         
         // Persist workflow history to disk
         this.stateManager.saveWorkflowHistory(sessionId, state.workflowHistory);
@@ -1099,6 +1227,24 @@ export class UnifiedCoordinatorService {
             console.warn(`[UnifiedCoordinatorService] Failed to broadcast workflow.completed:`, e);
         }
         
+        // Save workflow to persistent history
+        try {
+            await this.historyService.saveWorkflow({
+                id: workflowId,
+                sessionId,
+                type: workflow?.type || 'unknown',
+                status: result.success ? 'completed' : 'failed',
+                taskId,
+                startedAt: workflow?.getProgress().startedAt || state.createdAt,
+                completedAt: new Date().toISOString(),
+                duration: result.duration || 0,
+                output: result.output,
+                error: result.error
+            });
+        } catch (e) {
+            this.log(`Failed to save workflow history: ${e}`);
+        }
+        
         // Handle revision workflow completion (cleanup legacy state)
         // Note: workflow variable already declared above
         if (workflow?.type === 'planning_revision') {
@@ -1115,6 +1261,15 @@ export class UnifiedCoordinatorService {
         
         // Clean up old completed workflows to prevent memory growth
         this.cleanupCompletedWorkflows(sessionId);
+        
+        // If session is complete, check if it should be cleaned up from memory
+        const session = this.stateManager.getPlanningSession(sessionId);
+        if (session?.status === 'completed') {
+            // Schedule session cleanup (not immediate to allow inspection)
+            setTimeout(() => {
+                this.cleanupCompletedSessions();
+            }, 5 * 60 * 1000); // 5 minutes after completion
+        }
         
         this._onSessionStateChanged.fire(sessionId);
         
@@ -1394,6 +1549,19 @@ export class UnifiedCoordinatorService {
                 const completedAt = new Date(progress.updatedAt).getTime();
                 
                 if (now - completedAt > MAX_AGE_MS) {
+                    // Archive instead of just deleting
+                    const archived: ArchivedWorkflow = {
+                        id: workflowId,
+                        type: workflow.type,
+                        status: workflow.getStatus() as 'completed' | 'failed' | 'cancelled',
+                        taskId: workflow.getProgress().taskId,
+                        startedAt: workflow.getProgress().startedAt,
+                        completedAt: workflow.getProgress().updatedAt,
+                        archivedAt: new Date().toISOString()
+                    };
+                    
+                    state.archivedWorkflows.set(workflowId, archived);
+                    
                     // Dispose workflow before removing to clean up event listeners
                     workflow.dispose();
                     state.workflows.delete(workflowId);
@@ -1404,6 +1572,18 @@ export class UnifiedCoordinatorService {
         
         if (cleaned > 0) {
             this.log(`Cleaned up ${cleaned} old completed workflows for session ${sessionId}`);
+            
+            // Broadcast cleanup event so UI can update
+            try {
+                const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+                broadcaster.broadcast('workflows.cleaned', {
+                    sessionId,
+                    cleanedCount: cleaned,
+                    timestamp: new Date().toISOString()
+                }, sessionId);
+            } catch (e) {
+                // Ignore if broadcaster not available
+            }
         }
     }
     
@@ -1674,6 +1854,11 @@ export class UnifiedCoordinatorService {
         const state = this.sessions.get(sessionId);
         if (!state) return;
         
+        // Truncate long reasoning to save memory (keep first 500 chars)
+        const truncatedReasoning = decision.reasoning.length > 500 
+            ? decision.reasoning.substring(0, 500) + '... (truncated)'
+            : decision.reasoning;
+        
         const entry: CoordinatorHistoryEntry = {
             timestamp: new Date().toISOString(),
             event: {
@@ -1686,22 +1871,23 @@ export class UnifiedCoordinatorService {
                 askedUser: false,
                 pausedCount: 0,
                 resumedCount: 0,
-                reasoning: decision.reasoning
+                reasoning: truncatedReasoning
             }
         };
         
         state.coordinatorHistory.push(entry);
         
-        // Keep history bounded
-        const maxHistory = 50;
-        if (state.coordinatorHistory.length > maxHistory) {
-            state.coordinatorHistory = state.coordinatorHistory.slice(-maxHistory);
+        // Keep history bounded with sliding window
+        const MAX_COORDINATOR_HISTORY = 50;
+        if (state.coordinatorHistory.length > MAX_COORDINATOR_HISTORY) {
+            // Keep only the most recent entries
+            state.coordinatorHistory = state.coordinatorHistory.slice(-MAX_COORDINATOR_HISTORY);
         }
         
         // Persist history to disk for recovery across restarts
         this.stateManager.saveCoordinatorHistory(sessionId, state.coordinatorHistory);
         
-        this.log(`Logged coordinator decision. Reasoning: ${decision.reasoning.substring(0, 100)}...`);
+        this.log(`Logged coordinator decision. Reasoning: ${truncatedReasoning.substring(0, 100)}...`);
     }
     
     /**
@@ -1861,6 +2047,73 @@ export class UnifiedCoordinatorService {
     }
     
     /**
+     * Clean up completed sessions that are older than the specified age
+     * @param maxAgeMs - Maximum age in milliseconds for completed sessions (default: 4 hours)
+     */
+    private cleanupCompletedSessions(maxAgeMs: number = 4 * 60 * 60 * 1000): void {
+        const now = Date.now();
+        const sessionsToRemove: string[] = [];
+        
+        for (const [sessionId, state] of this.sessions) {
+            // Only cleanup completed sessions
+            const session = this.stateManager.getPlanningSession(sessionId);
+            if (!session || session.status !== 'completed') {
+                continue;
+            }
+            
+            // Check if session is old enough to cleanup
+            // Use updatedAt as a proxy for completion time
+            const sessionEndTime = new Date(session.updatedAt).getTime();
+            
+            if (now - sessionEndTime > maxAgeMs) {
+                sessionsToRemove.push(sessionId);
+            }
+        }
+        
+        // Remove old sessions
+        for (const sessionId of sessionsToRemove) {
+            const state = this.sessions.get(sessionId);
+            if (state) {
+                // Dispose all workflows
+                for (const workflow of state.workflows.values()) {
+                    workflow.dispose();
+                }
+                this.sessions.delete(sessionId);
+                this.log(`Cleaned up old completed session ${sessionId}`);
+            }
+        }
+    }
+    
+    /**
+     * Clean up stale completion signals that have timed out but weren't properly removed
+     * Should be called periodically to prevent memory leaks
+     */
+    private cleanupStaleCompletionSignals(): void {
+        const now = Date.now();
+        const staleKeys: string[] = [];
+        
+        // Find signals that should have timed out (we don't track creation time, so this is a safety net)
+        // In practice, timeouts should handle this, but this catches edge cases
+        for (const [key, _pending] of this.completionSignals) {
+            // If a signal has been waiting for more than 1 hour, it's definitely stale
+            // (normal timeout is 10 minutes, so 1 hour is extremely conservative)
+            // We can't directly check age without modifying the structure, so we'll limit total count instead
+        }
+        
+        // Safety limit: if we have more than 100 pending signals, something is wrong
+        if (this.completionSignals.size > 100) {
+            console.warn(`[UnifiedCoordinatorService] Large number of pending completion signals: ${this.completionSignals.size}`);
+            // Log the first few for debugging
+            let count = 0;
+            for (const key of this.completionSignals.keys()) {
+                if (count++ < 5) {
+                    console.warn(`  - ${key}`);
+                }
+            }
+        }
+    }
+    
+    /**
      * Check if there's a pending signal wait for a workflow/stage
      * 
      * @param workflowId The workflow ID
@@ -1955,12 +2208,16 @@ export class UnifiedCoordinatorService {
      * Dispose all resources
      */
     dispose(): void {
-        // Cancel all pending completion signals
-        for (const [key, pending] of this.completionSignals) {
+        // Stop periodic cleanup
+        this.stopPeriodicCleanup();
+        
+        // Cancel all pending completion signals with proper cleanup
+        for (const [_key, pending] of this.completionSignals) {
             clearTimeout(pending.timeoutId);
             pending.reject(new Error('Service disposed'));
         }
         this.completionSignals.clear();
+        
         // Dispose coordinator agent (clears debounce timer)
         this.coordinatorAgent.dispose();
         

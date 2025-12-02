@@ -42,6 +42,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     
     /** Track expanded session IDs for UI state */
     private expandedSessions: Set<string> = new Set();
+    
+    /** Track active workflow IDs to prevent stale queries */
+    private trackedWorkflows: Set<string> = new Set();
 
     constructor(private readonly _extensionUri: vscode.Uri) {
         this.dependencyService = ServiceLocator.resolve(DependencyService);
@@ -248,6 +251,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 case 'openWorkflowSettings':
                     vscode.commands.executeCommand('apc.openWorkflowSettings');
                     break;
+                case 'openFullHistory':
+                    vscode.commands.executeCommand('agenticPlanning.openHistoryView', { 
+                        sessionId: data.sessionId 
+                    });
+                    break;
             }
         });
 
@@ -289,6 +297,16 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             
             // Build client state with pre-computed values and pre-rendered HTML
             const clientState = buildClientState(state);
+            
+            // Track active workflow IDs
+            this.trackedWorkflows.clear();
+            for (const session of state.sessions) {
+                for (const workflow of [...(session.activeWorkflows || []), ...(session.workflowHistory || [])]) {
+                    if (workflow.status === 'running' || workflow.status === 'paused') {
+                        this.trackedWorkflows.add(workflow.id);
+                    }
+                }
+            }
             
             // Pre-render session and agent HTML for efficient updates
             const extendedState = {
@@ -394,13 +412,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                             continue;
                         }
                         
-                        // Extract taskId from workflow ID for task_implementation workflows
-                        // Workflow IDs for tasks are like "task_<sessionId>_<taskId>_<timestamp>"
-                        let taskId: string | undefined;
-                        if (progress.type === 'task_implementation') {
-                            const match = workflowId.match(/task_[^_]+_([^_]+)_/);
-                            taskId = match ? match[1] : undefined;
-                        }
+                        // Use taskId directly from progress (now included in WorkflowProgress)
+                        const taskId = progress.taskId;
                         
                         activeWorkflows.push({
                             id: workflowId,
@@ -495,7 +508,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 
             // Get agents assigned to this session with workflow context
             const sessionAgents: AgentInfo[] = [];
-            const busyAgents = this.stateProxy 
+            const busyAgents: Array<{ name: string; roleId?: string; coordinatorId: string; sessionId: string; workflowId?: string; task?: string }> = this.stateProxy 
                 ? await this.stateProxy.getBusyAgents()
                 : (this.agentPoolService?.getBusyAgents() || []);
             for (const agent of busyAgents) {
@@ -585,7 +598,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         const allAvailableAgents = this.stateProxy 
             ? await this.stateProxy.getAvailableAgents()
             : (this.agentPoolService?.getAvailableAgents() || []);
-        const allBusyAgents = this.stateProxy 
+        const allBusyAgents: Array<{ name: string; roleId?: string; coordinatorId: string; sessionId: string; workflowId?: string; task?: string }> = this.stateProxy 
             ? await this.stateProxy.getBusyAgents()
             : (this.agentPoolService?.getBusyAgents() || []);
         
@@ -734,6 +747,13 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             coordinatorStatus,
             connectionHealth
         };
+    }
+    
+    /**
+     * Clear a workflow from tracking (called when workflow completes)
+     */
+    public clearWorkflowTracking(workflowId: string): void {
+        this.trackedWorkflows.delete(workflowId);
     }
 
     /**

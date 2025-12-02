@@ -45,6 +45,13 @@ export class VsCodeClient extends BaseApcClient {
         showError?: (msg: string) => void;
     } = {};
     
+    // Workflow status cache to reduce redundant queries
+    private workflowStatusCache: Map<string, { 
+        status: any; 
+        timestamp: number 
+    }> = new Map();
+    private static readonly CACHE_TTL_MS = 5000; // 5 seconds
+    
     constructor(options: VsCodeClientOptions = {}) {
         super({
             ...options,
@@ -515,6 +522,55 @@ export class VsCodeClient extends BaseApcClient {
             };
         } catch (err) {
             return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    // ========================================================================
+    // Workflow Status Cache
+    // ========================================================================
+    
+    /**
+     * Get workflow status with caching to reduce redundant queries
+     */
+    async getWorkflowStatusCached(sessionId: string, workflowId: string): Promise<any> {
+        const cacheKey = `${sessionId}:${workflowId}`;
+        const cached = this.workflowStatusCache.get(cacheKey);
+        
+        // Return cached if fresh
+        if (cached && Date.now() - cached.timestamp < VsCodeClient.CACHE_TTL_MS) {
+            return cached.status;
+        }
+        
+        try {
+            const status = await this.send('workflow.status', { sessionId, workflowId });
+            
+            // Cache the result
+            this.workflowStatusCache.set(cacheKey, { 
+                status, 
+                timestamp: Date.now() 
+            });
+            
+            return status;
+        } catch (e) {
+            // If not found, cache the not_found state to avoid repeated queries
+            if (e instanceof Error && e.message.includes('not found')) {
+                this.workflowStatusCache.set(cacheKey, { 
+                    status: { status: 'not_found', workflowId, sessionId }, 
+                    timestamp: Date.now() 
+                });
+            }
+            throw e;
+        }
+    }
+    
+    /**
+     * Clear workflow from cache (call on workflow.completed event)
+     */
+    clearWorkflowCache(workflowId: string): void {
+        for (const [key] of this.workflowStatusCache) {
+            if (key.includes(workflowId)) {
+                this.workflowStatusCache.delete(key);
+            }
         }
     }
 }

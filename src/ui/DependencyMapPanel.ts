@@ -133,8 +133,21 @@ export class DependencyMapPanel {
      * Also returns info about tasks in other sessions if current session is empty
      */
     private async getTasks(): Promise<{ tasks: TaskNode[]; otherSessionsInfo?: { sessionId: string; taskCount: number }[] }> {
-        let tasks: ManagedTask[] = [];
-        let allTasks: ManagedTask[] = [];
+        // API response format (from ApiHandler task.list)
+        interface ApiTask {
+            id: string;          // Short ID (e.g., "T1")
+            globalId: string;    // Full ID (e.g., "ps_000001_T1")
+            sessionId: string;
+            description: string;
+            status: string;
+            type?: string;       // API uses "type" instead of "taskType"
+            dependencies: string[];
+            dependents: string[];
+            priority: number;
+        }
+        
+        let tasks: ApiTask[] = [];
+        let allTasks: ApiTask[] = [];
 
         console.log(`[DependencyMapPanel] getTasks() called for sessionId: ${this.sessionId}`);
 
@@ -142,14 +155,14 @@ export class DependencyMapPanel {
             try {
                 // Get tasks for this session
                 console.log(`[DependencyMapPanel] Querying daemon for tasks with sessionId: ${this.sessionId}`);
-                const response = await this.vsCodeClient.send<{ data: ManagedTask[] }>('task.list', { sessionId: this.sessionId });
+                const response = await this.vsCodeClient.send<{ data: ApiTask[] }>('task.list', { sessionId: this.sessionId });
                 tasks = response.data || [];
                 console.log(`[DependencyMapPanel] Daemon returned ${tasks.length} tasks for session ${this.sessionId}`);
                 
                 // If no tasks for this session, get all tasks to check other sessions
                 if (tasks.length === 0) {
                     console.log(`[DependencyMapPanel] No tasks found, fetching all tasks to check other sessions`);
-                    const allResponse = await this.vsCodeClient.send<{ data: ManagedTask[] }>('task.list', {});
+                    const allResponse = await this.vsCodeClient.send<{ data: ApiTask[] }>('task.list', {});
                     allTasks = allResponse.data || [];
                     console.log(`[DependencyMapPanel] Found ${allTasks.length} total tasks across all sessions`);
                 }
@@ -158,17 +171,41 @@ export class DependencyMapPanel {
             }
         }
 
-        // Fallback to local TaskManager
-        if (tasks.length === 0) {
+        // Fallback to local TaskManager if API returned no tasks
+        if (tasks.length === 0 && !this.vsCodeClient) {
             try {
                 console.log(`[DependencyMapPanel] Falling back to local TaskManager`);
                 const taskManager = ServiceLocator.resolve(TaskManager);
-                tasks = taskManager.getTasksForSession(this.sessionId);
-                console.log(`[DependencyMapPanel] TaskManager returned ${tasks.length} tasks for session ${this.sessionId}`);
+                const managedTasks = taskManager.getTasksForSession(this.sessionId);
+                console.log(`[DependencyMapPanel] TaskManager returned ${managedTasks.length} tasks for session ${this.sessionId}`);
+                
+                // Convert ManagedTask to ApiTask format
+                tasks = managedTasks.map(t => ({
+                    id: t.id.replace(`${this.sessionId}_`, ''),
+                    globalId: t.id,
+                    sessionId: t.sessionId,
+                    description: t.description,
+                    status: t.status,
+                    type: t.taskType,
+                    dependencies: t.dependencies,
+                    dependents: t.dependents,
+                    priority: t.priority
+                }));
                 
                 if (tasks.length === 0) {
-                    allTasks = taskManager.getAllTasks();
-                    console.log(`[DependencyMapPanel] TaskManager has ${allTasks.length} total tasks across all sessions`);
+                    const allManagedTasks = taskManager.getAllTasks();
+                    console.log(`[DependencyMapPanel] TaskManager has ${allManagedTasks.length} total tasks across all sessions`);
+                    allTasks = allManagedTasks.map(t => ({
+                        id: t.id.replace(`${t.sessionId}_`, ''),
+                        globalId: t.id,
+                        sessionId: t.sessionId,
+                        description: t.description,
+                        status: t.status,
+                        type: t.taskType,
+                        dependencies: t.dependencies,
+                        dependents: t.dependents,
+                        priority: t.priority
+                    }));
                 }
             } catch (err) {
                 console.error('[DependencyMapPanel] TaskManager not available:', err);
@@ -176,13 +213,20 @@ export class DependencyMapPanel {
         }
 
         // Convert to TaskNode format
+        // Note: dependencies and dependents from API are already short IDs (no session prefix)
         const taskNodes = tasks.map(t => ({
-            id: t.id,
-            shortId: t.id.replace(`${this.sessionId}_`, ''),
+            id: t.globalId || `${this.sessionId}_${t.id}`,  // Use globalId if available
+            shortId: t.id,  // API already returns short ID
             description: t.description,
             status: t.status,
-            dependencies: t.dependencies.map(d => d.replace(`${this.sessionId}_`, '')),
-            dependents: t.dependents.map(d => d.replace(`${this.sessionId}_`, ''))
+            dependencies: t.dependencies.map(d => {
+                // Dependencies might be short IDs or full IDs, normalize to short
+                return d.replace(`${this.sessionId}_`, '');
+            }),
+            dependents: t.dependents.map(d => {
+                // Dependents might be short IDs or full IDs, normalize to short
+                return d.replace(`${this.sessionId}_`, '');
+            })
         }));
 
         // If no tasks for this session, check which other sessions have tasks

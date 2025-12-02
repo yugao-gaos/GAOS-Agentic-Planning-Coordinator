@@ -688,7 +688,15 @@ export class ApiHandler {
             case 'status': {
                 const progress = this.services.coordinator.getWorkflowStatus(params.sessionId as string, params.workflowId as string);
                 if (!progress) {
-                    throw new Error(`Workflow ${params.workflowId} not found`);
+                    // Return graceful "not found" instead of throwing error
+                    return { 
+                        data: { 
+                            workflowId: params.workflowId,
+                            sessionId: params.sessionId,
+                            status: 'not_found',
+                            message: 'Workflow completed and cleaned up from memory'
+                        } 
+                    };
                 }
                 return { data: progress };
             }

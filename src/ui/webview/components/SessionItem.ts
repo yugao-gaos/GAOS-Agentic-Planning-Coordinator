@@ -203,27 +203,23 @@ function renderHistoryItem(wf: WorkflowInfo): string {
 /**
  * Find all agents assigned to a specific workflow.
  * Multiple agents can work on a single workflow (e.g., planner + reviewer in revision).
+ * Only matches by explicit workflowId - no fallback to prevent showing same agents on multiple workflows.
  */
 function findAgentsForWorkflow(wf: WorkflowInfo, agents: AgentInfo[]): AgentInfo[] {
     if (!agents || agents.length === 0) return [];
     
-    // First, try to match by workflowId (preferred - exact match)
-    const workflowIdMatches = agents.filter(a => a.workflowId && a.workflowId === wf.id);
-    if (workflowIdMatches.length > 0) {
-        return workflowIdMatches;
+    // Match only by workflowId - agents must be explicitly assigned to this workflow
+    const matches = agents.filter(a => a.workflowId && a.workflowId === wf.id);
+    
+    // Log warning if workflow is running but no agents matched
+    // This helps debug cases where workflowId isn't being set properly
+    if (matches.length === 0 && wf.status === 'running') {
+        console.warn(`[SessionItem] No agents matched for running workflow ${wf.id} (${wf.type}). Available agents:`, 
+            agents.map(a => ({ name: a.name, workflowId: a.workflowId, roleId: a.roleId }))
+        );
     }
     
-    // Fall back to role-based matching only if no workflowId matches found
-    // (for backwards compatibility during transitions)
-    const rolesForType: Record<string, string[]> = {
-        'planning_new': ['planner', 'analyst_architect', 'analyst_quality'],
-        'planning_revision': ['planner', 'analyst_architect', 'analyst_quality', 'analyst_reviewer'],
-        'task_implementation': ['engineer', 'context', 'code_reviewer'],
-        'error_resolution': ['engineer']
-    };
-    
-    const matchingRoles = rolesForType[wf.type] || [];
-    return agents.filter(a => matchingRoles.includes(a.roleId || ''));
+    return matches;
 }
 
 /**
@@ -363,7 +359,13 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                         </div>
                         <div class="history-children" data-history-children="${session.id}">
                             ${session.workflowHistory.slice(0, 5).map(wf => renderHistoryItem(wf)).join('')}
-                            ${session.workflowHistory.length > 5 ? `<div class="nested-item level-3" style="opacity: 0.5; font-size: 10px;">+ ${session.workflowHistory.length - 5} more</div>` : ''}
+                            ${session.workflowHistory.length > 5 ? `
+                            <div class="nested-item level-3 history-more-container">
+                                <button class="history-more-btn" data-action="openFullHistory" data-session-id="${session.id}" title="View all ${session.workflowHistory.length} workflow history items">
+                                    + ${session.workflowHistory.length - 5} more
+                                </button>
+                            </div>
+                            ` : ''}
                         </div>
                     ` : ''}
                     

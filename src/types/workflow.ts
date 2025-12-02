@@ -32,7 +32,8 @@ export type WorkflowStatus =
     | 'blocked'      // Waiting on external dependency
     | 'completed'    // Successfully finished
     | 'failed'       // Failed with error
-    | 'cancelled';   // Cancelled by user
+    | 'cancelled'    // Cancelled by user
+    | 'not_found';   // Workflow was cleaned up from memory
 
 /**
  * Progress tracking for UI updates
@@ -48,6 +49,7 @@ export interface WorkflowProgress {
     message: string;         // Human-readable status
     startedAt: string;
     updatedAt: string;
+    taskId?: string;         // Task ID for task_implementation/error_resolution workflows
     estimatedRemaining?: number; // Milliseconds
     logPath?: string;        // Path to workflow log file
 }

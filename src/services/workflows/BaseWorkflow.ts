@@ -283,6 +283,17 @@ export abstract class BaseWorkflow implements IWorkflow {
     
     getProgress(): WorkflowProgress {
         const phases = this.getPhases();
+        
+        // Extract taskId from input for task workflows
+        let taskId: string | undefined;
+        if (this.type === 'task_implementation' && 'taskId' in this.input) {
+            taskId = this.input.taskId as string;
+        } else if (this.type === 'error_resolution' && 'errors' in this.input) {
+            // For error resolution, try to get taskId from the first error's relatedTaskId
+            const errors = this.input.errors as Array<{ relatedTaskId?: string }>;
+            taskId = errors[0]?.relatedTaskId;
+        }
+        
         return {
             workflowId: this.id,
             type: this.type,
@@ -298,6 +309,7 @@ export abstract class BaseWorkflow implements IWorkflow {
                 ? new Date(this.startTime).toISOString() 
                 : '',
             updatedAt: new Date().toISOString(),
+            taskId,
             logPath: this.workflowLogPath
         };
     }
@@ -697,16 +709,33 @@ ${ctx.partialOutput.slice(-3000)}
         }
         
         // Clear continuation context (memory cleanup)
-        this.continuationContext = undefined;
+        // Explicitly release large strings
+        if (this.continuationContext) {
+            this.continuationContext.partialOutput = '';
+            this.continuationContext.filesModified = [];
+            this.continuationContext.whatWasDone = '';
+            this.continuationContext = undefined;
+        }
         this.currentAgentRunId = undefined;
         
         // Clear pause state
         this.pauseRequested = false;
         this.forcePauseRequested = false;
+        if (this.pauseResolve) {
+            // Resolve any pending pause to prevent hanging promises
+            this.pauseResolve();
+        }
         this.pausePromise = null;
         this.pauseResolve = null;
         
-        // Dispose event emitters
+        // Clear allocated agents array
+        this.allocatedAgents = [];
+        
+        // Clear task tracking
+        this.occupiedTaskIds = [];
+        this.conflictingTaskIds = [];
+        
+        // Dispose event emitters (this removes all listeners)
         this.onProgress.dispose();
         this.onComplete.dispose();
         this.onError.dispose();
@@ -715,6 +744,9 @@ ${ctx.partialOutput.slice(-3000)}
         this.onTaskOccupancyDeclared.dispose();
         this.onTaskOccupancyReleased.dispose();
         this.onTaskConflictDeclared.dispose();
+        
+        // Clear input to release any large objects
+        this.input = {};
     }
     
     // ========================================================================

@@ -31,6 +31,7 @@ export interface BusyAgentInfo {
     roleId?: string;
     coordinatorId: string;
     sessionId: string;
+    workflowId?: string;  // The specific workflow this agent is working on
     task?: string;
 }
 

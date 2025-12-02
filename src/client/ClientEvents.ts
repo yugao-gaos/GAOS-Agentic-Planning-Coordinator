@@ -434,6 +434,9 @@ export interface ApcEventMap {
     'workflow.failed': WorkflowCompletedEventData;
     'workflow.paused': { workflowId: string; sessionId: string; pausedAt: string };
     
+    // Workflow cleanup events
+    'workflows.cleaned': { sessionId: string; cleanedCount: number; timestamp: string };
+    
     // Agent events
     'agent.assigned': AgentAssignedEventData;
     'agent.allocated': AgentAllocatedEventData;

@@ -189,6 +189,11 @@ export function getSidebarScript(): string {
                         if (taskId) {
                             vscode.postMessage({ type: 'retryTask', sessionId, taskId });
                         }
+                    } else if (action === 'openFullHistory') {
+                        const historySessionId = el.dataset.sessionId;
+                        if (historySessionId) {
+                            vscode.postMessage({ type: 'openFullHistory', sessionId: historySessionId });
+                        }
                     } else {
                         vscode.postMessage({ type: action, sessionId });
                     }
