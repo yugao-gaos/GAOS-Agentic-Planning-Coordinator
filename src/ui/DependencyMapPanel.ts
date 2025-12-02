@@ -118,19 +118,35 @@ export class DependencyMapPanel {
                 // Could open task details or progress log
                 vscode.window.showInformationMessage(`Task ${message.taskId}: ${message.description}`);
                 break;
+            case 'switchSession':
+                // Switch to viewing a different session's tasks
+                if (message.sessionId) {
+                    this.sessionId = message.sessionId;
+                    this.updateWebviewContent();
+                }
+                break;
         }
     }
 
     /**
      * Get tasks for the session
+     * Also returns info about tasks in other sessions if current session is empty
      */
-    private async getTasks(): Promise<TaskNode[]> {
+    private async getTasks(): Promise<{ tasks: TaskNode[]; otherSessionsInfo?: { sessionId: string; taskCount: number }[] }> {
         let tasks: ManagedTask[] = [];
+        let allTasks: ManagedTask[] = [];
 
         if (this.vsCodeClient) {
             try {
+                // Get tasks for this session
                 const response = await this.vsCodeClient.send<{ data: ManagedTask[] }>('task.list', { sessionId: this.sessionId });
                 tasks = response.data || [];
+                
+                // If no tasks for this session, get all tasks to check other sessions
+                if (tasks.length === 0) {
+                    const allResponse = await this.vsCodeClient.send<{ data: ManagedTask[] }>('task.list', {});
+                    allTasks = allResponse.data || [];
+                }
             } catch (err) {
                 console.error('[DependencyMapPanel] Failed to fetch tasks from daemon:', err);
             }
@@ -141,13 +157,17 @@ export class DependencyMapPanel {
             try {
                 const taskManager = ServiceLocator.resolve(TaskManager);
                 tasks = taskManager.getTasksForSession(this.sessionId);
+                
+                if (tasks.length === 0) {
+                    allTasks = taskManager.getAllTasks();
+                }
             } catch (err) {
                 console.error('[DependencyMapPanel] TaskManager not available:', err);
             }
         }
 
         // Convert to TaskNode format
-        return tasks.map(t => ({
+        const taskNodes = tasks.map(t => ({
             id: t.id,
             shortId: t.id.replace(`${this.sessionId}_`, ''),
             description: t.description,
@@ -155,6 +175,20 @@ export class DependencyMapPanel {
             dependencies: t.dependencies.map(d => d.replace(`${this.sessionId}_`, '')),
             dependents: t.dependents.map(d => d.replace(`${this.sessionId}_`, ''))
         }));
+
+        // If no tasks for this session, check which other sessions have tasks
+        let otherSessionsInfo: { sessionId: string; taskCount: number }[] | undefined;
+        if (taskNodes.length === 0 && allTasks.length > 0) {
+            const sessionCounts = new Map<string, number>();
+            for (const t of allTasks) {
+                sessionCounts.set(t.sessionId, (sessionCounts.get(t.sessionId) || 0) + 1);
+            }
+            otherSessionsInfo = Array.from(sessionCounts.entries())
+                .map(([sessionId, taskCount]) => ({ sessionId, taskCount }))
+                .sort((a, b) => b.taskCount - a.taskCount);
+        }
+
+        return { tasks: taskNodes, otherSessionsInfo };
     }
 
     /**
@@ -228,20 +262,21 @@ export class DependencyMapPanel {
      * Update the webview content
      */
     private async updateWebviewContent(): Promise<void> {
-        const tasks = await this.getTasks();
+        const { tasks, otherSessionsInfo } = await this.getTasks();
         const layoutedTasks = this.calculateLayout(tasks);
         
         // Update panel title
         this.panel.title = `Task Dependencies - ${this.sessionId.substring(0, 8)} (${tasks.length} tasks)`;
         
-        this.panel.webview.html = this.getWebviewContent(layoutedTasks);
+        this.panel.webview.html = this.getWebviewContent(layoutedTasks, otherSessionsInfo);
     }
 
     /**
      * Generate the webview HTML content
      */
-    private getWebviewContent(tasks: TaskNode[]): string {
+    private getWebviewContent(tasks: TaskNode[], otherSessionsInfo?: { sessionId: string; taskCount: number }[]): string {
         const tasksJson = JSON.stringify(tasks);
+        const otherSessionsJson = JSON.stringify(otherSessionsInfo || []);
         
         // Calculate canvas size
         const maxX = Math.max(...tasks.map(t => (t.x || 0) + 100), 400);
@@ -524,6 +559,7 @@ export class DependencyMapPanel {
     <script>
         const vscode = acquireVsCodeApi();
         const tasks = ${tasksJson};
+        const otherSessions = ${otherSessionsJson};
         
         const statusIcons = {
             'completed': '✓',
@@ -539,7 +575,24 @@ export class DependencyMapPanel {
             const connections = document.getElementById('connections');
             
             if (tasks.length === 0) {
-                canvas.innerHTML = '<div class="empty-state"><div class="empty-state-icon">📋</div><div>No tasks yet</div><div style="margin-top: 8px; font-size: 0.9em;">Tasks will appear here once created</div></div>';
+                let emptyHtml = '<div class="empty-state"><div class="empty-state-icon">📋</div><div>No tasks yet</div>';
+                
+                if (otherSessions && otherSessions.length > 0) {
+                    // Show which sessions DO have tasks
+                    const sessionList = otherSessions.map(s => 
+                        '<div style="margin: 4px 0; padding: 4px 8px; background: rgba(59, 130, 246, 0.2); border-radius: 4px; cursor: pointer; display: inline-block;" ' +
+                        'onclick="vscode.postMessage({command: \\'switchSession\\', sessionId: \\'' + s.sessionId + '\\'});">' +
+                        s.sessionId.substring(0, 11) + ' (' + s.taskCount + ' tasks)</div>'
+                    ).join(' ');
+                    emptyHtml += '<div style="margin-top: 16px; font-size: 0.9em; color: #f59e0b;">⚠️ Tasks exist in other sessions:</div>';
+                    emptyHtml += '<div style="margin-top: 8px;">' + sessionList + '</div>';
+                    emptyHtml += '<div style="margin-top: 12px; font-size: 0.85em; opacity: 0.7;">Click a session to view its tasks</div>';
+                } else {
+                    emptyHtml += '<div style="margin-top: 8px; font-size: 0.9em;">Tasks will appear here once created</div>';
+                }
+                
+                emptyHtml += '</div>';
+                canvas.innerHTML = emptyHtml;
                 return;
             }
             

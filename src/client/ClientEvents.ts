@@ -348,6 +348,18 @@ export interface TaskPausedEventData {
     timestamp: string;
 }
 
+/**
+ * Coordinator status changed event data
+ * Triggered when coordinator state changes (idle, queuing, evaluating, cooldown)
+ */
+export interface CoordinatorStatusChangedEventData {
+    state: 'idle' | 'queuing' | 'evaluating' | 'cooldown';
+    pendingEvents: number;
+    lastEvaluation?: string;
+    evaluationCount: number;
+    timestamp: string;
+}
+
 // ============================================================================
 // Event Type Map
 // ============================================================================
@@ -411,6 +423,9 @@ export interface ApcEventMap {
     // Task attention events (require user intervention)
     'task.failedFinal': TaskFailedFinalEventData;
     'task.paused': TaskPausedEventData;
+    
+    // Coordinator events
+    'coordinator.statusChanged': CoordinatorStatusChangedEventData;
 }
 
 // ============================================================================

@@ -432,6 +432,25 @@ export class EventBroadcaster extends EventEmitter implements IEventBroadcaster 
     }
     
     /**
+     * Broadcast coordinator status change
+     * Notifies clients when coordinator state changes (idle, queuing, evaluating, cooldown)
+     */
+    coordinatorStatusChanged(
+        state: 'idle' | 'queuing' | 'evaluating' | 'cooldown',
+        pendingEvents: number,
+        evaluationCount: number,
+        lastEvaluation?: string
+    ): void {
+        this.broadcast('coordinator.statusChanged', {
+            state,
+            pendingEvents,
+            lastEvaluation,
+            evaluationCount,
+            timestamp: new Date().toISOString()
+        });
+    }
+    
+    /**
      * Dispose the broadcaster
      */
     dispose(): void {

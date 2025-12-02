@@ -282,6 +282,8 @@ export class CoordinatorAgent {
     /**
      * Save coordinator prompt/output to log file for debugging
      * Logs are saved to global folder: _AiDevLog/Logs/Coordinator/
+     * 
+     * Automatically cleans up old logs, keeping only the most recent runs.
      */
     private saveCoordinatorLog(sessionId: string, evalId: string, type: 'prompt' | 'output', content: string): void {
         try {
@@ -297,8 +299,48 @@ export class CoordinatorAgent {
             
             fs.writeFileSync(filepath, content);
             this.log(`[DEBUG] Saved coordinator ${type} to: ${filepath}`);
+            
+            // Clean up old log files after saving (keep last N runs worth)
+            this.cleanupOldLogs(logDir);
         } catch (err) {
             this.log(`[WARN] Failed to save coordinator log: ${err}`);
+        }
+    }
+    
+    /**
+     * Maximum number of evaluation runs to keep logs for.
+     * Each run creates 3 files: prompt, output, and stream log.
+     */
+    private static readonly MAX_LOG_RUNS = 10;
+    
+    /**
+     * Clean up old coordinator log files, keeping only the most recent runs.
+     * Files are sorted by name (which includes timestamp) to determine age.
+     */
+    private cleanupOldLogs(logDir: string): void {
+        try {
+            const files = fs.readdirSync(logDir)
+                .filter(f => f.endsWith('.txt') || f.endsWith('.log'))
+                .sort()
+                .reverse(); // Newest first (timestamp is in filename)
+            
+            // Each eval run produces ~3 files (prompt, output, stream), so keep MAX_LOG_RUNS * 3
+            const maxFiles = CoordinatorAgent.MAX_LOG_RUNS * 3;
+            
+            if (files.length > maxFiles) {
+                const filesToDelete = files.slice(maxFiles);
+                for (const file of filesToDelete) {
+                    try {
+                        fs.unlinkSync(path.join(logDir, file));
+                    } catch (err) {
+                        // Ignore deletion errors for individual files
+                    }
+                }
+                this.log(`[DEBUG] Cleaned up ${filesToDelete.length} old coordinator log files`);
+            }
+        } catch (err) {
+            // Don't fail if cleanup fails - it's not critical
+            this.log(`[WARN] Failed to cleanup old coordinator logs: ${err}`);
         }
     }
 

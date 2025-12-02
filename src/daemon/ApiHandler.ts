@@ -876,7 +876,11 @@ export class ApiHandler {
                 
                 return {
                     data: tasks.map(t => ({
-                        id: t.id.includes('_') ? t.id.split('_').slice(1).join('_') : t.id,
+                        // Extract short ID by removing the sessionId_ prefix
+                        // e.g., "ps_000001_T1" with sessionId "ps_000001" → "T1"
+                        id: t.sessionId && t.id.startsWith(`${t.sessionId}_`) 
+                            ? t.id.slice(t.sessionId.length + 1) 
+                            : t.id,
                         globalId: t.id,
                         sessionId: t.sessionId,
                         description: t.description,
