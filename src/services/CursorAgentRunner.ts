@@ -43,6 +43,8 @@ export interface AgentRunOptions {
     onStart?: (pid: number) => void;
     /** Additional metadata for tracking */
     metadata?: Record<string, any>;
+    /** Use simple mode without streaming JSON output (for coordinator) */
+    simpleMode?: boolean;
 }
 
 /**
@@ -94,7 +96,8 @@ export class CursorAgentRunner implements IAgentBackend {
             onOutput,
             onProgress,
             onStart,
-            metadata
+            metadata,
+            simpleMode = false
         } = options;
 
         const startTime = Date.now();
@@ -112,7 +115,12 @@ export class CursorAgentRunner implements IAgentBackend {
 
         // Build the shell command
         // Using cat to pipe prompt avoids escaping issues with complex prompts
-        const shellCmd = `cat "${promptFile}" | cursor agent --model "${model}" -p --force --approve-mcps --output-format stream-json --stream-partial-output 2>&1; rm -f "${promptFile}"`;
+        // Simple mode: minimal flags for coordinator-style execution (just execute and return)
+        // Normal mode: streaming JSON output for workflows that need progress updates
+        const cursorFlags = simpleMode
+            ? `--model "${model}" -p --force --approve-mcps`
+            : `--model "${model}" -p --force --approve-mcps --output-format stream-json --stream-partial-output`;
+        const shellCmd = `cat "${promptFile}" | cursor agent ${cursorFlags} 2>&1; rm -f "${promptFile}"`;
 
         onProgress?.(`🚀 Starting cursor agent (${model})...`);
         if (logFile) {
@@ -190,7 +198,7 @@ export class CursorAgentRunner implements IAgentBackend {
             let totalBytes = 0;
             let lastProgressTime = Date.now();
 
-            // Parse stdout streaming JSON
+            // Parse stdout - simple mode collects raw text, normal mode parses JSON
             proc.stdout?.on('data', (data) => {
                 const text = data.toString();
                 chunkCount++;
@@ -200,6 +208,7 @@ export class CursorAgentRunner implements IAgentBackend {
                 const run = this.activeRuns.get(id);
                 if (run) {
                     run.collectedOutput += text;
+                    run.lastOutputTime = Date.now();
                 }
 
                 // Progress report every 20 chunks
@@ -207,16 +216,25 @@ export class CursorAgentRunner implements IAgentBackend {
                     onProgress?.(`📊 Progress: ${chunkCount} chunks, ${Math.round(totalBytes / 1024)}KB`);
                 }
 
-                // Parse each line as JSON
-                const lines = text.split('\n').filter((l: string) => l.trim());
-                for (const line of lines) {
-                    this.parseLine(line, id, {
-                        onOutput,
-                        onProgress,
-                        logFile,
-                        planFile,
-                        collectedOutput: (text) => { collectedOutput += text; }
-                    });
+                if (simpleMode) {
+                    // Simple mode: just collect raw output
+                    collectedOutput += text;
+                    onOutput?.(text, 'text');
+                    if (logFile) {
+                        this.appendToLog(logFile, text);
+                    }
+                } else {
+                    // Normal mode: Parse each line as JSON
+                    const lines = text.split('\n').filter((l: string) => l.trim());
+                    for (const line of lines) {
+                        this.parseLine(line, id, {
+                            onOutput,
+                            onProgress,
+                            logFile,
+                            planFile,
+                            collectedOutput: (text) => { collectedOutput += text; }
+                        });
+                    }
                 }
             });
 

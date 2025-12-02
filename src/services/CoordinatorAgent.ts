@@ -161,13 +161,15 @@ export class CoordinatorAgent {
         const logFile = `${logDir}/${timestamp}_${evalId}_stream.log`;
         
         // Run the AI agent - it will call run_terminal_cmd directly
+        // Use simpleMode (no streaming JSON) for coordinator - cleaner output
         const result = await this.agentRunner.run({
             id: evalId,
             prompt,
             cwd: process.cwd(),
             model: this.config.model,
             timeoutMs: this.config.evaluationTimeout,
-            logFile,  // Capture streaming output
+            logFile,  // Capture output
+            simpleMode: true,  // Don't use streaming JSON - just execute and return
             onProgress: (msg) => this.log(`[eval] ${msg}`)
         });
         
