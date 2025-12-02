@@ -837,33 +837,42 @@ For each approved plan, use read_file to understand the tasks needed.
 
 ## Commands (use run_terminal_cmd tool)
 
-**List existing tasks (shows status and deps):**
+**IMPORTANT: Chain multiple commands with && for efficiency!**
+Each separate command has overhead. Chain related commands in a single run_terminal_cmd call.
+
+**List existing tasks:**
 \`\`\`bash
 apc task list
 \`\`\`
 
-**Create task (no deps - can start immediately):**
+**Create multiple tasks (chain with &&):**
 \`\`\`bash
-apc task create --session <sessionId> --id T1 --desc "Task description" --type implementation
+apc task create --session <sessionId> --id T0 --desc "First task" --type implementation && \\
+apc task create --session <sessionId> --id T1 --desc "Second task" --deps T0 --type implementation && \\
+apc task create --session <sessionId> --id T2 --desc "Third task" --deps T0 --type implementation
 \`\`\`
 
-**Create task with dependencies (can only start after deps complete):**
+**Create and start in one call:**
 \`\`\`bash
-apc task create --session <sessionId> --id T3 --desc "..." --deps T1,T2 --type implementation
+apc task create --session <sessionId> --id T0 --desc "Foundation task" --type implementation && \\
+apc task create --session <sessionId> --id T1 --desc "Depends on T0" --deps T0 --type implementation && \\
+apc task start --session <sessionId> --id T0 --workflow task_implementation
 \`\`\`
 
-**Start task (only if deps are met):**
+**Start multiple ready tasks:**
 \`\`\`bash
-apc task start --session <sessionId> --id T1 --workflow task_implementation
+apc task start --session <sessionId> --id T0 --workflow task_implementation && \\
+apc task start --session <sessionId> --id T1 --workflow task_implementation && \\
+apc task start --session <sessionId> --id T2 --workflow task_implementation
 \`\`\`
 
 ## What To Do
 
-1. Run \`apc task list\` to see existing tasks and their dependency status
-2. Read plan file(s) to identify needed tasks
-3. Create tasks that don't exist yet (with correct deps from plan)
-4. Start ONLY tasks that are ready (status=created/pending AND all deps completed)
-5. Start up to N tasks where N = number of available agents
+1. Run \`apc task list\` to see existing tasks
+2. Read plan file(s) to identify needed tasks  
+3. **In ONE chained command**: Create all missing tasks with correct deps
+4. **In ONE chained command**: Start all ready tasks (no deps OR deps completed)
+5. Start up to N tasks where N = available agents
 
 ## Your Response
 
