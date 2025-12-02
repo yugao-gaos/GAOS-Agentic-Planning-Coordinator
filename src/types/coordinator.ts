@@ -302,7 +302,7 @@ export interface CoordinatorAgentConfig {
  */
 export const DEFAULT_COORDINATOR_CONFIG: CoordinatorAgentConfig = {
     maxHistoryEntries: 20,
-    evaluationTimeout: 120000,  // 2 minutes - coordinator needs time to read plan and execute commands
+    evaluationTimeout: 300000,  // 5 minutes - coordinator needs time to read plan (can be 500+ lines) and execute multiple commands
     model: 'sonnet-4.5',
     includePlanContent: true,
     maxPlanContentLength: 50000,

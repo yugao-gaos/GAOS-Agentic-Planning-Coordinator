@@ -30,6 +30,7 @@ export class IdlePlanMonitor {
     private checkInterval: NodeJS.Timeout | null = null;
     private idlePlans: Map<string, IdlePlanState> = new Map();
     private outputManager?: OutputChannelManager;
+    private hasTriggeredStartup: boolean = false;
     
     constructor(
         private stateManager: StateManager,
@@ -46,19 +47,83 @@ export class IdlePlanMonitor {
     
     /**
      * Start monitoring for idle plans
+     * @param triggerImmediately If true, trigger coordinator for existing approved plans immediately on startup
      */
-    start(): void {
+    start(triggerImmediately: boolean = true): void {
         if (this.checkInterval) {
             return;  // Already running
         }
         
         this.log('Starting idle plan monitor');
+        
+        // On startup, trigger immediately for any existing approved plans
+        if (triggerImmediately && !this.hasTriggeredStartup) {
+            this.triggerStartupEvaluation();
+        }
+        
         this.checkInterval = setInterval(() => {
             this.checkIdlePlans();
         }, IdlePlanMonitor.CHECK_INTERVAL_MS);
         
-        // Also check immediately
+        // Start normal tracking (won't trigger due to cooldown from startup)
         this.checkIdlePlans();
+    }
+    
+    /**
+     * Trigger coordinator for all existing approved plans on startup
+     * This skips the idle threshold - we assume existing approved plans should be evaluated
+     */
+    private triggerStartupEvaluation(): void {
+        const sessions = this.stateManager.getAllPlanningSessions()
+            .filter(s => s.status === 'approved');
+        
+        const availableAgents = this.agentPoolService.getAvailableAgents();
+        
+        if (sessions.length === 0) {
+            this.log('No approved plans found on startup');
+            return;
+        }
+        
+        if (availableAgents.length === 0) {
+            this.log(`Found ${sessions.length} approved plan(s) but no agents available`);
+            return;
+        }
+        
+        this.log(`Startup: Found ${sessions.length} approved plan(s), ${availableAgents.length} agents available - triggering evaluation`);
+        
+        const now = Date.now();
+        for (const session of sessions) {
+            // Check if this session has active workflows
+            const sessionState = this.coordinator.getSessionState(session.id);
+            const hasActiveWorkflows = sessionState?.activeWorkflows && sessionState.activeWorkflows.size > 0;
+            
+            if (hasActiveWorkflows) {
+                this.log(`Startup: Skipping ${session.id} - has active workflows`);
+                continue;
+            }
+            
+            // Trigger coordinator
+            this.log(`Startup: Triggering coordinator for ${session.id}`);
+            this.coordinator.triggerCoordinatorEvaluation(
+                session.id,
+                'manual_evaluation',
+                {
+                    type: 'manual_evaluation',
+                    reason: `Daemon startup - evaluating approved plan with ${availableAgents.length} available agents`
+                }
+            ).catch(err => {
+                this.log(`Startup: Failed to trigger coordinator for ${session.id}: ${err}`);
+            });
+            
+            // Track this plan with last trigger set to now
+            this.idlePlans.set(session.id, {
+                sessionId: session.id,
+                idleSince: now,
+                lastTrigger: now  // Set to now so cooldown applies
+            });
+        }
+        
+        this.hasTriggeredStartup = true;
     }
     
     /**
