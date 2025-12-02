@@ -186,6 +186,13 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
     });
     console.log('[Standalone] PlanningService initialized');
     
+    // Initialize and start IdlePlanMonitor
+    const { IdlePlanMonitor } = await import('./IdlePlanMonitor');
+    const idlePlanMonitor = new IdlePlanMonitor(stateManager, agentPoolService, coordinator);
+    idlePlanMonitor.setOutputManager(outputManager);
+    idlePlanMonitor.start();
+    console.log('[Standalone] IdlePlanMonitor started');
+    
     // Return API services interface
     return {
         stateManager: {

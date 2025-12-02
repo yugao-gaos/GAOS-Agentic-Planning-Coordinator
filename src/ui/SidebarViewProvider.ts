@@ -277,9 +277,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 this.startPeriodicRefresh();
             }
             
-            // Check for idle approved plans with available agents - trigger coordinator evaluation
-            await this.checkAndTriggerIdleCoordinator(state);
-            
             // Build client state with pre-computed values and pre-rendered HTML
             const clientState = buildClientState(state);
             
@@ -296,66 +293,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         });
     }
     
-    /** Track sessions that have been triggered recently to avoid spam */
-    private recentlyTriggeredSessions: Map<string, number> = new Map();
-    private static readonly TRIGGER_COOLDOWN_MS = 60000; // 60 seconds between triggers per session
-    
-    /**
-     * Check for idle approved plans with available agents and trigger coordinator evaluation
-     */
-    private async checkAndTriggerIdleCoordinator(state: SidebarState): Promise<void> {
-        // Only trigger when system is ready
-        if (state.systemStatus !== 'ready') return;
-        
-        // Check if we have available agents
-        const availableAgents = state.agents.filter(a => a.status === 'available');
-        if (availableAgents.length === 0) return;
-        
-        const now = Date.now();
-        
-        for (const session of state.sessions) {
-            // Only trigger for approved plans with no active workflows
-            if (session.status !== 'approved') continue;
-            if (session.activeWorkflows.length > 0) continue;
-            
-            // Check cooldown - don't trigger same session too frequently
-            const lastTrigger = this.recentlyTriggeredSessions.get(session.id);
-            if (lastTrigger && (now - lastTrigger) < SidebarViewProvider.TRIGGER_COOLDOWN_MS) {
-                continue;
-            }
-            
-            // Trigger coordinator evaluation
-            console.log(`[SidebarViewProvider] Triggering coordinator for idle approved plan ${session.id} (${availableAgents.length} agents available)`);
-            
-            try {
-                if (this.stateProxy) {
-                    await this.stateProxy.requestCoordinatorEvaluation(
-                        session.id, 
-                        `idle_approved_plan_refresh (${availableAgents.length} agents available)`
-                    );
-                } else if (this.unifiedCoordinator) {
-                    await this.unifiedCoordinator.triggerCoordinatorEvaluation(
-                        session.id,
-                        'manual_evaluation',
-                        { type: 'manual_evaluation', reason: `idle_approved_plan_refresh (${availableAgents.length} agents available)` }
-                    );
-                }
-                
-                // Mark as recently triggered
-                this.recentlyTriggeredSessions.set(session.id, now);
-            } catch (err) {
-                console.warn(`[SidebarViewProvider] Failed to trigger coordinator for ${session.id}:`, err);
-            }
-        }
-        
-        // Clean up old entries from the map
-        for (const [sessionId, time] of this.recentlyTriggeredSessions) {
-            if (now - time > SidebarViewProvider.TRIGGER_COOLDOWN_MS * 2) {
-                this.recentlyTriggeredSessions.delete(sessionId);
-            }
-        }
-    }
-
     private async _buildStateAsync(): Promise<SidebarState> {
         // Check daemon connection first - this is critical for all operations
         if (this.stateProxy && !this.stateProxy.isDaemonConnected()) {
