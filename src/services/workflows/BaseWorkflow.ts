@@ -24,6 +24,7 @@ import { AgentPoolService } from '../AgentPoolService';
 import { AgentRoleRegistry } from '../AgentRoleRegistry';
 import { UnityControlManager } from '../UnityControlManager';
 import { OutputChannelManager } from '../OutputChannelManager';
+import { ProcessManager, ProcessState } from '../ProcessManager';
 import { ServiceLocator } from '../ServiceLocator';
 
 /**
@@ -101,6 +102,12 @@ export abstract class BaseWorkflow implements IWorkflow {
     readonly onAgentNeeded = new TypedEventEmitter<AgentRequest>();
     readonly onAgentReleased = new TypedEventEmitter<string>();
     readonly onAgentDemotedToBench = new TypedEventEmitter<string>();
+    readonly onAgentTerminated = new TypedEventEmitter<{
+        agentName: string;
+        runId: string;
+        reason: 'external_kill' | 'timeout' | 'error' | 'health_check_failed';
+        phase?: string;
+    }>();
     
     // Task occupancy/conflict events
     readonly onTaskOccupancyDeclared = new TypedEventEmitter<TaskOccupancy>();
@@ -135,6 +142,9 @@ export abstract class BaseWorkflow implements IWorkflow {
     /** Whether pause should force-kill the agent vs wait for phase boundary */
     private forcePauseRequested: boolean = false;
     
+    /** ProcessManager callback IDs for cleanup */
+    private processManagerCallbackIds: string[] = [];
+    
     // ========================================================================
     // Logging
     // ========================================================================
@@ -152,6 +162,7 @@ export abstract class BaseWorkflow implements IWorkflow {
     /** Unity Control Manager - only available when unityEnabled is true */
     protected unityManager: UnityControlManager | undefined;
     protected outputManager: OutputChannelManager;
+    protected processManager: ProcessManager;
     
     /** Whether Unity features are enabled for this workflow */
     protected unityEnabled: boolean;
@@ -235,10 +246,14 @@ export abstract class BaseWorkflow implements IWorkflow {
         this.roleRegistry = services.roleRegistry;
         this.unityManager = services.unityManager;
         this.outputManager = services.outputManager;
+        this.processManager = ServiceLocator.resolve(ProcessManager);
         this.unityEnabled = services.unityEnabled;
         
         // Initialize workflow log file (persistent)
         this.initializeWorkflowLog();
+        
+        // Subscribe to ProcessManager events for agent health monitoring
+        this.setupProcessManagerMonitoring();
     }
     
     /**
@@ -260,6 +275,73 @@ export abstract class BaseWorkflow implements IWorkflow {
         } catch {
             // Silently ignore log initialization errors
         }
+    }
+    
+    /**
+     * Setup ProcessManager monitoring for agent health
+     * Delegates health checking to ProcessManager (separation of concerns)
+     */
+    private setupProcessManagerMonitoring(): void {
+        // Register callback for stuck processes (no output for 5+ minutes)
+        const stuckCallbackId = this.processManager.onProcessStuck((processId, state) => {
+            // Check if this is one of our agent processes
+            if (processId.startsWith(this.id) && this.currentAgentRunId === processId) {
+                this.log(`⚠️ Agent process appears stuck: ${processId}`);
+                this.handleAgentUnexpectedTermination(processId, 'health_check_failed', state);
+            }
+        });
+        
+        // Register callback for process timeouts
+        const timeoutCallbackId = this.processManager.onProcessTimeout((processId, state) => {
+            // Check if this is one of our agent processes
+            if (processId.startsWith(this.id) && this.currentAgentRunId === processId) {
+                this.log(`⏰ Agent process timed out: ${processId}`);
+                this.handleAgentUnexpectedTermination(processId, 'timeout', state);
+            }
+        });
+        
+        // Store callback IDs for cleanup
+        this.processManagerCallbackIds.push(stuckCallbackId, timeoutCallbackId);
+    }
+    
+    /**
+     * Handle unexpected agent termination detected by ProcessManager
+     */
+    private handleAgentUnexpectedTermination(
+        runId: string,
+        reason: 'external_kill' | 'timeout' | 'error' | 'health_check_failed',
+        processState?: ProcessState
+    ): void {
+        // Find which agent this was
+        const agentName = this.allocatedAgents.find(name => 
+            processState?.metadata?.agentName === name
+        );
+        
+        const phaseName = this.getPhases()[this.phaseIndex] || 'unknown';
+        
+        this.log(`❌ Agent terminated unexpectedly: ${reason}`);
+        this.log(`  Run ID: ${runId}`);
+        this.log(`  Phase: ${phaseName}`);
+        if (agentName) {
+            this.log(`  Agent: ${agentName}`);
+        }
+        
+        // Fire termination event
+        this.onAgentTerminated.fire({
+            agentName: agentName || 'unknown',
+            runId,
+            reason,
+            phase: phaseName
+        });
+        
+        // Clear current agent run ID so we don't wait for it
+        if (this.currentAgentRunId === runId) {
+            this.currentAgentRunId = undefined;
+        }
+        
+        // Note: The agent runner's Promise will reject, which will be caught
+        // by the try-catch in runAgentTaskWithCallback or executePhase
+        // We don't need to do anything else here - just log and notify
     }
     
     // ========================================================================
@@ -725,6 +807,16 @@ ${ctx.partialOutput.slice(-3000)}
     // ========================================================================
     
     dispose(): void {
+        // Unregister ProcessManager callbacks to prevent memory leaks
+        for (const callbackId of this.processManagerCallbackIds) {
+            if (callbackId.startsWith('stuck_')) {
+                this.processManager.offProcessStuck(callbackId);
+            } else if (callbackId.startsWith('timeout_')) {
+                this.processManager.offProcessTimeout(callbackId);
+            }
+        }
+        this.processManagerCallbackIds = [];
+        
         // Release any remaining task occupancy
         if (this.occupiedTaskIds.length > 0) {
             this.releaseTaskOccupancy(this.occupiedTaskIds);
@@ -763,6 +855,7 @@ ${ctx.partialOutput.slice(-3000)}
         this.onError.dispose();
         this.onAgentNeeded.dispose();
         this.onAgentReleased.dispose();
+        this.onAgentTerminated.dispose();
         this.onTaskOccupancyDeclared.dispose();
         this.onTaskOccupancyReleased.dispose();
         this.onTaskConflictDeclared.dispose();
@@ -887,7 +980,7 @@ ${ctx.partialOutput.slice(-3000)}
         if (this.workflowLogPath) {
             try {
                 const timestamp = new Date().toISOString();
-                fs.appendFileSync(this.workflowLogPath, `[${timestamp}] ${message}\n`);
+                fs.appendFileSync(this.workflowLogPath, `[${timestamp}] ${message}\n`, 'utf8');
             } catch {
                 // Silently ignore file write errors
             }
@@ -903,6 +996,12 @@ ${ctx.partialOutput.slice(-3000)}
     
     /**
      * Request an agent from the pool
+     * 
+     * NEW ARCHITECTURE:
+     * 1. Requests agent allocation to bench
+     * 2. Immediately promotes to busy when allocated
+     * 3. Workflows can demote to bench if agent isn't immediately needed
+     * 
      * Returns a promise that resolves with the agent name when allocated
      */
     protected requestAgent(roleId: string): Promise<string> {
@@ -922,6 +1021,22 @@ ${ctx.partialOutput.slice(-3000)}
                     this.waitingForAgent = false;
                     this.waitingForAgentRole = undefined;
                     
+                    // Agent is now on bench - promote to busy immediately
+                    // (Workflows can demote back to bench if not immediately needed)
+                    const { AgentPoolService } = require('../AgentPoolService');
+                    const { ServiceLocator } = require('../ServiceLocator');
+                    const agentPoolService = ServiceLocator.resolve(AgentPoolService);
+                    
+                    const promoted = agentPoolService.promoteAgentToBusy(
+                        agentName,
+                        this.id,
+                        roleId  // Use roleId as task description
+                    );
+                    
+                    if (!promoted) {
+                        this.log(`⚠️ Failed to promote ${agentName} to busy - already working?`);
+                    }
+                    
                     // Change status to 'running' on first agent allocation
                     // This ensures UI sees workflow as running only after agent is assigned
                     if (!this.hasStartedRunning && this.status === 'pending') {
@@ -931,7 +1046,7 @@ ${ctx.partialOutput.slice(-3000)}
                     }
                     
                     this.allocatedAgents.push(agentName);
-                    this.log(`Agent allocated: ${agentName} (role: ${roleId})`);
+                    this.log(`Agent allocated and promoted to busy: ${agentName} (role: ${roleId})`);
                     
                     // Emit progress update to clear waiting indicator in UI
                     this.emitProgress();
@@ -959,6 +1074,7 @@ ${ctx.partialOutput.slice(-3000)}
             console.log(`[BaseWorkflow] Agent ${agentName} not in allocatedAgents, skipping release`);
         }
     }
+    
     
     /**
      * Demote agent to bench (allocated but idle, waiting for more work)
@@ -1127,9 +1243,16 @@ ${ctx.partialOutput.slice(-3000)}
                 coordinatorId: this.id,
                 sessionId: this.sessionId,
                 taskId,
-                agentName
+                agentName,
+                workflowType: this.type
             }
         });
+        
+        // IMPORTANT: The agent runner (CursorAgentRunner) already registers the process
+        // with ProcessManager in its run() method via registerExternalProcess().
+        // ProcessManager will now monitor the process health and call our callbacks
+        // (setupProcessManagerMonitoring) if the process gets stuck or times out.
+        // This provides automatic detection of external kills without duplicating logic.
         
         // Wait for CLI callback from coordinator (include taskId for parallel task support)
         const callbackPromise = coordinator.waitForAgentCompletion(

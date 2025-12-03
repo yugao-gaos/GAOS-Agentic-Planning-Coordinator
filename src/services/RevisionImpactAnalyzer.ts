@@ -3,9 +3,9 @@
 // ============================================================================
 
 import * as fs from 'fs';
-import { PlanParser, PlanTask } from './PlanParser';
-import { PlanCache } from './PlanCache';
+import { PlanTask } from './PlanParser';
 import { ServiceLocator } from './ServiceLocator';
+import { TaskManager } from './TaskManager';
 
 /**
  * Revision impact analysis result for a single task
@@ -98,10 +98,16 @@ export class RevisionImpactAnalyzer {
     
     /**
      * Analyze revision feedback to determine affected tasks
+     * 
+     * @param feedback - The revision feedback text
+     * @param sessionId - The session ID to get tasks for (extracted from planPath or provided directly)
+     * @param planPath - Optional plan path for backward compatibility (sessionId is extracted)
+     * @param currentTaskStates - Optional current task states
+     * @param options - Analysis options
      */
     static analyze(
         feedback: string,
-        planPath: string,
+        sessionIdOrPlanPath: string,
         currentTaskStates?: Map<string, { status: string; filesModified: string[] }>,
         options: AnalysisOptions = {}
     ): RevisionImpactResult {
@@ -111,18 +117,26 @@ export class RevisionImpactAnalyzer {
             considerInProgress = true
         } = options;
         
-        // Parse the plan to get all tasks (using cache for performance)
-        const planCache = ServiceLocator.resolve(PlanCache);
-        const plan = planCache.getPlan(planPath);
-        const allTasks: PlanTask[] = [];
-        
-        for (const [engineerName, tasks] of Object.entries(plan.engineerChecklists)) {
-            allTasks.push(...tasks);
+        // Extract sessionId from planPath if needed (e.g., "/path/Plans/ps_000001/plan.md" -> "ps_000001")
+        let sessionId = sessionIdOrPlanPath;
+        if (sessionIdOrPlanPath.includes('/')) {
+            const match = sessionIdOrPlanPath.match(/\/(ps_\d+)\//);
+            if (match) {
+                sessionId = match[1];
+            }
         }
         
-        if (allTasks.length === 0) {
+        // Get tasks from TaskManager instead of parsing the plan
+        const taskManager = ServiceLocator.resolve(TaskManager);
+        const managedTasks = taskManager.getTasksForSession(sessionId);
+        
+        if (managedTasks.length === 0) {
+            console.warn(`[RevisionImpactAnalyzer] No tasks found for session ${sessionId} in TaskManager`);
             return this.createEmptyResult();
         }
+        
+        // Convert ManagedTask[] to PlanTask[] format for compatibility with existing analysis logic
+        const allTasks: PlanTask[] = managedTasks.map(task => this.convertToPlanTask(task));
         
         // Extract keywords and entities from feedback
         const feedbackAnalysis = this.analyzeFeedback(feedback);
@@ -205,6 +219,28 @@ export class RevisionImpactAnalyzer {
                 unaffected,
                 feedbackAnalysis
             )
+        };
+    }
+    
+    /**
+     * Convert ManagedTask to PlanTask format for compatibility with existing analysis logic
+     */
+    private static convertToPlanTask(task: any): PlanTask {
+        // Extract local task ID (remove session prefix if present)
+        const localId = task.id.includes('_') ? task.id.split('_').pop() || task.id : task.id;
+        
+        // Convert dependencies to local IDs
+        const localDeps = (task.dependencies || []).map((depId: string) => 
+            depId.includes('_') ? depId.split('_').pop() || depId : depId
+        );
+        
+        return {
+            id: localId,
+            description: task.description,
+            completed: task.status === 'completed',
+            approved: task.status === 'completed', // Completed tasks are implicitly approved
+            engineer: task.actualAgent || 'Unassigned',
+            dependencies: localDeps
         };
     }
     

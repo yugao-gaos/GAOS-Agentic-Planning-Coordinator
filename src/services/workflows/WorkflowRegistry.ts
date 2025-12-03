@@ -35,6 +35,7 @@ export class WorkflowRegistry {
             type,
             name: metadata?.name || type,
             requiresUnity: metadata?.requiresUnity || false,
+            requiresCompleteDependencies: metadata?.requiresCompleteDependencies ?? true, // Default: require complete deps
             coordinatorPrompt: metadata?.coordinatorPrompt || `- '${type}' - ${type} workflow`
         };
         
@@ -73,17 +74,17 @@ export class WorkflowRegistry {
     }
     
     /**
-     * Get all registered workflow types
-     */
-    getTypes(): WorkflowType[] {
-        return Array.from(this.entries.keys());
-    }
-    
-    /**
      * Get metadata for a workflow type
      */
     getMetadata(type: WorkflowType): WorkflowMetadata | undefined {
         return this.entries.get(type)?.metadata;
+    }
+    
+    /**
+     * Get all registered workflow types
+     */
+    getTypes(): WorkflowType[] {
+        return Array.from(this.entries.keys());
     }
     
     /**

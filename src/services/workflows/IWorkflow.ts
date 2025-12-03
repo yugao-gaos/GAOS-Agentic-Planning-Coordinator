@@ -240,6 +240,20 @@ export interface WorkflowMetadata {
     requiresUnity: boolean;
     
     /**
+     * Whether this workflow requires all task dependencies to be fully completed
+     * before it can start.
+     * 
+     * - true: Workflow will be rejected if any dependencies are not 'completed'
+     *   (e.g., task_implementation must wait for dependencies)
+     * 
+     * - false: Workflow can start even with incomplete dependencies
+     *   (e.g., context_gathering can prepare while dependencies are in progress)
+     * 
+     * Default: true (most workflows should wait for dependencies)
+     */
+    requiresCompleteDependencies: boolean;
+    
+    /**
      * Prompt text to inject into coordinator's workflow selection section.
      * Describes when and how the coordinator should use this workflow.
      * 

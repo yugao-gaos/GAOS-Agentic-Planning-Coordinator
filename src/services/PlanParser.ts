@@ -5,6 +5,25 @@ import { getFolderStructureManager } from './FolderStructureManager';
 // ============================================================================
 // Plan Parser Types
 // ============================================================================
+//
+// ⚠️ DEPRECATION NOTICE ⚠️
+// 
+// PlanParser is DEPRECATED for task management. The current architecture uses
+// TaskManager to store tasks created via CLI commands (apc task create).
+//
+// **DO NOT USE** parsePlanFile() for task extraction in new code.
+//
+// **Still supported use cases:**
+// - Extracting metadata (title, version, recommendedEngineerCount)
+// - Calculating progress for display purposes (calculateProgressFromFile)
+//
+// **Migrated services:**
+// - RevisionImpactAnalyzer → now uses TaskManager
+// - CoordinatorContext → now uses session metadata + lightweight regex
+//
+// Plan markdown files remain the source of truth for requirements and documentation,
+// but tasks are managed separately in TaskManager.
+// ============================================================================
 
 /**
  * Parsed plan data structure
@@ -65,13 +84,35 @@ export class PlanParser {
     /**
      * Parse a plan markdown file
      * 
-     * @deprecated In the new coordinator-driven architecture, tasks are created
-     * via CLI commands rather than parsed from the plan. Use calculateProgressFromFile()
-     * for simple progress tracking. This method is kept for backwards compatibility.
+     * ⚠️ **DEPRECATED - DO NOT USE FOR TASK MANAGEMENT** ⚠️
      * 
-     * Supports two formats:
+     * This method is DEPRECATED for task extraction. The current architecture uses
+     * TaskManager to manage tasks created via CLI commands (apc task create).
+     * 
+     * **Why deprecated:**
+     * - Tasks are now created dynamically via CLI by the AI coordinator
+     * - TaskManager is the authoritative source for task data
+     * - Plan files may not contain task checklists in the current workflow
+     * 
+     * **Supported use cases (backward compatibility):**
+     * - Legacy plan files with task checklists
+     * - Progress calculation for display
+     * 
+     * **For new code, use instead:**
+     * - TaskManager.getTasksForSession(sessionId) - to get tasks
+     * - CoordinatorContext - for building coordinator input
+     * - RevisionImpactAnalyzer - for revision impact (now uses TaskManager)
+     * 
+     * **Metadata extraction:**
+     * If you only need metadata (title, recommendedEngineerCount), use
+     * lightweight regex extraction instead of full parsing (see CoordinatorContext).
+     * 
+     * Supports three formats:
      * 1. Legacy: ## Engineer's Checklist with - [ ] tasks
      * 2. Modern: ### Section with #### Task X.Y and **Engineer**: Engineer-N
+     * 3. Table: | ID | Task | Dependencies | Files | Tests |
+     * 
+     * @deprecated Use TaskManager for task management
      */
     static parsePlanFile(planPath: string): ParsedPlan {
         if (!fs.existsSync(planPath)) {

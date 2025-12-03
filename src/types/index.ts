@@ -837,25 +837,37 @@ Run: \`apc task list\` to see all current tasks, their status, and dependencies.
 - **A task can ONLY have ONE active workflow at a time**
 - Do NOT start a new workflow if the task already has one running!
 
-## STEP 2: Check Agent Capacity (80% Rule)
-**DO NOT START MORE WORKFLOWS if active workflows are at capacity!**
+## STEP 2: Check Agent Capacity (Per-Session Limits + Global 80% Rule)
+**CRITICAL: Respect BOTH per-session recommended team sizes AND global pool capacity!**
 
-**Capacity Calculation:**
-- Total Agents: {{AVAILABLE_AGENT_COUNT}} (pool) + (allocated/busy agents)
-- Many workflows require multiple agents (implementer + reviewer, etc.)
-- **RULE: Do NOT start workflows if:**
-  - (Current Active Workflows + 1) > (80% of Total Agents)
-  - Example: With 10 total agents, max 8 workflows
+### 2A. Per-Session Capacity (PRIMARY CONSTRAINT)
+Each plan specifies a **recommended team size** based on its parallelism design:
 
-**Before starting any workflow:**
-1. Count active workflows across ALL sessions
-2. Calculate capacity: \`(active_workflows + 1) <= (total_agents * 0.8)\`
-3. If over capacity, WAIT for workflows to complete
+**SESSION CAPACITIES:**
+{{SESSION_CAPACITIES}}
 
-**Why 80%?**
+**Rules:**
+- **NEVER allocate more agents to a session than its recommended count!**
+- If a session is at capacity, DO NOT start new workflows for that session
+- This prevents bottlenecks when parallel width >> available agents
+
+**Example:**
+- Session ps_000001: Recommends 3 engineers, currently using 2 → can add 1 more
+- Session ps_000002: Recommends 5 engineers, currently using 5 → FULL, cannot add any
+
+### 2B. Global Pool Capacity (SECONDARY CONSTRAINT)
+**Total Agents in Pool: {{AVAILABLE_AGENT_COUNT}}**
+
+**Global 80% Rule:**
+- (Current Active Workflows across ALL sessions + 1) ≤ ({{AVAILABLE_AGENT_COUNT}} * 0.8)
+- Example: With 10 total agents, max 8 concurrent workflows globally
 - Workflows need multiple agents (implementer, reviewer, context)
-- Reserve 20% buffer for new high-priority tasks
-- Prevents resource starvation
+- Reserve 20% buffer for high-priority tasks
+
+### Capacity Decision Flow:
+1. Check session-specific capacity first (is session at recommended limit?)
+2. If session has capacity, check global pool (is global pool at 80%?)
+3. Only start workflow if BOTH checks pass
 
 ## STEP 3: Read Plans
 For each approved plan, use read_file to understand the tasks needed.
@@ -865,9 +877,12 @@ For each approved plan, use read_file to understand the tasks needed.
    - The system will REJECT duplicate workflow starts
    - Always check \`apc task status\` first!
 2. **Respect Capacity Limits**: Honor the 80% rule to avoid resource contention
-3. **Dependencies First**: ONLY start tasks whose dependencies are ALL completed
-   - A task with deps "T1,T2" can only start if both T1 and T2 are completed
-   - Tasks with no dependencies can start immediately
+3. **Dependencies First**: Check workflow requirements for dependencies
+   - Most workflows (like 'task_implementation') REQUIRE all dependencies to be COMPLETED
+   - Some workflows (like 'context_gathering') can start even with incomplete dependencies
+   - The workflow definitions below specify which workflows require complete dependencies
+   - A task with deps "T1,T2" can only start implementation if both T1 and T2 are completed
+   - But context_gathering for that task can start while T1/T2 are still in progress
 4. **Avoid Duplicate Tasks**: Check existing tasks before creating new ones
 5. **INCREMENTAL TASK CREATION**: Do NOT create all tasks from the plan at once!
    - Only create tasks that can START IMMEDIATELY (no unmet deps)
@@ -1120,15 +1135,16 @@ export interface AgentPoolState {
     totalAgents: number;
     agentNames: string[];
     available: string[];  // Pool agents (idle)
-    allocated: Record<string, AllocatedAgentInfo>;  // On bench (waiting)
-    busy: Record<string, BusyAgentInfo>;  // Working on workflows
+    allocated: Record<string, AllocatedAgentInfo>;  // On bench (waiting for promotion)
+    busy: Record<string, BusyAgentInfo>;  // Working on workflows (actively running)
+    resting: Record<string, RestingAgentInfo>;  // Cooldown after release (5 seconds)
 }
 
 export interface AllocatedAgentInfo {
     sessionId: string;
+    workflowId: string;  // REQUIRED: the workflow that owns this agent on bench
     roleId: string;
     allocatedAt: string;
-    requestedByWorkflow?: string;  // Which workflow is waiting for this agent
 }
 
 export interface BusyAgentInfo {
@@ -1141,15 +1157,21 @@ export interface BusyAgentInfo {
     logFile?: string;
 }
 
+export interface RestingAgentInfo {
+    releasedAt: string;
+    restUntil: string;  // ISO timestamp when agent can be allocated again
+}
+
 export interface AgentStatus {
     name: string;
     roleId?: string;
-    status: 'available' | 'allocated' | 'busy' | 'paused' | 'error';
+    status: 'available' | 'allocated' | 'busy' | 'resting' | 'paused' | 'error';
     sessionId?: string;
     workflowId?: string;  // The specific workflow this agent is working on
     task?: string;
     logFile?: string;
     processId?: number;
+    restUntil?: string;  // ISO timestamp for resting agents
 }
 
 // ============================================================================

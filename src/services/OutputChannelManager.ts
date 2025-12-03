@@ -91,7 +91,7 @@ export class OutputChannelManager extends EventEmitter {
         // File output
         if ((this.outputTarget === 'file' || this.outputTarget === 'both') && this.logFilePath) {
             try {
-                fs.appendFileSync(this.logFilePath, formattedMessage + '\n');
+                fs.appendFileSync(this.logFilePath, formattedMessage + '\n', 'utf8');
             } catch (e) {
                 // Silently ignore file write errors
             }
@@ -115,7 +115,7 @@ export class OutputChannelManager extends EventEmitter {
         
         if ((this.outputTarget === 'file' || this.outputTarget === 'both') && this.logFilePath) {
             try {
-                fs.appendFileSync(this.logFilePath, message + '\n');
+                fs.appendFileSync(this.logFilePath, message + '\n', 'utf8');
             } catch (e) {
                 // Silently ignore
             }

@@ -1,14 +1,38 @@
 import { StateManager } from './StateManager';
 import { AgentRoleRegistry } from './AgentRoleRegistry';
-import { AgentPoolState, BusyAgentInfo, AllocatedAgentInfo, AgentStatus, AgentRole } from '../types';
+import { AgentPoolState, BusyAgentInfo, AllocatedAgentInfo, RestingAgentInfo, AgentStatus, AgentRole } from '../types';
 
+/**
+ * AgentPoolService - Manages agent lifecycle with bench + resting state
+ * 
+ * ARCHITECTURE:
+ * 1. Allocation ALWAYS goes to bench (allocated state) - NO auto-promotion
+ * 2. Workflows manually promote agents to busy when work starts
+ * 3. Release auto-demotes busy agents to bench, then to resting (5s cooldown)
+ * 4. Resting agents auto-transition to available after cooldown
+ * 
+ * States:
+ * - available: Ready to be allocated
+ * - resting: Cooldown after release (5 seconds) - cannot be allocated
+ * - allocated: On bench, waiting for workflow to promote to busy
+ * - busy: Actively working on a workflow
+ */
 export class AgentPoolService {
     private stateManager: StateManager;
     private roleRegistry: AgentRoleRegistry;
+    
+    // Cooldown duration after agent release (milliseconds)
+    private readonly REST_COOLDOWN_MS = 5000;  // 5 seconds
+    
+    // Timer IDs for resting agents (agentName -> timeoutId)
+    private restingTimers: Map<string, NodeJS.Timeout> = new Map();
 
     constructor(stateManager: StateManager, roleRegistry: AgentRoleRegistry) {
         this.stateManager = stateManager;
         this.roleRegistry = roleRegistry;
+        
+        // Check for expired resting agents on startup
+        this.processRestingAgents();
     }
 
     // ========================================================================
@@ -33,11 +57,12 @@ export class AgentPoolService {
     // Pool Status
     // ========================================================================
 
-    getPoolStatus(): { total: number; available: string[]; busy: string[] } {
+    getPoolStatus(): { total: number; available: string[]; allocated: string[]; busy: string[] } {
         const state = this.stateManager.getAgentPoolState();
         return {
             total: state.totalAgents,
             available: [...state.available],
+            allocated: Object.keys(state.allocated || {}),
             busy: Object.keys(state.busy)
         };
     }
@@ -78,6 +103,15 @@ export class AgentPoolService {
             return { name, status: 'available' };
         }
         
+        const restingInfo = state.resting?.[name];
+        if (restingInfo) {
+            return {
+                name,
+                status: 'resting',
+                restUntil: restingInfo.restUntil
+            };
+        }
+        
         const allocatedInfo = state.allocated?.[name];
         if (allocatedInfo) {
             return {
@@ -110,18 +144,25 @@ export class AgentPoolService {
     // ========================================================================
 
     /**
-     * Allocate agents to session bench (not yet working)
-     * @param sessionId The session requesting agents
+     * Allocate agents to workflow bench (ALWAYS to bench, never auto-promotes to busy)
+     * Workflows must explicitly call promoteAgentToBusy() when work starts
+     * 
+     * ARCHITECTURE: Bench is WORKFLOW-SCOPED
+     * - Each workflow has its own private bench
+     * - Agents on bench are owned by that specific workflow
+     * - Only the owning workflow can promote/use agents from its bench
+     * 
+     * @param sessionId The session (for capacity tracking)
+     * @param workflowId The workflow that owns these agents
      * @param count Number of agents to allocate
      * @param roleId Role to assign
-     * @param requestingWorkflowId Optional: workflow that needs this agent
      * @returns Array of allocated agent names
      */
     allocateAgents(
-        sessionId: string, 
+        sessionId: string,
+        workflowId: string,
         count: number, 
-        roleId: string = 'engineer',
-        requestingWorkflowId?: string
+        roleId: string = 'engineer'
     ): string[] {
         // Validate role exists in registry
         if (!this.roleRegistry.getRole(roleId)) {
@@ -139,6 +180,10 @@ export class AgentPoolService {
         }
         
         const state = this.stateManager.getAgentPoolState();
+        
+        // Process resting agents first (check if any can transition to available)
+        this.processRestingAgents();
+        
         const toAllocate = Math.min(count, state.available.length);
         const allocated: string[] = [];
 
@@ -146,12 +191,14 @@ export class AgentPoolService {
             const agent = state.available.shift();
             if (agent) {
                 allocated.push(agent);
+                // CRITICAL: Allocate to WORKFLOW's bench (not session's)
                 state.allocated[agent] = {
                     sessionId,
+                    workflowId,  // This workflow owns this agent
                     roleId,
-                    allocatedAt: new Date().toISOString(),
-                    requestedByWorkflow: requestingWorkflowId
+                    allocatedAt: new Date().toISOString()
                 };
+                console.log(`[AgentPoolService] ${agent} allocated to workflow ${workflowId}'s BENCH for role ${roleId}`);
             }
         }
 
@@ -161,6 +208,8 @@ export class AgentPoolService {
 
     /**
      * Promote agent from bench to busy (start working on workflow)
+     * This is explicitly called by workflows when they start using an agent
+     * 
      * @param agentName Agent to promote
      * @param workflowId Workflow ID
      * @param task Optional task description
@@ -185,6 +234,7 @@ export class AgentPoolService {
             startTime: new Date().toISOString()
         };
         
+        console.log(`[AgentPoolService] ${agentName} promoted to BUSY for workflow ${workflowId}`);
         this.stateManager.updateAgentPool(state);
         return true;
     }
@@ -206,7 +256,8 @@ export class AgentPoolService {
         state.allocated[agentName] = {
             sessionId: busyInfo.sessionId,
             roleId: busyInfo.roleId,
-            allocatedAt: new Date().toISOString()
+            allocatedAt: new Date().toISOString(),
+            workflowId: busyInfo.workflowId  // Keep workflow association
         };
         
         this.stateManager.updateAgentPool(state);
@@ -215,64 +266,97 @@ export class AgentPoolService {
 
     /**
      * Release agents back to the pool
+     * - If busy: demote to bench first, then to resting (5s cooldown)
+     * - If allocated: move directly to resting (5s cooldown)
+     * - After cooldown: auto-transition to available
+     * 
      * @param agentNames Names of agents to release
      */
     releaseAgents(agentNames: string[]): void {
         const state = this.stateManager.getAgentPoolState();
 
         for (const name of agentNames) {
-            // Check both busy and allocated
-            if (state.busy[name]) {
-                delete state.busy[name];
-            } else if (state.allocated?.[name]) {
-                delete state.allocated[name];
+            // Clear any existing resting timer
+            const existingTimer = this.restingTimers.get(name);
+            if (existingTimer) {
+                clearTimeout(existingTimer);
+                this.restingTimers.delete(name);
             }
             
-            if (!state.available.includes(name)) {
-                state.available.push(name);
+            // Check both busy and allocated
+            const wasBusy = !!state.busy[name];
+            const wasAllocated = !!state.allocated?.[name];
+            
+            if (wasBusy) {
+                console.log(`[AgentPoolService] Releasing BUSY agent ${name} -> resting (5s cooldown)`);
+                delete state.busy[name];
+            } else if (wasAllocated) {
+                console.log(`[AgentPoolService] Releasing ALLOCATED agent ${name} -> resting (5s cooldown)`);
+                delete state.allocated[name];
+            } else if (state.resting?.[name]) {
+                console.log(`[AgentPoolService] Agent ${name} already resting, resetting cooldown`);
+                delete state.resting[name];
+            } else {
+                // Already available or unknown
+                continue;
             }
+            
+            // Put agent in resting state with cooldown
+            const now = Date.now();
+            const restUntil = new Date(now + this.REST_COOLDOWN_MS).toISOString();
+            
+            if (!state.resting) {
+                state.resting = {};
+            }
+            state.resting[name] = {
+                releasedAt: new Date(now).toISOString(),
+                restUntil
+            };
+            
+            // Set timer to auto-transition to available after cooldown
+            const timerId = setTimeout(() => {
+                this.transitionRestingToAvailable(name);
+                this.restingTimers.delete(name);
+            }, this.REST_COOLDOWN_MS);
+            
+            this.restingTimers.set(name, timerId);
         }
 
-        // Sort available list for consistency
-        state.available.sort();
         this.stateManager.updateAgentPool(state);
     }
 
     /**
      * Release all agents belonging to a session
+     * Moves them to resting state with cooldown before returning to available
+     * 
      * @param sessionId The session ID
      */
     releaseSessionAgents(sessionId: string): string[] {
         const state = this.stateManager.getAgentPoolState();
-        const released: string[] = [];
+        const toRelease: string[] = [];
 
-        // Release busy agents
+        // Collect agents to release
         for (const [name, info] of Object.entries(state.busy)) {
             if (info.sessionId === sessionId) {
-                delete state.busy[name];
-                if (!state.available.includes(name)) {
-                    state.available.push(name);
-                }
-                released.push(name);
+                toRelease.push(name);
             }
         }
 
-        // Release allocated agents
+        // Also check allocated agents
         if (state.allocated) {
             for (const [name, info] of Object.entries(state.allocated)) {
                 if (info.sessionId === sessionId) {
-                    delete state.allocated[name];
-                    if (!state.available.includes(name)) {
-                        state.available.push(name);
-                    }
-                    released.push(name);
+                    toRelease.push(name);
                 }
             }
         }
 
-        state.available.sort();
-        this.stateManager.updateAgentPool(state);
-        return released;
+        // Release all collected agents (will go through resting cooldown)
+        if (toRelease.length > 0) {
+            this.releaseAgents(toRelease);
+        }
+
+        return toRelease;
     }
 
     // ========================================================================
@@ -306,25 +390,34 @@ export class AgentPoolService {
      * Allocate a single agent for a specific role
      * Returns the agent name or undefined if none available
      */
-    allocateAgentForRole(sessionId: string, roleId: string): string | undefined {
-        const allocated = this.allocateAgents(sessionId, 1, roleId);
+    allocateAgentForRole(sessionId: string, roleId: string, requestingWorkflowId?: string): string | undefined {
+        const allocated = this.allocateAgents(sessionId, requestingWorkflowId || 'unknown', 1, roleId);
         return allocated.length > 0 ? allocated[0] : undefined;
     }
 
     /**
      * Get agents on bench (allocated but not yet working)
+     * 
+     * WORKFLOW-SCOPED: Returns only agents owned by the specified workflow
+     * If no workflowId provided, returns all bench agents (for monitoring/debugging)
      */
-    getAgentsOnBench(sessionId?: string): Array<{ name: string; roleId: string; sessionId: string }> {
+    getAgentsOnBench(workflowId?: string): Array<{ 
+        name: string; 
+        roleId: string; 
+        sessionId: string;
+        workflowId: string;
+    }> {
         const state = this.stateManager.getAgentPoolState();
         if (!state.allocated) {
             return [];
         }
         return Object.entries(state.allocated)
-            .filter(([_, info]) => !sessionId || info.sessionId === sessionId)
+            .filter(([_, info]) => !workflowId || info.workflowId === workflowId)
             .map(([name, info]) => ({
                 name,
                 roleId: info.roleId,
-                sessionId: info.sessionId
+                sessionId: info.sessionId,
+                workflowId: info.workflowId
             }));
     }
 
@@ -379,6 +472,7 @@ export class AgentPoolService {
     getPoolSummary(): {
         total: number;
         available: number;
+        resting: number;
         allocated: number;
         busy: number;
         byRole: Record<string, number>;
@@ -389,6 +483,7 @@ export class AgentPoolService {
         return {
             total: state.totalAgents,
             available: state.available.length,
+            resting: state.resting ? Object.keys(state.resting).length : 0,
             allocated: state.allocated ? Object.keys(state.allocated).length : 0,
             busy: Object.keys(state.busy).length,
             byRole
@@ -472,6 +567,77 @@ export class AgentPoolService {
         this.stateManager.updateAgentPool(state);
         
         return { added, removed };
+    }
+    
+    // ========================================================================
+    // Resting State Management (Cooldown)
+    // ========================================================================
+    
+    /**
+     * Process resting agents - transition expired cooldowns to available
+     * Called automatically during allocation and on timer expiry
+     */
+    private processRestingAgents(): void {
+        const state = this.stateManager.getAgentPoolState();
+        if (!state.resting) {
+            state.resting = {};
+            return;
+        }
+        
+        const now = Date.now();
+        const toTransition: string[] = [];
+        
+        for (const [name, info] of Object.entries(state.resting)) {
+            const restUntilMs = new Date(info.restUntil).getTime();
+            if (now >= restUntilMs) {
+                toTransition.push(name);
+            }
+        }
+        
+        if (toTransition.length > 0) {
+            for (const name of toTransition) {
+                delete state.resting[name];
+                if (!state.available.includes(name)) {
+                    state.available.push(name);
+                }
+                console.log(`[AgentPoolService] ${name} cooldown expired -> available`);
+            }
+            
+            state.available.sort();
+            this.stateManager.updateAgentPool(state);
+        }
+    }
+    
+    /**
+     * Transition a specific agent from resting to available
+     * Called by timer callback after cooldown expires
+     */
+    private transitionRestingToAvailable(agentName: string): void {
+        const state = this.stateManager.getAgentPoolState();
+        
+        if (state.resting?.[agentName]) {
+            delete state.resting[agentName];
+            
+            if (!state.available.includes(agentName)) {
+                state.available.push(agentName);
+                state.available.sort();
+            }
+            
+            console.log(`[AgentPoolService] ${agentName} cooldown complete -> available`);
+            this.stateManager.updateAgentPool(state);
+        }
+    }
+    
+    /**
+     * Cleanup - cancel all resting timers
+     * Call this on service shutdown to prevent memory leaks
+     */
+    dispose(): void {
+        for (const timerId of this.restingTimers.values()) {
+            clearTimeout(timerId);
+        }
+        this.restingTimers.clear();
+        console.log('[AgentPoolService] Disposed all resting timers');
     }
 
 }

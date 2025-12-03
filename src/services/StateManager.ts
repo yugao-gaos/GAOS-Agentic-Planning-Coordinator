@@ -507,18 +507,25 @@ export class StateManager {
             totalAgents: size,
             agentNames: agentNames,
             available: [...agentNames],
-            allocated: {},  // NEW: Agent bench
-            busy: {}
+            allocated: {},  // Agents on bench (waiting for promotion)
+            resting: {},    // Agents in cooldown after release (5s)
+            busy: {}        // Agents actively working
         };
     }
 
     /**
-     * Migrate agent pool state from old format to new 3-state format
+     * Migrate agent pool state from old format to new 4-state format
+     * (available, resting, allocated/bench, busy)
      */
     private migrateAgentPoolState(state: any): AgentPoolState {
         // Add allocated field if missing
         if (!state.allocated) {
             state.allocated = {};
+        }
+        
+        // Add resting field if missing (new cooldown state)
+        if (!state.resting) {
+            state.resting = {};
         }
         
         // Remove coordinatorId from busy agents (legacy field)

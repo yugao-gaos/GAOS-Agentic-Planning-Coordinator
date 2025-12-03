@@ -4,6 +4,21 @@ import { PlanParser, ParsedPlan } from './PlanParser';
 // ============================================================================
 // PlanCache - LRU cache with mtime-based invalidation
 // ============================================================================
+//
+// NOTE: This cache wraps PlanParser, which is DEPRECATED for task management.
+// 
+// **Current use case:**
+// - Caching plan metadata for legacy compatibility
+// - May be used by remaining code that extracts plan metadata
+// 
+// **Not recommended for:**
+// - Task extraction (use TaskManager instead)
+// - New features requiring task information
+// 
+// **Future consideration:**
+// - Could be refactored to cache lightweight metadata only (title, version, etc.)
+// - Current implementation caches full ParsedPlan objects including deprecated task lists
+// ============================================================================
 
 interface CachedPlan {
     plan: ParsedPlan;

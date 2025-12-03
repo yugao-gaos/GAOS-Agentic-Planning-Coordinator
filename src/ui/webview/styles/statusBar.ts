@@ -60,6 +60,11 @@ export const statusBarStyles = `
     animation: pulse 1s infinite;
 }
 
+.status-dot.initializing {
+    background: var(--vscode-charts-blue, #4d9de0);
+    animation: pulse 1.5s infinite;
+}
+
 .status-text {
     font-weight: 500;
 }

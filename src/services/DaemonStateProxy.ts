@@ -165,6 +165,25 @@ export class DaemonStateProxy {
     isDaemonConnected(): boolean {
         return this.vsCodeClient.isConnected();
     }
+    
+    /**
+     * Check if daemon is fully ready (services initialized)
+     * Returns true if daemon is connected AND services are ready
+     */
+    async isDaemonReady(): Promise<boolean> {
+        if (!this.vsCodeClient.isConnected()) {
+            return false;
+        }
+        
+        try {
+            const response: { readyState?: string; servicesReady?: boolean } = 
+                await this.vsCodeClient.send('daemon.status');
+            return response.readyState === 'ready' && response.servicesReady === true;
+        } catch (e) {
+            // If daemon doesn't respond or doesn't have the status endpoint, assume not ready
+            return false;
+        }
+    }
 
     /**
      * Check if Unity features are enabled
@@ -367,6 +386,7 @@ export class DaemonStateProxy {
 
     /**
      * Get agents on bench (allocated but not busy)
+     * @deprecated Use getBenchAgents() instead (returns workflowId)
      */
     async getAgentsOnBench(sessionId?: string): Promise<Array<{ name: string; roleId: string; sessionId: string }>> {
         if (!this.vsCodeClient.isConnected()) {
@@ -377,6 +397,24 @@ export class DaemonStateProxy {
             const response: { agents?: Array<{ name: string; roleId: string; sessionId: string }> } = 
                 await this.vsCodeClient.send('pool.bench', { sessionId });
             return response.agents || [];
+        } catch (err) {
+            console.warn('[DaemonStateProxy] Failed to get bench agents from daemon:', err);
+            return [];
+        }
+    }
+
+    /**
+     * Get all benched agents (allocated but not busy) - includes workflowId
+     */
+    async getBenchAgents(): Promise<Array<{ name: string; roleId: string; sessionId: string; workflowId: string }>> {
+        if (!this.vsCodeClient.isConnected()) {
+            return [];
+        }
+
+        try {
+            const response = await this.vsCodeClient.getPoolStatus();
+            // Pool status should have allocated agents
+            return response.allocated || [];
         } catch (err) {
             console.warn('[DaemonStateProxy] Failed to get bench agents from daemon:', err);
             return [];
@@ -583,4 +621,38 @@ export class DaemonStateProxy {
             return undefined;
         }
     }
-}
+    
+    // ========================================================================
+    // Workflow Control
+    // ========================================================================
+    
+    /**
+     * Pause a workflow
+     */
+    async pauseWorkflow(sessionId: string, workflowId: string): Promise<{ success: boolean; error?: string }> {
+        if (!this.vsCodeClient.isConnected()) {
+            return { success: false, error: 'Daemon not connected' };
+        }
+        return this.vsCodeClient.pauseWorkflow(sessionId, workflowId);
+    }
+    
+    /**
+     * Resume a paused workflow
+     */
+    async resumeWorkflow(sessionId: string, workflowId: string): Promise<{ success: boolean; error?: string }> {
+        if (!this.vsCodeClient.isConnected()) {
+            return { success: false, error: 'Daemon not connected' };
+        }
+        return this.vsCodeClient.resumeWorkflow(sessionId, workflowId);
+    }
+    
+    /**
+     * Cancel a workflow
+     */
+    async cancelWorkflow(sessionId: string, workflowId: string): Promise<{ success: boolean; error?: string }> {
+        if (!this.vsCodeClient.isConnected()) {
+            return { success: false, error: 'Daemon not connected' };
+        }
+        return this.vsCodeClient.cancelWorkflow(sessionId, workflowId);
+    }
+    }

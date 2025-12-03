@@ -345,6 +345,13 @@ export class UnifiedCoordinatorService {
         return this.coordinatorAgent.getStatus();
     }
     
+    /**
+     * Get the workflow registry (for accessing workflow metadata)
+     */
+    getWorkflowRegistry(): WorkflowRegistry {
+        return this.workflowRegistry;
+    }
+    
     // =========================================================================
     // SESSION MANAGEMENT
     // =========================================================================
@@ -622,6 +629,27 @@ export class UnifiedCoordinatorService {
             }
         }
         
+        // VALIDATION: Check dependencies if workflow requires it
+        // Some workflows (like context_gathering) can start even with incomplete dependencies
+        const workflowMetadata = this.workflowRegistry.getMetadata(workflowType as WorkflowType);
+        
+        if (workflowMetadata?.requiresCompleteDependencies !== false) {
+            // This workflow requires all dependencies to be complete
+            const unmetDeps = task.dependencies.filter(depId => {
+                const depTask = taskManager.getTask(depId);
+                return !depTask || depTask.status !== 'completed';
+            });
+            
+            if (unmetDeps.length > 0) {
+                throw new Error(
+                    `Task ${taskId} has unmet dependencies: ${unmetDeps.join(', ')}. ` +
+                    `The workflow '${workflowType}' requires all dependencies to be completed first.`
+                );
+            }
+        } else {
+            this.log(`Workflow '${workflowType}' does not require complete dependencies - allowing start for task ${taskId}`);
+        }
+        
         // Get plan path (session already declared above)
         const planPath = session?.currentPlanPath || '';
         
@@ -849,6 +877,32 @@ export class UnifiedCoordinatorService {
     }
     
     /**
+     * Pause a specific workflow
+     */
+    async pauseWorkflow(sessionId: string, workflowId: string): Promise<void> {
+        const state = this.sessions.get(sessionId);
+        if (!state) return;
+        
+        const workflow = state.workflows.get(workflowId);
+        if (workflow) {
+            await workflow.pause();
+        }
+    }
+    
+    /**
+     * Resume a paused workflow
+     */
+    async resumeWorkflow(sessionId: string, workflowId: string): Promise<void> {
+        const state = this.sessions.get(sessionId);
+        if (!state) return;
+        
+        const workflow = state.workflows.get(workflowId);
+        if (workflow) {
+            await workflow.resume();
+        }
+    }
+    
+    /**
      * Get workflow status
      */
     getWorkflowStatus(sessionId: string, workflowId: string): WorkflowProgress | undefined {
@@ -987,6 +1041,11 @@ export class UnifiedCoordinatorService {
     
     /**
      * Process the agent request queue
+     * 
+     * ARCHITECTURE CHANGE:
+     * - This method ONLY allocates agents to bench
+     * - It does NOT auto-promote to busy
+     * - Workflows must explicitly call AgentPoolService.promoteAgentToBusy() when work starts
      */
     private processAgentQueue(): void {
         const taskManager = ServiceLocator.resolve(TaskManager);
@@ -1009,23 +1068,26 @@ export class UnifiedCoordinatorService {
                 continue;
             }
             
-            // Try to get agent from session bench first
-            const benchAgents = this.agentPoolService.getAgentsOnBench(sessionId)
+            // Try to get agent from THIS WORKFLOW's bench first
+            // WORKFLOW-SCOPED: Only look at agents owned by this workflow
+            const benchAgents = this.agentPoolService.getAgentsOnBench(request.workflowId)
                 .filter(a => a.roleId === request.roleId);
             
             let agentName: string | undefined;
             
             if (benchAgents.length > 0) {
-                // Use agent from bench
+                // Use agent from this workflow's bench
                 agentName = benchAgents[0].name;
-                this.agentPoolService.promoteAgentToBusy(agentName, request.workflowId, request.roleId);
-            } else {
-                // Allocate new agent to bench, then promote to busy
+                this.log(`Agent ${agentName} found on workflow ${request.workflowId}'s bench`);
+            }
+            
+            if (!agentName) {
+                // No agents on this workflow's bench - allocate new agent
                 const allocated = this.agentPoolService.allocateAgents(
-                    sessionId, 
+                    sessionId,
+                    request.workflowId,  // This workflow owns the agent
                     1, 
-                    request.roleId, 
-                    request.workflowId
+                    request.roleId
                 );
                 
                 if (allocated.length === 0) {
@@ -1034,7 +1096,7 @@ export class UnifiedCoordinatorService {
                 }
                 
                 agentName = allocated[0];
-                this.agentPoolService.promoteAgentToBusy(agentName, request.workflowId, request.roleId);
+                this.log(`Agent ${agentName} allocated to workflow ${request.workflowId}'s BENCH`);
             }
             
             // Remove from queue
@@ -1052,9 +1114,9 @@ export class UnifiedCoordinatorService {
                 workflowId: request.workflowId
             });
             
-            // Fulfill request
+            // Fulfill request - workflow will promote to busy when ready
             request.callback(agentName);
-            this.log(`Agent ${agentName} promoted to busy for workflow ${request.workflowId}`);
+            this.log(`Agent ${agentName} ready on bench for workflow ${request.workflowId} - workflow must promote to busy`);
         }
     }
     
@@ -1309,7 +1371,15 @@ export class UnifiedCoordinatorService {
             taskId,
             startedAt: workflow?.getProgress().startedAt || state.createdAt,
             completedAt: new Date().toISOString(),
+            
+            // New structured fields
+            success: result.success,
+            error: result.error,
+            output: result.output,
+            
+            // Deprecated field (kept for backward compatibility)
             result: result.error,
+            
             logPath: workflow?.getProgress().logPath
         };
         state.workflowHistory.unshift(historySummary); // Add to front (newest first)
@@ -1383,6 +1453,7 @@ export class UnifiedCoordinatorService {
                 startedAt: workflow?.getProgress().startedAt || state.createdAt,
                 completedAt: new Date().toISOString(),
                 duration: result.duration || 0,
+                success: result.success,
                 output: result.output,
                 error: result.error
             });

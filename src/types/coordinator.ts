@@ -168,6 +168,19 @@ export interface PlanSummary {
     planPath: string;
     requirement: string;
     status: string;
+    recommendedAgents?: number;  // Recommended team size from plan
+}
+
+/**
+ * Per-session capacity analysis for coordinator
+ * Helps coordinator respect recommended team sizes per plan
+ */
+export interface SessionCapacity {
+    sessionId: string;
+    recommendedAgents: number;    // Max agents recommended by plan
+    currentlyAllocated: number;   // Agents currently on this session (busy + bench)
+    availableCapacity: number;    // Can still allocate this many agents
+    activeWorkflows: number;      // Currently running workflows for this session
 }
 
 export interface CoordinatorInput {
@@ -215,6 +228,10 @@ export interface CoordinatorInput {
         context: string;
         askedAt: string;
     }>;
+    
+    // ---- Capacity Planning (NEW) ----
+    /** Per-session capacity analysis for respecting recommended team sizes */
+    sessionCapacities: SessionCapacity[];
 }
 
 // ============================================================================

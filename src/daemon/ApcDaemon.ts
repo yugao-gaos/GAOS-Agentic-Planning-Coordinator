@@ -56,6 +56,7 @@ export interface DaemonOptions {
  * Daemon state
  */
 export type DaemonState = 'stopped' | 'starting' | 'running' | 'stopping';
+export type DaemonReadyState = 'starting' | 'checking_dependencies' | 'initializing_services' | 'ready';
 
 // ============================================================================
 // APC Daemon
@@ -67,6 +68,7 @@ export type DaemonState = 'stopped' | 'starting' | 'running' | 'stopping';
  */
 export class ApcDaemon {
     private state: DaemonState = 'stopped';
+    private readyState: DaemonReadyState = 'starting';
     private wss: WebSocketServer | null = null;
     private httpServer: http.Server | null = null;
     private clients: Map<string, ConnectedClient> = new Map();
@@ -134,9 +136,12 @@ export class ApcDaemon {
                 if (req.url === '/health') {
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({
-                        status: 'ok',
+                        status: this.readyState === 'ready' ? 'ok' : 'initializing',
+                        state: this.state,
+                        readyState: this.readyState,
                         uptime: Date.now() - this.startTime,
-                        clients: this.clients.size
+                        clients: this.clients.size,
+                        servicesReady: this.readyState === 'ready'
                     }));
                     return;
                 }
@@ -170,19 +175,56 @@ export class ApcDaemon {
             this.log('info', `APC Daemon started on port ${this.config.port}`);
             this.log('info', `Workspace: ${this.config.workspaceRoot}`);
             
-            // Broadcast ready event
-            this.broadcaster.broadcast('daemon.ready', {
+            // Broadcast starting event (WebSocket ready, but services may not be)
+            this.readyState = this.config.services ? 'initializing_services' : 'ready';
+            this.broadcaster.broadcast('daemon.starting', {
                 version: '0.1.0',
                 port: this.config.port,
                 workspaceRoot: this.config.workspaceRoot,
-                startedAt: new Date().toISOString()
+                startedAt: new Date().toISOString(),
+                readyState: this.readyState
             });
+            
+            // If no services provided (testing/minimal mode), mark as ready immediately
+            if (!this.config.services) {
+                this.readyState = 'ready';
+                this.broadcaster.broadcast('daemon.ready', {
+                    version: '0.1.0',
+                    servicesReady: false
+                });
+            }
             
         } catch (err) {
             this.state = 'stopped';
             cleanupDaemonInfo(this.config.workspaceRoot);
             throw err;
         }
+    }
+    
+    /**
+     * Mark services as ready. Called by standalone.ts after all services are initialized.
+     * This signals that the daemon is fully ready to handle requests.
+     */
+    setServicesReady(): void {
+        if (this.readyState !== 'ready') {
+            this.readyState = 'ready';
+            this.log('info', 'All services initialized - daemon is fully ready');
+            this.broadcaster.broadcast('daemon.ready', {
+                version: '0.1.0',
+                servicesReady: true,
+                readyState: 'ready'
+            });
+        }
+    }
+    
+    /**
+     * Set services after daemon is started.
+     * Used when daemon starts before services are initialized.
+     */
+    setServices(services: ApiServices): void {
+        this.services = services;
+        this.apiHandler = new ApiHandler(services, this.broadcaster);
+        this.log('info', 'Services registered with daemon');
     }
     
     /**
@@ -393,6 +435,22 @@ export class ApcDaemon {
                 id: request.id,
                 success: true,
                 message: `Unsubscribed from session ${sessionId}`
+            });
+            return;
+        }
+        
+        // Handle daemon.status (shows ready state)
+        if (request.cmd === 'daemon.status') {
+            this.sendResponse(client, {
+                id: request.id,
+                success: true,
+                data: {
+                    state: this.state,
+                    readyState: this.readyState,
+                    servicesReady: this.readyState === 'ready',
+                    uptime: Date.now() - this.startTime,
+                    clients: this.clients.size
+                }
             });
             return;
         }

@@ -29,14 +29,16 @@ import { HeadlessTerminalManager } from '../services/HeadlessTerminalManager';
 import { AgentRunner } from '../services/AgentBackend';
 import { OutputChannelManager } from '../services/OutputChannelManager';
 import { TaskManager } from '../services/TaskManager';
+import { ProcessManager } from '../services/ProcessManager';
 import { UnityControlManager } from '../services/UnityControlManager';
 import { bootstrapDaemonServices, ServiceLocator } from '../services/DaemonBootstrap';
 import { EventBroadcaster } from './EventBroadcaster';
 
 /**
  * Initialize all services for standalone daemon mode
+ * @param daemon The daemon instance (so we can signal when services are ready)
  */
-async function initializeServices(config: CoreConfig): Promise<ApiServices> {
+async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promise<ApiServices> {
     console.log('[Standalone] Initializing services...');
     console.log(`[Standalone] Workspace: ${config.workspaceRoot}`);
     console.log(`[Standalone] Working directory: ${config.workingDirectory}`);
@@ -48,6 +50,16 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
     // Initialize output channel manager (file-only mode for standalone)
     const outputManager = ServiceLocator.resolve(OutputChannelManager);
     outputManager.setOutputTarget('file');
+    
+    // Kill orphan cursor-agent processes from previous sessions
+    console.log('[Standalone] Cleaning up orphan cursor-agent processes...');
+    const processManager = ServiceLocator.resolve(ProcessManager);
+    const killedCount = await processManager.killOrphanCursorAgents();
+    if (killedCount > 0) {
+        console.log(`[Standalone] Killed ${killedCount} orphan cursor-agent processes`);
+    } else {
+        console.log('[Standalone] No orphan cursor-agent processes found');
+    }
     
     // Initialize StateManager
     const stateManagerConfig: StateManagerConfig = {
@@ -208,19 +220,23 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
     idlePlanMonitor.start();
     console.log('[Standalone] IdlePlanMonitor started');
     
-    // Signal system ready - this allows IdlePlanMonitor to trigger startup evaluation
-    // After a short delay to ensure all async initialization is complete
-    setTimeout(() => {
-        idlePlanMonitor.setSystemReady();
-        console.log('[Standalone] System initialization complete - marked as ready');
-    }, 1000);  // 1 second delay to ensure everything is fully initialized
+    // Signal system ready - all services initialized successfully
+    // This allows IdlePlanMonitor to trigger startup evaluation immediately
+    idlePlanMonitor.setSystemReady();
+    console.log('[Standalone] System initialization complete - marked as ready');
+    
+    // Signal daemon that services are ready (if daemon instance provided)
+    if (daemon) {
+        daemon.setServicesReady();
+    }
     
     // Return API services interface
     return {
         stateManager: {
             getAllPlanningSessions: () => stateManager.getAllPlanningSessions(),
             getPlanningSession: (id: string) => stateManager.getPlanningSession(id),
-            deletePlanningSession: (id: string) => stateManager.deletePlanningSession(id)
+            deletePlanningSession: (id: string) => stateManager.deletePlanningSession(id),
+            getSessionTasksFilePath: (sessionId: string) => stateManager.getSessionTasksFilePath(sessionId)
         },
         agentPoolService: {
             getPoolStatus: () => agentPoolService.getPoolStatus(),
@@ -244,6 +260,8 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
             getWorkflowStatus: (sessionId: string, workflowId: string) => coordinator.getWorkflowStatus(sessionId, workflowId),
             dispatchWorkflow: (sessionId: string, type: string, input: any) => coordinator.dispatchWorkflow(sessionId, type as any, input),
             cancelWorkflow: (sessionId: string, workflowId: string) => coordinator.cancelWorkflow(sessionId, workflowId),
+            pauseWorkflow: (sessionId: string, workflowId: string) => coordinator.pauseWorkflow(sessionId, workflowId),
+            resumeWorkflow: (sessionId: string, workflowId: string) => coordinator.resumeWorkflow(sessionId, workflowId),
             pauseSession: (sessionId: string) => coordinator.pauseSession(sessionId),
             resumeSession: (sessionId: string) => coordinator.resumeSession(sessionId),
             cancelSession: (sessionId: string) => coordinator.cancelSession(sessionId),
@@ -282,35 +300,41 @@ async function initializeServices(config: CoreConfig): Promise<ApiServices> {
             restartPlanning: (id: string) => planningService.restartPlanning(id),
             removeSession: (id: string) => planningService.removeSession(id)
         },
+        processManager: {
+            killOrphanCursorAgents: async () => {
+                const pm = ServiceLocator.resolve(ProcessManager);
+                return await pm.killOrphanCursorAgents();
+            }
+        },
         // Optional services for full API support
-        taskManager: (() => {
-            const tm = ServiceLocator.resolve(TaskManager);
-            return {
-                getProgressForSession: (sessionId: string) => {
-                    const progress = tm.getProgressForSession(sessionId);
-                    // Map 'paused' to 'failed' for API compatibility
-                    return {
-                        completed: progress.completed,
-                        pending: progress.pending,
-                        inProgress: progress.inProgress,
-                        failed: progress.paused, // TaskManager uses 'paused', API expects 'failed'
-                        ready: progress.ready,
-                        total: progress.total
-                    };
-                },
-                getTasksForSession: (sessionId: string) => tm.getTasksForSession(sessionId),
-                getTask: (globalTaskId: string) => tm.getTask(globalTaskId),
-                getAllTasks: () => tm.getAllTasks(),
-                createTaskFromCli: (params: { sessionId: string; taskId: string; description: string; dependencies?: string[]; taskType?: 'implementation' | 'error_fix'; priority?: number; errorText?: string }) => 
-                    tm.createTaskFromCli(params),
-                completeTask: (globalTaskId: string, summary?: string) => tm.markTaskCompletedViaCli(globalTaskId, summary),
-                updateTaskStage: (globalTaskId: string, stage: string) => tm.updateTaskStage(globalTaskId, stage),
-                markTaskFailed: (globalTaskId: string, reason?: string) => tm.markTaskFailed(globalTaskId, reason),
-                deleteTask: (globalTaskId: string, reason?: string) => tm.deleteTask(globalTaskId, reason),
-                validateTaskFormat: (task: any) => tm.validateTaskFormat(task),
-                reloadPersistedTasks: () => tm.reloadPersistedTasks()
-            };
-        })(),
+        // Use lazy resolution (resolve on each call) to avoid initialization order issues
+        taskManager: {
+            getProgressForSession: (sessionId: string) => {
+                const tm = ServiceLocator.resolve(TaskManager);
+                const progress = tm.getProgressForSession(sessionId);
+                // Map 'paused' to 'failed' for API compatibility
+                return {
+                    completed: progress.completed,
+                    pending: progress.pending,
+                    inProgress: progress.inProgress,
+                    failed: progress.paused, // TaskManager uses 'paused', API expects 'failed'
+                    ready: progress.ready,
+                    total: progress.total
+                };
+            },
+            getTasksForSession: (sessionId: string) => ServiceLocator.resolve(TaskManager).getTasksForSession(sessionId),
+            getTask: (globalTaskId: string) => ServiceLocator.resolve(TaskManager).getTask(globalTaskId),
+            getAllTasks: () => ServiceLocator.resolve(TaskManager).getAllTasks(),
+            createTaskFromCli: (params: { sessionId: string; taskId: string; description: string; dependencies?: string[]; taskType?: 'implementation' | 'error_fix'; priority?: number; errorText?: string }) => 
+                ServiceLocator.resolve(TaskManager).createTaskFromCli(params),
+            completeTask: (globalTaskId: string, summary?: string) => ServiceLocator.resolve(TaskManager).markTaskCompletedViaCli(globalTaskId, summary),
+            updateTaskStage: (globalTaskId: string, stage: string) => ServiceLocator.resolve(TaskManager).updateTaskStage(globalTaskId, stage),
+            markTaskFailed: (globalTaskId: string, reason?: string) => ServiceLocator.resolve(TaskManager).markTaskFailed(globalTaskId, reason),
+            deleteTask: (globalTaskId: string, reason?: string) => ServiceLocator.resolve(TaskManager).deleteTask(globalTaskId, reason),
+            validateTaskFormat: (task: any) => ServiceLocator.resolve(TaskManager).validateTaskFormat(task),
+            reloadPersistedTasks: () => ServiceLocator.resolve(TaskManager).reloadPersistedTasks(),
+            getAgentAssignmentsForUI: () => ServiceLocator.resolve(TaskManager).getAgentAssignmentsForUI?.() || []
+        },
         roleRegistry: {
             getRole: (roleId: string) => roleRegistry.getRole(roleId),
             updateRole: (roleId: string, updates: Record<string, any>) => {
@@ -363,18 +387,25 @@ async function main(): Promise<void> {
     }
     
     try {
-        // Initialize all services
-        const services = await initializeServices(config);
-        
-        // Create and start daemon
+        // Create daemon first (without services)
         const daemonOptions: DaemonOptions = {
             port: config.port,
             workspaceRoot: config.workspaceRoot,
-            services,
+            services: undefined,  // Services initialized below
             verbose: process.env.APC_VERBOSE === 'true'
         };
         
         const daemon = new ApcDaemon(daemonOptions);
+        
+        // Start daemon WebSocket server
+        await daemon.start();
+        console.log(`[Standalone] Daemon WebSocket server started on port ${config.port}`);
+        
+        // Now initialize all services (passing daemon so it can be marked ready)
+        const services = await initializeServices(config, daemon);
+        
+        // Register services with daemon
+        daemon.setServices(services);
         
         // Handle shutdown signals
         const shutdown = async (signal: string) => {
@@ -385,9 +416,6 @@ async function main(): Promise<void> {
         
         process.on('SIGINT', () => shutdown('SIGINT'));
         process.on('SIGTERM', () => shutdown('SIGTERM'));
-        
-        // Start daemon
-        await daemon.start();
         
         console.log('');
         console.log('[Standalone] Daemon is ready!');

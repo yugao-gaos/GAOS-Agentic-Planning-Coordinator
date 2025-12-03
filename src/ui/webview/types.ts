@@ -4,7 +4,7 @@
  */
 
 export interface SidebarState {
-    systemStatus: 'checking' | 'ready' | 'missing' | 'daemon_missing';
+    systemStatus: 'checking' | 'ready' | 'missing' | 'daemon_missing' | 'initializing';
     missingCount: number;
     sessions: SessionInfo[];
     agents: AgentInfo[];
@@ -45,6 +45,12 @@ export interface WorkflowInfo {
     waitingForAgentRole?: string;
     /** Brief summary of what was accomplished or why it failed */
     summary?: string;
+    /** Explicit success flag (for completed workflows) */
+    success?: boolean;
+    /** Error message (for failed workflows) */
+    error?: string;
+    /** Workflow output data (workflow-specific) */
+    output?: any;
 }
 
 export interface SessionInfo {
@@ -63,9 +69,7 @@ export interface SessionInfo {
     workflowHistory: WorkflowInfo[];  // Completed workflows (newest first)
     isRevising: boolean;
     failedTasks: FailedTaskInfo[];
-    sessionAgents: AgentInfo[];
-    benchAgents?: AgentInfo[];  // NEW: Agents on bench
-    benchCount?: number;  // NEW: Count of bench agents
+    sessionAgents: AgentInfo[];  // All agents associated with this session (for workflow display)
 }
 
 export interface FailedTaskInfo {

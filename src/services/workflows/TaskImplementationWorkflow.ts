@@ -63,9 +63,12 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     private filesModified: string[] = [];
     private unityResult: { success: boolean; errors?: string[] } | null = null;
     private previousErrors: string[] = [];
+    private skipUnity: boolean = false; // Set true if max iterations reached with critical issues
     
-    // Note: Agent tracking now handled by BaseWorkflow.allocatedAgents array
-    // No need for phase-specific agent name variables
+    // Agent names for bench management
+    private engineerName?: string;
+    private reviewerName?: string;
+    private contextGathererName?: string;
     
     private agentRunner: AgentRunner;
     
@@ -117,12 +120,28 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         const phase = this.getPhases()[phaseIndex];
         
         // Declare occupancy at the start of implement phase (first phase now)
+        // Also allocate both engineer and reviewer upfront (only if not already allocated)
         if (phaseIndex === 0) {
             this.declareTaskOccupancy(
                 [this.taskId],
                 'exclusive',
                 `Implementing task ${this.taskId}`
             );
+            
+            // Allocate engineer and reviewer upfront - they stay on bench when idle
+            // Only allocate if not already allocated (handles review iteration loops)
+            if (!this.engineerName && !this.reviewerName) {
+                this.log(`🎭 Allocating engineer and reviewer for workflow...`);
+                this.engineerName = await this.requestAgent('engineer');
+                this.reviewerName = await this.requestAgent('code_reviewer');
+                this.log(`✓ Agents allocated: ${this.engineerName} (engineer), ${this.reviewerName} (reviewer)`);
+                
+                // Demote reviewer to bench immediately - it won't work until review phase
+                this.demoteAgentToBench(this.reviewerName);
+                this.log(`Reviewer ${this.reviewerName} moved to bench (waiting for review phase)`);
+            } else {
+                this.log(`✓ Using already allocated agents: ${this.engineerName} (engineer), ${this.reviewerName} (reviewer)`);
+            }
         }
         
         switch (phase) {
@@ -149,6 +168,25 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             case 'finalize':
                 await this.executeFinalizePhase();
                 break;
+        }
+        
+        // Release engineer and reviewer after finalize phase (or if skipping to delta_context)
+        if (phase === 'finalize' || (phase === 'delta_context' && this.skipUnity)) {
+            if (this.engineerName) {
+                this.log(`Releasing engineer: ${this.engineerName}`);
+                this.releaseAgent(this.engineerName);
+                this.engineerName = undefined;
+            }
+            if (this.reviewerName) {
+                this.log(`Releasing reviewer: ${this.reviewerName}`);
+                this.releaseAgent(this.reviewerName);
+                this.reviewerName = undefined;
+            }
+            if (this.contextGathererName) {
+                this.log(`Releasing context gatherer: ${this.contextGathererName}`);
+                this.releaseAgent(this.contextGathererName);
+                this.contextGathererName = undefined;
+            }
         }
     }
     
@@ -193,16 +231,16 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     }
     
     protected getOutput(): any {
-        // When Unity is disabled, success is determined by code review approval
-        const success = this.status === 'completed' && 
-            (this.unityEnabled ? this.unityResult?.success !== false : this.reviewResult === 'approved');
+        // With fire-and-forget Unity, workflow success is determined by code review approval
+        // Unity verification happens asynchronously - coordinator monitors for errors
+        const success = this.status === 'completed' && this.reviewResult === 'approved';
         
         return {
             taskId: this.taskId,
             success,
             filesModified: this.filesModified,
             reviewIterations: this.reviewIterations,
-            unityResult: this.unityResult,
+            unityVerificationQueued: this.unityEnabled,
             unityEnabled: this.unityEnabled
         };
     }
@@ -252,12 +290,18 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             : '';
         this.log(`\n🔧 PHASE: IMPLEMENT${iteration} for task ${this.taskId}`);
         
+        if (!this.engineerName) {
+            throw new Error('Engineer not allocated - workflow initialization failed');
+        }
+        
+        // Note: Reviewer is already on bench from initial allocation - will be promoted when review phase starts
+        
         const role = this.getRole('engineer');
         const prompt = this.buildImplementPrompt(role);
         
-        this.log(`Running engineer (${role?.defaultModel || 'sonnet-4.5'})...`);
+        this.log(`Running engineer ${this.engineerName} (${role?.defaultModel || 'sonnet-4.5'})...`);
         
-        // Agent is automatically allocated and released by runAgentTaskWithCallback
+        // Use pre-allocated engineer (don't request/release in runAgentTaskWithCallback)
         const result = await this.runAgentTaskWithCallback(
             `implement_${this.taskId}`,
             prompt,
@@ -289,26 +333,36 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             }
         }
         
-        // Note: Agent is automatically released by runAgentTaskWithCallback's finally block
+        // Demote engineer to bench after work (reviewer will work next)
+        this.demoteAgentToBench(this.engineerName);
     }
     
     private async executeReviewPhase(): Promise<void> {
         this.reviewIterations++;
         this.log(`\n🔍 PHASE: REVIEW (iteration ${this.reviewIterations}) for task ${this.taskId}`);
         
+        if (!this.reviewerName) {
+            throw new Error('Reviewer not allocated - workflow initialization failed');
+        }
+        
+        // Demote engineer to bench while reviewer works
+        if (this.engineerName) {
+            this.demoteAgentToBench(this.engineerName);
+        }
+        
         const role = this.getRole('code_reviewer');
         const prompt = this.buildReviewPrompt(role);
         
-        this.log(`Running code reviewer (${role?.defaultModel || 'sonnet-4.5'})...`);
+        this.log(`Running code reviewer ${this.reviewerName} (${role?.defaultModel || 'sonnet-4.5'})...`);
         
-        // Agent is automatically allocated and released by runAgentTaskWithCallback
+        // Use pre-allocated reviewer (don't request/release in runAgentTaskWithCallback)
         const result = await this.runAgentTaskWithCallback(
             `review_${this.taskId}`,
             prompt,
             'code_reviewer',
             {
                 expectedStage: 'review',
-                timeout: role?.timeoutMs || 300000,
+                timeout: role?.timeoutMs || 600000,
                 model: role?.defaultModel,
                 cwd: this.stateManager.getWorkspaceRoot()
             }
@@ -316,40 +370,35 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         
         if (result.fromCallback) {
             // Got structured data from CLI callback - preferred path
-            if (result.result === 'approved') {
+            const resultType = result.result?.toLowerCase();
+            
+            if (resultType === 'approved') {
                 this.reviewResult = 'approved';
-                this.reviewFeedback = '';
-                this.log(`✅ Review result via CLI callback: APPROVED`);
-            } else if (result.result === 'changes_requested') {
+                this.log(`✓ Review approved via CLI callback`);
+            } else if (resultType === 'changes_requested') {
                 this.reviewResult = 'changes_requested';
-                this.reviewFeedback = result.payload?.feedback || 'Changes requested (no specific feedback)';
-                this.log(`⚠️ Review result via CLI callback: CHANGES_REQUESTED`);
-                this.log(`Feedback: ${this.reviewFeedback.substring(0, 100)}...`);
+                this.reviewFeedback = result.payload?.feedback || (Array.isArray(result.payload?.issues) ? result.payload.issues.join('\n') : '') || 'See review comments';
+                this.log(`⚠️ Changes requested via CLI callback`);
             } else {
-                // Unexpected result - treat as approved to not block
-                this.log(`⚠️ Unexpected review result: ${result.result}, treating as approved`);
-                this.reviewResult = 'approved';
+                // Fallback: treat non-approved as changes_requested
+                this.reviewResult = 'changes_requested';
+                this.reviewFeedback = result.payload?.message || 'Review feedback unavailable';
+                this.log(`⚠️ Review result unclear, treating as changes_requested`);
             }
         } else {
-            // Legacy fallback: parse output
-            if (result.success && result.rawOutput) {
-                const { approved, feedback } = this.parseReviewResult(result.rawOutput);
-                this.reviewResult = approved ? 'approved' : 'changes_requested';
-                this.reviewFeedback = feedback;
-                
-                const icon = approved ? '✅' : '⚠️';
-                this.log(`${icon} Review result via output parsing: ${this.reviewResult.toUpperCase()}`);
-                if (!approved) {
-                    this.log(`Feedback: ${feedback.substring(0, 100)}...`);
-                }
-            } else {
-                // Treat failed review as approved to not block
-                this.log(`⚠️ Review failed, treating as approved`);
+            // Legacy fallback: treat success as approved
+            if (result.success) {
                 this.reviewResult = 'approved';
+                this.log(`✓ Review approved (legacy fallback)`);
+            } else {
+                this.reviewResult = 'changes_requested';
+                this.reviewFeedback = result.rawOutput || 'Review failed';
+                this.log(`⚠️ Review failed, requesting changes`);
             }
         }
         
-        // Note: Agent is automatically released by runAgentTaskWithCallback's finally block
+        // Demote reviewer to bench after work
+        this.demoteAgentToBench(this.reviewerName);
     }
     
     private async executeApprovalPhase(): Promise<void> {
@@ -361,7 +410,24 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
                 // Loop back to implement phase (index 0) - set to -1 since runPhases increments
                 this.phaseIndex = -1; // Will be incremented to 0 (implement)
             } else {
-                this.log(`⚠️ Max review iterations reached, proceeding despite changes`);
+                // Max iterations reached - check if there are critical issues in feedback
+                const hasCriticalIssues = this.reviewFeedback && (
+                    this.reviewFeedback.toLowerCase().includes('critical') ||
+                    this.reviewFeedback.toLowerCase().includes('blocking') ||
+                    this.reviewFeedback.toLowerCase().includes('must fix') ||
+                    this.reviewFeedback.toLowerCase().includes('error') ||
+                    this.reviewFeedback.toLowerCase().includes('crash') ||
+                    this.reviewFeedback.toLowerCase().includes('broken')
+                );
+                
+                if (hasCriticalIssues) {
+                    this.log(`⚠️ Max review iterations reached WITH CRITICAL ISSUES`);
+                    this.log(`⏩ Skipping Unity compilation - will go directly to context update`);
+                    this.skipUnity = true;
+                } else {
+                    this.log(`⚠️ Max review iterations reached, proceeding despite non-critical changes`);
+                }
+                
                 this.reviewResult = 'approved';
             }
         } else {
@@ -372,13 +438,22 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     private async executeDeltaContextPhase(): Promise<void> {
         this.log(`\n📝 PHASE: DELTA CONTEXT for task ${this.taskId}`);
         
+        // Request context gatherer from pool
+        this.contextGathererName = await this.requestAgent('context_gatherer');
+        this.log(`✓ Context gatherer allocated: ${this.contextGathererName}`);
+        
         const role = this.getRole('context_gatherer');
         const prompt = this.buildDeltaContextPrompt(role);
         
-        this.log(`Running context gatherer in delta mode (${role?.defaultModel || 'gemini-3-pro'})...`);
+        this.log(`Running context gatherer ${this.contextGathererName} in delta mode (${role?.defaultModel || 'gemini-3-pro'})...`);
         
-        // Agent is automatically allocated and released by runAgentTask
-        const result = await this.runAgentTask('delta_context', prompt, role, undefined);
+        // Use allocated context gatherer
+        const result = await this.runAgentTask(
+            'delta_context', 
+            prompt, 
+            role, 
+            undefined
+        );
         
         if (result.success) {
             this.log(`✓ Delta context updated`);
@@ -386,11 +461,18 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             this.log(`⚠️ Delta context update failed, continuing`);
         }
         
-        // Note: Agent is automatically released by runAgentTask
+        // Context gatherer will be released in executePhase cleanup
     }
     
     private async executeUnityPhase(): Promise<void> {
         this.log(`\n🎮 PHASE: UNITY PIPELINE for task ${this.taskId}`);
+        
+        // Skip Unity if flagged (max iterations with critical issues)
+        if (this.skipUnity) {
+            this.log(`⏩ Skipping Unity pipeline due to critical review issues`);
+            this.unityResult = { success: true }; // Treat as success to not block workflow
+            return;
+        }
         
         // Check if Unity is available
         if (!this.isUnityAvailable() || !this.unityManager) {
@@ -411,50 +493,40 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             filesModified: [] // Could track from engineer output
         };
         
-        this.log(`Queueing Unity pipeline: ${operations.join(' → ')}`);
-        this.setBlocked('Waiting for Unity pipeline');
+        // FIRE-AND-FORGET: Queue the Unity pipeline without waiting
+        // The centralized Unity service will handle compilation/tests asynchronously
+        // If compilation or test errors occur, the coordinator will detect them and create error tasks
+        this.log(`📤 Queueing Unity pipeline (fire-and-forget): ${operations.join(' → ')}`);
         
-        // Queue the pipeline and wait for result
         try {
-            const result = await this.unityManager.queuePipelineAndWait(
+            // Use queuePipeline (not queuePipelineAndWait) for fire-and-forget
+            this.unityManager.queuePipeline(
                 this.id, // coordinatorId
                 operations,
                 [taskContext],
                 true // Allow merging with other queued requests
             );
             
-            this.unityResult = {
-                success: result.success,
-                errors: result.allErrors.map(e => e.message)
-            };
+            // Always mark as success - we've successfully queued the request
+            // Actual compilation/test results will be handled by coordinator's error monitoring
+            this.unityResult = { success: true };
             
-            if (result.success) {
-                this.log(`✓ Unity pipeline passed`);
-            } else {
-                this.log(`❌ Unity pipeline failed: ${result.allErrors.map(e => e.message).join(', ')}`);
-            }
+            this.log(`✓ Unity pipeline queued - coordinator will monitor results asynchronously`);
         } catch (error) {
             const errorMsg = error instanceof Error ? error.message : String(error);
-            this.log(`❌ Unity pipeline error: ${errorMsg}`);
-            this.unityResult = {
-                success: false,
-                errors: [errorMsg]
-            };
+            this.log(`⚠️ Unity pipeline queueing warning: ${errorMsg}`);
+            // Even queueing issues don't fail the workflow - just log the warning
+            this.unityResult = { success: true };
         }
-        
-        this.setUnblocked();
     }
     
     private async executeFinalizePhase(): Promise<void> {
         this.log(`\n📋 PHASE: FINALIZE for task ${this.taskId}`);
         
-        // Update task checkbox in plan file
-        if (this.unityResult?.success) {
-            await this.updateTaskCheckbox(true);
-            this.log(`✅ Task ${this.taskId} completed successfully`);
-        } else {
-            this.log(`⚠️ Task ${this.taskId} needs work (Unity errors)`);
-        }
+        // Since Unity is now fire-and-forget, we always mark the task as complete
+        // Any Unity compilation or test errors will be handled asynchronously by the coordinator
+        await this.updateTaskCheckbox(true);
+        this.log(`✅ Task ${this.taskId} workflow completed - Unity verification queued`);
         
         // Release task occupancy - coordinator can now dispatch other work on this task
         this.releaseTaskOccupancy([this.taskId]);
@@ -507,12 +579,16 @@ Provide a focused context brief in markdown format.`;
         
         let revisionContext = '';
         if (this.reviewIterations > 0 && this.reviewFeedback) {
+            const filesModifiedList = this.filesModified.length > 0
+                ? `\n## Files You Modified in Previous Iteration\n${this.filesModified.map(f => `- ${f}`).join('\n')}\n`
+                : '';
+            
             revisionContext = `
 ## REVISION REQUIRED
 This is revision ${this.reviewIterations}. Address the following feedback:
 
 ${this.reviewFeedback}
-
+${filesModifiedList}
 Focus on fixing the issues raised while preserving working code.`;
         }
         

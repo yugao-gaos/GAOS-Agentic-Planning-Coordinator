@@ -39,6 +39,12 @@ export class AgentPoolProvider implements vscode.TreeDataProvider<AgentPoolItem>
             items.push(new AgentPoolItem('available', name, status));
         }
 
+        // Add allocated agents (on bench - not available but not yet working)
+        for (const name of poolStatus.allocated) {
+            const status = this.agentPoolService.getAgentStatus(name);
+            items.push(new AgentPoolItem('allocated', name, status));
+        }
+
         // Add busy agents
         for (const name of poolStatus.busy) {
             const status = this.agentPoolService.getAgentStatus(name);
@@ -51,7 +57,7 @@ export class AgentPoolProvider implements vscode.TreeDataProvider<AgentPoolItem>
 
 export class AgentPoolItem extends vscode.TreeItem {
     constructor(
-        public readonly itemType: 'summary' | 'available' | 'busy',
+        public readonly itemType: 'summary' | 'available' | 'allocated' | 'busy',
         label: string,
         public readonly agentStatus?: AgentStatus
     ) {
@@ -65,6 +71,14 @@ export class AgentPoolItem extends vscode.TreeItem {
             this.iconPath = new vscode.ThemeIcon('person', new vscode.ThemeColor('charts.green'));
             this.description = 'available';
             this.tooltip = `${label} - Ready to work`;
+        } else if (itemType === 'allocated' && agentStatus) {
+            this.contextValue = 'allocatedAgent';
+            this.iconPath = new vscode.ThemeIcon('person', new vscode.ThemeColor('charts.purple'));
+            
+            // Show role name in description if available
+            const roleLabel = agentStatus.roleId ? ` [${agentStatus.roleId}]` : '';
+            this.description = `on bench${roleLabel}`;
+            this.tooltip = this.getAllocatedTooltip(label, agentStatus);
         } else if (itemType === 'busy' && agentStatus) {
             this.contextValue = 'busyAgent';
             this.iconPath = new vscode.ThemeIcon('person', new vscode.ThemeColor('charts.yellow'));
@@ -81,6 +95,20 @@ export class AgentPoolItem extends vscode.TreeItem {
                 arguments: [label]
             };
         }
+    }
+
+    private getAllocatedTooltip(name: string, status: AgentStatus): vscode.MarkdownString {
+        const md = new vscode.MarkdownString();
+        md.appendMarkdown(`**${name}**\n\n`);
+        md.appendMarkdown(`**Status:** Allocated (on bench)\n\n`);
+        if (status.roleId) {
+            md.appendMarkdown(`**Role:** ${status.roleId}\n\n`);
+        }
+        if (status.sessionId) {
+            md.appendMarkdown(`**Session:** ${status.sessionId}\n\n`);
+        }
+        md.appendMarkdown(`\n*Waiting to be assigned to a workflow*`);
+        return md;
     }
 
     private getBusyTooltip(name: string, status: AgentStatus): vscode.MarkdownString {

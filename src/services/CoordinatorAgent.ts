@@ -18,6 +18,7 @@ import { OutputChannelManager } from './OutputChannelManager';
 import { AgentRoleRegistry } from './AgentRoleRegistry';
 import { ServiceLocator } from './ServiceLocator';
 import { StateManager } from './StateManager';
+import { ProcessManager } from './ProcessManager';
 import { TypedEventEmitter } from './TypedEventEmitter';
 import { EventBroadcaster } from '../daemon/EventBroadcaster';
 import {
@@ -204,6 +205,9 @@ export class CoordinatorAgent {
         
         this.log(`Starting evaluation #${this.evaluationCount} for event: ${input.event.type}`);
         
+        // Check capacity and cleanup orphans if over 100%
+        await this.checkCapacityAndCleanup(input);
+        
         // Check if cursor CLI is available
         const isAvailable = await this.agentRunner.isAvailable();
         if (!isAvailable) {
@@ -294,6 +298,60 @@ export class CoordinatorAgent {
     }
     
     /**
+     * Check system capacity and cleanup orphan processes if over 100%
+     * This prevents resource exhaustion from accumulated orphan processes
+     */
+    private async checkCapacityAndCleanup(input: CoordinatorInput): Promise<void> {
+        try {
+            // Count cursor agent processes
+            const { execSync } = require('child_process');
+            const processCount = parseInt(
+                execSync('ps aux | grep -E "cursor.*(agent|--model)" | grep -v grep | wc -l', 
+                    { encoding: 'utf-8', timeout: 5000 }).trim()
+            );
+            
+            // Calculate capacity
+            const availableAgentCount = input.availableAgents?.length ?? 0;
+            const busyAgentCount = input.agentStatuses?.filter(a => a.status === 'busy').length ?? 0;
+            const totalAgentCount = availableAgentCount + busyAgentCount;
+            
+            if (totalAgentCount === 0) {
+                // No agents configured - skip capacity check
+                return;
+            }
+            
+            const capacityPercent = (processCount / totalAgentCount) * 100;
+            
+            this.log(`[CAPACITY CHECK] ${processCount} cursor agent processes, ${totalAgentCount} agents in pool (${capacityPercent.toFixed(0)}% capacity)`);
+            
+            // If over 100% capacity, cleanup orphans immediately
+            if (capacityPercent > 100) {
+                this.log(`[CAPACITY CHECK] ⚠️ OVER CAPACITY (${capacityPercent.toFixed(0)}%) - killing orphan processes...`);
+                
+                const processManager = ServiceLocator.resolve(ProcessManager);
+                const killedCount = await processManager.killOrphanCursorAgents();
+                
+                if (killedCount > 0) {
+                    this.log(`[CAPACITY CHECK] ✅ Killed ${killedCount} orphan processes`);
+                    
+                    // Re-count after cleanup
+                    const afterCount = parseInt(
+                        execSync('ps aux | grep -E "cursor.*(agent|--model)" | grep -v grep | wc -l', 
+                            { encoding: 'utf-8', timeout: 5000 }).trim()
+                    );
+                    const afterCapacity = (afterCount / totalAgentCount) * 100;
+                    this.log(`[CAPACITY CHECK] After cleanup: ${afterCount} processes (${afterCapacity.toFixed(0)}% capacity)`);
+                } else {
+                    this.log(`[CAPACITY CHECK] No orphan processes found - capacity issue may be from legitimate active workflows`);
+                }
+            }
+        } catch (err) {
+            this.log(`[CAPACITY CHECK] Warning: Failed to check capacity: ${err}`);
+            // Don't throw - capacity check is a safety feature, not critical
+        }
+    }
+    
+    /**
      * Maximum number of evaluation runs to keep streaming logs for.
      * Only stream logs (.log files) are kept now.
      */
@@ -346,6 +404,7 @@ export class CoordinatorAgent {
         const agentsSection = this.formatAgents(input.agentStatuses, input.availableAgents);
         const eventSection = this.formatEventSection(input);
         const plansSection = this.formatApprovedPlans(input);
+        const capacitiesSection = this.formatSessionCapacities(input.sessionCapacities || []);
         
         // Get customizable prompt parts from registry (or use defaults)
         const promptConfig = this.roleRegistry?.getCoordinatorPrompt() || DefaultCoordinatorPrompt;
@@ -368,7 +427,8 @@ export class CoordinatorAgent {
             .replace('{{timestamp}}', String(Date.now()))
             .replace('{{WORKFLOW_SELECTION}}', workflowPrompts || 'No workflows registered')
             .replace('{{planPath}}', input.planPath || 'N/A')
-            .replace(/\{\{AVAILABLE_AGENT_COUNT\}\}/g, String(totalAgentCount));
+            .replace(/\{\{AVAILABLE_AGENT_COUNT\}\}/g, String(totalAgentCount))
+            .replace('{{SESSION_CAPACITIES}}', capacitiesSection);
         
         return `${promptConfig.roleIntro}
 
@@ -559,6 +619,24 @@ ${decisionInstructions}`;
         return `${plans.length} approved plan(s):\n\n` + plans.map((p, i) => 
             `[${i + 1}] Session: ${p.sessionId}\n    Plan File: ${p.planPath}\n    Requirement: ${p.requirement}\n    Status: ${p.status}`
         ).join('\n\n');
+    }
+    
+    /**
+     * Format session capacity information for the prompt
+     * Shows per-session agent limits and current allocation
+     */
+    private formatSessionCapacities(capacities: any[]): string {
+        if (!capacities || capacities.length === 0) {
+            return 'No session capacity data available.';
+        }
+        
+        return capacities.map(c => {
+            const status = c.availableCapacity > 0 
+                ? `✅ Can add ${c.availableCapacity} more agent(s)`
+                : '🔴 FULL - cannot add more agents';
+            
+            return `- ${c.sessionId}: Recommends ${c.recommendedAgents} agents, currently using ${c.currentlyAllocated} (${c.activeWorkflows} workflows)\n  ${status}`;
+        }).join('\n');
     }
 
     /**

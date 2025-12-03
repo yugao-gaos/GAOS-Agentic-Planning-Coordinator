@@ -161,6 +161,33 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 case 'releaseAgent':
                     vscode.commands.executeCommand('agenticPlanning.releaseAgent', { label: data.agentName });
                     break;
+                case 'pauseWorkflow':
+                    if (data.sessionId && data.workflowId && this.stateProxy) {
+                        const result = await this.stateProxy.pauseWorkflow(data.sessionId, data.workflowId);
+                        if (!result.success) {
+                            vscode.window.showErrorMessage(result.error || 'Failed to pause workflow');
+                        }
+                        this.refresh();
+                    }
+                    break;
+                case 'resumeWorkflow':
+                    if (data.sessionId && data.workflowId && this.stateProxy) {
+                        const result = await this.stateProxy.resumeWorkflow(data.sessionId, data.workflowId);
+                        if (!result.success) {
+                            vscode.window.showErrorMessage(result.error || 'Failed to resume workflow');
+                        }
+                        this.refresh();
+                    }
+                    break;
+                case 'cancelWorkflow':
+                    if (data.sessionId && data.workflowId && this.stateProxy) {
+                        const result = await this.stateProxy.cancelWorkflow(data.sessionId, data.workflowId);
+                        if (!result.success) {
+                            vscode.window.showErrorMessage(result.error || 'Failed to cancel workflow');
+                        }
+                        this.refresh();
+                    }
+                    break;
                 case 'showAgentTerminal':
                     vscode.commands.executeCommand('agenticPlanning.showAgentTerminal', data.agentName);
                     break;
@@ -309,6 +336,37 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 }
             };
         }
+        
+        // Check if daemon is fully ready (services initialized)
+        const daemonReady = this.stateProxy ? await this.stateProxy.isDaemonReady() : true;
+        if (!daemonReady) {
+            // Daemon connected but services not ready yet
+            return {
+                systemStatus: 'initializing',
+                missingCount: 0,
+                sessions: [],
+                agents: [],
+                unity: {
+                    connected: false,
+                    isPlaying: false,
+                    isCompiling: false,
+                    hasErrors: false,
+                    errorCount: 0,
+                    queueLength: 0
+                },
+                unityEnabled: this.unityEnabled,
+                coordinatorStatus: {
+                    state: 'idle',
+                    pendingEvents: 0,
+                    evaluationCount: 0
+                },
+                connectionHealth: {
+                    state: 'unknown',
+                    lastPingSuccess: false,
+                    consecutiveFailures: 0
+                }
+            };
+        }
 
         // System Status - check dependencies
         const statuses = this.dependencyService.getCachedStatus();
@@ -317,7 +375,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         const requiredStatuses = relevantStatuses.filter(s => s.required);
         const missingDeps = requiredStatuses.filter(s => !s.installed);
 
-        let systemStatus: 'checking' | 'ready' | 'missing' | 'daemon_missing' = 'checking';
+        let systemStatus: 'checking' | 'ready' | 'missing' | 'daemon_missing' | 'initializing' = 'checking';
         if (relevantStatuses.length > 0) {
             systemStatus = missingDeps.length === 0 ? 'ready' : 'missing';
         }
@@ -361,7 +419,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                             startedAt: hist.startedAt,
                             taskId: hist.taskId,
                             logPath: hist.logPath,
-                            summary: hist.summary
+                            summary: hist.summary,
+                            // New fields
+                            success: hist.success,
+                            error: hist.error,
+                            output: hist.output
                         });
                     }
                     
@@ -530,29 +592,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 }
             }
             
-            // Collect agents on bench for this session
-            const sessionBench: AgentInfo[] = [];
-            const benchAgentsRaw = this.stateProxy 
-                ? await this.stateProxy.getAgentsOnBench(s.id)
-                : [];
-            for (const agent of benchAgentsRaw) {
-                let roleColor: string | undefined;
-                if (agent.roleId) {
-                    const role = this.stateProxy 
-                        ? await this.stateProxy.getRole(agent.roleId) 
-                        : undefined;
-                    roleColor = role?.color;
-                }
-                
-                sessionBench.push({
-                    name: agent.name,
-                    status: 'allocated',
-                    roleId: agent.roleId,
-                    roleColor: roleColor || '#6366f1',
-                    sessionId: s.id
-                });
-            }
-            
             sessions.push({
                 id: s.id,
                 requirement: s.requirement,
@@ -569,9 +608,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 workflowHistory,
                 isRevising,
                 failedTasks,
-                sessionAgents,
-                benchAgents: sessionBench,
-                benchCount: sessionBench.length
+                sessionAgents
             });
         }
 
@@ -595,8 +632,67 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             agents.push({ name, status: 'available' });
         }
         
-        // Collect allocated (bench) agents (not yet available in daemon)
+        // Collect allocated (bench) agents - get from state proxy
+        const allBenchAgentsRaw = this.stateProxy
+            ? await this.stateProxy.getBenchAgents()
+            : [];
+        const allBenchAgents = allBenchAgentsRaw.map(b => ({
+            name: b.name,
+            roleId: b.roleId,
+            sessionId: b.sessionId,
+            workflowId: b.workflowId
+        }));
         
+        for (const agent of allBenchAgents) {
+            // Get role color if available
+            let roleColor: string | undefined;
+            if (agent.roleId) {
+                const role = this.stateProxy 
+                    ? await this.stateProxy.getRole(agent.roleId) 
+                    : undefined;
+                roleColor = role?.color;
+            }
+            
+            // Find workflow context for this agent
+            let workflowType: string | undefined;
+            let currentPhase: string | undefined;
+            let taskId: string | undefined;
+            let sessionId: string | undefined;
+            
+            // Search through sessions to find matching workflow using workflowId
+            for (const session of sessions) {
+                if (agent.workflowId && agent.sessionId === session.id) {
+                    sessionId = session.id;
+                    
+                    // Find matching workflow by workflowId
+                    if (agent.workflowId) {
+                        for (const wf of session.activeWorkflows) {
+                            if (wf.id === agent.workflowId) {
+                                workflowType = wf.type;
+                                currentPhase = wf.phase;
+                                taskId = wf.taskId;
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            
+            agents.push({
+                name: agent.name,
+                status: 'allocated',  // On bench, not busy
+                roleId: agent.roleId,
+                workflowId: agent.workflowId,
+                roleColor: roleColor || '#6366f1',  // Default indigo for benched
+                workflowType,
+                currentPhase,
+                taskId,
+                sessionId
+            });
+        }
+        
+        // Collect busy agents
         for (const agent of allBusyAgents) {
             // Get role color if available
             let roleColor: string | undefined;

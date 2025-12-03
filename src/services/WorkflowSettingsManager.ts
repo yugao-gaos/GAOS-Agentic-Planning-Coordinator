@@ -33,6 +33,7 @@ export const DEFAULT_WORKFLOW_METADATA: Record<WorkflowType, WorkflowMetadata> =
         type: 'planning_new',
         name: 'New Planning',
         requiresUnity: false,
+        requiresCompleteDependencies: false, // Planning can start independently
         coordinatorPrompt: `- 'planning_new' - Create a new execution plan from scratch
    Use when: Starting a new feature, major refactoring, or first-time setup`
     },
@@ -40,6 +41,7 @@ export const DEFAULT_WORKFLOW_METADATA: Record<WorkflowType, WorkflowMetadata> =
         type: 'planning_revision',
         name: 'Plan Revision',
         requiresUnity: false,
+        requiresCompleteDependencies: false, // Revision can start independently
         coordinatorPrompt: `- 'planning_revision' - Revise an existing plan based on feedback
    Use when: User requests changes to the plan, or plan needs adjustment after errors`
     },
@@ -47,14 +49,17 @@ export const DEFAULT_WORKFLOW_METADATA: Record<WorkflowType, WorkflowMetadata> =
         type: 'task_implementation',
         name: 'Task Implementation',
         requiresUnity: false,
+        requiresCompleteDependencies: true, // Implementation MUST wait for dependencies
         coordinatorPrompt: `- 'task_implementation' - Implement a task from the plan
    Use when: Task dependencies are complete and agent is available
-   Input: taskId, taskDescription, dependencies, planPath`
+   Input: taskId, taskDescription, dependencies, planPath
+   Note: This workflow requires all task dependencies to be COMPLETED before it can start`
     },
     error_resolution: {
         type: 'error_resolution',
         name: 'Error Resolution',
         requiresUnity: false,
+        requiresCompleteDependencies: false, // Error fixing can happen independently
         coordinatorPrompt: `- 'error_resolution' - Fix compilation or test errors (fire and forget)
    Use when: Unity errors occur or previous fix attempt failed
    Input: errors array, previousAttempts (for retries), previousFixSummary (what was tried)
@@ -64,10 +69,12 @@ export const DEFAULT_WORKFLOW_METADATA: Record<WorkflowType, WorkflowMetadata> =
         type: 'context_gathering',
         name: 'Context Gathering',
         requiresUnity: false,
+        requiresCompleteDependencies: false, // Context gathering is preparatory, doesn't need deps complete
         coordinatorPrompt: `- 'context_gathering' - Gather and analyze context from folders/files
    Use when: Run in parallel when building plans to get general understanding of the project, before starting work on unfamiliar task, after repeated errors. If you foresee tasks that need to build assets like prefab, scene, GUIs, run context gathering before the implementation workflow to help you understand what assets are available and how to choose them based on requirement.
    Input: targets (folders/files), focusAreas (optional), depth ('shallow'|'deep'), taskId (optional - to associate context with a specific task)
-   Output: Context summary written to _AiDevLog/Context/`
+   Output: Context summary written to _AiDevLog/Context/
+   Note: This workflow does NOT require dependencies to be complete - it's a preparation step`
     }
 };
 

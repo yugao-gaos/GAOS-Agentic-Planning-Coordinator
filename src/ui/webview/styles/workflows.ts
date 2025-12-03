@@ -153,10 +153,27 @@ export const workflowStyles = `
     font-weight: 600;
     padding: 2px 8px;
     border-radius: 10px;
+    white-space: nowrap;
+}
+
+/* Busy agents - colored with role color */
+.workflow-agent.busy {
     background: color-mix(in srgb, var(--agent-color, #f97316) 15%, transparent);
     color: var(--agent-color, #f97316);
-    white-space: nowrap;
     border: 1px solid color-mix(in srgb, var(--agent-color, #f97316) 30%, transparent);
+}
+
+/* Benched agents - grey, subdued */
+.workflow-agent.benched {
+    background: rgba(128, 128, 128, 0.1);
+    color: rgba(128, 128, 128, 0.8);
+    border: 1px solid rgba(128, 128, 128, 0.25);
+    opacity: 0.7;
+}
+
+.workflow-agent.benched::before {
+    content: '⏸ ';
+    opacity: 0.6;
 }
 
 /* Execution progress text in header */
@@ -175,5 +192,47 @@ export const workflowStyles = `
     color: var(--vscode-descriptionForeground);
     opacity: 0.7;
     white-space: nowrap;
+}
+
+/* Workflow action buttons container */
+.workflow-actions {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+    align-items: center;
+}
+
+/* Workflow control buttons (pause/resume/cancel) */
+.workflow-action-btn {
+    padding: 2px 8px;
+    border: 1px solid var(--vscode-widget-border);
+    border-radius: 3px;
+    background: transparent;
+    color: var(--vscode-foreground);
+    font-size: 12px;
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity 0.2s, background 0.2s, border-color 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+    min-width: 20px;
+}
+
+.workflow-action-btn:hover {
+    opacity: 1;
+    background: var(--vscode-list-hoverBackground);
+    border-color: var(--vscode-focusBorder);
+}
+
+.workflow-action-btn.danger {
+    color: #f14c4c;
+    border-color: rgba(241, 76, 76, 0.3);
+}
+
+.workflow-action-btn.danger:hover {
+    background: rgba(241, 76, 76, 0.15);
+    border-color: rgba(241, 76, 76, 0.5);
 }
 `;

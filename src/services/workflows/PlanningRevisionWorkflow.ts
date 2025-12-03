@@ -519,6 +519,7 @@ ${this.analystOutput || 'No review available'}
             // Track agent run ID for pause handling
             this.currentAgentRunId = options.id;
             
+            const agentRunId = options.id;
             const result = await this.agentRunner.run(options);
             
             this.currentAgentRunId = undefined;

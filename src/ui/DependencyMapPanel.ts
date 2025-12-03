@@ -11,6 +11,7 @@ interface TaskNode {
     status: string;
     dependencies: string[];
     dependents: string[];
+    workflowType?: string;  // Current workflow type (e.g., 'task_implementation', 'context_gathering')
     x?: number;
     y?: number;
     level?: number;
@@ -131,75 +132,109 @@ export class DependencyMapPanel {
      * Also returns info about tasks in other sessions if current session is empty
      */
     private async getTasks(): Promise<{ tasks: TaskNode[]; otherSessionsInfo?: { sessionId: string; taskCount: number }[] }> {
-        // API response format (from ApiHandler task.list)
-        interface ApiTask {
-            id: string;          // Short ID (e.g., "T1")
-            globalId: string;    // Full ID (e.g., "ps_000001_T1")
+        // Task format from tasks.json file
+        interface TaskFromFile {
+            id: string;              // Full ID (e.g., "ps_000001_T1")
             sessionId: string;
             description: string;
             status: string;
-            type?: string;       // API uses "type" instead of "taskType"
-            dependencies: string[];
-            dependents: string[];
+            taskType?: string;
+            dependencies: string[];  // Full IDs (e.g., ["ps_000001_T2"])
+            dependents: string[];    // Full IDs
             priority: number;
+            currentWorkflow?: string;  // Workflow ID if active
+            workflowHistory?: string[];  // All workflows run on this task
         }
-        
-        let tasks: ApiTask[] = [];
-        let allTasks: ApiTask[] = [];
 
         console.log(`[DependencyMapPanel] getTasks() called for sessionId: ${this.sessionId}`);
 
+        if (!this.vsCodeClient) {
+            console.error('[DependencyMapPanel] vsCodeClient is not initialized');
+            return { tasks: [] };
+        }
+
         try {
-            // Get tasks for this session from daemon
-            console.log(`[DependencyMapPanel] Querying daemon for tasks with sessionId: ${this.sessionId}`);
-            // @ts-ignore - Type error due to strict null checking
-            const response = await this.vsCodeClient.send<{ data: ApiTask[] }>('task.list', { sessionId: this.sessionId });
-            const tasks = response?.data || [];
-            console.log(`[DependencyMapPanel] Daemon returned ${tasks.length} tasks for session ${this.sessionId}`);
+            // Get the tasks file path from daemon
+            console.log(`[DependencyMapPanel] Requesting tasks file path for session: ${this.sessionId}`);
+            const pathResponse = await this.vsCodeClient.send<{ sessionId: string; filePath: string; exists: boolean }>('task.getFilePath', { sessionId: this.sessionId });
             
-            // If no tasks for this session, get all tasks to check other sessions
-            if (tasks.length === 0) {
-                console.log(`[DependencyMapPanel] No tasks found, fetching all tasks to check other sessions`);
-                // @ts-ignore - Type error due to strict null checking
-                const allResponse = await this.vsCodeClient.send<{ data: ApiTask[] }>('task.list', {});
-                const allTasks = allResponse?.data || [];
-                console.log(`[DependencyMapPanel] Found ${allTasks.length} total tasks across all sessions`);
+            if (!pathResponse) {
+                console.error('[DependencyMapPanel] No response from daemon for task file path');
+                vscode.window.showErrorMessage('Failed to get tasks file path from daemon');
+                return { tasks: [] };
             }
+            
+            const { filePath, exists } = pathResponse;
+            console.log(`[DependencyMapPanel] Tasks file path: ${filePath}, exists: ${exists}`);
+            
+            if (!exists) {
+                console.log(`[DependencyMapPanel] Tasks file does not exist yet`);
+                return { tasks: [] };
+            }
+            
+            // Read tasks.json directly from disk
+            // This ensures we get ALL tasks including completed ones
+            // (TaskManager may have removed completed tasks from memory for optimization)
+            const fs = require('fs');
+            const fileContent = fs.readFileSync(filePath, 'utf-8');
+            const fileData = JSON.parse(fileContent);
+            
+            if (!fileData.tasks || !Array.isArray(fileData.tasks)) {
+                console.warn('[DependencyMapPanel] Invalid tasks file format');
+                return { tasks: [] };
+            }
+            
+            const tasksFromFile: TaskFromFile[] = fileData.tasks;
+            console.log(`[DependencyMapPanel] Read ${tasksFromFile.length} tasks from file (includes completed)`);
+            
+            // Get active workflows for this session to map workflow types
+            let activeWorkflows: any = {};
+            try {
+                const workflowsResponse = await this.vsCodeClient.send<any>('workflow.list', { sessionId: this.sessionId });
+                if (workflowsResponse?.workflows) {
+                    activeWorkflows = workflowsResponse.workflows;
+                }
+            } catch (e) {
+                console.warn('[DependencyMapPanel] Could not fetch workflows:', e);
+            }
+            
+            // Convert to TaskNode format
+            const taskNodes = tasksFromFile.map(t => {
+                // Extract short ID from full ID
+                // e.g., "ps_000001_T1" → "T1"
+                const shortId = t.id.replace(`${t.sessionId}_`, '');
+                
+                // Get workflow type from active workflows
+                let workflowType: string | undefined;
+                if (t.currentWorkflow && activeWorkflows[t.currentWorkflow]) {
+                    workflowType = activeWorkflows[t.currentWorkflow].type;
+                }
+                
+                return {
+                    id: t.id,           // Keep full ID for uniqueness
+                    shortId: shortId,   // Short ID for display
+                    description: t.description,
+                    status: t.status,
+                    workflowType: workflowType,  // e.g., 'task_implementation', 'context_gathering'
+                    dependencies: t.dependencies.map(depId => 
+                        // Convert full dependency IDs to short IDs
+                        depId.replace(`${t.sessionId}_`, '')
+                    ),
+                    dependents: t.dependents.map(depId => 
+                        // Convert full dependent IDs to short IDs
+                        depId.replace(`${t.sessionId}_`, '')
+                    )
+                };
+            });
+            
+            console.log(`[DependencyMapPanel] Converted ${taskNodes.length} tasks to TaskNode format`);
+            return { tasks: taskNodes };
+            
         } catch (err) {
-            console.error('[DependencyMapPanel] Failed to fetch tasks from daemon:', err);
-            vscode.window.showErrorMessage('Cannot load tasks: Daemon connection error. Please ensure the daemon is running.');
+            console.error('[DependencyMapPanel] Failed to load tasks from file:', err);
+            vscode.window.showErrorMessage(`Cannot load tasks: ${err instanceof Error ? err.message : String(err)}`);
+            return { tasks: [] };
         }
-
-        // Convert to TaskNode format
-        // Note: dependencies and dependents from API are already short IDs (no session prefix)
-        const taskNodes = tasks.map(t => ({
-            id: t.globalId || `${this.sessionId}_${t.id}`,  // Use globalId if available
-            shortId: t.id,  // API already returns short ID
-            description: t.description,
-            status: t.status,
-            dependencies: t.dependencies.map(d => {
-                // Dependencies might be short IDs or full IDs, normalize to short
-                return d.replace(`${this.sessionId}_`, '');
-            }),
-            dependents: t.dependents.map(d => {
-                // Dependents might be short IDs or full IDs, normalize to short
-                return d.replace(`${this.sessionId}_`, '');
-            })
-        }));
-
-        // If no tasks for this session, check which other sessions have tasks
-        let otherSessionsInfo: { sessionId: string; taskCount: number }[] | undefined;
-        if (taskNodes.length === 0 && allTasks.length > 0) {
-            const sessionCounts = new Map<string, number>();
-            for (const t of allTasks) {
-                sessionCounts.set(t.sessionId, (sessionCounts.get(t.sessionId) || 0) + 1);
-            }
-            otherSessionsInfo = Array.from(sessionCounts.entries())
-                .map(([sessionId, taskCount]) => ({ sessionId, taskCount }))
-                .sort((a, b) => b.taskCount - a.taskCount);
-        }
-
-        return { tasks: taskNodes, otherSessionsInfo };
     }
 
     /**
@@ -274,26 +309,22 @@ export class DependencyMapPanel {
      */
     private async updateWebviewContent(): Promise<void> {
         console.log(`[DependencyMapPanel] Fetching tasks for session: ${this.sessionId}`);
-        const { tasks, otherSessionsInfo } = await this.getTasks();
+        const { tasks } = await this.getTasks();
         const layoutedTasks = this.calculateLayout(tasks);
         
         console.log(`[DependencyMapPanel] Found ${tasks.length} tasks for session ${this.sessionId}`);
-        if (tasks.length === 0 && otherSessionsInfo && otherSessionsInfo.length > 0) {
-            console.log(`[DependencyMapPanel] Other sessions with tasks:`, otherSessionsInfo);
-        }
         
         // Update panel title
         this.panel.title = `Task Dependencies - ${this.sessionId} (${tasks.length} tasks)`;
         
-        this.panel.webview.html = this.getWebviewContent(layoutedTasks, otherSessionsInfo);
+        this.panel.webview.html = this.getWebviewContent(layoutedTasks);
     }
 
     /**
      * Generate the webview HTML content
      */
-    private getWebviewContent(tasks: TaskNode[], otherSessionsInfo?: { sessionId: string; taskCount: number }[]): string {
+    private getWebviewContent(tasks: TaskNode[]): string {
         const tasksJson = JSON.stringify(tasks);
-        const otherSessionsJson = JSON.stringify(otherSessionsInfo || []);
         
         // Calculate canvas size
         const maxX = Math.max(...tasks.map(t => (t.x || 0) + 100), 400);
@@ -370,6 +401,19 @@ export class DependencyMapPanel {
         .legend-box.paused { background: #8b5cf6; }
         .legend-box.failed { background: #ef4444; }
         
+        /* Workflow type legend borders */
+        .legend-border {
+            width: 20px;
+            height: 16px;
+            border-radius: 3px;
+            border: 3px solid;
+            background: transparent;
+        }
+        
+        .legend-border.implementation { border-color: #3b82f6; }
+        .legend-border.context { border-color: #a855f7; }
+        .legend-border.error { border-color: #ef4444; }
+        
         button {
             padding: 6px 12px;
             background: var(--button-bg);
@@ -438,6 +482,33 @@ export class DependencyMapPanel {
             animation: pulse 2s infinite;
         }
         
+        /* Animated border for tasks with active workflows */
+        .task-node.in_progress[data-workflow]:not([data-workflow=""]) {
+            animation: borderPulse 2s infinite, pulse 2s infinite;
+            border-width: 3px;
+        }
+        
+        /* Workflow-specific border colors for in_progress tasks */
+        .task-node.in_progress[data-workflow="task_implementation"] {
+            border-color: #3b82f6;  /* Blue for implementation */
+        }
+        
+        .task-node.in_progress[data-workflow="context_gathering"] {
+            border-color: #a855f7;  /* Purple for context */
+        }
+        
+        .task-node.in_progress[data-workflow="error_resolution"] {
+            border-color: #ef4444;  /* Red for error fixing */
+        }
+        
+        .task-node.in_progress[data-workflow="planning_new"] {
+            border-color: #10b981;  /* Green for planning */
+        }
+        
+        .task-node.in_progress[data-workflow="planning_revision"] {
+            border-color: #f59e0b;  /* Orange for revision */
+        }
+        
         .task-node.created {
             background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%);
             border-color: #9ca3af;
@@ -461,6 +532,18 @@ export class DependencyMapPanel {
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.85; }
+        }
+        
+        /* Animated looping border for active tasks */
+        @keyframes borderPulse {
+            0%, 100% { 
+                border-width: 3px;
+                box-shadow: 0 0 0 0px currentColor;
+            }
+            50% { 
+                border-width: 4px;
+                box-shadow: 0 0 8px 2px currentColor;
+            }
         }
         
         .task-id {
@@ -555,6 +638,12 @@ export class DependencyMapPanel {
                 <div class="legend-item"><div class="legend-box paused"></div> Paused</div>
                 <div class="legend-item"><div class="legend-box failed"></div> Failed</div>
             </div>
+            <div class="legend" style="margin-left: 16px; padding-left: 16px; border-left: 1px solid var(--border-color);">
+                <div style="font-size: 0.85em; opacity: 0.6; margin-right: 8px;">Active Workflow:</div>
+                <div class="legend-item"><div class="legend-border implementation"></div> Implement</div>
+                <div class="legend-item"><div class="legend-border context"></div> Context</div>
+                <div class="legend-item"><div class="legend-border error"></div> Error Fix</div>
+            </div>
             <button onclick="refresh()">🔄 Refresh</button>
         </div>
     </div>
@@ -576,7 +665,6 @@ export class DependencyMapPanel {
     <script>
         const vscode = acquireVsCodeApi();
         const tasks = ${tasksJson};
-        const otherSessions = ${otherSessionsJson};
         
         const statusIcons = {
             'completed': '✓',
@@ -592,23 +680,11 @@ export class DependencyMapPanel {
             const connections = document.getElementById('connections');
             
             if (tasks.length === 0) {
-                let emptyHtml = '<div class="empty-state"><div class="empty-state-icon">📋</div><div>No tasks yet</div>';
-                
-                if (otherSessions && otherSessions.length > 0) {
-                    // Show which sessions DO have tasks
-                    const sessionList = otherSessions.map(s => 
-                        '<div style="margin: 4px 0; padding: 4px 8px; background: rgba(59, 130, 246, 0.2); border-radius: 4px; cursor: pointer; display: inline-block;" ' +
-                        'onclick="vscode.postMessage({command: \\'switchSession\\', sessionId: \\'' + s.sessionId + '\\'});">' +
-                        s.sessionId.substring(0, 11) + ' (' + s.taskCount + ' tasks)</div>'
-                    ).join(' ');
-                    emptyHtml += '<div style="margin-top: 16px; font-size: 0.9em; color: #f59e0b;">⚠️ Tasks exist in other sessions:</div>';
-                    emptyHtml += '<div style="margin-top: 8px;">' + sessionList + '</div>';
-                    emptyHtml += '<div style="margin-top: 12px; font-size: 0.85em; opacity: 0.7;">Click a session to view its tasks</div>';
-                } else {
-                    emptyHtml += '<div style="margin-top: 8px; font-size: 0.9em;">Tasks will appear here once created</div>';
-                }
-                
-                emptyHtml += '</div>';
+                const emptyHtml = '<div class="empty-state">' +
+                    '<div class="empty-state-icon">📋</div>' +
+                    '<div>No tasks yet</div>' +
+                    '<div style="margin-top: 8px; font-size: 0.9em;">Tasks will appear here once created</div>' +
+                    '</div>';
                 canvas.innerHTML = emptyHtml;
                 return;
             }
@@ -622,6 +698,7 @@ export class DependencyMapPanel {
                 const x = task.x || 0;
                 const y = task.y || 0;
                 const icon = statusIcons[task.status] || '○';
+                const workflowType = task.workflowType || '';
                 
                 nodesHtml += \`
                     <div class="task-node \${task.status}" 
@@ -630,6 +707,7 @@ export class DependencyMapPanel {
                          data-description="\${escapeHtml(task.description)}"
                          data-status="\${task.status}"
                          data-deps="\${task.dependencies.join(', ') || 'None'}"
+                         data-workflow="\${workflowType}"
                          onmouseenter="showTooltip(event, this)"
                          onmousemove="moveTooltip(event)"
                          onmouseleave="hideTooltip()">
@@ -686,12 +764,24 @@ export class DependencyMapPanel {
             const description = element.dataset.description;
             const status = element.dataset.status;
             const deps = element.dataset.deps;
+            const workflowType = element.dataset.workflow || '';
             
             tooltipId.textContent = taskId;
             tooltipStatus.textContent = status.replace('_', ' ');
             tooltipStatus.className = 'tooltip-status ' + status;
             tooltipDesc.textContent = description;
-            tooltipDeps.textContent = deps ? 'Dependencies: ' + deps : '';
+            
+            let depsText = deps ? 'Dependencies: ' + deps : '';
+            if (workflowType) {
+                const workflowLabel = workflowType
+                    .replace('task_implementation', 'Implementation')
+                    .replace('context_gathering', 'Context Gathering')
+                    .replace('error_resolution', 'Error Fix')
+                    .replace('planning_new', 'Planning')
+                    .replace('planning_revision', 'Revision');
+                depsText += (depsText ? '\\n' : '') + '🔄 Active Workflow: ' + workflowLabel;
+            }
+            tooltipDeps.textContent = depsText;
             
             tooltip.classList.add('visible');
             moveTooltip(event);

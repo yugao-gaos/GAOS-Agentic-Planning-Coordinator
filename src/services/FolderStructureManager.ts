@@ -296,13 +296,20 @@ export class FolderStructureManager {
 // ============================================================================
 
 let globalInstance: FolderStructureManager | null = null;
+let globalWorkingDir: string | null = null;
 
 /**
  * Get or create the global folder structure manager instance
  */
 export function getFolderStructureManager(workingDir?: string): FolderStructureManager {
-    if (!globalInstance && workingDir) {
+    // If workingDir is provided and different from current, reinitialize
+    if (workingDir && globalWorkingDir !== workingDir) {
+        console.log(`[FolderStructureManager] Initializing with workingDir: ${workingDir}`);
+        if (globalInstance && globalWorkingDir) {
+            console.log(`[FolderStructureManager] Replacing existing instance (was: ${globalWorkingDir})`);
+        }
         globalInstance = new FolderStructureManager(workingDir);
+        globalWorkingDir = workingDir;
     }
     
     if (!globalInstance) {
@@ -317,5 +324,6 @@ export function getFolderStructureManager(workingDir?: string): FolderStructureM
  */
 export function resetFolderStructureManager(): void {
     globalInstance = null;
+    globalWorkingDir = null;
 }
 

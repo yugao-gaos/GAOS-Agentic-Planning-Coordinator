@@ -17,7 +17,14 @@ export interface WorkflowHistoryEntry {
     startedAt: string;
     completedAt: string;
     duration: number;
+    
+    /** Explicit success flag */
+    success?: boolean;
+    
+    /** Workflow output data */
     output?: any;
+    
+    /** Error message if failed */
     error?: string;
 }
 

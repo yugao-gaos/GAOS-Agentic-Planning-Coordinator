@@ -454,6 +454,7 @@ ${result.output}
                 onProgress: (msg) => this.log(`  [summarize] ${msg}`)
             };
             
+            const agentRunId = options.id;
             const result = await this.agentRunner.run(options);
             
             if (result.success && result.output) {

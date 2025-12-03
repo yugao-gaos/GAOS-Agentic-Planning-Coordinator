@@ -119,7 +119,19 @@ export interface CompletedWorkflowSummary {
     taskId?: string;
     startedAt: string;
     completedAt: string;
+    
+    /** Explicit success flag - true if workflow completed successfully */
+    success: boolean;
+    
+    /** Error message if workflow failed */
+    error?: string;
+    
+    /** Workflow output data (workflow-specific) */
+    output?: any;
+    
+    /** @deprecated Use success/error/output instead. Kept for backward compatibility. */
     result?: string;
+    
     logPath?: string;
     summary?: string;  // One-paragraph completion summary
 }

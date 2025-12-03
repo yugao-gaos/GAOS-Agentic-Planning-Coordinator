@@ -278,6 +278,12 @@ export interface PoolStatusResponse {
         sessionId: string;
         task?: string;
     }>;
+    allocated?: Array<{
+        name: string;
+        roleId: string;
+        sessionId: string;
+        workflowId: string;
+    }>;
 }
 
 export interface PoolResizeParams {

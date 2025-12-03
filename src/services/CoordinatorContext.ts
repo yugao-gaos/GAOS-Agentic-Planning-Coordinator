@@ -21,7 +21,8 @@ import {
     CoordinatorHistoryEntry,
     TaskSummary,
     ActiveWorkflowSummary,
-    PlanSummary
+    PlanSummary,
+    SessionCapacity
 } from '../types/coordinator';
 import { IWorkflow } from './workflows';
 
@@ -96,6 +97,9 @@ export class CoordinatorContext {
         const agentStatuses = this.buildAgentStatuses();
         const availableAgents = this.agentPoolService.getAvailableAgents();
         
+        // Calculate per-session capacity analysis
+        const sessionCapacities = this.calculateSessionCapacities(approvedPlans, sessionState);
+        
         return {
             event,
             sessionId,
@@ -109,23 +113,68 @@ export class CoordinatorContext {
             tasks,
             activeWorkflows,
             sessionStatus: session?.status || 'unknown',
-            pendingQuestions: sessionState?.pendingQuestions || []
+            pendingQuestions: sessionState?.pendingQuestions || [],
+            sessionCapacities
         };
     }
     
     /**
-     * Get all approved and uncompleted plans
+     * Get all approved and uncompleted plans with recommended agent counts
      */
     private getApprovedPlans(): PlanSummary[] {
         const sessions = this.stateManager.getAllPlanningSessions();
         return sessions
             .filter(s => s.status === 'approved') // Only approved plans need tasks created
-            .map(s => ({
-                sessionId: s.id,
-                planPath: s.currentPlanPath || '',
-                requirement: s.requirement || '',
-                status: s.status
-            }));
+            .map(s => {
+                // Priority order for getting recommended agent count:
+                // 1. Stored session metadata (primary source)
+                // 2. Lightweight regex extraction from plan file
+                // 3. Default value (5)
+                let recommendedAgents: number | undefined = s.recommendedAgents?.count;
+                
+                // If not stored, try lightweight extraction from plan content
+                if (!recommendedAgents && s.currentPlanPath) {
+                    try {
+                        recommendedAgents = this.extractRecommendedAgentsFromPlan(s.currentPlanPath);
+                    } catch (e) {
+                        console.warn(`[CoordinatorContext] Failed to extract recommended agents for ${s.id}:`, e);
+                    }
+                }
+                
+                return {
+                    sessionId: s.id,
+                    planPath: s.currentPlanPath || '',
+                    requirement: s.requirement || '',
+                    status: s.status,
+                    recommendedAgents: recommendedAgents || 5  // Default to 5 if not found
+                };
+            });
+    }
+    
+    /**
+     * Extract recommended agent count from plan file using lightweight regex (no full parsing)
+     */
+    private extractRecommendedAgentsFromPlan(planPath: string): number | undefined {
+        try {
+            if (!fs.existsSync(planPath)) {
+                return undefined;
+            }
+            
+            const content = fs.readFileSync(planPath, 'utf-8');
+            
+            // Try to find recommended engineer count from plan
+            // Matches: "**Recommended:** 5 engineers" or "Use 5 engineers"
+            const recommendedMatch = content.match(/\*\*Recommended:\*\*\s*(\d+)\s*engineers/i) ||
+                                     content.match(/use\s+(\d+)\s+engineers/i);
+            
+            if (recommendedMatch) {
+                return parseInt(recommendedMatch[1], 10);
+            }
+            
+            return undefined;
+        } catch (e) {
+            return undefined;
+        }
     }
     
     /**
@@ -290,6 +339,66 @@ export class CoordinatorContext {
         }
         
         return statuses;
+    }
+    
+    /**
+     * Calculate per-session capacity analysis
+     * Helps coordinator respect recommended team sizes and avoid over-allocation
+     * 
+     * @param approvedPlans - All approved plans with their recommended agent counts
+     * @param sessionState - Optional: current session workflow state (if available)
+     * @returns Array of capacity info per session
+     */
+    private calculateSessionCapacities(
+        approvedPlans: PlanSummary[],
+        sessionState?: SessionStateSnapshot
+    ): SessionCapacity[] {
+        const capacities: SessionCapacity[] = [];
+        const poolSummary = this.agentPoolService.getPoolSummary();
+        
+        for (const plan of approvedPlans) {
+            const sessionId = plan.sessionId;
+            const recommendedAgents = plan.recommendedAgents || 5;
+            
+            // Count agents currently allocated to this session (busy + bench)
+            const busyAgents = poolSummary.byRole;  // Get busy agents
+            const benchAgents = this.agentPoolService.getAgentsOnBench(sessionId);
+            
+            // Count busy agents for this session
+            let busyCount = 0;
+            const poolStatus = this.agentPoolService.getPoolStatus();
+            for (const agent of poolStatus.busy) {
+                // Check if this busy agent belongs to this session
+                const agentStatus = this.agentPoolService.getAgentStatus(agent);
+                if (agentStatus && agentStatus.status === 'busy' && agentStatus.sessionId === sessionId) {
+                    busyCount++;
+                }
+            }
+            
+            const currentlyAllocated = busyCount + benchAgents.length;
+            const availableCapacity = Math.max(0, recommendedAgents - currentlyAllocated);
+            
+            // Count active workflows for this session
+            let activeWorkflows = 0;
+            if (sessionState && sessionState.sessionId === sessionId) {
+                for (const workflow of sessionState.workflows.values()) {
+                    const status = workflow.getStatus();
+                    if (status === 'running' || status === 'pending' || status === 'blocked') {
+                        activeWorkflows++;
+                    }
+                }
+            }
+            
+            capacities.push({
+                sessionId,
+                recommendedAgents,
+                currentlyAllocated,
+                availableCapacity,
+                activeWorkflows
+            });
+        }
+        
+        return capacities;
     }
 }
 
