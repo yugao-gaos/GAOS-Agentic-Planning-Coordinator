@@ -380,7 +380,8 @@ export abstract class BaseWorkflow implements IWorkflow {
      *                      If false (default), pause happens at next phase boundary.
      */
     async pause(options?: { force?: boolean }): Promise<void> {
-        if (this.status !== 'running' && this.status !== 'blocked') {
+        // Allow pausing workflows in pending, running, or blocked states
+        if (this.status !== 'pending' && this.status !== 'running' && this.status !== 'blocked') {
             return;
         }
         
