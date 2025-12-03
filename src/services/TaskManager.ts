@@ -1061,6 +1061,7 @@ export class TaskManager {
     /**
      * Clear the current workflow when it completes
      * Does NOT automatically complete the task - coordinator decides
+     * Always persists changes to ensure stale references are removed from disk
      */
     clearTaskCurrentWorkflow(taskId: string): void {
         const task = this.tasks.get(taskId);
@@ -1069,6 +1070,7 @@ export class TaskManager {
         task.currentWorkflow = undefined;
         // Keep status as in_progress - coordinator will decide next step
         this.log(`Task ${taskId} workflow cleared, awaiting coordinator decision`);
+        this.persistTasks();
     }
     
     /**
@@ -1592,14 +1594,16 @@ export class TaskManager {
 
     /**
      * Reset task to created state
+     * Can be used to recover tasks stuck in any status with stale workflow references
      */
     resetTaskToReady(taskId: string): void {
         const task = this.tasks.get(taskId);
-        if (task && task.status === 'in_progress') {
+        if (task) {
+            const oldStatus = task.status;
             task.status = 'created';
             task.actualAgent = undefined;
             task.currentWorkflow = undefined;
-            this.log(`Task ${taskId} reset to created`);
+            this.log(`Task ${taskId} reset to created (was: ${oldStatus})`);
             this.persistTasks();
         }
     }
