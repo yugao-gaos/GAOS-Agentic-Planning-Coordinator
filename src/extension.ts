@@ -328,6 +328,30 @@ export async function activate(context: vscode.ExtensionContext) {
             })
         );
         
+        // Subscribe to Unity status changes to update Unity GUI
+        if (unityFeaturesEnabled) {
+            eventSubscriptions.push(
+                vsCodeClient.subscribe('unity.statusChanged', () => {
+                    console.log('[APC] Unity status changed, refreshing UI');
+                    sidebarProvider?.refresh();
+                })
+            );
+            
+            eventSubscriptions.push(
+                vsCodeClient.subscribe('unity.pipelineStarted', () => {
+                    console.log('[APC] Unity pipeline started, refreshing UI');
+                    sidebarProvider?.refresh();
+                })
+            );
+            
+            eventSubscriptions.push(
+                vsCodeClient.subscribe('unity.pipelineCompleted', () => {
+                    console.log('[APC] Unity pipeline completed, refreshing UI');
+                    sidebarProvider?.refresh();
+                })
+            );
+        }
+        
     } catch (daemonError) {
         console.error('Agentic Planning: Failed to connect to daemon:', daemonError);
         vscode.window.showWarningMessage(

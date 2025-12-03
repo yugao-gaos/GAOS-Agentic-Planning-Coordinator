@@ -260,7 +260,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             this.trackedWorkflows.clear();
             for (const session of state.sessions) {
                 for (const workflow of [...(session.activeWorkflows || []), ...(session.workflowHistory || [])]) {
-                    if (workflow.status === 'running' || workflow.status === 'paused') {
+                    const status = workflow.status;
+                    if (status === 'running' || status === 'paused' || status === 'pending') {
                         this.trackedWorkflows.add(workflow.id);
                     }
                 }
@@ -419,11 +420,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             
             // Determine execution status from workflows or session status
             let executionStatus = 'Not started';
-            const runningWorkflows = activeWorkflows.filter(w => w.status === 'running');
+            const activeRunningWorkflows = activeWorkflows.filter(w => w.status === 'running' || w.status === 'pending');
             const pausedWorkflows = activeWorkflows.filter(w => w.status === 'paused');
             
-            if (runningWorkflows.length > 0) {
-                executionStatus = `Running (${runningWorkflows.length} workflows)`;
+            if (activeRunningWorkflows.length > 0) {
+                executionStatus = `Running (${activeRunningWorkflows.length} workflows)`;
             } else if (pausedWorkflows.length > 0) {
                 executionStatus = 'Paused';
             } else if (s.status === 'completed') {

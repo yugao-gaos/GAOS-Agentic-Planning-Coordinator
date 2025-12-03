@@ -1603,6 +1603,12 @@ export class TaskManager {
             task.status = 'created';
             task.actualAgent = undefined;
             task.currentWorkflow = undefined;
+            
+            // Clear pause metadata to avoid inconsistent state
+            // (task marked as 'created' but with pause fields still set)
+            task.pausedAt = undefined;
+            task.pausedReason = undefined;
+            
             this.log(`Task ${taskId} reset to created (was: ${oldStatus})`);
             this.persistTasks();
         }

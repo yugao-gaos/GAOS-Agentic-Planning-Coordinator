@@ -88,6 +88,9 @@ export abstract class BaseWorkflow implements IWorkflow {
     protected waitingForAgent: boolean = false;
     protected waitingForAgentRole: string | undefined;
     
+    // Track if workflow has started running (becomes true after first agent allocation)
+    private hasStartedRunning: boolean = false;
+    
     // ========================================================================
     // Events (from IWorkflow)
     // ========================================================================
@@ -330,7 +333,8 @@ export abstract class BaseWorkflow implements IWorkflow {
             throw new Error(`Cannot start workflow in ${this.status} state`);
         }
         
-        this.status = 'running';
+        // NOTE: Status stays 'pending' until first agent is allocated
+        // This prevents UI from showing "running workflow with no agents" warnings
         this.startTime = Date.now();
         this.log(`Starting workflow: ${this.type}`);
         this.emitProgress();
@@ -509,7 +513,17 @@ export abstract class BaseWorkflow implements IWorkflow {
         this.log(`Resuming`);
         this.pauseRequested = false;
         this.forcePauseRequested = false;
-        this.status = 'running';
+        
+        // If we already have agents allocated, set status to running immediately
+        // Otherwise, status will change to running when first agent is allocated
+        if (this.allocatedAgents.length > 0) {
+            this.status = 'running';
+            this.hasStartedRunning = true;
+            this.log(`Resuming with ${this.allocatedAgents.length} allocated agents`);
+        } else {
+            this.log(`Resuming - will change to running when agent is allocated`);
+        }
+        
         this.emitProgress();
         
         // Log continuation context if we have it
@@ -906,6 +920,14 @@ ${ctx.partialOutput.slice(-3000)}
                     // Clear waiting state when agent is allocated
                     this.waitingForAgent = false;
                     this.waitingForAgentRole = undefined;
+                    
+                    // Change status to 'running' on first agent allocation
+                    // This ensures UI sees workflow as running only after agent is assigned
+                    if (!this.hasStartedRunning && this.status === 'pending') {
+                        this.status = 'running';
+                        this.hasStartedRunning = true;
+                        this.log(`Workflow status changed to running (first agent allocated)`);
+                    }
                     
                     this.allocatedAgents.push(agentName);
                     this.log(`Agent allocated: ${agentName} (role: ${roleId})`);

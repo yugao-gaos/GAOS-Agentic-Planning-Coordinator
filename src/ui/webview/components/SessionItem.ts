@@ -146,7 +146,7 @@ function renderWorkflowItem(wf: WorkflowInfo, agents: AgentInfo[]): string {
         : '';
     
     const percentage = Math.round(wf.percentage);
-    const isActive = wf.status === 'running';
+    const isActive = wf.status === 'running' || wf.status === 'pending';
     
     // Build phase display with waiting indicator if applicable
     let phaseDisplay = `${wf.phase} (${wf.phaseIndex + 1}/${wf.totalPhases})`;
@@ -261,7 +261,7 @@ function renderFailedTasks(failedTasks: FailedTaskInfo[]): string {
  * Get execution progress summary for the header badge.
  */
 function getExecutionProgressText(session: SessionInfo): string {
-    const runningWf = session.activeWorkflows?.find(w => w.status === 'running');
+    const runningWf = session.activeWorkflows?.find(w => w.status === 'running' || w.status === 'pending');
     
     if (runningWf) {
         return `${Math.round(runningWf.percentage)}%`;
@@ -288,7 +288,7 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
     const planBadgeClass = getPlanBadgeClass(session.planStatus);
     
     // Determine if session is active (has running workflows)
-    const hasRunningWorkflow = session.activeWorkflows?.some(w => w.status === 'running') || false;
+    const hasRunningWorkflow = session.activeWorkflows?.some(w => w.status === 'running' || w.status === 'pending') || false;
     const isRevising = session.status === 'revising' || session.isRevising;
     const activityClass = isRevising ? 'revising' : (hasRunningWorkflow ? 'active' : '');
     

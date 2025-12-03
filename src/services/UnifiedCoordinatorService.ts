@@ -760,7 +760,8 @@ export class UnifiedCoordinatorService {
         this.log(`Pausing session: ${sessionId}`);
         
         for (const workflow of state.workflows.values()) {
-            if (workflow.getStatus() === 'running') {
+            const status = workflow.getStatus();
+            if (status === 'running' || status === 'pending') {
                 await workflow.pause();
             }
         }
@@ -1110,7 +1111,8 @@ export class UnifiedCoordinatorService {
                 const workflowsToPause = [...new Set(occupiedTasks.map(o => o.occupyingWorkflowId))];
                 for (const otherWorkflowId of workflowsToPause) {
                     const workflow = state.workflows.get(otherWorkflowId);
-                    if (workflow && (workflow.getStatus() === 'running' || workflow.getStatus() === 'blocked')) {
+                    const status = workflow?.getStatus();
+                    if (workflow && (status === 'running' || status === 'blocked' || status === 'pending')) {
                         await workflow.pause({ force: true });
                         state.pausedForRevision.push(otherWorkflowId);
                         this.log(`   ⏸️  Force-paused ${otherWorkflowId.substring(0, 8)}`);
@@ -1132,7 +1134,8 @@ export class UnifiedCoordinatorService {
                     [...new Set(occupiedTasks.map(o => o.occupyingWorkflowId))]
                 );
                 const workflow = state.workflows.get(workflowId);
-                if (workflow && workflow.getStatus() === 'running') {
+                const status = workflow?.getStatus();
+                if (workflow && (status === 'running' || status === 'pending')) {
                     await workflow.pause();
                 }
                 break;
