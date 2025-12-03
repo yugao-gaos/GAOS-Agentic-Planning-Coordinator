@@ -122,6 +122,20 @@ export async function activate(context: vscode.ExtensionContext) {
     ServiceLocator.markInitialized();
     console.log('[APC] Step 2: Extension-local services registered');
     
+    // Kill orphan cursor-agent processes from previous sessions
+    console.log('[APC] Step 2b: Cleaning up orphan cursor-agent processes...');
+    try {
+        const processManager = ServiceLocator.resolve(ProcessManager);
+        const killedCount = await processManager.killOrphanCursorAgents();
+        if (killedCount > 0) {
+            console.log(`[APC] Step 2b: Killed ${killedCount} orphan cursor-agent processes`);
+        } else {
+            console.log('[APC] Step 2b: No orphan cursor-agent processes found');
+        }
+    } catch (err) {
+        console.warn(`[APC] Step 2b: Failed to cleanup orphans: ${err}`);
+    }
+    
     // ========================================================================
     // ARCHITECTURE GUARD: Verify extension hasn't registered daemon services
     // ========================================================================

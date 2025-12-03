@@ -425,6 +425,42 @@ export class VsCodeClient extends BaseApcClient {
         }
     }
     
+    /**
+     * Pause a workflow
+     */
+    async pauseWorkflow(sessionId: string, workflowId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('workflow.pause', { sessionId, workflowId });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Resume a paused workflow
+     */
+    async resumeWorkflow(sessionId: string, workflowId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('workflow.resume', { sessionId, workflowId });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Cancel a workflow
+     */
+    async cancelWorkflow(sessionId: string, workflowId: string): Promise<{ success: boolean; error?: string }> {
+        try {
+            await this.send('workflow.cancel', { sessionId, workflowId });
+            return { success: true };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
     // ========================================================================
     // Config Management
     // ========================================================================

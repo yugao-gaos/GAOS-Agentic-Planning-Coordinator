@@ -45,6 +45,12 @@ export interface WorkflowInfo {
     waitingForAgentRole?: string;
     /** Brief summary of what was accomplished or why it failed */
     summary?: string;
+    /** Explicit success flag (for completed workflows) */
+    success?: boolean;
+    /** Error message (for failed workflows) */
+    error?: string;
+    /** Workflow output data (workflow-specific) */
+    output?: any;
 }
 
 export interface SessionInfo {

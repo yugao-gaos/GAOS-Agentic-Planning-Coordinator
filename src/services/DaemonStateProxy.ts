@@ -583,4 +583,38 @@ export class DaemonStateProxy {
             return undefined;
         }
     }
-}
+    
+    // ========================================================================
+    // Workflow Control
+    // ========================================================================
+    
+    /**
+     * Pause a workflow
+     */
+    async pauseWorkflow(sessionId: string, workflowId: string): Promise<{ success: boolean; error?: string }> {
+        if (!this.vsCodeClient.isConnected()) {
+            return { success: false, error: 'Daemon not connected' };
+        }
+        return this.vsCodeClient.pauseWorkflow(sessionId, workflowId);
+    }
+    
+    /**
+     * Resume a paused workflow
+     */
+    async resumeWorkflow(sessionId: string, workflowId: string): Promise<{ success: boolean; error?: string }> {
+        if (!this.vsCodeClient.isConnected()) {
+            return { success: false, error: 'Daemon not connected' };
+        }
+        return this.vsCodeClient.resumeWorkflow(sessionId, workflowId);
+    }
+    
+    /**
+     * Cancel a workflow
+     */
+    async cancelWorkflow(sessionId: string, workflowId: string): Promise<{ success: boolean; error?: string }> {
+        if (!this.vsCodeClient.isConnected()) {
+            return { success: false, error: 'Daemon not connected' };
+        }
+        return this.vsCodeClient.cancelWorkflow(sessionId, workflowId);
+    }
+    }

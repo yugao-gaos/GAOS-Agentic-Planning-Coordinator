@@ -68,6 +68,7 @@ export class CursorAgentRunner implements IAgentBackend {
         lastOutputTime: number;    // Timestamp of last output (for idle detection)
         idleInterval?: NodeJS.Timeout;  // Interval for idle indicator
         idleSpinnerIndex: number;  // Current spinner frame index
+        lastIdleLogTime: number;  // Last time we logged idle status to file
     }> = new Map();
     
     // Track runs that were intentionally stopped (so we don't log them as failures)
@@ -79,9 +80,78 @@ export class CursorAgentRunner implements IAgentBackend {
     // Spinner animation frames for idle indicator
     private static readonly SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     private static readonly IDLE_THRESHOLD_MS = 5000;  // 5 seconds
+    private static readonly IDLE_LOG_INTERVAL_MS = 10000;  // Log idle status every 10 seconds (not every second)
+    
+    // ANSI color codes for terminal output
+    private COLORS = {
+        reset: '\x1b[0m',
+        bold: '\x1b[1m',
+        dim: '\x1b[2m',
+        red: '\x1b[31m',
+        green: '\x1b[32m',
+        yellow: '\x1b[33m',
+        blue: '\x1b[34m',
+        magenta: '\x1b[35m',
+        cyan: '\x1b[36m',
+        gray: '\x1b[90m'
+    };
 
     constructor() {
         this.processManager = ServiceLocator.resolve(ProcessManager);
+    }
+
+    /**
+     * Format text for better terminal readability with markdown-aware formatting
+     * Supports: bullet lists, headers, code blocks, sentence breaks, indentation
+     */
+    private formatTextForTerminal(text: string): string {
+        if (!text) return text;
+        
+        // First, preserve existing newlines and structure
+        const lines = text.split('\n');
+        const formatted: string[] = [];
+        
+        for (let i = 0; i < lines.length; i++) {
+            let line = lines[i];
+            const trimmed = line.trim();
+            
+            // Preserve empty lines
+            if (!trimmed) {
+                formatted.push('');
+                continue;
+            }
+            
+            // Preserve headers (# ## ###)
+            if (/^#{1,6}\s+/.test(trimmed)) {
+                formatted.push(line);
+                continue;
+            }
+            
+            // Preserve bullet lists (-, *, •, 1., 2., etc.)
+            if (/^[\s]*[-*•]\s+/.test(trimmed) || /^[\s]*\d+\.\s+/.test(trimmed)) {
+                formatted.push(line);
+                continue;
+            }
+            
+            // Preserve code blocks
+            if (trimmed.startsWith('```') || trimmed.startsWith('    ')) {
+                formatted.push(line);
+                continue;
+            }
+            
+            // For regular text paragraphs, add line breaks after sentences
+            // Only if the line is long enough and doesn't already have structure
+            if (line.length > 80 && !line.includes('  ') && !line.startsWith(' ')) {
+                // Add breaks after ". " followed by a capital letter or number
+                line = line.replace(/\.\s+([A-Z0-9])/g, '.\n$1');
+                // Add breaks after "! " and "? " for better readability
+                line = line.replace(/([!?])\s+([A-Z])/g, '$1\n$2');
+            }
+            
+            formatted.push(line);
+        }
+        
+        return formatted.join('\n');
     }
 
     /**
@@ -123,7 +193,9 @@ export class CursorAgentRunner implements IAgentBackend {
         const cursorFlags = `--model "${model}" -p --force --approve-mcps --output-format stream-json --stream-partial-output`;
         const shellCmd = `cat "${promptFile}" | cursor agent ${cursorFlags} 2>&1; rm -f "${promptFile}"`;
         
+        // Rotate log file if needed (1MB max, keep 3 backups)
         if (logFile) {
+            this.rotateLogIfNeeded(logFile);
             this.appendToLog(logFile, `[DEBUG] Shell command: ${shellCmd}\n`);
             this.appendToLog(logFile, `[DEBUG] simpleMode: ${simpleMode}\n`);
         }
@@ -159,7 +231,8 @@ export class CursorAgentRunner implements IAgentBackend {
                 planStartIndex: -1,
                 lastOutputTime: Date.now(),
                 idleInterval: undefined as NodeJS.Timeout | undefined,
-                idleSpinnerIndex: 0
+                idleSpinnerIndex: 0,
+                lastIdleLogTime: 0
             };
             this.activeRuns.set(id, runEntry);
             
@@ -171,14 +244,15 @@ export class CursorAgentRunner implements IAgentBackend {
                     
                     const idleTime = Date.now() - run.lastOutputTime;
                     if (idleTime >= CursorAgentRunner.IDLE_THRESHOLD_MS) {
-                        // Show animated spinner
-                        const frame = CursorAgentRunner.SPINNER_FRAMES[run.idleSpinnerIndex % CursorAgentRunner.SPINNER_FRAMES.length];
-                        run.idleSpinnerIndex++;
-                        
-                        // Use ANSI escape to overwrite the same line
-                        // \r moves cursor to start of line, \x1B[K clears to end of line
-                        const seconds = Math.floor(idleTime / 1000);
-                        this.appendToLog(logFile, `\r\x1B[K${this.COLORS.gray}${frame} Working... (${seconds}s)${this.COLORS.reset}`);
+                        // For log files, don't use ANSI overwriting - just append periodic status updates
+                        // Log idle status every 10 seconds to avoid spamming the log file
+                        const timeSinceLastLog = Date.now() - run.lastIdleLogTime;
+                        if (timeSinceLastLog >= CursorAgentRunner.IDLE_LOG_INTERVAL_MS) {
+                            const seconds = Math.floor(idleTime / 1000);
+                            // Use simple newline-terminated message (no ANSI overwriting)
+                            this.appendToLog(logFile, `${this.COLORS.gray}⏳ Agent working... (${seconds}s since last activity)${this.COLORS.reset}\n`);
+                            run.lastIdleLogTime = Date.now();
+                        }
                     }
                 }, 1000);
             }
@@ -206,7 +280,7 @@ export class CursorAgentRunner implements IAgentBackend {
 
             // Parse stdout - simple mode collects raw text, normal mode parses JSON
             proc.stdout?.on('data', (data) => {
-                const text = data.toString();
+                const text = data.toString('utf8');
                 chunkCount++;
                 totalBytes += text.length;
 
@@ -253,7 +327,7 @@ export class CursorAgentRunner implements IAgentBackend {
 
             // Handle stderr
             proc.stderr?.on('data', (data) => {
-                const text = data.toString();
+                const text = data.toString('utf8');
                 if (text.trim()) {
                     onOutput?.(text, 'error');
                     if (logFile) {
@@ -275,6 +349,16 @@ export class CursorAgentRunner implements IAgentBackend {
                 }
                 this.activeRuns.delete(id);
                 
+                // Unregister from ProcessManager to prevent orphan processes
+                // The process has already exited, so we just need to remove it from tracking
+                try {
+                    this.processManager.stopProcess(id, false).catch(() => {
+                        // Process already exited, ignore errors
+                    });
+                } catch {
+                    // Ignore - process already exited
+                }
+                
                 // Clean up temp prompt file (in case shell didn't delete it)
                 try {
                     if (fs.existsSync(promptFile)) {
@@ -290,37 +374,43 @@ export class CursorAgentRunner implements IAgentBackend {
                     this.stoppedIntentionally.delete(id);  // Clean up
                 }
 
-                // Success if: clean exit (code 0), OR intentionally stopped (CLI callback completed)
-                const success = (code === 0 && !error) || wasStoppedIntentionally;
-                const statusIcon = success ? '✅' : '❌';
-                const statusText = wasStoppedIntentionally 
-                    ? 'Agent work completed successfully' 
-                    : `Agent finished (exit code: ${code})`;
-                onProgress?.(`${statusIcon} ${statusText}, duration: ${Math.round(duration / 1000)}s`);
+                // Wait briefly for stdout/stderr to finish flushing buffered data
+                // This prevents the "work completed" message from appearing before progress chunks
+                const flushDelayMs = 200;  // 200ms should be enough for buffered data to flush
+                
+                setTimeout(() => {
+                    // Success if: clean exit (code 0), OR intentionally stopped (CLI callback completed)
+                    const success = (code === 0 && !error) || wasStoppedIntentionally;
+                    const statusIcon = success ? '✅' : '❌';
+                    const statusText = wasStoppedIntentionally 
+                        ? 'Agent work completed successfully' 
+                        : `Agent finished (exit code: ${code})`;
+                    onProgress?.(`${statusIcon} ${statusText}, duration: ${Math.round(duration / 1000)}s`);
 
-                if (logFile) {
-                    const C = this.COLORS;
-                    const color = success ? C.green : C.red;
-                    this.appendToLog(logFile, `\n\n${C.gray}---${C.reset}\n`);
-                    this.appendToLog(logFile, `${color}${C.bold}${statusIcon} ${statusText}: ${new Date().toISOString()}${C.reset}\n`);
-                    this.appendToLog(logFile, `${C.gray}Exit code: ${code}${C.reset}\n`);
-                    this.appendToLog(logFile, `${C.gray}Duration: ${Math.round(duration / 1000)}s${C.reset}\n`);
-                    this.appendToLog(logFile, `${C.gray}Collected output length: ${collectedOutput.length} chars${C.reset}\n`);
-                    if (collectedOutput.length > 0) {
-                        this.appendToLog(logFile, `${C.gray}Output preview: ${collectedOutput.substring(0, 500)}${C.reset}\n`);
+                    if (logFile) {
+                        const C = this.COLORS;
+                        const color = success ? C.green : C.red;
+                        this.appendToLog(logFile, `\n\n${C.gray}---${C.reset}\n`);
+                        this.appendToLog(logFile, `${color}${C.bold}${statusIcon} ${statusText}: ${new Date().toISOString()}${C.reset}\n`);
+                        this.appendToLog(logFile, `${C.gray}Exit code: ${code}${C.reset}\n`);
+                        this.appendToLog(logFile, `${C.gray}Duration: ${Math.round(duration / 1000)}s${C.reset}\n`);
+                        this.appendToLog(logFile, `${C.gray}Collected output length: ${collectedOutput.length} chars${C.reset}\n`);
+                        if (collectedOutput.length > 0) {
+                            this.appendToLog(logFile, `${C.gray}Output preview: ${collectedOutput.substring(0, 500)}${C.reset}\n`);
+                        }
+                        
+                        // Close log file descriptor now that agent is done
+                        this.closeLogFile(logFile);
                     }
-                    
-                    // Close log file descriptor now that agent is done
-                    this.closeLogFile(logFile);
-                }
 
-                resolve({
-                    success,
-                    output: collectedOutput,
-                    exitCode: code,
-                    durationMs: duration,
-                    error
-                });
+                    resolve({
+                        success,
+                        output: collectedOutput,
+                        exitCode: code,
+                        durationMs: duration,
+                        error
+                    });
+                }, flushDelayMs);
             });
 
             proc.on('error', (err) => {
@@ -334,6 +424,13 @@ export class CursorAgentRunner implements IAgentBackend {
                     clearInterval(errorRun.idleInterval);
                 }
                 this.activeRuns.delete(id);
+                
+                // Unregister from ProcessManager
+                try {
+                    this.processManager.stopProcess(id, false).catch(() => {});
+                } catch {
+                    // Ignore
+                }
                 
                 // Clean up temp prompt file
                 try {
@@ -355,16 +452,6 @@ export class CursorAgentRunner implements IAgentBackend {
         });
     }
 
-    // ANSI color codes for terminal output
-    private readonly COLORS = {
-        reset: '\x1b[0m',
-        cyan: '\x1b[36m',
-        yellow: '\x1b[33m',
-        green: '\x1b[32m',
-        red: '\x1b[31m',
-        gray: '\x1b[90m',
-        bold: '\x1b[1m',
-    };
 
     /**
      * Parse a single line of cursor agent output
@@ -436,7 +523,9 @@ export class CursorAgentRunner implements IAgentBackend {
                                 if (logFile) {
                                     const newContent = item.text.substring(run.lastLoggedLength);
                                     if (newContent) {
-                                        this.appendToLog(logFile, newContent);
+                                        // Format text: preserve markdown structure and add smart line breaks
+                                        const formatted = this.formatTextForTerminal(newContent);
+                                        this.appendToLog(logFile, formatted);
                                         run.lastLoggedLength = item.text.length;
                                     }
                                 }
@@ -449,7 +538,9 @@ export class CursorAgentRunner implements IAgentBackend {
                                 if (logFile && run.lastLoggedLength < commentaryPart.length) {
                                     const newCommentary = commentaryPart.substring(run.lastLoggedLength);
                                     if (newCommentary) {
-                                        this.appendToLog(logFile, newCommentary);
+                                        // Format text: preserve markdown structure and add smart line breaks
+                                        const formatted = this.formatTextForTerminal(newCommentary);
+                                        this.appendToLog(logFile, formatted);
                                     }
                                     run.lastLoggedLength = commentaryPart.length;
                                 }
@@ -538,9 +629,10 @@ export class CursorAgentRunner implements IAgentBackend {
             }
 
         } catch (parseErr) {
-            // Not JSON - might be meaningful text output
+            // Not JSON or unparseable - skip logging raw JSON to avoid clutter
+            // Only log if it looks like meaningful non-JSON text
             const trimmed = line.trim();
-            if (trimmed.length > 5 && !trimmed.startsWith('{')) {
+            if (trimmed.length > 5 && !trimmed.startsWith('{') && !trimmed.startsWith('"')) {
                 onOutput?.(trimmed, 'info');
                 if (logFile) {
                     this.appendToLog(logFile, `${C.cyan}ℹ️ ${trimmed}${C.reset}\n`);
@@ -597,11 +689,15 @@ export class CursorAgentRunner implements IAgentBackend {
                             if (run) {
                                 const newContent = item.text.substring(run.lastLoggedLength);
                                 if (newContent) {
-                                    this.appendToLog(logFile, newContent);
+                                    // Format text: preserve markdown structure and add smart line breaks
+                                    const formatted = this.formatTextForTerminal(newContent);
+                                    this.appendToLog(logFile, formatted);
                                     run.lastLoggedLength = item.text.length;
                                 }
                             } else {
-                                this.appendToLog(logFile, item.text);
+                                // Format text: preserve markdown structure and add smart line breaks
+                                const formatted = this.formatTextForTerminal(item.text);
+                                this.appendToLog(logFile, formatted);
                             }
                         }
                     } else if (item?.type === 'tool_use') {
@@ -666,7 +762,9 @@ export class CursorAgentRunner implements IAgentBackend {
                     onOutput?.(parsed.result, 'text');
                     onProgress?.(`📋 Final result (${parsed.result.length} chars)`);
                     if (logFile) {
-                        this.appendToLog(logFile, `\n${C.bold}📋 Final Result:${C.reset}\n${parsed.result}`);
+                        // Format text: preserve markdown structure and add smart line breaks
+                        const formatted = this.formatTextForTerminal(parsed.result);
+                        this.appendToLog(logFile, `\n${C.bold}📋 Final Result:${C.reset}\n${formatted}`);
                     }
                 }
             }
@@ -681,9 +779,10 @@ export class CursorAgentRunner implements IAgentBackend {
             }
 
         } catch (parseErr) {
-            // Not JSON - log as-is
+            // Not JSON or unparseable - skip logging raw JSON to avoid clutter
+            // Only log if it looks like meaningful non-JSON text (doesn't start with {)
             const trimmed = line.trim();
-            if (trimmed.length > 5) {
+            if (trimmed.length > 5 && !trimmed.startsWith('{') && !trimmed.startsWith('"')) {
                 onOutput?.(trimmed, 'info');
                 if (logFile) {
                     this.appendToLog(logFile, `${trimmed}\n`);
@@ -845,6 +944,51 @@ export class CursorAgentRunner implements IAgentBackend {
         this.activeRuns.delete(id);
     }
 
+    /**
+     * Rotate log file if it exceeds maxSize
+     * Keeps up to maxBackups old log files
+     */
+    private rotateLogIfNeeded(logFile: string, maxSizeBytes: number = 1 * 1024 * 1024, maxBackups: number = 3): void {
+        try {
+            if (!fs.existsSync(logFile)) {
+                return;
+            }
+
+            const stats = fs.statSync(logFile);
+            if (stats.size < maxSizeBytes) {
+                return;
+            }
+
+            // Close any open file descriptor for this log
+            this.closeLogFile(logFile);
+
+            // Rotate existing backups (log.3 -> delete, log.2 -> log.3, log.1 -> log.2)
+            for (let i = maxBackups; i >= 1; i--) {
+                const currentBackup = `${logFile}.${i}`;
+                const nextBackup = `${logFile}.${i + 1}`;
+                
+                if (i === maxBackups) {
+                    // Delete oldest backup
+                    if (fs.existsSync(currentBackup)) {
+                        fs.unlinkSync(currentBackup);
+                    }
+                } else {
+                    // Shift backup to next number
+                    if (fs.existsSync(currentBackup)) {
+                        fs.renameSync(currentBackup, nextBackup);
+                    }
+                }
+            }
+
+            // Move current log to .1
+            fs.renameSync(logFile, `${logFile}.1`);
+            
+            console.log(`[CursorAgentRunner] Log rotated: ${logFile} (${Math.round(stats.size / 1024)}KB -> 0KB, kept ${maxBackups} backups)`);
+        } catch (e) {
+            console.error(`[CursorAgentRunner] Error rotating log file ${logFile}:`, e);
+        }
+    }
+
     private appendToLog(logFile: string, text: string): void {
         try {
             let fd = this.logFileDescriptors.get(logFile);
@@ -855,10 +999,11 @@ export class CursorAgentRunner implements IAgentBackend {
                 this.logFileDescriptors.set(logFile, fd);
             }
             
-            // Write synchronously to file descriptor
+            // Write synchronously to file descriptor with explicit UTF-8 encoding
             // This bypasses Node.js buffering and makes output immediately visible to tail -f
+            // Explicit UTF-8 encoding ensures Unicode characters are properly handled
             // No fsync needed - writeSync to file descriptor is sufficient for real-time streaming
-            fs.writeSync(fd, text);
+            fs.writeSync(fd, text, null, 'utf8');
         } catch (e) {
             console.error(`Error writing to log file ${logFile}:`, e);
         }

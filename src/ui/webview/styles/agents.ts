@@ -167,34 +167,5 @@ export const agentStyles = `
     height: 10px;
     fill: currentColor;
 }
-
-.agent-stop-btn {
-    margin-top: 4px;
-    padding: 3px 6px;
-    border: 1px solid rgba(241, 76, 76, 0.3);
-    border-radius: 3px;
-    background: transparent;
-    color: #f14c4c;
-    font-size: 9px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 4px;
-}
-
-.agent-stop-btn:hover {
-    background: rgba(241, 76, 76, 0.2);
-}
-
-.agent-stop-btn:active {
-    background: rgba(241, 76, 76, 0.3);
-}
-
-.agent-stop-btn svg {
-    width: 10px;
-    height: 10px;
-    fill: currentColor;
-}
 `;
 

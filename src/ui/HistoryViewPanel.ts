@@ -114,7 +114,11 @@ export class HistoryViewPanel {
                         startedAt: hist.startedAt || '',
                         taskId: hist.taskId,
                         logPath: hist.logPath,
-                        summary: hist.summary
+                        summary: hist.summary,
+                        // New fields
+                        success: hist.success,
+                        error: hist.error,
+                        output: hist.output
                     });
                 }
             }
@@ -303,6 +307,25 @@ export class HistoryViewPanel {
             flex: 1;
         }
 
+        .error-text {
+            color: var(--vscode-errorForeground);
+            font-family: var(--vscode-editor-font-family);
+            font-size: 11px;
+            background: rgba(241, 76, 76, 0.1);
+            padding: 4px 8px;
+            border-radius: 2px;
+        }
+
+        .output-text {
+            font-family: var(--vscode-editor-font-family);
+            font-size: 11px;
+            background: var(--vscode-editor-inactiveSelectionBackground);
+            padding: 4px 8px;
+            border-radius: 2px;
+            white-space: pre-wrap;
+            word-break: break-word;
+        }
+
         .log-link {
             color: var(--vscode-textLink-foreground);
             cursor: pointer;
@@ -370,8 +393,9 @@ export class HistoryViewPanel {
 
     private renderHistoryItem(wf: WorkflowInfo): string {
         const typeInfo = this.getWorkflowTypeInfo(wf.type);
-        const statusClass = wf.status === 'completed' ? 'completed' : 'failed';
-        const statusText = wf.status === 'completed' ? 'Completed' : 'Failed';
+        // Explicitly check for failed status - treat anything else (completed, cancelled, etc.) as non-error
+        const statusClass = wf.status === 'failed' ? 'failed' : wf.status === 'completed' ? 'completed' : '';
+        const statusText = wf.status === 'failed' ? 'Failed' : wf.status === 'completed' ? 'Completed' : wf.status;
         
         const label = wf.taskId 
             ? `${wf.taskId} ${typeInfo.label}`
@@ -387,7 +411,7 @@ export class HistoryViewPanel {
                     </div>
                     <div class="workflow-label">${this.escapeHtml(label)}</div>
                     <div class="workflow-status ${statusClass}">
-                        ${wf.status === 'completed' ? '✓' : '✗'} ${statusText}
+                        ${wf.status === 'failed' ? '✗' : wf.status === 'completed' ? '✓' : '◷'} ${statusText}
                     </div>
                 </div>
                 <div class="history-details">
@@ -395,6 +419,18 @@ export class HistoryViewPanel {
                     <div class="detail-row">
                         <div class="detail-label">Summary:</div>
                         <div class="detail-value">${this.escapeHtml(wf.summary)}</div>
+                    </div>
+                    ` : ''}
+                    ${wf.error ? `
+                    <div class="detail-row">
+                        <div class="detail-label">Error:</div>
+                        <div class="detail-value error-text">${this.escapeHtml(wf.error)}</div>
+                    </div>
+                    ` : ''}
+                    ${wf.output && typeof wf.output === 'object' && Object.keys(wf.output).length > 0 ? `
+                    <div class="detail-row">
+                        <div class="detail-label">Output:</div>
+                        <div class="detail-value output-text">${this.formatOutput(wf.output)}</div>
                     </div>
                     ` : ''}
                     <div class="detail-row">
@@ -458,6 +494,29 @@ export class HistoryViewPanel {
             "'": '&#039;'
         };
         return text.replace(/[&<>"']/g, m => map[m]);
+    }
+
+    private formatOutput(output: any): string {
+        try {
+            // If output has specific known fields, format them nicely
+            if (output.summary) {
+                return this.escapeHtml(output.summary);
+            }
+            if (output.planPath) {
+                return `Plan: ${this.escapeHtml(output.planPath)}`;
+            }
+            if (output.files && Array.isArray(output.files)) {
+                return `Modified ${output.files.length} file(s)`;
+            }
+            // Otherwise show compact JSON
+            const json = JSON.stringify(output, null, 2);
+            if (json.length > 200) {
+                return this.escapeHtml(json.substring(0, 200) + '...');
+            }
+            return this.escapeHtml(json);
+        } catch {
+            return this.escapeHtml(String(output));
+        }
     }
 
     private getNonce(): string {

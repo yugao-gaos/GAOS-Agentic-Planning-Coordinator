@@ -209,6 +209,25 @@ export function getSidebarScript(): string {
                 };
             });
             
+            // Workflow action button handlers (pause/resume/cancel)
+            sessionsContent.querySelectorAll('.workflow-action-btn').forEach(btn => {
+                btn.onclick = (e) => {
+                    e.stopPropagation();
+                    const action = btn.dataset.action;
+                    const workflowId = btn.dataset.workflowId;
+                    const sessionItem = btn.closest('.session-item');
+                    const sessionId = sessionItem ? sessionItem.dataset.sessionId : null;
+                    
+                    if (action && workflowId && sessionId) {
+                        vscode.postMessage({ 
+                            type: action, 
+                            sessionId: sessionId, 
+                            workflowId: workflowId 
+                        });
+                    }
+                };
+            });
+            
             // Coordinator expand/collapse handlers
             sessionsContent.querySelectorAll('.coordinator-header[data-coord-toggle]').forEach(header => {
                 header.onclick = (e) => {
@@ -262,17 +281,7 @@ export function getSidebarScript(): string {
             grid.querySelectorAll('.agent-card.busy').forEach(card => {
                 card.style.cursor = 'pointer';
                 card.onclick = (e) => {
-                    // Don't open terminal if clicking stop button
-                    if (e.target.closest('.agent-stop-btn')) return;
                     vscode.postMessage({ type: 'showAgentTerminal', agentName: card.dataset.agent });
-                };
-            });
-            
-            // Stop button handler
-            grid.querySelectorAll('.agent-stop-btn').forEach(btn => {
-                btn.onclick = (e) => {
-                    e.stopPropagation();
-                    vscode.postMessage({ type: 'releaseAgent', agentName: btn.dataset.agent });
                 };
             });
         }

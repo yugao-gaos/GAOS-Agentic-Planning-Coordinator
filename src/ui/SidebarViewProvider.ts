@@ -161,6 +161,33 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 case 'releaseAgent':
                     vscode.commands.executeCommand('agenticPlanning.releaseAgent', { label: data.agentName });
                     break;
+                case 'pauseWorkflow':
+                    if (data.sessionId && data.workflowId && this.stateProxy) {
+                        const result = await this.stateProxy.pauseWorkflow(data.sessionId, data.workflowId);
+                        if (!result.success) {
+                            vscode.window.showErrorMessage(result.error || 'Failed to pause workflow');
+                        }
+                        this.refresh();
+                    }
+                    break;
+                case 'resumeWorkflow':
+                    if (data.sessionId && data.workflowId && this.stateProxy) {
+                        const result = await this.stateProxy.resumeWorkflow(data.sessionId, data.workflowId);
+                        if (!result.success) {
+                            vscode.window.showErrorMessage(result.error || 'Failed to resume workflow');
+                        }
+                        this.refresh();
+                    }
+                    break;
+                case 'cancelWorkflow':
+                    if (data.sessionId && data.workflowId && this.stateProxy) {
+                        const result = await this.stateProxy.cancelWorkflow(data.sessionId, data.workflowId);
+                        if (!result.success) {
+                            vscode.window.showErrorMessage(result.error || 'Failed to cancel workflow');
+                        }
+                        this.refresh();
+                    }
+                    break;
                 case 'showAgentTerminal':
                     vscode.commands.executeCommand('agenticPlanning.showAgentTerminal', data.agentName);
                     break;
@@ -361,7 +388,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                             startedAt: hist.startedAt,
                             taskId: hist.taskId,
                             logPath: hist.logPath,
-                            summary: hist.summary
+                            summary: hist.summary,
+                            // New fields
+                            success: hist.success,
+                            error: hist.error,
+                            output: hist.output
                         });
                     }
                     

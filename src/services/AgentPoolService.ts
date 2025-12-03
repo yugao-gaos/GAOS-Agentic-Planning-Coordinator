@@ -33,11 +33,12 @@ export class AgentPoolService {
     // Pool Status
     // ========================================================================
 
-    getPoolStatus(): { total: number; available: string[]; busy: string[] } {
+    getPoolStatus(): { total: number; available: string[]; allocated: string[]; busy: string[] } {
         const state = this.stateManager.getAgentPoolState();
         return {
             total: state.totalAgents,
             available: [...state.available],
+            allocated: Object.keys(state.allocated || {}),
             busy: Object.keys(state.busy)
         };
     }

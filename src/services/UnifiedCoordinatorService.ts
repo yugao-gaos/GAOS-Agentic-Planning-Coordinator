@@ -849,6 +849,32 @@ export class UnifiedCoordinatorService {
     }
     
     /**
+     * Pause a specific workflow
+     */
+    async pauseWorkflow(sessionId: string, workflowId: string): Promise<void> {
+        const state = this.sessions.get(sessionId);
+        if (!state) return;
+        
+        const workflow = state.workflows.get(workflowId);
+        if (workflow) {
+            await workflow.pause();
+        }
+    }
+    
+    /**
+     * Resume a paused workflow
+     */
+    async resumeWorkflow(sessionId: string, workflowId: string): Promise<void> {
+        const state = this.sessions.get(sessionId);
+        if (!state) return;
+        
+        const workflow = state.workflows.get(workflowId);
+        if (workflow) {
+            await workflow.resume();
+        }
+    }
+    
+    /**
      * Get workflow status
      */
     getWorkflowStatus(sessionId: string, workflowId: string): WorkflowProgress | undefined {
@@ -1309,7 +1335,15 @@ export class UnifiedCoordinatorService {
             taskId,
             startedAt: workflow?.getProgress().startedAt || state.createdAt,
             completedAt: new Date().toISOString(),
+            
+            // New structured fields
+            success: result.success,
+            error: result.error,
+            output: result.output,
+            
+            // Deprecated field (kept for backward compatibility)
             result: result.error,
+            
             logPath: workflow?.getProgress().logPath
         };
         state.workflowHistory.unshift(historySummary); // Add to front (newest first)
@@ -1383,6 +1417,7 @@ export class UnifiedCoordinatorService {
                 startedAt: workflow?.getProgress().startedAt || state.createdAt,
                 completedAt: new Date().toISOString(),
                 duration: result.duration || 0,
+                success: result.success,
                 output: result.output,
                 error: result.error
             });

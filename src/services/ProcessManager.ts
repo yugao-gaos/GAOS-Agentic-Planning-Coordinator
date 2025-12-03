@@ -176,7 +176,7 @@ export class ProcessManager {
 
         // Capture stdout
         proc.stdout?.on('data', (data: Buffer) => {
-            const text = data.toString();
+            const text = data.toString('utf8');
             managed.outputBuffer.push(text);
             managed.lastActivityTime = Date.now();  // Update activity time
             // Keep last 100 lines
@@ -189,7 +189,7 @@ export class ProcessManager {
 
         // Capture stderr
         proc.stderr?.on('data', (data: Buffer) => {
-            const text = data.toString();
+            const text = data.toString('utf8');
             managed.outputBuffer.push(`[stderr] ${text}`);
             managed.lastActivityTime = Date.now();  // Update activity time
             if (managed.outputBuffer.length > 100) {
@@ -291,7 +291,7 @@ export class ProcessManager {
         // Track stdout activity (if available)
         proc.stdout?.on('data', (data: Buffer) => {
             managed.lastActivityTime = Date.now();
-            const text = data.toString();
+            const text = data.toString('utf8');
             managed.outputBuffer.push(text);
             if (managed.outputBuffer.length > 100) {
                 managed.outputBuffer.shift();
@@ -302,7 +302,7 @@ export class ProcessManager {
         // Track stderr activity (if available)
         proc.stderr?.on('data', (data: Buffer) => {
             managed.lastActivityTime = Date.now();
-            const text = data.toString();
+            const text = data.toString('utf8');
             managed.outputBuffer.push(`[stderr] ${text}`);
             if (managed.outputBuffer.length > 100) {
                 managed.outputBuffer.shift();

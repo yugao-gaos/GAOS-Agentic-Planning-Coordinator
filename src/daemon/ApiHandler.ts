@@ -35,6 +35,7 @@ export interface ApiServices {
     agentPoolService: IAgentPoolApi;
     coordinator: ICoordinatorApi;
     planningService: IPlanningApi;
+    processManager: IProcessManagerApi;
     unityManager?: IUnityApi;
     taskManager?: ITaskManagerApi;
     roleRegistry?: IRoleRegistryApi;
@@ -61,6 +62,7 @@ export interface IStateManagerApi {
     getAllPlanningSessions(): PlanningSessionData[];
     getPlanningSession(id: string): PlanningSessionData | undefined;
     deletePlanningSession(id: string): void;
+    getSessionTasksFilePath(sessionId: string): string;
 }
 
 /**
@@ -73,6 +75,13 @@ export interface RoleData {
     isBuiltIn: boolean;
     defaultModel: string;
     timeoutMs: number;
+}
+
+/**
+ * Minimal process manager interface for API handler
+ */
+export interface IProcessManagerApi {
+    killOrphanCursorAgents(): Promise<number>;
 }
 
 /**
@@ -142,6 +151,8 @@ export interface ICoordinatorApi {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     dispatchWorkflow(sessionId: string, type: string, input: any): Promise<string>;
     cancelWorkflow(sessionId: string, workflowId: string): Promise<void>;
+    pauseWorkflow(sessionId: string, workflowId: string): Promise<void>;
+    resumeWorkflow(sessionId: string, workflowId: string): Promise<void>;
     pauseSession(sessionId: string): Promise<void>;
     resumeSession(sessionId: string): Promise<void>;
     cancelSession(sessionId: string): Promise<void>;
@@ -358,6 +369,9 @@ export class ApiHandler {
             
             case 'coordinator':
                 return this.handleCoordinator(action, params);
+            
+            case 'process':
+                return this.handleProcess(action, params);
             
             case 'config':
                 return this.handleConfig(action, params);
@@ -718,6 +732,16 @@ export class ApiHandler {
                 return { message: `Workflow ${params.workflowId} cancelled` };
             }
             
+            case 'pause': {
+                await this.services.coordinator.pauseWorkflow(params.sessionId as string, params.workflowId as string);
+                return { message: `Workflow ${params.workflowId} paused` };
+            }
+            
+            case 'resume': {
+                await this.services.coordinator.resumeWorkflow(params.sessionId as string, params.workflowId as string);
+                return { message: `Workflow ${params.workflowId} resumed` };
+            }
+            
             case 'list': {
                 const workflows = this.services.coordinator.getWorkflowSummaries(params.sessionId as string);
                 return { data: workflows };
@@ -981,6 +1005,26 @@ export class ApiHandler {
                         priority: t.priority
                     })),
                     message: `Found ${tasks.length} task(s)`
+                };
+            }
+            
+            case 'getFilePath': {
+                // Get the tasks.json file path for a session
+                // This is used by the dependency map to read tasks directly from disk
+                // (bypassing TaskManager which may have removed completed tasks from memory)
+                if (!sessionId) {
+                    throw new Error('Missing session parameter');
+                }
+                
+                const tasksFilePath = this.services.stateManager.getSessionTasksFilePath(sessionId);
+                
+                return {
+                    data: {
+                        sessionId,
+                        filePath: tasksFilePath,
+                        exists: require('fs').existsSync(tasksFilePath)
+                    },
+                    message: `Tasks file path: ${tasksFilePath}`
                 };
             }
             
@@ -1540,6 +1584,47 @@ export class ApiHandler {
             
             default:
                 throw new Error(`Unknown folders action: ${action}`);
+        }
+    }
+    
+    // ========================================================================
+    // Process Management
+    // ========================================================================
+    
+    /**
+     * Handle process management commands
+     */
+    private async handleProcess(action: string, params: Record<string, unknown>): Promise<{ data?: unknown; message?: string }> {
+        const processManager = this.services.processManager;
+        
+        switch (action) {
+            case 'cleanup':
+            case 'kill-orphans': {
+                const killedCount = await processManager.killOrphanCursorAgents();
+                return { 
+                    data: { killedCount },
+                    message: killedCount > 0 
+                        ? `Killed ${killedCount} orphan cursor-agent processes`
+                        : 'No orphan cursor-agent processes found'
+                };
+            }
+            
+            case 'count': {
+                // Count cursor agent processes
+                const { execSync } = require('child_process');
+                try {
+                    const count = parseInt(
+                        execSync('ps aux | grep -E "cursor.*(agent|--model)" | grep -v grep | wc -l', 
+                            { encoding: 'utf-8' }).trim()
+                    );
+                    return { data: { processCount: count } };
+                } catch (err) {
+                    return { data: { processCount: 0, error: String(err) } };
+                }
+            }
+            
+            default:
+                throw new Error(`Unknown process action: ${action}`);
         }
     }
     

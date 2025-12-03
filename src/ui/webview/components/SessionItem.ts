@@ -155,6 +155,18 @@ function renderWorkflowItem(wf: WorkflowInfo, agents: AgentInfo[]): string {
         phaseDisplay = `⏳ Waiting for ${roleLabel}...`;
     }
     
+    // Build workflow control buttons based on status
+    const workflowActions = (() => {
+        if (wf.status === 'running') {
+            return `<button class="workflow-action-btn" data-action="pauseWorkflow" data-workflow-id="${escapeHtml(wf.id)}" title="Pause workflow">⏸</button>`;
+        } else if (wf.status === 'paused') {
+            return `<button class="workflow-action-btn" data-action="resumeWorkflow" data-workflow-id="${escapeHtml(wf.id)}" title="Resume workflow">▶</button>`;
+        } else if (wf.status === 'pending' || wf.status === 'blocked') {
+            return `<button class="workflow-action-btn danger" data-action="cancelWorkflow" data-workflow-id="${escapeHtml(wf.id)}" title="Cancel workflow">✕</button>`;
+        }
+        return '';
+    })();
+    
     return `
         <div class="workflow-item ${wf.status}${isActive ? ' active' : ''}${wf.waitingForAgent ? ' waiting' : ''}" 
              data-action="openWorkflowLog" 
@@ -171,6 +183,7 @@ function renderWorkflowItem(wf: WorkflowInfo, agents: AgentInfo[]): string {
                     <span class="workflow-phase">${phaseDisplay}</span>
                 </div>
                 ${agentBadges}
+                ${workflowActions ? `<div class="workflow-actions">${workflowActions}</div>` : ''}
             </div>
         </div>
     `;
@@ -354,22 +367,16 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                         ${session.activeWorkflows.map(wf => renderWorkflowItem(wf, findAgentsForWorkflow(wf, session.sessionAgents || []))).join('')}
                     ` : ''}
                     
-                    <!-- Agent Bench (allocated but waiting) -->
+                    <!-- Bench (allocated but waiting) -->
                     ${session.benchAgents && session.benchAgents.length > 0 ? `
-                        <div class="bench-section">
-                            <div class="nested-item bench-header">
-                                <div class="nested-icon" style="color: #6366f1;">
-                                    ⏸️
-                                </div>
-                                <span class="nested-label">Agent Bench (${session.benchCount} waiting)</span>
+                        <div class="nested-item">
+                            <div class="nested-icon" style="color: #6366f1;">
+                                ⏸️
                             </div>
-                            <div class="bench-agents">
+                            <span class="nested-label">Bench</span>
+                            <div class="bench-agents-bubbles">
                                 ${session.benchAgents.map(agent => `
-                                    <div class="bench-agent" style="border-left: 3px solid ${agent.roleColor}">
-                                        <span class="agent-name">${agent.name}</span>
-                                        <span class="agent-role">${agent.roleId}</span>
-                                        <span class="agent-status">waiting</span>
-                                    </div>
+                                    <span class="workflow-agent" style="--agent-color: ${agent.roleColor || '#6366f1'};" title="${agent.name} - ${agent.roleId}">${agent.name}</span>
                                 `).join('')}
                             </div>
                         </div>

@@ -24,6 +24,7 @@ function renderAvailableAgent(agent: AgentInfo): string {
 
 /**
  * Render a busy agent card with role and task info.
+ * Note: Control buttons removed - use workflow-level controls instead.
  */
 function renderBusyAgent(agent: AgentInfo): string {
     const initial = agent.name.charAt(0).toUpperCase();
@@ -62,10 +63,6 @@ function renderBusyAgent(agent: AgentInfo): string {
             <div class="agent-status-line" style="color: ${roleColor};">${statusLine}</div>
             ${workflowLine ? `<div class="agent-task-line">${workflowLine}</div>` : ''}
             ${sessionLine ? `<div class="agent-task-line agent-session-line">${sessionLine}</div>` : ''}
-            <button class="agent-stop-btn" data-agent="${agent.name}">
-                ${ICONS.stop}
-                Stop
-            </button>
         </div>
     `;
 }

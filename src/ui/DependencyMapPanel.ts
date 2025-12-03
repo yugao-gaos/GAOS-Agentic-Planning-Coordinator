@@ -131,75 +131,85 @@ export class DependencyMapPanel {
      * Also returns info about tasks in other sessions if current session is empty
      */
     private async getTasks(): Promise<{ tasks: TaskNode[]; otherSessionsInfo?: { sessionId: string; taskCount: number }[] }> {
-        // API response format (from ApiHandler task.list)
-        interface ApiTask {
-            id: string;          // Short ID (e.g., "T1")
-            globalId: string;    // Full ID (e.g., "ps_000001_T1")
+        // Task format from tasks.json file
+        interface TaskFromFile {
+            id: string;              // Full ID (e.g., "ps_000001_T1")
             sessionId: string;
             description: string;
             status: string;
-            type?: string;       // API uses "type" instead of "taskType"
-            dependencies: string[];
-            dependents: string[];
+            taskType?: string;
+            dependencies: string[];  // Full IDs (e.g., ["ps_000001_T2"])
+            dependents: string[];    // Full IDs
             priority: number;
         }
-        
-        let tasks: ApiTask[] = [];
-        let allTasks: ApiTask[] = [];
 
         console.log(`[DependencyMapPanel] getTasks() called for sessionId: ${this.sessionId}`);
 
         try {
-            // Get tasks for this session from daemon
-            console.log(`[DependencyMapPanel] Querying daemon for tasks with sessionId: ${this.sessionId}`);
+            // Get the tasks file path from daemon
+            console.log(`[DependencyMapPanel] Requesting tasks file path for session: ${this.sessionId}`);
             // @ts-ignore - Type error due to strict null checking
-            const response = await this.vsCodeClient.send<{ data: ApiTask[] }>('task.list', { sessionId: this.sessionId });
-            const tasks = response?.data || [];
-            console.log(`[DependencyMapPanel] Daemon returned ${tasks.length} tasks for session ${this.sessionId}`);
+            const pathResponse = await this.vsCodeClient.send<{ data: { sessionId: string; filePath: string; exists: boolean } }>('task.getFilePath', { sessionId: this.sessionId });
             
-            // If no tasks for this session, get all tasks to check other sessions
-            if (tasks.length === 0) {
-                console.log(`[DependencyMapPanel] No tasks found, fetching all tasks to check other sessions`);
-                // @ts-ignore - Type error due to strict null checking
-                const allResponse = await this.vsCodeClient.send<{ data: ApiTask[] }>('task.list', {});
-                const allTasks = allResponse?.data || [];
-                console.log(`[DependencyMapPanel] Found ${allTasks.length} total tasks across all sessions`);
+            if (!pathResponse?.data) {
+                console.error('[DependencyMapPanel] No response from daemon for task file path');
+                vscode.window.showErrorMessage('Failed to get tasks file path from daemon');
+                return { tasks: [] };
             }
+            
+            const { filePath, exists } = pathResponse.data;
+            console.log(`[DependencyMapPanel] Tasks file path: ${filePath}, exists: ${exists}`);
+            
+            if (!exists) {
+                console.log(`[DependencyMapPanel] Tasks file does not exist yet`);
+                return { tasks: [] };
+            }
+            
+            // Read tasks.json directly from disk
+            // This ensures we get ALL tasks including completed ones
+            // (TaskManager may have removed completed tasks from memory for optimization)
+            const fs = require('fs');
+            const fileContent = fs.readFileSync(filePath, 'utf-8');
+            const fileData = JSON.parse(fileContent);
+            
+            if (!fileData.tasks || !Array.isArray(fileData.tasks)) {
+                console.warn('[DependencyMapPanel] Invalid tasks file format');
+                return { tasks: [] };
+            }
+            
+            const tasksFromFile: TaskFromFile[] = fileData.tasks;
+            console.log(`[DependencyMapPanel] Read ${tasksFromFile.length} tasks from file (includes completed)`);
+            
+            // Convert to TaskNode format
+            const taskNodes = tasksFromFile.map(t => {
+                // Extract short ID from full ID
+                // e.g., "ps_000001_T1" → "T1"
+                const shortId = t.id.replace(`${t.sessionId}_`, '');
+                
+                return {
+                    id: t.id,           // Keep full ID for uniqueness
+                    shortId: shortId,   // Short ID for display
+                    description: t.description,
+                    status: t.status,
+                    dependencies: t.dependencies.map(depId => 
+                        // Convert full dependency IDs to short IDs
+                        depId.replace(`${t.sessionId}_`, '')
+                    ),
+                    dependents: t.dependents.map(depId => 
+                        // Convert full dependent IDs to short IDs
+                        depId.replace(`${t.sessionId}_`, '')
+                    )
+                };
+            });
+            
+            console.log(`[DependencyMapPanel] Converted ${taskNodes.length} tasks to TaskNode format`);
+            return { tasks: taskNodes };
+            
         } catch (err) {
-            console.error('[DependencyMapPanel] Failed to fetch tasks from daemon:', err);
-            vscode.window.showErrorMessage('Cannot load tasks: Daemon connection error. Please ensure the daemon is running.');
+            console.error('[DependencyMapPanel] Failed to load tasks from file:', err);
+            vscode.window.showErrorMessage(`Cannot load tasks: ${err instanceof Error ? err.message : String(err)}`);
+            return { tasks: [] };
         }
-
-        // Convert to TaskNode format
-        // Note: dependencies and dependents from API are already short IDs (no session prefix)
-        const taskNodes = tasks.map(t => ({
-            id: t.globalId || `${this.sessionId}_${t.id}`,  // Use globalId if available
-            shortId: t.id,  // API already returns short ID
-            description: t.description,
-            status: t.status,
-            dependencies: t.dependencies.map(d => {
-                // Dependencies might be short IDs or full IDs, normalize to short
-                return d.replace(`${this.sessionId}_`, '');
-            }),
-            dependents: t.dependents.map(d => {
-                // Dependents might be short IDs or full IDs, normalize to short
-                return d.replace(`${this.sessionId}_`, '');
-            })
-        }));
-
-        // If no tasks for this session, check which other sessions have tasks
-        let otherSessionsInfo: { sessionId: string; taskCount: number }[] | undefined;
-        if (taskNodes.length === 0 && allTasks.length > 0) {
-            const sessionCounts = new Map<string, number>();
-            for (const t of allTasks) {
-                sessionCounts.set(t.sessionId, (sessionCounts.get(t.sessionId) || 0) + 1);
-            }
-            otherSessionsInfo = Array.from(sessionCounts.entries())
-                .map(([sessionId, taskCount]) => ({ sessionId, taskCount }))
-                .sort((a, b) => b.taskCount - a.taskCount);
-        }
-
-        return { tasks: taskNodes, otherSessionsInfo };
     }
 
     /**
@@ -274,26 +284,22 @@ export class DependencyMapPanel {
      */
     private async updateWebviewContent(): Promise<void> {
         console.log(`[DependencyMapPanel] Fetching tasks for session: ${this.sessionId}`);
-        const { tasks, otherSessionsInfo } = await this.getTasks();
+        const { tasks } = await this.getTasks();
         const layoutedTasks = this.calculateLayout(tasks);
         
         console.log(`[DependencyMapPanel] Found ${tasks.length} tasks for session ${this.sessionId}`);
-        if (tasks.length === 0 && otherSessionsInfo && otherSessionsInfo.length > 0) {
-            console.log(`[DependencyMapPanel] Other sessions with tasks:`, otherSessionsInfo);
-        }
         
         // Update panel title
         this.panel.title = `Task Dependencies - ${this.sessionId} (${tasks.length} tasks)`;
         
-        this.panel.webview.html = this.getWebviewContent(layoutedTasks, otherSessionsInfo);
+        this.panel.webview.html = this.getWebviewContent(layoutedTasks);
     }
 
     /**
      * Generate the webview HTML content
      */
-    private getWebviewContent(tasks: TaskNode[], otherSessionsInfo?: { sessionId: string; taskCount: number }[]): string {
+    private getWebviewContent(tasks: TaskNode[]): string {
         const tasksJson = JSON.stringify(tasks);
-        const otherSessionsJson = JSON.stringify(otherSessionsInfo || []);
         
         // Calculate canvas size
         const maxX = Math.max(...tasks.map(t => (t.x || 0) + 100), 400);
@@ -576,7 +582,6 @@ export class DependencyMapPanel {
     <script>
         const vscode = acquireVsCodeApi();
         const tasks = ${tasksJson};
-        const otherSessions = ${otherSessionsJson};
         
         const statusIcons = {
             'completed': '✓',
@@ -592,23 +597,11 @@ export class DependencyMapPanel {
             const connections = document.getElementById('connections');
             
             if (tasks.length === 0) {
-                let emptyHtml = '<div class="empty-state"><div class="empty-state-icon">📋</div><div>No tasks yet</div>';
-                
-                if (otherSessions && otherSessions.length > 0) {
-                    // Show which sessions DO have tasks
-                    const sessionList = otherSessions.map(s => 
-                        '<div style="margin: 4px 0; padding: 4px 8px; background: rgba(59, 130, 246, 0.2); border-radius: 4px; cursor: pointer; display: inline-block;" ' +
-                        'onclick="vscode.postMessage({command: \\'switchSession\\', sessionId: \\'' + s.sessionId + '\\'});">' +
-                        s.sessionId.substring(0, 11) + ' (' + s.taskCount + ' tasks)</div>'
-                    ).join(' ');
-                    emptyHtml += '<div style="margin-top: 16px; font-size: 0.9em; color: #f59e0b;">⚠️ Tasks exist in other sessions:</div>';
-                    emptyHtml += '<div style="margin-top: 8px;">' + sessionList + '</div>';
-                    emptyHtml += '<div style="margin-top: 12px; font-size: 0.85em; opacity: 0.7;">Click a session to view its tasks</div>';
-                } else {
-                    emptyHtml += '<div style="margin-top: 8px; font-size: 0.9em;">Tasks will appear here once created</div>';
-                }
-                
-                emptyHtml += '</div>';
+                const emptyHtml = '<div class="empty-state">' +
+                    '<div class="empty-state-icon">📋</div>' +
+                    '<div>No tasks yet</div>' +
+                    '<div style="margin-top: 8px; font-size: 0.9em;">Tasks will appear here once created</div>' +
+                    '</div>';
                 canvas.innerHTML = emptyHtml;
                 return;
             }

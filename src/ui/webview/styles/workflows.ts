@@ -176,4 +176,46 @@ export const workflowStyles = `
     opacity: 0.7;
     white-space: nowrap;
 }
+
+/* Workflow action buttons container */
+.workflow-actions {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+    align-items: center;
+}
+
+/* Workflow control buttons (pause/resume/cancel) */
+.workflow-action-btn {
+    padding: 2px 8px;
+    border: 1px solid var(--vscode-widget-border);
+    border-radius: 3px;
+    background: transparent;
+    color: var(--vscode-foreground);
+    font-size: 12px;
+    cursor: pointer;
+    opacity: 0.7;
+    transition: opacity 0.2s, background 0.2s, border-color 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+    min-width: 20px;
+}
+
+.workflow-action-btn:hover {
+    opacity: 1;
+    background: var(--vscode-list-hoverBackground);
+    border-color: var(--vscode-focusBorder);
+}
+
+.workflow-action-btn.danger {
+    color: #f14c4c;
+    border-color: rgba(241, 76, 76, 0.3);
+}
+
+.workflow-action-btn.danger:hover {
+    background: rgba(241, 76, 76, 0.15);
+    border-color: rgba(241, 76, 76, 0.5);
+}
 `;
