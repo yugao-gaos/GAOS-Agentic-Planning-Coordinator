@@ -281,6 +281,7 @@ export class UnifiedCoordinatorService {
     private performPeriodicCleanup(): void {
         let totalWorkflowsCleaned = 0;
         let totalSessionsCleaned = 0;
+        let totalStaleReferencesCleaned = 0;
         
         // Clean up old workflows in each session
         for (const [sessionId, _state] of this.sessions) {
@@ -288,6 +289,9 @@ export class UnifiedCoordinatorService {
             this.cleanupCompletedWorkflows(sessionId);
             const afterSize = _state.workflows.size;
             totalWorkflowsCleaned += (beforeSize - afterSize);
+            
+            // Clean up stale workflow references
+            totalStaleReferencesCleaned += this.cleanupStaleWorkflows(sessionId);
         }
         
         // Clean up old completed sessions
@@ -307,8 +311,8 @@ export class UnifiedCoordinatorService {
         this.cleanupStaleCompletionSignals();
         
         // Log summary if anything was cleaned
-        if (totalWorkflowsCleaned > 0 || totalSessionsCleaned > 0) {
-            this.log(`Periodic cleanup: ${totalWorkflowsCleaned} workflows, ${totalSessionsCleaned} sessions removed`);
+        if (totalWorkflowsCleaned > 0 || totalSessionsCleaned > 0 || totalStaleReferencesCleaned > 0) {
+            this.log(`Periodic cleanup: ${totalWorkflowsCleaned} workflows, ${totalSessionsCleaned} sessions, ${totalStaleReferencesCleaned} stale refs removed`);
         }
     }
     
@@ -1999,12 +2003,73 @@ export class UnifiedCoordinatorService {
     }
     
     /**
+     * Clean up stale workflow references before coordinator evaluation
+     * 
+     * A workflow reference is stale if:
+     * - Task has currentWorkflow set
+     * - But the workflow doesn't exist in session state OR is completed/failed/cancelled
+     * 
+     * This happens when workflows crash/stall without properly completing.
+     */
+    private cleanupStaleWorkflows(sessionId: string): number {
+        const state = this.sessions.get(sessionId);
+        if (!state) return 0;
+        
+        const taskManager = ServiceLocator.resolve(TaskManager);
+        const tasks = taskManager.getTasksForSession(sessionId);
+        
+        let cleanedCount = 0;
+        
+        for (const task of tasks) {
+            if (!task.currentWorkflow) continue;
+            
+            // Check if the workflow exists and is active
+            const workflow = state.workflows.get(task.currentWorkflow);
+            
+            let isStale = false;
+            if (!workflow) {
+                // Workflow doesn't exist in session state - definitely stale
+                isStale = true;
+            } else {
+                const status = workflow.getStatus();
+                if (status === 'completed' || status === 'failed' || status === 'cancelled') {
+                    // Workflow is done but task wasn't updated - stale
+                    isStale = true;
+                }
+            }
+            
+            if (isStale) {
+                this.log(`🧹 Cleaning stale workflow reference: ${task.id} → ${task.currentWorkflow?.substring(0, 8)}`);
+                
+                // Clear the workflow reference
+                taskManager.clearTaskCurrentWorkflow(task.id);
+                
+                // Reset task to created if it's stuck in progress
+                if (task.status === 'in_progress') {
+                    taskManager.resetTaskToReady(task.id);
+                }
+                
+                cleanedCount++;
+            }
+        }
+        
+        if (cleanedCount > 0) {
+            this.log(`Cleaned ${cleanedCount} stale workflow reference(s) for session ${sessionId}`);
+        }
+        
+        return cleanedCount;
+    }
+    
+    /**
      * Build coordinator input context for AI evaluation
      */
     private async buildCoordinatorInput(
         sessionId: string,
         event: CoordinatorEvent
     ): Promise<CoordinatorInput> {
+        // Clean up stale workflows before building input
+        this.cleanupStaleWorkflows(sessionId);
+        
         const state = this.sessions.get(sessionId);
         
         const sessionSnapshot = state ? {
