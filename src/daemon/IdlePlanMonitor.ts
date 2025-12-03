@@ -1,13 +1,20 @@
 /**
- * IdlePlanMonitor - Monitors for idle approved plans and triggers coordinator
+ * IdlePlanMonitor - Monitors approved plans and triggers coordinator for optimal agent utilization
  * 
- * This service runs in the daemon and checks for:
- * - Approved plans with no active workflows
- * - Available agents in the pool
- * - Plans that have been idle for more than IDLE_THRESHOLD_MS
+ * This service runs in the daemon and checks every 10 seconds for:
+ * - Approved plans with NO active workflows → trigger after 60s idle
+ * - Approved plans WITH active workflows but have ready tasks + available agents → trigger immediately
  * 
- * When conditions are met, it triggers a coordinator evaluation.
- * After triggering, it enters a cooldown period before checking again.
+ * This enables:
+ * - Periodic coordinator evaluations to maximize agent utilization
+ * - Event-driven triggers (workflow completion, errors, etc.) still work
+ * - 5-minute cooldown prevents excessive coordinator evaluations per plan
+ * 
+ * Protection layers:
+ * - 5-minute cooldown (this monitor) prevents plan spam
+ * - 10s debounce/cooldown (CoordinatorAgent) prevents evaluation spam
+ * - Duplicate workflow check (UnifiedCoordinatorService) prevents duplicate starts
+ * - 80% capacity rule (Coordinator AI) prevents resource exhaustion
  */
 
 import { StateManager } from '../services/StateManager';
@@ -163,7 +170,12 @@ export class IdlePlanMonitor {
     }
     
     /**
-     * Check for idle approved plans and trigger coordinator if needed
+     * Check for plans that could use coordination and trigger when appropriate
+     * 
+     * New behavior (Option 1):
+     * - Plans with NO active workflows: trigger after 60s idle (original behavior)
+     * - Plans WITH active workflows BUT have ready tasks + available agents: trigger immediately
+     * - This allows periodic coordinator evaluations to maximize agent utilization
      */
     private checkIdlePlans(): void {
         try {
@@ -181,39 +193,77 @@ export class IdlePlanMonitor {
                 return;
             }
             
+            // Get task manager for checking ready tasks
+            const { ServiceLocator } = require('../services/ServiceLocator');
+            const TaskManager = require('../services/TaskManager').TaskManager;
+            let taskManager: any;
+            try {
+                taskManager = ServiceLocator.resolve(TaskManager);
+            } catch {
+                // Task manager not available - use conservative behavior (skip plans with workflows)
+                this.log('TaskManager not available, using conservative mode');
+            }
+            
             for (const session of sessions) {
                 // Check if this session has active workflows
                 const sessionState = this.coordinator.getSessionState(session.id);
-                const hasActiveWorkflows = sessionState?.activeWorkflows && sessionState.activeWorkflows.size > 0;
+                const activeWorkflowCount = sessionState?.activeWorkflows?.size || 0;
+                const hasActiveWorkflows = activeWorkflowCount > 0;
                 
-                if (hasActiveWorkflows) {
-                    // Not idle - remove from tracking
+                // Check if there are ready tasks (tasks with all dependencies met)
+                let readyTasks: any[] = [];
+                let hasReadyTasks = false;
+                
+                if (taskManager) {
+                    try {
+                        readyTasks = taskManager.getReadyTasksForSession(session.id) || [];
+                        hasReadyTasks = readyTasks.length > 0;
+                    } catch (err) {
+                        this.log(`Error checking ready tasks for ${session.id}: ${err}`);
+                    }
+                }
+                
+                // Determine if we should track this plan for coordination
+                // Track if: (1) No workflows (idle), OR (2) Has ready tasks that could use available agents
+                const shouldTrack = !hasActiveWorkflows || hasReadyTasks;
+                
+                if (!shouldTrack) {
+                    // Has workflows but no ready tasks - nothing for coordinator to do
                     this.idlePlans.delete(session.id);
                     continue;
                 }
                 
-                // Session is idle (approved, no workflows)
+                // Determine appropriate threshold based on situation
+                // - Fully idle (no workflows): 60s threshold (less urgent, avoid spam)
+                // - Has workflows + ready tasks: 0s threshold (immediate - maximize parallelization)
+                const threshold = hasActiveWorkflows ? 0 : IdlePlanMonitor.IDLE_THRESHOLD_MS;
+                
+                // Get or create tracking state for this plan
                 let planState = this.idlePlans.get(session.id);
                 
                 if (!planState) {
-                    // Start tracking this idle plan
+                    // Start tracking this plan
                     planState = {
                         sessionId: session.id,
                         idleSince: now,
                         lastTrigger: 0
                     };
                     this.idlePlans.set(session.id, planState);
-                    this.log(`Tracking idle plan: ${session.id}`);
+                    
+                    const reason = hasActiveWorkflows 
+                        ? `has ${activeWorkflowCount} workflows + ${readyTasks.length} ready tasks`
+                        : 'idle (no workflows)';
+                    this.log(`Tracking plan: ${session.id} (${reason})`);
                     continue;  // Don't trigger on first detection
                 }
                 
-                // Check if plan has been idle long enough
-                const idleDuration = now - planState.idleSince;
-                if (idleDuration < IdlePlanMonitor.IDLE_THRESHOLD_MS) {
-                    continue;  // Not idle long enough
+                // Check if plan has been in this state long enough
+                const timeSinceTracking = now - planState.idleSince;
+                if (timeSinceTracking < threshold) {
+                    continue;  // Not ready yet
                 }
                 
-                // Check cooldown
+                // Check cooldown - respect minimum time between triggers
                 const timeSinceLastTrigger = now - planState.lastTrigger;
                 if (planState.lastTrigger > 0 && timeSinceLastTrigger < IdlePlanMonitor.COOLDOWN_MS) {
                     const remaining = Math.round((IdlePlanMonitor.COOLDOWN_MS - timeSinceLastTrigger) / 1000);
@@ -225,14 +275,18 @@ export class IdlePlanMonitor {
                 }
                 
                 // Trigger coordinator evaluation
-                this.log(`Triggering coordinator for idle plan ${session.id} (idle ${Math.round(idleDuration / 1000)}s, ${availableAgents.length} agents available)`);
+                const reason = hasActiveWorkflows
+                    ? `${readyTasks.length} ready tasks with ${availableAgents.length} available agents (${activeWorkflowCount} workflows running)`
+                    : `idle for ${Math.round(timeSinceTracking / 1000)}s with ${availableAgents.length} available agents`;
+                
+                this.log(`Triggering coordinator for ${session.id}: ${reason}`);
                 
                 this.coordinator.triggerCoordinatorEvaluation(
                     session.id,
                     'manual_evaluation',
                     {
                         type: 'manual_evaluation',
-                        reason: `Idle plan detected - idle for ${Math.round(idleDuration / 1000)}s with ${availableAgents.length} available agents`
+                        reason: `Periodic check - ${reason}`
                     }
                 ).catch(err => {
                     this.log(`Failed to trigger coordinator for ${session.id}: ${err}`);

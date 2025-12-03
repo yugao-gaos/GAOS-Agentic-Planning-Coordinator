@@ -583,6 +583,15 @@ export class UnifiedCoordinatorService {
         const taskManager = ServiceLocator.resolve(TaskManager);
         const globalTaskId = `${sessionId}_${taskId}`;
         
+        // VALIDATION: Only start workflows for approved plans
+        const session = this.stateManager.getPlanningSession(sessionId);
+        if (session && session.status !== 'approved') {
+            throw new Error(
+                `Cannot start workflow for session ${sessionId}: Plan status is '${session.status}'. ` +
+                `Workflows can only be started for approved plans. Current status must be 'approved'.`
+            );
+        }
+        
         // Get the task
         const task = taskManager.getTask(globalTaskId);
         if (!task) {
@@ -609,8 +618,7 @@ export class UnifiedCoordinatorService {
             }
         }
         
-        // Get plan path
-        const session = this.stateManager.getPlanningSession(sessionId);
+        // Get plan path (session already declared above)
         const planPath = session?.currentPlanPath || '';
         
         // Build workflow input based on workflow type

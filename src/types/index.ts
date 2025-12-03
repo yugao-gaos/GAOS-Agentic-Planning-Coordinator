@@ -818,9 +818,11 @@ Your job is to:
 - Avoid creating duplicate tasks
 - Respect task dependencies
 
-⚠️ CRITICAL RULE: You may ONLY create and start tasks for plans with status 'approved'.
-NEVER create tasks for plans with status 'reviewing', 'revising', 'planning', or any other non-approved status.
-Only the plans listed in the "APPROVED PLANS" section below are allowed to have tasks created.`,
+⚠️ CRITICAL RULES:
+1. You may ONLY create and start tasks for plans with status 'approved'.
+2. NEVER create tasks or start workflows for plans with status 'reviewing', 'revising', 'planning', or any other non-approved status.
+3. Only the plans listed in the "APPROVED PLANS" section below are allowed to have tasks created.
+4. The system will REJECT any attempt to create tasks or start workflows for non-approved plans.`,
 
         decisionInstructions: `Based on the triggering event and current state, decide what actions to take.
 

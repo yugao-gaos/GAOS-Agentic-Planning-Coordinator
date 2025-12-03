@@ -73,6 +73,9 @@ export class CursorAgentRunner implements IAgentBackend {
     // Track runs that were intentionally stopped (so we don't log them as failures)
     private stoppedIntentionally: Set<string> = new Set();
     
+    // Track open file descriptors for log files (for real-time streaming)
+    private logFileDescriptors: Map<string, number> = new Map();
+    
     // Spinner animation frames for idle indicator
     private static readonly SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     private static readonly IDLE_THRESHOLD_MS = 5000;  // 5 seconds
@@ -117,9 +120,8 @@ export class CursorAgentRunner implements IAgentBackend {
         // Using cat to pipe prompt avoids escaping issues with complex prompts
         // Always use stream-json format - text mode doesn't produce capturable stdout
         // simpleMode affects how we PARSE the output, not the output format
-        // stdbuf -oL enables line-buffered output to prevent bash from buffering stdout
         const cursorFlags = `--model "${model}" -p --force --approve-mcps --output-format stream-json --stream-partial-output`;
-        const shellCmd = `cat "${promptFile}" | stdbuf -oL cursor agent ${cursorFlags} 2>&1; rm -f "${promptFile}"`;
+        const shellCmd = `cat "${promptFile}" | cursor agent ${cursorFlags} 2>&1; rm -f "${promptFile}"`;
         
         if (logFile) {
             this.appendToLog(logFile, `[DEBUG] Shell command: ${shellCmd}\n`);
@@ -307,6 +309,9 @@ export class CursorAgentRunner implements IAgentBackend {
                     if (collectedOutput.length > 0) {
                         this.appendToLog(logFile, `${C.gray}Output preview: ${collectedOutput.substring(0, 500)}${C.reset}\n`);
                     }
+                    
+                    // Close log file descriptor now that agent is done
+                    this.closeLogFile(logFile);
                 }
 
                 resolve({
@@ -842,9 +847,32 @@ export class CursorAgentRunner implements IAgentBackend {
 
     private appendToLog(logFile: string, text: string): void {
         try {
-            fs.appendFileSync(logFile, text);
+            let fd = this.logFileDescriptors.get(logFile);
+            
+            if (!fd) {
+                // Open file in append mode - keep it open for duration of agent run
+                fd = fs.openSync(logFile, 'a');
+                this.logFileDescriptors.set(logFile, fd);
+            }
+            
+            // Write synchronously to file descriptor
+            // This bypasses Node.js buffering and makes output immediately visible to tail -f
+            // No fsync needed - writeSync to file descriptor is sufficient for real-time streaming
+            fs.writeSync(fd, text);
         } catch (e) {
             console.error(`Error writing to log file ${logFile}:`, e);
+        }
+    }
+    
+    private closeLogFile(logFile: string): void {
+        const fd = this.logFileDescriptors.get(logFile);
+        if (fd) {
+            try {
+                fs.closeSync(fd);
+                this.logFileDescriptors.delete(logFile);
+            } catch (e) {
+                console.error(`Error closing log file ${logFile}:`, e);
+            }
         }
     }
 }

@@ -859,6 +859,18 @@ export class TaskManager {
             return { success: false, error: 'Invalid description: must be a non-empty string' };
         }
         
+        // VALIDATION: Only create tasks for approved plans
+        const stateManager = this.getStateManager();
+        if (stateManager) {
+            const session = stateManager.getPlanningSession(sessionId);
+            if (session && session.status !== 'approved') {
+                return { 
+                    success: false, 
+                    error: `Cannot create task for session ${sessionId}: Plan status is '${session.status}'. Tasks can only be created for approved plans. Current status must be 'approved'.` 
+                };
+            }
+        }
+        
         // Validate taskType
         const validTypes: TaskType[] = ['implementation', 'error_fix'];
         if (!validTypes.includes(taskType)) {
