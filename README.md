@@ -14,6 +14,24 @@ A VS Code/Cursor extension for multi-agent AI planning and execution, designed f
 
 ## Installation
 
+### Prerequisites
+
+Before installing the extension, ensure you have **BOTH Cursor CLI tools** installed:
+
+```bash
+# Check if Cursor CLI is installed
+cursor --version
+
+# Check if Cursor Agent CLI is installed (REQUIRED)
+cursor-agent --version
+
+# If either is missing, use our checking/installation scripts:
+# Windows: .\scripts\check-cursor-cli.ps1
+# Unix-like: ./scripts/check-cursor-cli.sh
+```
+
+📖 **See [Cursor CLI Installation Guide](Documentation/CURSOR_CLI_INSTALLATION.md) for detailed setup instructions**
+
 ### From VSIX (Recommended for Development)
 
 1. Build the extension:
@@ -34,6 +52,29 @@ A VS Code/Cursor extension for multi-agent AI planning and execution, designed f
 1. Clone the repository
 2. Run `npm install`
 3. Press F5 to launch Extension Development Host
+
+### Dependency Checking
+
+Run automated dependency checks:
+
+**Windows:**
+```powershell
+.\scripts\check-cursor-cli.ps1          # Basic check
+.\scripts\check-cursor-cli.ps1 -Verbose  # Detailed info
+```
+
+**macOS / Linux / WSL:**
+```bash
+./scripts/check-cursor-cli.sh          # Basic check
+./scripts/check-cursor-cli.sh --verbose # Detailed info
+```
+
+These scripts verify:
+- ✅ Cursor CLI (required)
+- ✅ Cursor Agent CLI (required)
+- ✅ Node.js and npm
+- ✅ MCP configuration
+- ✅ Platform-specific tools
 
 ## Usage
 

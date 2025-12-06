@@ -9,6 +9,18 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Daemon', 'FolderStructureManager');
+
+// ============================================================================
+// Constants
+// ============================================================================
+
+/**
+ * Standard working directory name (not configurable)
+ */
+export const WORKING_DIR_NAME = '_AiDevLog';
 
 // ============================================================================
 // Folder Structure Types
@@ -110,13 +122,13 @@ export class FolderStructureManager {
     setFolder(key: FolderKey, name: string): boolean {
         // Don't allow changing .config or .cache
         if (key === 'config' || key === 'cache') {
-            console.warn(`FolderStructureManager: Cannot customize '${key}' folder`);
+            log.warn(`Cannot customize '${key}' folder`);
             return false;
         }
         
         // Validate folder name
         if (!this.validateFolderName(name)) {
-            console.error(`FolderStructureManager: Invalid folder name: ${name}`);
+            log.error(`Invalid folder name: ${name}`);
             return false;
         }
         
@@ -211,7 +223,7 @@ export class FolderStructureManager {
                     }
                 }
             } catch (err) {
-                console.warn(`FolderStructureManager: Failed to load folders from ${this.configPath}:`, err);
+                log.warn(`Failed to load folders from ${this.configPath}:`, err);
             }
         }
         
@@ -245,7 +257,7 @@ export class FolderStructureManager {
             
             fs.writeFileSync(this.configPath, JSON.stringify(toSave, null, 2));
         } catch (err) {
-            console.error(`FolderStructureManager: Failed to save folders to ${this.configPath}:`, err);
+            log.error(`Failed to save folders to ${this.configPath}:`, err);
         }
     }
     
@@ -285,7 +297,7 @@ export class FolderStructureManager {
             try {
                 callback(this.getFolders());
             } catch (err) {
-                console.error('FolderStructureManager: Error in change callback:', err);
+                log.error('Error in change callback:', err);
             }
         }
     }
@@ -300,20 +312,27 @@ let globalWorkingDir: string | null = null;
 
 /**
  * Get or create the global folder structure manager instance
+ * 
+ * @param workspaceRoot Workspace root path (will use workspaceRoot/_AiDevLog as workingDir)
  */
-export function getFolderStructureManager(workingDir?: string): FolderStructureManager {
-    // If workingDir is provided and different from current, reinitialize
-    if (workingDir && globalWorkingDir !== workingDir) {
-        console.log(`[FolderStructureManager] Initializing with workingDir: ${workingDir}`);
-        if (globalInstance && globalWorkingDir) {
-            console.log(`[FolderStructureManager] Replacing existing instance (was: ${globalWorkingDir})`);
+export function getFolderStructureManager(workspaceRoot?: string): FolderStructureManager {
+    // If workspaceRoot provided, calculate workingDir and initialize
+    if (workspaceRoot) {
+        const workingDir = path.join(workspaceRoot, WORKING_DIR_NAME);
+        
+        // Only reinitialize if different from current
+        if (globalWorkingDir !== workingDir) {
+            log.info(`Initializing with workingDir: ${workingDir}`);
+            if (globalInstance && globalWorkingDir) {
+                log.info(`Replacing existing instance (was: ${globalWorkingDir})`);
+            }
+            globalInstance = new FolderStructureManager(workingDir);
+            globalWorkingDir = workingDir;
         }
-        globalInstance = new FolderStructureManager(workingDir);
-        globalWorkingDir = workingDir;
     }
     
     if (!globalInstance) {
-        throw new Error('FolderStructureManager: Not initialized. Call with workingDir first.');
+        throw new Error('FolderStructureManager: Not initialized. Call with workspaceRoot first.');
     }
     
     return globalInstance;

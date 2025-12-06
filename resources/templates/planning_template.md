@@ -49,7 +49,7 @@ Analysts must output their review in this format:
   - Identifies edge cases
   - Validates test coverage
 
-- **review_arch**: Architecture Review | Role: analyst_reviewer
+- **review_arch**: Architecture Review | Role: analyst_architecture
   - Reviews architectural soundness
   - Checks integration with existing code
   - Assesses risks

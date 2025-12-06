@@ -1,0 +1,355 @@
+name: Task Implementation (Scriptable)
+version: 1.0
+description: |
+  Demonstrates scriptable workflow capabilities by implementing a task with:
+  - System events (reading task state, agent management, file reading)
+  - Custom JavaScript logic (review result parsing, decision making)
+  - Agent orchestration (engineer + reviewer workflow)
+  
+  This workflow shows how to replicate built-in TaskImplementationWorkflow
+  using scriptable nodes.
+
+parameters:
+  - name: task_id
+    type: string
+    required: true
+    description: Task ID to implement
+  - name: session_id
+    type: string
+    required: true
+    description: Session ID for context
+
+variables:
+  - id: task_description
+    type: string
+    default: ""
+  - id: task_dependencies
+    type: array
+    default: []
+  - id: engineer_agent
+    type: string
+    default: ""
+  - id: reviewer_agent
+    type: string
+    default: ""
+  - id: review_approved
+    type: boolean
+    default: false
+  - id: review_feedback
+    type: string
+    default: ""
+  - id: review_iteration
+    type: number
+    default: 0
+
+nodes:
+  # ========================================================================
+  # Start
+  # ========================================================================
+  
+  - id: start
+    type: start
+    position: { x: 100, y: 200 }
+
+  # ========================================================================
+  # Read Task State (System Event)
+  # ========================================================================
+  
+  - id: read_task
+    type: event
+    config:
+      eventType: read_task_state
+      taskId: "{{parameters.task_id}}"
+    position: { x: 300, y: 200 }
+  
+  # Store task info in variables using script
+  - id: store_task_info
+    type: script
+    config:
+      script: |
+        const task = inputData.task_data;
+        context.setVariable('task_description', task.description);
+        context.setVariable('task_dependencies', task.dependencies);
+        log(`Task loaded: ${task.description}`);
+        return { success: true };
+    position: { x: 500, y: 200 }
+
+  # ========================================================================
+  # Read Context Files (System Events)
+  # ========================================================================
+  
+  - id: read_plan
+    type: event
+    config:
+      eventType: read_plan_file
+      session_id: "{{parameters.session_id}}"
+    position: { x: 700, y: 200 }
+  
+  - id: read_context
+    type: event
+    config:
+      eventType: read_context_brief
+      session_id: "{{parameters.session_id}}"
+    position: { x: 900, y: 200 }
+
+  # ========================================================================
+  # Request Engineer (System Event)
+  # ========================================================================
+  
+  - id: request_engineer
+    type: event
+    config:
+      eventType: request_agent_with_return
+      role: engineer
+    position: { x: 1100, y: 200 }
+  
+  - id: store_engineer
+    type: script
+    config:
+      script: |
+        const agentName = inputData.agent_name;
+        context.setVariable('engineer_agent', agentName);
+        log(`Engineer assigned: ${agentName}`);
+        return { success: true };
+    position: { x: 1300, y: 200 }
+
+  # ========================================================================
+  # Implementation Phase
+  # ========================================================================
+  
+  - id: implement_task
+    type: agentic_work
+    config:
+      promptTemplate: |
+        You are implementing a task from the plan.
+        
+        Task: {{task_description}}
+        Dependencies: {{task_dependencies}}
+        
+        Context Brief:
+        {{read_context.content}}
+        
+        Please implement this task following the plan's requirements.
+        Make sure to:
+        1. Check dependencies are complete
+        2. Write clean, maintainable code
+        3. Add necessary tests if applicable
+        4. Update documentation
+      expectedStage: implementation
+    timeout_ms: 600000
+    position: { x: 1500, y: 200 }
+
+  # ========================================================================
+  # Request Reviewer (System Event)
+  # ========================================================================
+  
+  - id: request_reviewer
+    type: event
+    config:
+      eventType: request_agent_with_return
+      role: code_reviewer
+    position: { x: 1700, y: 200 }
+  
+  - id: store_reviewer
+    type: script
+    config:
+      script: |
+        const agentName = inputData.agent_name;
+        context.setVariable('reviewer_agent', agentName);
+        log(`Reviewer assigned: ${agentName}`);
+        return { success: true };
+    position: { x: 1900, y: 200 }
+
+  # ========================================================================
+  # Review Phase
+  # ========================================================================
+  
+  - id: review_implementation
+    type: agentic_work
+    config:
+      promptTemplate: |
+        You are reviewing a task implementation.
+        
+        Task: {{task_description}}
+        
+        Please review the implementation for:
+        1. Correctness - does it meet requirements?
+        2. Code quality - is it clean and maintainable?
+        3. Testing - are tests adequate?
+        4. Documentation - is it well documented?
+        
+        Respond with APPROVED or CHANGES_REQUESTED followed by your feedback.
+      expectedStage: code_review
+    timeout_ms: 300000
+    position: { x: 2100, y: 200 }
+
+  # ========================================================================
+  # Parse Review Result (Custom JavaScript)
+  # ========================================================================
+  
+  - id: parse_review
+    type: script
+    config:
+      script: |
+        const reviewOutput = inputData.output || '';
+        const approved = reviewOutput.toUpperCase().includes('APPROVED');
+        const iteration = context.getVariable('review_iteration') || 0;
+        
+        context.setVariable('review_approved', approved);
+        context.setVariable('review_feedback', reviewOutput);
+        context.setVariable('review_iteration', iteration + 1);
+        
+        log(`Review result: ${approved ? 'Approved' : 'Changes needed'} (iteration ${iteration + 1})`);
+        log(`Feedback: ${reviewOutput.substring(0, 100)}...`);
+        
+        return {
+          approved: approved,
+          iteration: iteration + 1,
+          max_iterations_reached: iteration >= 2
+        };
+      timeout: 2000
+    position: { x: 2300, y: 200 }
+
+  # ========================================================================
+  # Check if approved or max iterations
+  # ========================================================================
+  
+  - id: check_approval
+    type: if_condition
+    config:
+      condition: "parse_review.approved == true || parse_review.max_iterations_reached == true"
+    position: { x: 2500, y: 200 }
+
+  # If not approved and under max iterations, log and loop back
+  - id: log_rework
+    type: log
+    config:
+      message: "Changes requested, engineer will rework (iteration {{review_iteration}})"
+      level: info
+    position: { x: 2300, y: 400 }
+
+  # ========================================================================
+  # Release Agents (System Events)
+  # ========================================================================
+  
+  - id: release_reviewer
+    type: event
+    config:
+      eventType: release_agent_call
+      agent_name: "{{reviewer_agent}}"
+    position: { x: 2700, y: 200 }
+  
+  - id: release_engineer
+    type: event
+    config:
+      eventType: release_agent_call
+      agent_name: "{{engineer_agent}}"
+    position: { x: 2900, y: 200 }
+
+  # ========================================================================
+  # Finalize
+  # ========================================================================
+  
+  - id: log_complete
+    type: log
+    config:
+      message: |
+        Task {{parameters.task_id}} implementation complete
+        Review status: {{review_approved}}
+        Iterations: {{review_iteration}}
+      level: info
+    position: { x: 3100, y: 200 }
+
+  - id: end
+    type: end
+    position: { x: 3300, y: 200 }
+
+# ============================================================================
+# Connections
+# ============================================================================
+
+connections:
+  # Start -> Read task
+  - from: { nodeId: start, portId: trigger }
+    to: { nodeId: read_task, portId: trigger }
+  
+  # Read task -> Store task info
+  - from: { nodeId: read_task, portId: task_data }
+    to: { nodeId: store_task_info, portId: inputData }
+  - from: { nodeId: read_task, portId: done }
+    to: { nodeId: store_task_info, portId: trigger }
+  
+  # Store task info -> Read plan
+  - from: { nodeId: store_task_info, portId: done }
+    to: { nodeId: read_plan, portId: trigger }
+  
+  # Read plan -> Read context
+  - from: { nodeId: read_plan, portId: done }
+    to: { nodeId: read_context, portId: trigger }
+  
+  # Read context -> Request engineer
+  - from: { nodeId: read_context, portId: done }
+    to: { nodeId: request_engineer, portId: trigger }
+  
+  # Request engineer -> Store engineer
+  - from: { nodeId: request_engineer, portId: agent_name }
+    to: { nodeId: store_engineer, portId: inputData }
+  - from: { nodeId: request_engineer, portId: done }
+    to: { nodeId: store_engineer, portId: trigger }
+  
+  # Store engineer -> Implement
+  - from: { nodeId: store_engineer, portId: done }
+    to: { nodeId: implement_task, portId: trigger }
+  
+  # Implement -> Request reviewer
+  - from: { nodeId: implement_task, portId: done }
+    to: { nodeId: request_reviewer, portId: trigger }
+  
+  # Request reviewer -> Store reviewer
+  - from: { nodeId: request_reviewer, portId: agent_name }
+    to: { nodeId: store_reviewer, portId: inputData }
+  - from: { nodeId: request_reviewer, portId: done }
+    to: { nodeId: store_reviewer, portId: trigger }
+  
+  # Store reviewer -> Review
+  - from: { nodeId: store_reviewer, portId: done }
+    to: { nodeId: review_implementation, portId: trigger }
+  
+  # Review -> Parse
+  - from: { nodeId: review_implementation, portId: output }
+    to: { nodeId: parse_review, portId: inputData }
+  - from: { nodeId: review_implementation, portId: done }
+    to: { nodeId: parse_review, portId: trigger }
+  
+  # Parse -> Check approval
+  - from: { nodeId: parse_review, portId: done }
+    to: { nodeId: check_approval, portId: trigger }
+  
+  # If approved -> Release reviewer
+  - from: { nodeId: check_approval, portId: true }
+    to: { nodeId: release_reviewer, portId: trigger }
+  
+  # If not approved -> Log rework -> Loop back to implement
+  - from: { nodeId: check_approval, portId: false }
+    to: { nodeId: log_rework, portId: trigger }
+  - from: { nodeId: log_rework, portId: done }
+    to: { nodeId: implement_task, portId: trigger }
+  
+  # Release reviewer -> Release engineer
+  - from: { nodeId: release_reviewer, portId: done }
+    to: { nodeId: release_engineer, portId: trigger }
+  
+  # Release engineer -> Log complete
+  - from: { nodeId: release_engineer, portId: done }
+    to: { nodeId: log_complete, portId: trigger }
+  
+  # Log complete -> End
+  - from: { nodeId: log_complete, portId: done }
+    to: { nodeId: end, portId: trigger }
+
+editor:
+  zoom: 0.6
+  panX: -50
+  panY: 0
+
+

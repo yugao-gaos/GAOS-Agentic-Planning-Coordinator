@@ -4,6 +4,9 @@
 import { SessionInfo, WorkflowInfo, AgentInfo, FailedTaskInfo } from '../types';
 import { ICONS } from '../icons';
 import { escapeHtml } from '../helpers';
+import { Logger } from '../../../utils/Logger';
+
+const log = Logger.create('Client', 'SessionItem');
 
 /**
  * Workflow type configuration for icons and labels.
@@ -250,7 +253,7 @@ function findAgentsForWorkflow(wf: WorkflowInfo, agents: AgentInfo[]): AgentInfo
     // Log warning if workflow is running but no agents matched
     // This helps debug cases where workflowId isn't being set properly
     if (matches.length === 0 && wf.status === 'running') {
-        console.warn(`[SessionItem] No agents matched for running workflow ${wf.id} (${wf.type}). Available agents:`, 
+        log.warn(`No agents matched for running workflow ${wf.id} (${wf.type}). Available agents:`, 
             agents.map(a => ({ name: a.name, workflowId: a.workflowId, roleId: a.roleId }))
         );
     }

@@ -1,17 +1,20 @@
 import * as vscode from 'vscode';
 import { AgentRoleRegistry } from '../services/AgentRoleRegistry';
-import { AgentRole, DefaultRoleConfigs, SystemPromptConfig, DefaultSystemPrompts, CoordinatorPromptConfig, DefaultCoordinatorPrompt } from '../types';
+import { AgentRole, DefaultRoleConfigs } from '../types';
 import { VsCodeClient } from '../vscode/VsCodeClient';
+import { Logger } from '../utils/Logger';
+import { getSettingsCommonStyles } from './webview/styles/settingsCommon';
+
+const log = Logger.create('Client', 'RoleSettings');
 
 /**
- * Webview panel for configuring agent roles and system prompts.
- * Provides a tabbed interface with:
+ * Webview panel for configuring agent roles.
+ * Provides a tabbed interface for:
  * - Agent Roles: Built-in (engineer, reviewer, context) + custom roles
- * - System Prompts: Coordinator, Context Gatherer, Planning Analyst, etc.
  * 
- * Supports two modes:
- * - Legacy: Uses local AgentRoleRegistry (for backwards compatibility)
- * - Client: Uses VsCodeClient to communicate with daemon (preferred)
+ * Note: System prompts (coordinator, unity_polling) are managed in SystemSettingsPanel.
+ * 
+ * Uses VsCodeClient to communicate with daemon for role management.
  */
 export class RoleSettingsPanel {
     public static currentPanel: RoleSettingsPanel | undefined;
@@ -21,8 +24,7 @@ export class RoleSettingsPanel {
     private readonly extensionUri: vscode.Uri;
     private disposables: vscode.Disposable[] = [];
     private cachedRoles: any[] = [];
-    private cachedSystemPrompts: any[] = [];
-    private cachedCoordinatorPrompt: any = null;
+    private cachedConfig: { agentPoolSize?: number; autoOpenTerminals?: boolean } = {};
 
     private constructor(
         panel: vscode.WebviewPanel,
@@ -92,9 +94,9 @@ export class RoleSettingsPanel {
     }
 
     /**
-     * Show the role settings panel using local registry (legacy mode)
+     * Show the role settings panel using local AgentRoleRegistry (offline mode)
      */
-    public static show(registry: AgentRoleRegistry, extensionUri: vscode.Uri): void {
+    public static showWithRegistry(registry: AgentRoleRegistry | undefined, extensionUri: vscode.Uri): void {
         const column = vscode.window.activeTextEditor
             ? vscode.window.activeTextEditor.viewColumn
             : undefined;
@@ -117,8 +119,9 @@ export class RoleSettingsPanel {
             }
         );
 
-        RoleSettingsPanel.currentPanel = new RoleSettingsPanel(panel, extensionUri, registry);
+        RoleSettingsPanel.currentPanel = new RoleSettingsPanel(panel, extensionUri, registry, undefined);
     }
+
 
     /**
      * Handle messages from the webview
@@ -137,18 +140,6 @@ export class RoleSettingsPanel {
             case 'create':
                 await this.createRole(message.role);
                 break;
-            case 'saveSystemPrompt':
-                await this.saveSystemPrompt(message.prompt);
-                break;
-            case 'resetSystemPrompt':
-                await this.resetSystemPrompt(message.promptId);
-                break;
-            case 'saveCoordinatorPrompt':
-                await this.saveCoordinatorPrompt(message.config);
-                break;
-            case 'resetCoordinatorPrompt':
-                await this.resetCoordinatorPrompt();
-                break;
             case 'exportConfig':
                 await this.exportConfig();
                 break;
@@ -161,6 +152,36 @@ export class RoleSettingsPanel {
             case 'refresh':
                 this.updateWebviewContent();
                 break;
+            case 'setPoolConfig':
+                await this.setPoolConfig(message.key, message.value);
+                break;
+        }
+    }
+    
+    /**
+     * Set pool configuration value
+     */
+    private async setPoolConfig(key: string, value: unknown): Promise<void> {
+        try {
+            if (this.vsCodeClient) {
+                // Convert value to proper type
+                let typedValue: unknown = value;
+                if (key === 'agentPoolSize') {
+                    typedValue = parseInt(value as string, 10);
+                } else if (key === 'autoOpenTerminals') {
+                    typedValue = value === 'true' || value === true;
+                }
+                
+                const result = await this.vsCodeClient.setConfig(key, typedValue);
+                if (result.success) {
+                    vscode.window.showInformationMessage(`Setting "${key}" updated`);
+                    this.updateWebviewContent();
+                } else {
+                    vscode.window.showErrorMessage(`Failed to update: ${result.error}`);
+                }
+            }
+        } catch (err: any) {
+            vscode.window.showErrorMessage(`Error updating setting: ${err.message}`);
         }
     }
 
@@ -288,115 +309,15 @@ export class RoleSettingsPanel {
     }
 
     /**
-     * Save system prompt changes
-     */
-    private async saveSystemPrompt(promptData: any): Promise<void> {
-        try {
-            if (this.vsCodeClient) {
-                // Daemon mode
-                await this.vsCodeClient.send('prompts.update', { prompt: promptData });
-                vscode.window.showInformationMessage(`System prompt "${promptData.name}" saved successfully`);
-                this.updateWebviewContent();
-            } else if (this.registry) {
-                // Local registry mode
-                const config = SystemPromptConfig.fromJSON(promptData);
-                this.registry.updateSystemPrompt(config);
-                vscode.window.showInformationMessage(`System prompt "${config.name}" saved successfully`);
-                this.updateWebviewContent();
-            }
-        } catch (e: any) {
-            vscode.window.showErrorMessage(`Failed to save system prompt: ${e.message}`);
-        }
-    }
-
-    /**
-     * Reset a system prompt to defaults
-     */
-    private async resetSystemPrompt(promptId: string): Promise<void> {
-        const config = this.registry?.getSystemPrompt(promptId) || this.cachedSystemPrompts.find(p => p.id === promptId);
-        if (!config) return;
-
-        const confirm = await vscode.window.showWarningMessage(
-            `Reset "${config.name}" to default prompt? Your customizations will be lost.`,
-            { modal: true },
-            'Reset'
-        );
-
-        if (confirm === 'Reset') {
-            if (this.vsCodeClient) {
-                // Daemon mode
-                await this.vsCodeClient.send('prompts.reset', { promptId });
-                vscode.window.showInformationMessage(`System prompt reset to defaults`);
-                this.updateWebviewContent();
-            } else if (this.registry) {
-                // Local registry mode
-                const resetConfig = this.registry.resetSystemPromptToDefault(promptId);
-                if (resetConfig) {
-                    vscode.window.showInformationMessage(`System prompt "${resetConfig.name}" reset to defaults`);
-                    this.updateWebviewContent();
-                }
-            }
-        }
-    }
-
-    /**
-     * Save coordinator prompt changes
-     */
-    private async saveCoordinatorPrompt(configData: any): Promise<void> {
-        try {
-            if (this.vsCodeClient) {
-                // Daemon mode
-                await this.vsCodeClient.send('prompts.updateCoordinator', { config: configData });
-                vscode.window.showInformationMessage('Coordinator prompt saved successfully');
-                this.updateWebviewContent();
-            } else if (this.registry) {
-                // Local registry mode
-                this.registry.updateCoordinatorPrompt(configData);
-                vscode.window.showInformationMessage('Coordinator prompt saved successfully');
-                this.updateWebviewContent();
-            }
-        } catch (e: any) {
-            vscode.window.showErrorMessage(`Failed to save coordinator prompt: ${e.message}`);
-        }
-    }
-
-    /**
-     * Reset coordinator prompt to defaults
-     */
-    private async resetCoordinatorPrompt(): Promise<void> {
-        const confirm = await vscode.window.showWarningMessage(
-            'Reset Coordinator prompt to defaults? Your customizations will be lost.',
-            { modal: true },
-            'Reset'
-        );
-
-        if (confirm === 'Reset') {
-            if (this.vsCodeClient) {
-                // Daemon mode
-                await this.vsCodeClient.send('prompts.resetCoordinator', {});
-                vscode.window.showInformationMessage('Coordinator prompt reset to defaults');
-                this.updateWebviewContent();
-            } else if (this.registry) {
-                // Local registry mode
-                this.registry.resetCoordinatorPromptToDefault();
-                vscode.window.showInformationMessage('Coordinator prompt reset to defaults');
-                this.updateWebviewContent();
-            }
-        }
-    }
-
-    /**
      * Export all config to clipboard
      */
     private async exportConfig(): Promise<void> {
         try {
             const exportData = {
-                roles: this.cachedRoles.filter(r => !r.isBuiltIn), // Only custom roles
-                systemPrompts: this.cachedSystemPrompts,
-                coordinatorPrompt: this.cachedCoordinatorPrompt
+                roles: this.cachedRoles.filter(r => !r.isBuiltIn) // Only custom roles
             };
             await vscode.env.clipboard.writeText(JSON.stringify(exportData, null, 2));
-            vscode.window.showInformationMessage('Agent settings copied to clipboard');
+            vscode.window.showInformationMessage('Agent role settings copied to clipboard');
         } catch (e: any) {
             vscode.window.showErrorMessage(`Failed to export: ${e.message}`);
         }
@@ -412,7 +333,7 @@ export class RoleSettingsPanel {
             const importData = JSON.parse(clipboardText);
             
             const confirm = await vscode.window.showWarningMessage(
-                'Import agent settings from clipboard? This will merge with your current settings.',
+                'Import agent role settings from clipboard? This will merge with your current settings.',
                 { modal: true },
                 'Import'
             );
@@ -431,28 +352,7 @@ export class RoleSettingsPanel {
                     }
                 }
                 
-                // Import system prompts
-                if (importData.systemPrompts && Array.isArray(importData.systemPrompts)) {
-                    for (const prompt of importData.systemPrompts) {
-                        if (this.vsCodeClient) {
-                            await this.vsCodeClient.send('prompts.update', { prompt });
-                        } else if (this.registry) {
-                            const config = SystemPromptConfig.fromJSON(prompt);
-                            this.registry.updateSystemPrompt(config);
-                        }
-                    }
-                }
-                
-                // Import coordinator prompt
-                if (importData.coordinatorPrompt) {
-                    if (this.vsCodeClient) {
-                        await this.vsCodeClient.send('prompts.updateCoordinator', { config: importData.coordinatorPrompt });
-                    } else if (this.registry) {
-                        this.registry.updateCoordinatorPrompt(importData.coordinatorPrompt);
-                    }
-                }
-                
-                vscode.window.showInformationMessage('Agent settings imported successfully');
+                vscode.window.showInformationMessage('Agent role settings imported successfully');
                 this.updateWebviewContent();
             }
         } catch (e: any) {
@@ -495,16 +395,24 @@ export class RoleSettingsPanel {
         if (this.vsCodeClient) {
             // Fetch from daemon
             try {
-                const response = await this.vsCodeClient.send<{ roles: any[]; systemPrompts: any[]; coordinatorPrompt: any }>('roles.getAll', {});
+                const response = await this.vsCodeClient.send<{ roles: any[] }>('roles.getAll', {});
                 this.cachedRoles = response.roles || [];
-                this.cachedSystemPrompts = response.systemPrompts || [];
-                this.cachedCoordinatorPrompt = response.coordinatorPrompt || DefaultCoordinatorPrompt;
+                
+                // Also fetch config for pool settings
+                try {
+                    const config = await this.vsCodeClient.getConfig();
+                    this.cachedConfig = {
+                        agentPoolSize: (config as any).agentPoolSize,
+                        autoOpenTerminals: (config as any).autoOpenTerminals
+                    };
+                } catch {
+                    this.cachedConfig = { agentPoolSize: 10, autoOpenTerminals: true };
+                }
             } catch (err) {
-                console.error('[RoleSettingsPanel] Failed to fetch roles from daemon:', err);
-                // Use defaults if daemon fetch fails
-                this.cachedRoles = Object.values(DefaultRoleConfigs).map(c => ({ ...c, isBuiltIn: true }));
-                this.cachedSystemPrompts = Object.values(DefaultSystemPrompts);
-                this.cachedCoordinatorPrompt = DefaultCoordinatorPrompt;
+                log.error('Failed to fetch roles from daemon:', err);
+                // Don't mask errors with fallback - let UI show the error
+                this.cachedRoles = [];
+                this.cachedConfig = { agentPoolSize: 10, autoOpenTerminals: true };
             }
         }
         this.panel.webview.html = this.getWebviewContent();
@@ -514,15 +422,18 @@ export class RoleSettingsPanel {
      * Generate the webview HTML content
      */
     private getWebviewContent(): string {
+        // Detect daemon connection status
+        let isDaemonConnected = false;
+        if (this.vsCodeClient) {
+            isDaemonConnected = this.vsCodeClient.isConnected();
+        }
+        
         // Get data from either daemon cache or local registry
         let roles: any[];
         let roleIds: string[];
-        let systemPrompts: any[];
-        let systemPromptIds: string[];
-        let coordinatorPrompt: any;
         
         if (this.vsCodeClient) {
-            // Daemon mode: use cached data
+            // Daemon mode: use cached data - no fallback, show error if empty
             roles = this.cachedRoles;
             roleIds = roles.map(r => r.id).sort((a, b) => {
                 const aBuiltIn = roles.find(r => r.id === a)?.isBuiltIn;
@@ -531,23 +442,15 @@ export class RoleSettingsPanel {
                 if (!aBuiltIn && bBuiltIn) return 1;
                 return a.localeCompare(b);
             });
-            systemPrompts = this.cachedSystemPrompts;
-            systemPromptIds = systemPrompts.map(p => p.id).sort();
-            coordinatorPrompt = this.cachedCoordinatorPrompt;
         } else if (this.registry) {
             // Local registry mode
             roles = this.registry.getAllRoles().map(r => r.toJSON());
             roleIds = this.registry.getRoleIdsSorted();
-            systemPrompts = this.registry.getAllSystemPrompts().map(p => p.toJSON());
-            systemPromptIds = this.registry.getSystemPromptIdsSorted();
-            coordinatorPrompt = this.registry.getCoordinatorPrompt();
         } else {
-            // Fallback to defaults
+            // No registry or daemon - use default role definitions for initial display
+            // This is acceptable as it's just the initial UI state, not runtime data
             roles = Object.values(DefaultRoleConfigs).map(c => ({ ...c, isBuiltIn: true }));
             roleIds = Object.keys(DefaultRoleConfigs);
-            systemPrompts = Object.values(DefaultSystemPrompts);
-            systemPromptIds = Object.keys(DefaultSystemPrompts);
-            coordinatorPrompt = DefaultCoordinatorPrompt;
         }
 
         // Build sidebar tabs data
@@ -556,33 +459,34 @@ export class RoleSettingsPanel {
             if (!role) return null;
             return { type: 'role', id: role.id, name: role.name, isBuiltIn: role.isBuiltIn };
         }).filter(Boolean);
-        
-        const systemTabsData = [
-            { type: 'coordinator', id: 'coordinator', name: 'Coordinator Agent', category: 'system' },
-            ...systemPromptIds.map(id => {
-                const prompt = systemPrompts.find(p => p.id === id);
-                if (!prompt) return null;
-                return { type: 'system', id: prompt.id, name: prompt.name, category: prompt.category };
-            }).filter(Boolean)
-        ];
 
         // Generate data as JSON for JavaScript
         const rolesJson = JSON.stringify(roles.map(r => typeof r.toJSON === 'function' ? r.toJSON() : r));
-        const systemPromptsJson = JSON.stringify(systemPrompts.map(p => typeof p.toJSON === 'function' ? p.toJSON() : p));
-        const coordinatorPromptJson = JSON.stringify(coordinatorPrompt);
         const defaultsJson = JSON.stringify(
             Object.fromEntries(
                 Object.entries(DefaultRoleConfigs).map(([id, config]) => [id, config])
             )
         );
-        const defaultSystemPromptsJson = JSON.stringify(
-            Object.fromEntries(
-                Object.entries(DefaultSystemPrompts).map(([id, config]) => [id, config])
-            )
-        );
-        const defaultCoordinatorPromptJson = JSON.stringify(DefaultCoordinatorPrompt);
         const roleTabsDataJson = JSON.stringify(roleTabsData);
-        const systemTabsDataJson = JSON.stringify(systemTabsData);
+        const poolConfigJson = JSON.stringify(this.cachedConfig);
+        const poolDefaultsJson = JSON.stringify({ agentPoolSize: 10, autoOpenTerminals: true });
+        
+        // Generate daemon status banner
+        const daemonStatusBanner = isDaemonConnected 
+            ? `<div class="info-banner success">
+                    <div class="banner-icon">✓</div>
+                    <div class="banner-content">
+                        <div class="banner-title">Daemon Connected</div>
+                        <div class="banner-text">Changes will be applied immediately</div>
+                    </div>
+                </div>`
+            : `<div class="info-banner warning">
+                    <div class="banner-icon">⚠</div>
+                    <div class="banner-content">
+                        <div class="banner-title">Daemon Not Connected</div>
+                        <div class="banner-text">You can still edit settings. Changes will be loaded when daemon starts.</div>
+                    </div>
+                </div>`;
 
         return `<!DOCTYPE html>
 <html lang="en">
@@ -592,60 +496,9 @@ export class RoleSettingsPanel {
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
     <title>Agent Settings</title>
     <style>
-        :root {
-            --bg-color: var(--vscode-editor-background);
-            --fg-color: var(--vscode-editor-foreground);
-            --border-color: var(--vscode-panel-border);
-            --input-bg: var(--vscode-input-background);
-            --input-fg: var(--vscode-input-foreground);
-            --input-border: var(--vscode-input-border);
-            --button-bg: var(--vscode-button-background);
-            --button-fg: var(--vscode-button-foreground);
-            --button-hover: var(--vscode-button-hoverBackground);
-            --tab-active: var(--vscode-tab-activeBackground);
-            --tab-inactive: var(--vscode-tab-inactiveBackground);
-            --success-color: var(--vscode-terminal-ansiGreen);
-            --warning-color: var(--vscode-editorWarning-foreground);
-        }
+${getSettingsCommonStyles()}
         
-        * { box-sizing: border-box; }
-        
-        body {
-            font-family: var(--vscode-font-family);
-            font-size: var(--vscode-font-size);
-            color: var(--fg-color);
-            background: var(--bg-color);
-            margin: 0;
-            padding: 20px;
-        }
-        
-        h1 { margin: 0 0 20px 0; font-size: 1.5em; font-weight: 500; }
-        h2 { margin: 24px 0 12px 0; font-size: 1.1em; font-weight: 500; opacity: 0.8; }
-        h3 { margin: 16px 0 8px 0; font-size: 1em; font-weight: 500; }
-        
-        .header-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 20px;
-        }
-        
-        .header-actions {
-            display: flex;
-            gap: 8px;
-        }
-        
-        /* Vertical sidebar layout */
-        .layout {
-            display: flex;
-            gap: 20px;
-        }
-        
-        .sidebar {
-            width: 220px;
-            flex-shrink: 0;
-        }
-        
+        /* Panel-specific styles */
         .sidebar-section {
             margin-bottom: 20px;
         }
@@ -657,172 +510,6 @@ export class RoleSettingsPanel {
             opacity: 0.6;
             margin-bottom: 8px;
             padding-left: 4px;
-        }
-        
-        .sidebar-tabs {
-            display: flex;
-            flex-direction: column;
-            gap: 2px;
-            border-right: 1px solid var(--border-color);
-            padding-right: 12px;
-        }
-        
-        .sidebar-tab {
-            padding: 10px 14px;
-            background: transparent;
-            border: none;
-            border-left: 3px solid transparent;
-            color: var(--fg-color);
-            cursor: pointer;
-            font-size: inherit;
-            font-family: inherit;
-            text-align: left;
-            opacity: 0.7;
-            border-radius: 0 4px 4px 0;
-        }
-        
-        .sidebar-tab:hover {
-            opacity: 1;
-            background: var(--input-bg);
-        }
-        
-        .sidebar-tab.active {
-            opacity: 1;
-            background: var(--tab-active);
-            border-left-color: var(--button-bg);
-        }
-        
-        .sidebar-tab .tab-name {
-            font-weight: 500;
-        }
-        
-        .sidebar-tab .tab-type {
-            font-size: 0.8em;
-            opacity: 0.6;
-            margin-top: 2px;
-        }
-        
-        .sidebar-tab.tab-add {
-            opacity: 0.5;
-            font-style: italic;
-        }
-        
-        .main-content {
-            flex: 1;
-            min-width: 0;
-        }
-        
-        .section {
-            background: var(--input-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 4px;
-            padding: 16px;
-            margin-bottom: 16px;
-        }
-        
-        .section-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 12px;
-        }
-        
-        .section-title {
-            font-weight: 500;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        
-        .badge {
-            font-size: 0.75em;
-            padding: 2px 6px;
-            border-radius: 3px;
-            background: var(--border-color);
-        }
-        
-        .badge.builtin { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
-        .badge.custom { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
-        .badge.execution { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
-        .badge.planning { background: rgba(251, 191, 36, 0.2); color: #fbbf24; }
-        .badge.utility { background: rgba(100, 100, 100, 0.2); opacity: 0.7; }
-        .badge.system { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
-        
-        .form-group {
-            margin-bottom: 12px;
-        }
-        
-        .form-group label {
-            display: block;
-            margin-bottom: 4px;
-            font-size: 0.9em;
-            opacity: 0.8;
-        }
-        
-        .form-group .hint {
-            font-size: 0.85em;
-            opacity: 0.6;
-            margin-top: 4px;
-        }
-        
-        input, textarea, select {
-            width: 100%;
-            padding: 8px;
-            background: var(--bg-color);
-            color: var(--input-fg);
-            border: 1px solid var(--input-border);
-            border-radius: 4px;
-            font-family: inherit;
-            font-size: inherit;
-        }
-        
-        textarea {
-            min-height: 80px;
-            resize: vertical;
-        }
-        
-        textarea.prompt-large {
-            min-height: 200px;
-            font-family: var(--vscode-editor-font-family, monospace);
-            font-size: 0.9em;
-        }
-        
-        textarea.prompt-xlarge {
-            min-height: 350px;
-            font-family: var(--vscode-editor-font-family, monospace);
-            font-size: 0.9em;
-        }
-        
-        button {
-            padding: 8px 16px;
-            background: var(--button-bg);
-            color: var(--button-fg);
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: inherit;
-            font-family: inherit;
-        }
-        
-        button:hover { background: var(--button-hover); }
-        button.secondary {
-            background: transparent;
-            border: 1px solid var(--border-color);
-            color: var(--fg-color);
-        }
-        button.danger {
-            background: rgba(239, 68, 68, 0.2);
-            color: #f87171;
-        }
-        button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-        
-        .button-row {
-            display: flex;
-            gap: 8px;
-            margin-top: 12px;
         }
         
         .role-id-display {
@@ -837,6 +524,46 @@ export class RoleSettingsPanel {
             padding-top: 16px;
             border-top: 1px solid var(--border-color);
         }
+        
+        /* Daemon Status Banner */
+        .info-banner {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px 16px;
+            margin-bottom: 16px;
+            border-radius: 6px;
+            border: 1px solid;
+        }
+        
+        .info-banner.success {
+            background: rgba(34, 197, 94, 0.1);
+            border-color: rgba(34, 197, 94, 0.3);
+        }
+        
+        .info-banner.warning {
+            background: rgba(251, 191, 36, 0.1);
+            border-color: rgba(251, 191, 36, 0.3);
+        }
+        
+        .banner-icon {
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+        
+        .banner-content {
+            flex: 1;
+        }
+        
+        .banner-title {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        
+        .banner-text {
+            font-size: 0.9em;
+            opacity: 0.8;
+        }
     </style>
 </head>
 <body>
@@ -849,15 +576,21 @@ export class RoleSettingsPanel {
         </div>
     </div>
     
+    ${daemonStatusBanner}
+    
     <div class="layout">
         <div class="sidebar">
             <div class="sidebar-section">
-                <div class="sidebar-section-label">Agent Roles</div>
-                <div class="sidebar-tabs" id="role-tabs"></div>
+                <div class="sidebar-section-label">Agent Pool</div>
+                <div class="sidebar-tabs" id="pool-tabs">
+                    <button class="sidebar-tab" data-type="pool" data-id="settings">
+                        <div class="tab-name">🎛️ Pool Settings</div>
+                    </button>
+                </div>
             </div>
             <div class="sidebar-section">
-                <div class="sidebar-section-label">System Prompts</div>
-                <div class="sidebar-tabs" id="system-tabs"></div>
+                <div class="sidebar-section-label">Agent Roles</div>
+                <div class="sidebar-tabs" id="role-tabs"></div>
             </div>
         </div>
         
@@ -869,28 +602,30 @@ export class RoleSettingsPanel {
         
         // Data
         const roles = ${rolesJson};
-        const systemPrompts = ${systemPromptsJson};
-        const coordinatorPrompt = ${coordinatorPromptJson};
         const defaults = ${defaultsJson};
-        const defaultSystemPrompts = ${defaultSystemPromptsJson};
-        const defaultCoordinatorPrompt = ${defaultCoordinatorPromptJson};
         const roleTabsData = ${roleTabsDataJson};
-        const systemTabsData = ${systemTabsDataJson};
+        const poolConfig = ${poolConfigJson};
+        const poolDefaults = ${poolDefaultsJson};
         
-        // Track active selection
-        let activeType = 'role';
-        let activeId = roles.length > 0 ? roles[0].id : '__new__';
+        // Track active selection - start with pool settings
+        let activeType = 'pool';
+        let activeId = 'settings';
         
         function getRoleById(id) {
             return roles.find(r => r.id === id);
         }
         
-        function getSystemPromptById(id) {
-            return systemPrompts.find(p => p.id === id);
-        }
-        
         // Render sidebar tabs
         function renderSidebarTabs() {
+            // Pool tabs
+            const poolContainer = document.getElementById('pool-tabs');
+            poolContainer.innerHTML = \`
+                <button class="sidebar-tab \${activeType === 'pool' && activeId === 'settings' ? 'active' : ''}" 
+                        data-type="pool" data-id="settings">
+                    <div class="tab-name">🎛️ Pool Settings</div>
+                </button>
+            \`;
+            
             // Role tabs
             const roleContainer = document.getElementById('role-tabs');
             roleContainer.innerHTML = roleTabsData.map(tab => \`
@@ -905,20 +640,6 @@ export class RoleSettingsPanel {
                     <div class="tab-name">+ Add Custom Role</div>
                 </button>
             \`;
-            
-            // System prompt tabs
-            const systemContainer = document.getElementById('system-tabs');
-            systemContainer.innerHTML = systemTabsData.map(tab => {
-                const icons = { coordinator: '🎯', system: '🎯', execution: '🎯', planning: '📋', utility: '⚙️' };
-                const icon = icons[tab.category] || '📝';
-                return \`
-                    <button class="sidebar-tab \${activeType === tab.type && activeId === tab.id ? 'active' : ''}" 
-                            data-type="\${tab.type}" data-id="\${tab.id}">
-                        <div class="tab-name">\${icon} \${tab.name}</div>
-                        <div class="tab-type">\${tab.id}</div>
-                    </button>
-                \`;
-            }).join('');
             
             // Attach click handlers
             document.querySelectorAll('.sidebar-tab').forEach(tab => {
@@ -935,7 +656,9 @@ export class RoleSettingsPanel {
         function renderContent() {
             const container = document.getElementById('main-content');
             
-            if (activeType === 'role') {
+            if (activeType === 'pool') {
+                container.innerHTML = renderPoolSettingsForm();
+            } else if (activeType === 'role') {
                 if (activeId === '__new__') {
                     container.innerHTML = renderNewRoleForm();
                 } else {
@@ -944,16 +667,71 @@ export class RoleSettingsPanel {
                         container.innerHTML = renderRoleForm(role);
                     }
                 }
-            } else if (activeType === 'coordinator') {
-                container.innerHTML = renderCoordinatorForm();
-            } else if (activeType === 'system') {
-                const prompt = getSystemPromptById(activeId);
-                if (prompt) {
-                    container.innerHTML = renderSystemPromptForm(prompt);
-                }
             }
             
             attachFormListeners();
+        }
+        
+        function renderPoolSettingsForm() {
+            const isPoolSizeDefault = poolConfig.agentPoolSize === undefined || poolConfig.agentPoolSize === poolDefaults.agentPoolSize;
+            const isAutoOpenDefault = poolConfig.autoOpenTerminals === undefined || poolConfig.autoOpenTerminals === poolDefaults.autoOpenTerminals;
+            
+            return \`
+                <div class="section">
+                    <div class="section-header">
+                        <div class="section-title">
+                            Agent Pool Settings
+                            <span class="badge system">System</span>
+                        </div>
+                    </div>
+                    <p style="opacity: 0.8; margin: 0;">Configure the agent pool size and terminal behavior.</p>
+                </div>
+                
+                <div class="section">
+                    <div class="section-header">
+                        <div class="section-title">Pool Size</div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>
+                            Number of Agents
+                            <span class="badge \${isPoolSizeDefault ? 'builtin' : 'custom'}">\${isPoolSizeDefault ? 'Default' : 'Custom'}</span>
+                        </label>
+                        <input 
+                            type="number" 
+                            id="agentPoolSize" 
+                            min="1" 
+                            max="20"
+                            value="\${poolConfig.agentPoolSize ?? poolDefaults.agentPoolSize}"
+                            onchange="setPoolConfig('agentPoolSize', this.value)"
+                        />
+                        <div class="hint">Number of agents in the pool (1-20). More agents = more parallel tasks.</div>
+                    </div>
+                </div>
+                
+                <div class="section">
+                    <div class="section-header">
+                        <div class="section-title">User Interface</div>
+                    </div>
+                    
+                    <div class="form-group">
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <input 
+                                type="checkbox" 
+                                id="autoOpenTerminals"
+                                \${(poolConfig.autoOpenTerminals ?? poolDefaults.autoOpenTerminals) ? 'checked' : ''}
+                                onchange="setPoolConfig('autoOpenTerminals', this.checked)"
+                                style="width: auto;"
+                            />
+                            <label for="autoOpenTerminals" style="margin-bottom: 0;">
+                                Auto-open agent terminals
+                                <span class="badge \${isAutoOpenDefault ? 'builtin' : 'custom'}">\${isAutoOpenDefault ? 'Default' : 'Custom'}</span>
+                            </label>
+                        </div>
+                        <div class="hint">Automatically open a terminal window for each agent when it starts working.</div>
+                    </div>
+                </div>
+            \`;
         }
         
         function renderRoleForm(role) {
@@ -1167,153 +945,6 @@ export class RoleSettingsPanel {
             \`;
         }
         
-        function renderSystemPromptForm(prompt) {
-            const categoryLabels = { execution: 'Execution', planning: 'Planning', utility: 'Utility' };
-            const hasDefault = defaultSystemPrompts[prompt.id];
-            
-            return \`
-                <div class="section">
-                    <div class="section-header">
-                        <div class="section-title">
-                            \${prompt.name}
-                            <span class="badge \${prompt.category}">\${categoryLabels[prompt.category] || prompt.category}</span>
-                        </div>
-                    </div>
-                    <p style="opacity: 0.8; margin: 0;">\${prompt.description}</p>
-                    <div class="role-id-display">ID: \${prompt.id}</div>
-                </div>
-                
-                <form id="systemPromptForm">
-                    <input type="hidden" name="id" value="\${prompt.id}">
-                    <input type="hidden" name="category" value="\${prompt.category}">
-                    
-                    <div class="section">
-                        <div class="section-header">
-                            <div class="section-title">Settings</div>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="name">Display Name</label>
-                            <input type="text" id="name" name="name" value="\${escapeHtml(prompt.name)}">
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="description">Description</label>
-                            <input type="text" id="description" name="description" value="\${escapeHtml(prompt.description)}">
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="defaultModel">Default Model</label>
-                            <select id="defaultModel" name="defaultModel">
-                                <option value="sonnet-4.5" \${prompt.defaultModel === 'sonnet-4.5' ? 'selected' : ''}>Claude Sonnet 4.5</option>
-                                <option value="opus-4.5" \${prompt.defaultModel === 'opus-4.5' ? 'selected' : ''}>Claude Opus 4.5</option>
-                                <option value="gemini-3-pro" \${prompt.defaultModel === 'gemini-3-pro' ? 'selected' : ''}>Gemini 3 Pro</option>
-                                <option value="haiku-3.5" \${prompt.defaultModel === 'haiku-3.5' ? 'selected' : ''}>Claude Haiku 3.5</option>
-                                <option value="gpt-5.1-codex-high" \${prompt.defaultModel === 'gpt-5.1-codex-high' ? 'selected' : ''}>GPT-5.1 Codex High</option>
-                            </select>
-                        </div>
-                    </div>
-                    
-                    <div class="section">
-                        <div class="section-header">
-                            <div class="section-title">System Prompt</div>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="promptTemplate">Prompt Template</label>
-                            <textarea id="promptTemplate" name="promptTemplate" class="prompt-xlarge">\${escapeHtml(prompt.promptTemplate)}</textarea>
-                            <div class="hint">This is the base system prompt for this agent. Scenario-specific context will be added at runtime.</div>
-                        </div>
-                        
-                        <div class="button-row">
-                            <button type="submit">Save Changes</button>
-                            \${hasDefault ? '<button type="button" class="secondary" onclick="resetSystemPrompt()">Reset to Default</button>' : ''}
-                        </div>
-                    </div>
-                </form>
-            \`;
-        }
-        
-        function renderCoordinatorForm() {
-            const config = coordinatorPrompt;
-            
-            return \`
-                <div class="section">
-                    <div class="section-header">
-                        <div class="section-title">
-                            Coordinator Agent
-                            <span class="badge system">System</span>
-                        </div>
-                    </div>
-                    <p style="opacity: 0.8; margin: 0;">\${config.description}</p>
-                    <div class="role-id-display">ID: \${config.id}</div>
-                    <p class="hint" style="margin-top: 8px;">
-                        <strong>Note:</strong> The Coordinator Agent makes high-level decisions about task dispatch, 
-                        workflow selection, and user interaction. Its prompt has two configurable parts (roleIntro and 
-                        decisionInstructions), while runtime context (current tasks, events, history) is injected dynamically.
-                    </p>
-                </div>
-                
-                <form id="coordinatorForm">
-                    <div class="section">
-                        <div class="section-header">
-                            <div class="section-title">Settings</div>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="coordinatorName">Display Name</label>
-                            <input type="text" id="coordinatorName" name="name" value="\${escapeHtml(config.name)}">
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="coordinatorDescription">Description</label>
-                            <input type="text" id="coordinatorDescription" name="description" value="\${escapeHtml(config.description)}">
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="coordinatorModel">Default Model</label>
-                            <select id="coordinatorModel" name="defaultModel">
-                                <option value="sonnet-4.5" \${config.defaultModel === 'sonnet-4.5' ? 'selected' : ''}>Claude Sonnet 4.5</option>
-                                <option value="opus-4.5" \${config.defaultModel === 'opus-4.5' ? 'selected' : ''}>Claude Opus 4.5</option>
-                                <option value="gemini-3-pro" \${config.defaultModel === 'gemini-3-pro' ? 'selected' : ''}>Gemini 3 Pro</option>
-                                <option value="haiku-3.5" \${config.defaultModel === 'haiku-3.5' ? 'selected' : ''}>Claude Haiku 3.5</option>
-                                <option value="gpt-5.1-codex-high" \${config.defaultModel === 'gpt-5.1-codex-high' ? 'selected' : ''}>GPT-5.1 Codex High</option>
-                            </select>
-                        </div>
-                    </div>
-                    
-                    <div class="section">
-                        <div class="section-header">
-                            <div class="section-title">Role Introduction</div>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="roleIntro">Introduction Prompt</label>
-                            <textarea id="roleIntro" name="roleIntro" class="prompt-large">\${escapeHtml(config.roleIntro)}</textarea>
-                            <div class="hint">This sets the context and identity for the Coordinator Agent. It appears at the start of the prompt.</div>
-                        </div>
-                    </div>
-                    
-                    <div class="section">
-                        <div class="section-header">
-                            <div class="section-title">Decision Instructions</div>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="decisionInstructions">Decision Making Instructions</label>
-                            <textarea id="decisionInstructions" name="decisionInstructions" class="prompt-xlarge">\${escapeHtml(config.decisionInstructions)}</textarea>
-                            <div class="hint">These instructions guide how the Coordinator makes decisions. Runtime context (tasks, events, agents) is injected between the introduction and these instructions.</div>
-                        </div>
-                        
-                        <div class="button-row">
-                            <button type="submit">Save Changes</button>
-                            <button type="button" class="secondary" onclick="resetCoordinatorPrompt()">Reset to Default</button>
-                        </div>
-                    </div>
-                </form>
-            \`;
-        }
-        
         // Utility functions
         function escapeHtml(str) {
             if (!str) return '';
@@ -1338,22 +969,6 @@ export class RoleSettingsPanel {
                     saveRole();
                 });
             }
-            
-            const systemForm = document.getElementById('systemPromptForm');
-            if (systemForm) {
-                systemForm.addEventListener('submit', (e) => {
-                    e.preventDefault();
-                    saveSystemPrompt();
-                });
-            }
-            
-            const coordinatorForm = document.getElementById('coordinatorForm');
-            if (coordinatorForm) {
-                coordinatorForm.addEventListener('submit', (e) => {
-                    e.preventDefault();
-                    saveCoordinatorPrompt();
-                });
-            }
         }
         
         function getRoleFormData() {
@@ -1375,34 +990,6 @@ export class RoleSettingsPanel {
             };
         }
         
-        function getSystemPromptFormData() {
-            const form = document.getElementById('systemPromptForm');
-            const formData = new FormData(form);
-            
-            return {
-                id: formData.get('id'),
-                name: formData.get('name'),
-                description: formData.get('description') || '',
-                category: formData.get('category'),
-                defaultModel: formData.get('defaultModel'),
-                promptTemplate: formData.get('promptTemplate') || ''
-            };
-        }
-        
-        function getCoordinatorFormData() {
-            const form = document.getElementById('coordinatorForm');
-            const formData = new FormData(form);
-            
-            return {
-                id: 'coordinator',
-                name: formData.get('name'),
-                description: formData.get('description') || '',
-                defaultModel: formData.get('defaultModel'),
-                roleIntro: formData.get('roleIntro') || '',
-                decisionInstructions: formData.get('decisionInstructions') || ''
-            };
-        }
-        
         // Actions
         function saveRole() {
             const data = getRoleFormData();
@@ -1413,26 +1000,12 @@ export class RoleSettingsPanel {
             }
         }
         
-        function saveSystemPrompt() {
-            const data = getSystemPromptFormData();
-            vscode.postMessage({ command: 'saveSystemPrompt', prompt: data });
-        }
-        
-        function saveCoordinatorPrompt() {
-            const data = getCoordinatorFormData();
-            vscode.postMessage({ command: 'saveCoordinatorPrompt', config: data });
+        function setPoolConfig(key, value) {
+            vscode.postMessage({ command: 'setPoolConfig', key, value });
         }
         
         function resetRole() {
             vscode.postMessage({ command: 'reset', roleId: activeId });
-        }
-        
-        function resetSystemPrompt() {
-            vscode.postMessage({ command: 'resetSystemPrompt', promptId: activeId });
-        }
-        
-        function resetCoordinatorPrompt() {
-            vscode.postMessage({ command: 'resetCoordinatorPrompt' });
         }
         
         function deleteRole() {

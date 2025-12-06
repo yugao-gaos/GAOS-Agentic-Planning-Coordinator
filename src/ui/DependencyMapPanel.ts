@@ -1,5 +1,8 @@
 import * as vscode from 'vscode';
 import { VsCodeClient } from '../vscode/VsCodeClient';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Client', 'DependencyMap');
 
 /**
  * Task node for dependency visualization
@@ -146,29 +149,29 @@ export class DependencyMapPanel {
             workflowHistory?: string[];  // All workflows run on this task
         }
 
-        console.log(`[DependencyMapPanel] getTasks() called for sessionId: ${this.sessionId}`);
+        log.debug(`getTasks() called for sessionId: ${this.sessionId}`);
 
         if (!this.vsCodeClient) {
-            console.error('[DependencyMapPanel] vsCodeClient is not initialized');
+            log.error('vsCodeClient is not initialized');
             return { tasks: [] };
         }
 
         try {
             // Get the tasks file path from daemon
-            console.log(`[DependencyMapPanel] Requesting tasks file path for session: ${this.sessionId}`);
+            log.debug(`Requesting tasks file path for session: ${this.sessionId}`);
             const pathResponse = await this.vsCodeClient.send<{ sessionId: string; filePath: string; exists: boolean }>('task.getFilePath', { sessionId: this.sessionId });
             
             if (!pathResponse) {
-                console.error('[DependencyMapPanel] No response from daemon for task file path');
+                log.error('No response from daemon for task file path');
                 vscode.window.showErrorMessage('Failed to get tasks file path from daemon');
                 return { tasks: [] };
             }
             
             const { filePath, exists } = pathResponse;
-            console.log(`[DependencyMapPanel] Tasks file path: ${filePath}, exists: ${exists}`);
+            log.debug(`Tasks file path: ${filePath}, exists: ${exists}`);
             
             if (!exists) {
-                console.log(`[DependencyMapPanel] Tasks file does not exist yet`);
+                log.debug(`Tasks file does not exist yet`);
                 return { tasks: [] };
             }
             
@@ -180,12 +183,12 @@ export class DependencyMapPanel {
             const fileData = JSON.parse(fileContent);
             
             if (!fileData.tasks || !Array.isArray(fileData.tasks)) {
-                console.warn('[DependencyMapPanel] Invalid tasks file format');
+                log.warn('Invalid tasks file format');
                 return { tasks: [] };
             }
             
             const tasksFromFile: TaskFromFile[] = fileData.tasks;
-            console.log(`[DependencyMapPanel] Read ${tasksFromFile.length} tasks from file (includes completed)`);
+            log.debug(`Read ${tasksFromFile.length} tasks from file (includes completed)`);
             
             // Get active workflows for this session to map workflow types
             let activeWorkflows: any = {};
@@ -195,7 +198,7 @@ export class DependencyMapPanel {
                     activeWorkflows = workflowsResponse.workflows;
                 }
             } catch (e) {
-                console.warn('[DependencyMapPanel] Could not fetch workflows:', e);
+                log.warn('Could not fetch workflows:', e);
             }
             
             // Convert to TaskNode format
@@ -227,11 +230,11 @@ export class DependencyMapPanel {
                 };
             });
             
-            console.log(`[DependencyMapPanel] Converted ${taskNodes.length} tasks to TaskNode format`);
+            log.debug(`Converted ${taskNodes.length} tasks to TaskNode format`);
             return { tasks: taskNodes };
             
         } catch (err) {
-            console.error('[DependencyMapPanel] Failed to load tasks from file:', err);
+            log.error('Failed to load tasks from file:', err);
             vscode.window.showErrorMessage(`Cannot load tasks: ${err instanceof Error ? err.message : String(err)}`);
             return { tasks: [] };
         }
@@ -308,11 +311,11 @@ export class DependencyMapPanel {
      * Update the webview content
      */
     private async updateWebviewContent(): Promise<void> {
-        console.log(`[DependencyMapPanel] Fetching tasks for session: ${this.sessionId}`);
+        log.debug(`Fetching tasks for session: ${this.sessionId}`);
         const { tasks } = await this.getTasks();
         const layoutedTasks = this.calculateLayout(tasks);
         
-        console.log(`[DependencyMapPanel] Found ${tasks.length} tasks for session ${this.sessionId}`);
+        log.debug(`Found ${tasks.length} tasks for session ${this.sessionId}`);
         
         // Update panel title
         this.panel.title = `Task Dependencies - ${this.sessionId} (${tasks.length} tasks)`;

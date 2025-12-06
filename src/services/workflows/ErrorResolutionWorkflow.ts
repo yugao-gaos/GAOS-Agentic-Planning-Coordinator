@@ -141,14 +141,12 @@ export class ErrorResolutionWorkflow extends BaseWorkflow {
                 throw new Error('Error fix failed');
             }
         } else {
-            // Fallback: use process exit status
-            if (result.success) {
-                this.fixApplied = true;
-                this.log(`✓ Fix applied`);
-            } else {
-                this.log(`❌ Fix failed`);
-                throw new Error('Error fix failed');
-            }
+            // No callback received - agent must use CLI callback
+            throw new Error(
+                'Fixer did not use CLI callback (`apc agent complete`). ' +
+                'All agents must report results via CLI callback for structured data. ' +
+                'Legacy output parsing is no longer supported.'
+            );
         }
         
         // Release fixer

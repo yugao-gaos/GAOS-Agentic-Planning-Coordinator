@@ -11,6 +11,9 @@ import {
 } from '../types';
 import { getMemoryMonitor } from './MemoryMonitor';
 import { FolderStructureManager, getFolderStructureManager } from './FolderStructureManager';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Daemon', 'StateManager');
 
 /**
  * Configuration interface for StateManager initialization.
@@ -20,10 +23,8 @@ import { FolderStructureManager, getFolderStructureManager } from './FolderStruc
  * When running in daemon mode, this comes from DaemonConfig.
  */
 export interface StateManagerConfig {
-    /** Workspace root path */
+    /** Workspace root path (workingDir will be workspaceRoot/_AiDevLog) */
     workspaceRoot: string;
-    /** Working directory relative to workspace (default: '_AiDevLog') */
-    workingDirectory?: string;
     /** Agent pool size (default: 10) */
     agentPoolSize?: number;
     /** Default AI backend (default: 'cursor') */
@@ -117,20 +118,20 @@ class FileLock {
                         }
                     } catch (e) {
                         // Stat failed, file may have been deleted - continue to retry
-                        console.debug('[FileLock] Stat failed during lock check:', e);
+                        log.debug('FileLock stat failed during lock check:', e);
                         continue;
                     }
                     // Wait before retry
                     await new Promise(resolve => setTimeout(resolve, this.RETRY_INTERVAL_MS));
                 } else {
                     // Other error - give up
-                    console.error('Lock acquire error:', e);
+                    log.error('Lock acquire error:', e);
                     return false;
                 }
             }
         }
         
-        console.warn(`Lock acquisition timed out for ${this.lockPath}`);
+        log.warn(`Lock acquisition timed out for ${this.lockPath}`);
         return false;
     }
 
@@ -164,7 +165,7 @@ export function atomicWriteFileSync(filePath: string, data: string): void {
         try {
             fs.unlinkSync(tempPath);
         } catch (cleanupError) {
-            console.debug('[StateManager] Cleanup error (non-fatal):', cleanupError);
+            log.debug('StateManager cleanup error (non-fatal):', cleanupError);
         }
         throw e;
     }
@@ -184,7 +185,7 @@ async function atomicWriteFile(filePath: string, data: string): Promise<void> {
         try {
             await fs.promises.unlink(tempPath);
         } catch (cleanupError) {
-            console.debug('[StateManager] Async cleanup error (non-fatal):', cleanupError);
+            log.debug('StateManager async cleanup error (non-fatal):', cleanupError);
         }
         throw e;
     }
@@ -194,6 +195,11 @@ async function atomicWriteFile(filePath: string, data: string): Promise<void> {
  * Debounce interval for batched writes (ms)
  */
 const WRITE_DEBOUNCE_MS = 100;
+
+/**
+ * Maximum pending writes before forcing immediate flush
+ */
+const MAX_PENDING_WRITES = 10;
 
 export class StateManager {
     private workspaceRoot: string;
@@ -225,8 +231,7 @@ export class StateManager {
      * const vsConfig = vscode.workspace.getConfiguration('agenticPlanning');
      * const stateManager = new StateManager({
      *     workspaceRoot: vscode.workspace.workspaceFolders[0].uri.fsPath,
-     *     workingDirectory: vsConfig.get('workingDirectory', '_AiDevLog'),
-     *     agentPoolSize: vsConfig.get('agentPoolSize', 5),
+     *     agentPoolSize: vsConfig.get('agentPoolSize', 10),
      *     defaultBackend: vsConfig.get('defaultBackend', 'cursor')
      * });
      * ```
@@ -237,14 +242,14 @@ export class StateManager {
         this.workspaceRoot = config.workspaceRoot;
         
         // Use provided values or defaults
-        const workingDirectory = config.workingDirectory || '_AiDevLog';
         const agentPoolSize = config.agentPoolSize ?? 10;
         const defaultBackend = config.defaultBackend || 'cursor';
         
-        this.workingDir = path.join(this.workspaceRoot, workingDirectory);
+        // Working directory is always workspaceRoot/_AiDevLog
+        this.workingDir = path.join(this.workspaceRoot, '_AiDevLog');
         
-        // Initialize folder structure manager
-        this.folderStructure = getFolderStructureManager(this.workingDir);
+        // Initialize folder structure manager (uses workspaceRoot to calculate _AiDevLog)
+        this.folderStructure = getFolderStructureManager(this.workspaceRoot);
         
         // Initialize file lock for cross-process state operations
         // Use temp directory to avoid polluting workspace
@@ -411,7 +416,7 @@ export class StateManager {
         // Load existing state from files
         this.loadStateFromFilesSync();
         
-        console.log(`StateManager initialized. Found ${this.planningSessions.size} sessions`);
+        log.info(`Initialized. Found ${this.planningSessions.size} sessions`);
     }
 
     private async ensureDirectories(): Promise<void> {
@@ -452,9 +457,9 @@ export class StateManager {
             if (fs.existsSync(oldPath) && !fs.existsSync(newPath)) {
                 try {
                     fs.renameSync(oldPath, newPath);
-                    console.log(`StateManager: Migrated ${oldRel} → ${newRel}`);
+                    log.info(`Migrated ${oldRel} → ${newRel}`);
                 } catch (e) {
-                    console.warn(`StateManager: Failed to migrate ${oldRel}:`, e);
+                    log.warn(`Failed to migrate ${oldRel}:`, e);
                 }
             }
         }
@@ -472,9 +477,9 @@ export class StateManager {
                         fs.renameSync(oldFile, newFile);
                     }
                 }
-                console.log(`StateManager: Migrated Roles/ → .config/roles/`);
+                log.info(`Migrated Roles/ → .config/roles/`);
             } catch (e) {
-                console.warn('StateManager: Failed to migrate Roles/:', e);
+                log.warn('Failed to migrate Roles/:', e);
             }
         }
         
@@ -491,9 +496,9 @@ export class StateManager {
                         fs.renameSync(oldFile, newFile);
                     }
                 }
-                console.log(`StateManager: Migrated SystemPrompts/ → .config/prompts/`);
+                log.info(`Migrated SystemPrompts/ → .config/prompts/`);
             } catch (e) {
-                console.warn('StateManager: Failed to migrate SystemPrompts/:', e);
+                log.warn('Failed to migrate SystemPrompts/:', e);
             }
         }
     }
@@ -537,7 +542,7 @@ export class StateManager {
                 }
                 // Ensure workflowId is present (required field now)
                 if (!agentInfoAny.workflowId) {
-                    console.warn('[StateManager] Migrating busy agent without workflowId - setting to "unknown"');
+                    log.warn('Migrating busy agent without workflowId - setting to "unknown"');
                     (agentInfo as any).workflowId = 'unknown';
                 }
             }
@@ -566,13 +571,13 @@ export class StateManager {
             // Check if a write operation started while we were waiting
             // If so, skip reload as the write will have fresher data
             if (this.writeOperationId !== currentWriteId) {
-                console.log('StateManager: Skipping reload - write operation occurred while waiting');
+                log.debug('Skipping reload - write operation occurred while waiting');
                 return;
             }
             
             // Try to acquire cross-process file lock
             if (this.fileLock && !(await this.fileLock.acquire())) {
-                console.warn('StateManager: Skipping reload - could not acquire file lock');
+                log.warn('Skipping reload - could not acquire file lock');
                 return;
             }
             
@@ -582,7 +587,7 @@ export class StateManager {
                 
                 // Load fresh from files
                 this.loadStateFromFilesSync();
-                console.log(`StateManager: Reloaded state from files. Found ${this.planningSessions.size} sessions`);
+                log.info(`Reloaded state from files. Found ${this.planningSessions.size} sessions`);
             } finally {
                 this.fileLock?.release();
             }
@@ -614,7 +619,7 @@ export class StateManager {
                 const data = JSON.parse(fs.readFileSync(extensionStatePath, 'utf-8'));
                 this.extensionState = { ...this.extensionState, ...data };
             } catch (e) {
-                console.error('Failed to load extension state:', e);
+                log.error('Failed to load extension state:', e);
             }
         }
 
@@ -625,7 +630,7 @@ export class StateManager {
                 const data = JSON.parse(fs.readFileSync(poolStatePath, 'utf-8'));
                 this.agentPoolState = this.migrateAgentPoolState(data);
             } catch (e) {
-                console.error('Failed to load agent pool state:', e);
+                log.error('Failed to load agent pool state:', e);
             }
         }
 
@@ -637,7 +642,7 @@ export class StateManager {
                 .filter(d => d.isDirectory())
                 .map(d => d.name);
 
-            console.log(`StateManager: Found plan folders: ${planFolders.join(', ')}`);
+            log.debug(`Found plan folders: ${planFolders.join(', ')}`);
 
             let loadedCount = 0;
             let skippedCount = 0;
@@ -654,17 +659,17 @@ export class StateManager {
                         if (data.status !== 'completed') {
                             this.planningSessions.set(data.id, data);
                             loadedCount++;
-                            console.log(`StateManager: Loaded session ${data.id} (${data.status})`);
+                            log.debug(`Loaded session ${data.id} (${data.status})`);
                         } else {
                             skippedCount++;
-                            console.log(`StateManager: Skipped completed session ${data.id} (stays on disk)`);
+                            log.debug(`Skipped completed session ${data.id} (stays on disk)`);
                         }
                 } catch (e) {
-                        console.error(`Failed to load planning session ${sessionId}:`, e);
+                        log.error(`Failed to load planning session ${sessionId}:`, e);
             }
         }
             }
-            console.log(`StateManager: Loaded ${loadedCount} active sessions, skipped ${skippedCount} completed sessions`);
+            log.info(`Loaded ${loadedCount} active sessions, skipped ${skippedCount} completed sessions`);
         }
     }
 
@@ -678,7 +683,7 @@ export class StateManager {
         try {
             // Acquire cross-process file lock
             if (this.fileLock && !(await this.fileLock.acquire())) {
-                console.warn('StateManager: Could not acquire file lock for state update');
+                log.warn('Could not acquire file lock for state update');
                 return;
             }
             
@@ -754,7 +759,7 @@ export class StateManager {
                 return data as PlanningSession;
             }
         } catch (e) {
-            console.error(`Failed to load session ${sessionId} from disk:`, e);
+            log.error(`Failed to load session ${sessionId} from disk:`, e);
         }
         return undefined;
     }
@@ -787,7 +792,7 @@ export class StateManager {
                 }
             }
         } catch (e) {
-            console.error('Failed to get completed session IDs:', e);
+            log.error('Failed to get completed session IDs:', e);
         }
         return completedIds;
     }
@@ -843,7 +848,7 @@ export class StateManager {
         this.queueWrite(
             this.getSessionFilePath(session.id),
             JSON.stringify(session, null, 2)
-        ).catch(e => console.error(`Failed to save session ${session.id}:`, e));
+        ).catch(e => log.error(`Failed to save session ${session.id}:`, e));
     }
     
     /**
@@ -863,6 +868,7 @@ export class StateManager {
     /**
      * Queue a write for debounced execution
      * Multiple writes to the same file within WRITE_DEBOUNCE_MS are batched.
+     * When queue reaches MAX_PENDING_WRITES, triggers immediate flush to prevent memory buildup.
      */
     private queueWrite(filePath: string, data: string): Promise<void> {
         return new Promise((resolve, reject) => {
@@ -879,7 +885,18 @@ export class StateManager {
                 });
             }
             
-            // Reset debounce timer
+            // Check if queue is full - if so, flush immediately to make space
+            if (this.pendingWrites.size >= MAX_PENDING_WRITES) {
+                if (this.writeDebounceTimer) {
+                    clearTimeout(this.writeDebounceTimer);
+                    this.writeDebounceTimer = null;
+                }
+                // Flush immediately and don't return early - promise will resolve after flush
+                this.flushWrites();
+                return;
+            }
+            
+            // Reset debounce timer for normal operation
             if (this.writeDebounceTimer) {
                 clearTimeout(this.writeDebounceTimer);
             }
@@ -977,7 +994,7 @@ export class StateManager {
             try {
                 return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
             } catch (e) {
-                console.error(`Failed to load paused workflow ${workflowId}:`, e);
+                log.error(`Failed to load paused workflow ${workflowId}:`, e);
             }
         }
         return null;
@@ -1004,7 +1021,7 @@ export class StateManager {
                 }
             }
         } catch (e) {
-            console.error(`Failed to load paused workflows for session ${sessionId}:`, e);
+            log.error(`Failed to load paused workflows for session ${sessionId}:`, e);
         }
         
         return result;
@@ -1019,7 +1036,7 @@ export class StateManager {
             try {
                 fs.unlinkSync(filePath);
             } catch (e) {
-                console.error(`Failed to delete paused workflow ${workflowId}:`, e);
+                log.error(`Failed to delete paused workflow ${workflowId}:`, e);
             }
         }
     }
@@ -1036,7 +1053,7 @@ export class StateManager {
                     fs.unlinkSync(path.join(folder, file));
                 }
             } catch (e) {
-                console.error(`Failed to delete paused workflows for session ${sessionId}:`, e);
+                log.error(`Failed to delete paused workflows for session ${sessionId}:`, e);
             }
         }
     }
@@ -1073,7 +1090,7 @@ export class StateManager {
         
         // Use queued async write to avoid blocking the event loop
         this.queueWrite(filePath, JSON.stringify(data, null, 2))
-            .catch(e => console.error(`Failed to save coordinator history for ${sessionId}:`, e));
+            .catch(e => log.error(`Failed to save coordinator history for ${sessionId}:`, e));
     }
     
     /**
@@ -1094,7 +1111,7 @@ export class StateManager {
             const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
             return data.history || [];
         } catch (e) {
-            console.error(`Failed to load coordinator history for session ${sessionId}:`, e);
+            log.error(`Failed to load coordinator history for session ${sessionId}:`, e);
             return [];
         }
     }
@@ -1108,7 +1125,7 @@ export class StateManager {
             try {
                 fs.unlinkSync(filePath);
             } catch (e) {
-                console.error(`Failed to delete coordinator history for session ${sessionId}:`, e);
+                log.error(`Failed to delete coordinator history for session ${sessionId}:`, e);
             }
         }
     }
@@ -1145,7 +1162,7 @@ export class StateManager {
         
         // Use queued async write to avoid blocking the event loop
         this.queueWrite(filePath, JSON.stringify(data, null, 2))
-            .catch(e => console.error(`Failed to save workflow history for ${sessionId}:`, e));
+            .catch(e => log.error(`Failed to save workflow history for ${sessionId}:`, e));
     }
     
     /**
@@ -1166,7 +1183,7 @@ export class StateManager {
             const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
             return data.history || [];
         } catch (e) {
-            console.error(`Failed to load workflow history for session ${sessionId}:`, e);
+            log.error(`Failed to load workflow history for session ${sessionId}:`, e);
             return [];
         }
     }
@@ -1180,7 +1197,7 @@ export class StateManager {
             try {
                 fs.unlinkSync(filePath);
             } catch (e) {
-                console.error(`Failed to delete workflow history for session ${sessionId}:`, e);
+                log.error(`Failed to delete workflow history for session ${sessionId}:`, e);
             }
         }
     }
@@ -1224,7 +1241,7 @@ export class StateManager {
             try {
                 return JSON.parse(fs.readFileSync(configPath, 'utf-8'));
             } catch (e) {
-                console.error(`Failed to load role config for ${roleId}:`, e);
+                log.error(`Failed to load role config for ${roleId}:`, e);
             }
         }
         return undefined;
@@ -1248,7 +1265,7 @@ export class StateManager {
             try {
                 fs.unlinkSync(configPath);
             } catch (e) {
-                console.error(`Failed to clear role config for ${roleId}:`, e);
+                log.error(`Failed to clear role config for ${roleId}:`, e);
             }
         }
     }
@@ -1275,7 +1292,7 @@ export class StateManager {
                     return data;
                 }
             } catch (e) {
-                console.error('Failed to load custom roles:', e);
+                log.error('Failed to load custom roles:', e);
             }
         }
         
@@ -1344,7 +1361,7 @@ export class StateManager {
             try {
                 return JSON.parse(fs.readFileSync(configPath, 'utf-8'));
             } catch (e) {
-                console.error(`Failed to read system prompt config: ${promptId}`, e);
+                log.error(`Failed to read system prompt config: ${promptId}`, e);
             }
         }
         return undefined;
@@ -1368,7 +1385,7 @@ export class StateManager {
             try {
                 fs.unlinkSync(configPath);
             } catch (e) {
-                console.error(`Failed to delete system prompt config: ${promptId}`, e);
+                log.error(`Failed to delete system prompt config: ${promptId}`, e);
             }
         }
     }
@@ -1409,7 +1426,7 @@ export class StateManager {
                 const content = fs.readFileSync(configPath, 'utf-8');
                 return JSON.parse(content);
             } catch (e) {
-                console.error('Failed to load coordinator prompt config', e);
+                log.error('Failed to load coordinator prompt config', e);
             }
         }
         return null;
@@ -1433,7 +1450,7 @@ export class StateManager {
             try {
                 fs.unlinkSync(configPath);
             } catch (e) {
-                console.error('Failed to delete coordinator prompt config', e);
+                log.error('Failed to delete coordinator prompt config', e);
             }
         }
     }
@@ -1528,7 +1545,7 @@ export class StateManager {
      * Call this on extension deactivation
      */
     dispose(): void {
-        console.log('StateManager: Disposing...');
+        log.info('Disposing...');
         
         // Cancel debounce timer
         if (this.writeDebounceTimer) {
@@ -1545,7 +1562,7 @@ export class StateManager {
                     resolve();
                 }
             } catch (e) {
-                console.error(`Failed to flush write to ${filePath}:`, e);
+                log.error(`Failed to flush write to ${filePath}:`, e);
                 for (const { reject } of entry.resolvers) {
                     reject(e as Error);
                 }
@@ -1561,7 +1578,7 @@ export class StateManager {
         // Clear in-memory state
         this.planningSessions.clear();
         
-        console.log('StateManager: Disposed');
+        log.info('Disposed');
     }
 }
 

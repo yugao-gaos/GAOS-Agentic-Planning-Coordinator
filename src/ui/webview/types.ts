@@ -3,9 +3,32 @@
  * These mirror the types in SidebarViewProvider but are exported for component use.
  */
 
+export interface MissingDependencyInfo {
+    name: string;
+    description: string;
+    installUrl?: string;
+    installCommand?: string;
+    /** Special handling - e.g. 'apc-cli' for custom install, 'cursor-agent-cli' for cursor-agent installer */
+    installType?: 'url' | 'command' | 'apc-cli' | 'vscode-command' | 'cursor-agent-cli' | 'retry';
+}
+
 export interface SidebarState {
-    systemStatus: 'checking' | 'ready' | 'missing' | 'daemon_missing' | 'initializing';
+    /**
+     * System status:
+     * - initializing: Daemon process starting
+     * - connecting: Client attempting to connect
+     * - checking: Connected, daemon checking dependencies
+     * - ready: All checks passed
+     * - missing: Checks completed, dependencies missing
+     * - daemon_missing: Not connected
+     */
+    systemStatus: 'initializing' | 'connecting' | 'checking' | 'ready' | 'missing' | 'daemon_missing';
     missingCount: number;
+    missingDependencies: MissingDependencyInfo[];
+    /** Connection retry count for daemon_missing state */
+    connectionRetries: number;
+    /** Current initialization step (for initializing/checking states) */
+    initializationStep?: string;
     sessions: SessionInfo[];
     agents: AgentInfo[];
     unity: UnityInfo;

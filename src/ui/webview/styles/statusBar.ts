@@ -149,6 +149,15 @@ export const statusBarStyles = `
     margin-left: auto;
 }
 
+.icon-btn.danger {
+    color: var(--vscode-testing-iconFailed, #f14c4c);
+}
+
+.icon-btn.danger:hover {
+    background: rgba(239, 68, 68, 0.15);
+    color: var(--vscode-testing-iconFailed, #f14c4c);
+}
+
 /* Status bar wrapper for health warning and Unity compact box */
 .status-bar-wrapper {
     display: flex;
@@ -216,6 +225,280 @@ export const statusBarStyles = `
 @keyframes fadeIn {
     from { opacity: 0; }
     to { opacity: 1; }
+}
+
+/* ============================================
+   System Context Box - Dynamic content area
+   ============================================ */
+
+.system-context-box {
+    border: 1px solid var(--vscode-widget-border);
+    border-top: none;
+    border-radius: 0 0 6px 6px;
+    overflow: hidden;
+}
+
+.context-box {
+    padding: 10px 12px;
+    background: var(--vscode-editor-background);
+}
+
+.context-box-warning {
+    background: rgba(204, 167, 0, 0.05);
+}
+
+.context-box-info {
+    background: rgba(0, 122, 204, 0.05);
+}
+
+.context-box-ready {
+    background: var(--vscode-editor-background);
+    padding: 8px 10px;
+}
+
+.context-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.context-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    color: var(--vscode-list-warningForeground, #cca700);
+}
+
+.context-icon-spin {
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+.context-title {
+    font-weight: 600;
+    font-size: 12px;
+    color: var(--vscode-foreground);
+}
+
+.context-body {
+    padding-left: 24px;
+}
+
+.context-text {
+    margin: 0 0 10px 0;
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground);
+    line-height: 1.4;
+}
+
+.context-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.context-btn {
+    padding: 4px 10px;
+    border: 1px solid var(--vscode-widget-border);
+    border-radius: 4px;
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    font-size: 11px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.context-btn:hover {
+    background: var(--vscode-button-secondaryHoverBackground);
+}
+
+.context-btn-primary {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border-color: var(--vscode-button-background);
+}
+
+.context-btn-primary:hover {
+    background: var(--vscode-button-hoverBackground);
+}
+
+/* Dependencies List */
+.deps-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.dep-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    background: var(--vscode-editor-background);
+    border: 1px solid var(--vscode-widget-border);
+    border-radius: 4px;
+}
+
+.dep-info {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1;
+    min-width: 0;
+}
+
+.dep-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    color: var(--vscode-list-warningForeground, #cca700);
+    flex-shrink: 0;
+}
+
+.dep-name {
+    font-weight: 600;
+    font-size: 12px;
+    color: var(--vscode-foreground);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.dep-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.dep-btn {
+    padding: 5px 12px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.15s;
+    border: 1px solid transparent;
+    white-space: nowrap;
+}
+
+.dep-btn-secondary {
+    background: transparent;
+    color: var(--vscode-foreground);
+    border-color: var(--vscode-widget-border);
+}
+
+.dep-btn-secondary:hover {
+    background: var(--vscode-list-hoverBackground);
+    border-color: var(--vscode-focusBorder);
+}
+
+.dep-btn-primary {
+    background: var(--vscode-button-background);
+    color: var(--vscode-button-foreground);
+    border-color: var(--vscode-button-background);
+}
+
+.dep-btn-primary:hover {
+    background: var(--vscode-button-hoverBackground);
+    border-color: var(--vscode-button-hoverBackground);
+}
+
+/* Ready State Info - Horizontal Layout */
+.status-boxes-row {
+    display: flex;
+    gap: 8px;
+}
+
+.status-box {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    border: 1px solid var(--vscode-widget-border);
+    border-radius: 4px;
+    background: var(--vscode-editor-background);
+    min-width: 0;
+}
+
+.status-box.clickable {
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.status-box.clickable:hover {
+    background: var(--vscode-list-hoverBackground);
+    border-color: var(--vscode-focusBorder);
+}
+
+.status-box-label {
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    color: var(--vscode-descriptionForeground);
+    flex-shrink: 0;
+}
+
+/* Legacy ready-info styles for compatibility */
+.ready-info {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.ready-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 0;
+}
+
+.ready-item.clickable {
+    cursor: pointer;
+    padding: 4px 8px;
+    margin: 0 -8px;
+    border-radius: 4px;
+    transition: background 0.15s;
+}
+
+.ready-item.clickable:hover {
+    background: var(--vscode-list-hoverBackground);
+}
+
+.ready-label {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--vscode-descriptionForeground);
+}
+
+.ready-value {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.unity-badge {
+    padding: 2px 8px;
+    border-radius: 10px;
+    font-size: 10px;
+    font-weight: 500;
+    color: var(--vscode-badge-foreground);
+}
+
+.unity-queue {
+    font-size: 10px;
+    color: var(--vscode-descriptionForeground);
 }
 `;
 

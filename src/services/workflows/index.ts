@@ -28,6 +28,9 @@ import { WorkflowRegistry } from './WorkflowRegistry';
 import { WorkflowServices } from './IWorkflow';
 import { PlanningNewWorkflow } from './PlanningNewWorkflow';
 import { PlanningRevisionWorkflow } from './PlanningRevisionWorkflow';
+import { Logger } from '../../utils/Logger';
+
+const log = Logger.create('Daemon', 'Workflows');
 import { TaskImplementationWorkflow } from './TaskImplementationWorkflow';
 import { ErrorResolutionWorkflow } from './ErrorResolutionWorkflow';
 import { ContextGatheringWorkflow } from './ContextGatheringWorkflow';
@@ -73,8 +76,14 @@ export function registerBuiltinWorkflows(registry: WorkflowRegistry): void {
         DEFAULT_WORKFLOW_METADATA.context_gathering
     );
     
-    console.log(`[Workflows] Registered ${registry.size} workflow types`);
+    log.info(`Registered ${registry.size} built-in workflow types`);
 }
+
+// Export ScriptableWorkflowRegistry for dynamic custom workflows
+export { ScriptableWorkflowRegistry } from './ScriptableWorkflowRegistry';
+
+// Export scriptable node workflow system
+export * from './scriptable';
 
 /**
  * Create a fully configured WorkflowRegistry with all built-in types

@@ -166,9 +166,11 @@ export class PlanningNewWorkflow extends BaseWorkflow {
         if (result.success) {
             // Plan was streamed to file; verify it exists
             if (!fs.existsSync(this.planPath)) {
-                // Fallback: extract from output if streaming didn't produce plan
-                const planContent = this.extractPlanFromOutput(result.output);
-                fs.writeFileSync(this.planPath, planContent);
+                throw new Error(
+                    `Plan streaming failed: expected plan file at '${this.planPath}' not created. ` +
+                    `This indicates the agent did not properly stream the plan to the file. ` +
+                    `Check agent logs for streaming errors.`
+                );
             }
             this.log(`✓ Plan ${mode === 'create' ? 'created' : 'updated'}`);
         } else {
@@ -179,11 +181,11 @@ export class PlanningNewWorkflow extends BaseWorkflow {
     private async executeAnalystsPhase(): Promise<void> {
         this.log('');
         this.log('🔍 PHASE: ANALYST REVIEWS (parallel)');
-        this.log(`Starting ${3} analysts: analyst_architect, analyst_quality, analyst_reviewer`);
+        this.log(`Starting ${3} analysts: analyst_implementation, analyst_quality, analyst_architecture`);
         
         this.analystOutputs = {};
         
-        const analystRoles = ['analyst_architect', 'analyst_quality', 'analyst_reviewer'];
+        const analystRoles = ['analyst_implementation', 'analyst_quality', 'analyst_architecture'];
         
         // Run all analysts in parallel
         const startTime = Date.now();
@@ -233,9 +235,11 @@ export class PlanningNewWorkflow extends BaseWorkflow {
         if (result.success) {
             // Plan was streamed to file; verify it exists
             if (!fs.existsSync(this.planPath)) {
-                // Fallback: extract from output if streaming didn't produce plan
-                const planContent = this.extractPlanFromOutput(result.output);
-                fs.writeFileSync(this.planPath, planContent);
+                throw new Error(
+                    `Plan finalization streaming failed: expected plan file at '${this.planPath}' not created. ` +
+                    `This indicates the agent did not properly stream the plan to the file. ` +
+                    `Check agent logs for streaming errors.`
+                );
             }
             this.log('✓ Plan finalized');
         }
@@ -544,19 +548,12 @@ You MUST output your review in this EXACT format:
             
             this.log(`✓ ${roleId} complete via CLI callback: ${verdict.toUpperCase()}`);
         } else {
-            // Legacy fallback: use raw output for parsing
-            if (result.success && result.rawOutput) {
-                this.analystOutputs[roleId] = result.rawOutput;
-                this.log(`✓ ${roleId} complete via output (will parse)`);
-            } else {
-                // Analyst failed - log the error but DON'T silently pass
-                // Mark as critical so it gets attention
-                this.log(`❌ ${roleId} FAILED - marking as CRITICAL (requires investigation)`);
-                this.analystOutputs[roleId] = `### Review Result: CRITICAL\n\n#### Critical Issues\n- Analyst ${roleId} failed to complete review\n- Error: ${result.payload?.error || 'Unknown error'}\n\n#### Minor Suggestions\n- None\n`;
-                this.analystResults[roleId] = 'critical';
-                this.criticalIssues.push(`[${roleId}] Analyst failed to run - check agent pool and role configuration`);
-                this.analystUsedCallback.add(roleId);
-            }
+            // No callback received - agent must use CLI callback
+            throw new Error(
+                `Analyst ${roleId} did not use CLI callback (\`apc agent complete\`). ` +
+                'All agents must report results via CLI callback for structured data. ' +
+                'Legacy output parsing is no longer supported.'
+            );
         }
     }
     

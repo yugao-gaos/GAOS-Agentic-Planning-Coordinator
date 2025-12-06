@@ -1,6 +1,9 @@
 import { StateManager } from './StateManager';
 import { AgentRoleRegistry } from './AgentRoleRegistry';
 import { AgentPoolState, BusyAgentInfo, AllocatedAgentInfo, RestingAgentInfo, AgentStatus, AgentRole } from '../types';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Daemon', 'AgentPool');
 
 /**
  * AgentPoolService - Manages agent lifecycle with bench + resting state
@@ -17,6 +20,36 @@ import { AgentPoolState, BusyAgentInfo, AllocatedAgentInfo, RestingAgentInfo, Ag
  * - allocated: On bench, waiting for workflow to promote to busy
  * - busy: Actively working on a workflow
  */
+/**
+ * Async mutex for critical section protection
+ */
+class AsyncMutex {
+    private locked: boolean = false;
+    private queue: Array<() => void> = [];
+
+    async acquire(): Promise<() => void> {
+        return new Promise((resolve) => {
+            const tryAcquire = () => {
+                if (!this.locked) {
+                    this.locked = true;
+                    resolve(() => this.release());
+                } else {
+                    this.queue.push(tryAcquire);
+                }
+            };
+            tryAcquire();
+        });
+    }
+
+    private release(): void {
+        this.locked = false;
+        const next = this.queue.shift();
+        if (next) {
+            next();
+        }
+    }
+}
+
 export class AgentPoolService {
     private stateManager: StateManager;
     private roleRegistry: AgentRoleRegistry;
@@ -26,6 +59,9 @@ export class AgentPoolService {
     
     // Timer IDs for resting agents (agentName -> timeoutId)
     private restingTimers: Map<string, NodeJS.Timeout> = new Map();
+    
+    // Mutex to prevent concurrent allocation race conditions
+    private allocationMutex: AsyncMutex = new AsyncMutex();
 
     constructor(stateManager: StateManager, roleRegistry: AgentRoleRegistry) {
         this.stateManager = stateManager;
@@ -152,58 +188,69 @@ export class AgentPoolService {
      * - Agents on bench are owned by that specific workflow
      * - Only the owning workflow can promote/use agents from its bench
      * 
+     * THREAD SAFETY: Uses mutex to prevent race conditions when multiple workflows
+     * request agents simultaneously. The entire allocation operation is atomic.
+     * 
      * @param sessionId The session (for capacity tracking)
      * @param workflowId The workflow that owns these agents
      * @param count Number of agents to allocate
      * @param roleId Role to assign
      * @returns Array of allocated agent names
      */
-    allocateAgents(
+    async allocateAgents(
         sessionId: string,
         workflowId: string,
         count: number, 
         roleId: string = 'engineer'
-    ): string[] {
-        // Validate role exists in registry
-        if (!this.roleRegistry.getRole(roleId)) {
-            console.warn(`[AgentPoolService] Unknown role: ${roleId}, defaulting to 'engineer'`);
-            roleId = 'engineer';
+    ): Promise<string[]> {
+        // CRITICAL: Acquire mutex to prevent concurrent allocation
+        const release = await this.allocationMutex.acquire();
+        
+        try {
+            // Validate role exists in registry
+            if (!this.roleRegistry.getRole(roleId)) {
+                const availableRoles = this.roleRegistry.getAllRoles().map(r => r.id).join(', ');
+                throw new Error(
+                    `Role '${roleId}' not found in registry. Available roles: ${availableRoles || 'none'}. ` +
+                    `Please register the role or use an existing one.`
+                );
+            }
             
-            // Double-check 'engineer' exists, fallback to first available role
-            if (!this.roleRegistry.getRole('engineer')) {
-                const allRoles = this.roleRegistry.getAllRoles();
-                if (allRoles.length > 0) {
-                    roleId = allRoles[0].id;
-                    console.warn(`[AgentPoolService] 'engineer' role not found, using '${roleId}'`);
+            // Get fresh state inside critical section
+            const state = this.stateManager.getAgentPoolState();
+            
+            // Process resting agents first (check if any can transition to available)
+            this.processRestingAgents();
+            
+            // Re-fetch state after processing resting agents
+            const updatedState = this.stateManager.getAgentPoolState();
+            const toAllocate = Math.min(count, updatedState.available.length);
+            const allocated: string[] = [];
+
+            for (let i = 0; i < toAllocate; i++) {
+                const agent = updatedState.available.shift();
+                if (agent) {
+                    allocated.push(agent);
+                    // CRITICAL: Allocate to WORKFLOW's bench (not session's)
+                    updatedState.allocated[agent] = {
+                        sessionId,
+                        workflowId,  // This workflow owns this agent
+                        roleId,
+                        allocatedAt: new Date().toISOString()
+                    };
+                    log.debug(`${agent} allocated to workflow ${workflowId}'s BENCH for role ${roleId}`);
                 }
             }
-        }
-        
-        const state = this.stateManager.getAgentPoolState();
-        
-        // Process resting agents first (check if any can transition to available)
-        this.processRestingAgents();
-        
-        const toAllocate = Math.min(count, state.available.length);
-        const allocated: string[] = [];
 
-        for (let i = 0; i < toAllocate; i++) {
-            const agent = state.available.shift();
-            if (agent) {
-                allocated.push(agent);
-                // CRITICAL: Allocate to WORKFLOW's bench (not session's)
-                state.allocated[agent] = {
-                    sessionId,
-                    workflowId,  // This workflow owns this agent
-                    roleId,
-                    allocatedAt: new Date().toISOString()
-                };
-                console.log(`[AgentPoolService] ${agent} allocated to workflow ${workflowId}'s BENCH for role ${roleId}`);
-            }
+            // Update state before releasing mutex
+            this.stateManager.updateAgentPool(updatedState);
+            
+            log.info(`🔒 Allocated ${allocated.length}/${count} agents to workflow ${workflowId} (mutex protected)`);
+            return allocated;
+        } finally {
+            // CRITICAL: Always release mutex, even on error
+            release();
         }
-
-        this.stateManager.updateAgentPool(state);
-        return allocated;
     }
 
     /**
@@ -220,7 +267,7 @@ export class AgentPoolService {
         
         const allocatedInfo = state.allocated?.[agentName];
         if (!allocatedInfo) {
-            console.warn(`[AgentPoolService] Cannot promote ${agentName}: not on bench`);
+            log.warn(`Cannot promote ${agentName}: not on bench`);
             return false;
         }
         
@@ -234,7 +281,7 @@ export class AgentPoolService {
             startTime: new Date().toISOString()
         };
         
-        console.log(`[AgentPoolService] ${agentName} promoted to BUSY for workflow ${workflowId}`);
+        log.debug(`${agentName} promoted to BUSY for workflow ${workflowId}`);
         this.stateManager.updateAgentPool(state);
         return true;
     }
@@ -247,7 +294,7 @@ export class AgentPoolService {
         
         const busyInfo = state.busy[agentName];
         if (!busyInfo) {
-            console.warn(`[AgentPoolService] Cannot demote ${agentName}: not busy`);
+            log.warn(`Cannot demote ${agentName}: not busy`);
             return false;
         }
         
@@ -288,13 +335,13 @@ export class AgentPoolService {
             const wasAllocated = !!state.allocated?.[name];
             
             if (wasBusy) {
-                console.log(`[AgentPoolService] Releasing BUSY agent ${name} -> resting (5s cooldown)`);
+                log.debug(`Releasing BUSY agent ${name} -> resting (5s cooldown)`);
                 delete state.busy[name];
             } else if (wasAllocated) {
-                console.log(`[AgentPoolService] Releasing ALLOCATED agent ${name} -> resting (5s cooldown)`);
+                log.debug(`Releasing ALLOCATED agent ${name} -> resting (5s cooldown)`);
                 delete state.allocated[name];
             } else if (state.resting?.[name]) {
-                console.log(`[AgentPoolService] Agent ${name} already resting, resetting cooldown`);
+                log.debug(`Agent ${name} already resting, resetting cooldown`);
                 delete state.resting[name];
             } else {
                 // Already available or unknown
@@ -390,8 +437,8 @@ export class AgentPoolService {
      * Allocate a single agent for a specific role
      * Returns the agent name or undefined if none available
      */
-    allocateAgentForRole(sessionId: string, roleId: string, requestingWorkflowId?: string): string | undefined {
-        const allocated = this.allocateAgents(sessionId, requestingWorkflowId || 'unknown', 1, roleId);
+    async allocateAgentForRole(sessionId: string, roleId: string, requestingWorkflowId?: string): Promise<string | undefined> {
+        const allocated = await this.allocateAgents(sessionId, requestingWorkflowId || 'unknown', 1, roleId);
         return allocated.length > 0 ? allocated[0] : undefined;
     }
 
@@ -600,7 +647,7 @@ export class AgentPoolService {
                 if (!state.available.includes(name)) {
                     state.available.push(name);
                 }
-                console.log(`[AgentPoolService] ${name} cooldown expired -> available`);
+                log.debug(`${name} cooldown expired -> available`);
             }
             
             state.available.sort();
@@ -623,7 +670,7 @@ export class AgentPoolService {
                 state.available.sort();
             }
             
-            console.log(`[AgentPoolService] ${agentName} cooldown complete -> available`);
+            log.debug(`${agentName} cooldown complete -> available`);
             this.stateManager.updateAgentPool(state);
         }
     }
@@ -637,7 +684,7 @@ export class AgentPoolService {
             clearTimeout(timerId);
         }
         this.restingTimers.clear();
-        console.log('[AgentPoolService] Disposed all resting timers');
+        log.info('Disposed all resting timers');
     }
 
 }

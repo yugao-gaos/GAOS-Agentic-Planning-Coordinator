@@ -35,6 +35,8 @@ export const ICONS = {
     
     error: `<svg viewBox="0 0 16 16"><path d="M8 0L0 14h16L8 0zm0 12.5a1 1 0 110-2 1 1 0 010 2zm1-3H7V5h2v4.5z"/></svg>`,
     
+    warning: `<svg viewBox="0 0 16 16"><path d="M7.56 1h.88l6.54 12.26-.44.74H1.44L1 13.26 7.56 1zM8 2.28L2.28 13H13.7L8 2.28zM8.625 12v-1h-1.25v1h1.25zm-1.25-2V6h1.25v4h-1.25z"/></svg>`,
+    
     // People & Agents
     person: `<svg viewBox="0 0 16 16"><path d="M8 8a3 3 0 100-6 3 3 0 000 6zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>`,
     

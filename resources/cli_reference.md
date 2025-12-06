@@ -382,7 +382,7 @@ apc workflow list --session <id>
 | `error_analyst` | Analyzes compilation/test errors | sonnet-4.5 |
 | `analyst_codex` | Reviews plans for implementation | gpt-5.1-codex-high |
 | `analyst_gemini` | Reviews plans for testing | gemini-3-pro |
-| `analyst_reviewer` | Reviews plans for architecture | sonnet-4.5 |
+| `analyst_architecture` | Reviews plans for architecture | sonnet-4.5 |
 | `planner` | Creates and updates execution plans | opus-4.5 |
 
 Use `apc agent roles` to see all available roles including custom ones.

@@ -4,6 +4,9 @@
 
 import { WorkflowType, WorkflowConfig } from '../../types/workflow';
 import { IWorkflow, WorkflowFactory, WorkflowServices, WorkflowMetadata } from './IWorkflow';
+import { Logger } from '../../utils/Logger';
+
+const log = Logger.create('Daemon', 'WorkflowRegistry');
 
 /**
  * Registry entry containing factory and metadata
@@ -27,7 +30,7 @@ export class WorkflowRegistry {
      */
     register(type: WorkflowType, factory: WorkflowFactory, metadata?: Partial<WorkflowMetadata>): void {
         if (this.entries.has(type)) {
-            console.warn(`[WorkflowRegistry] Overwriting existing factory for: ${type}`);
+            log.warn(`Overwriting existing factory for: ${type}`);
         }
         
         // Build full metadata with defaults
@@ -40,7 +43,7 @@ export class WorkflowRegistry {
         };
         
         this.entries.set(type, { factory, metadata: fullMetadata });
-        console.log(`[WorkflowRegistry] Registered workflow type: ${type}`);
+        log.debug(`Registered workflow type: ${type}`);
     }
     
     /**
@@ -140,7 +143,7 @@ export class WorkflowRegistry {
         const existed = this.entries.has(type);
         this.entries.delete(type);
         if (existed) {
-            console.log(`[WorkflowRegistry] Unregistered workflow type: ${type}`);
+            log.debug(`Unregistered workflow type: ${type}`);
         }
         return existed;
     }
@@ -150,7 +153,7 @@ export class WorkflowRegistry {
      */
     clear(): void {
         this.entries.clear();
-        console.log(`[WorkflowRegistry] Cleared all entries`);
+        log.debug(`Cleared all entries`);
     }
     
     /**

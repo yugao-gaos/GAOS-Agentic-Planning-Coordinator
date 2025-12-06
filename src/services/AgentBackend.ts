@@ -15,6 +15,28 @@ import { ServiceLocator } from './ServiceLocator';
 // Re-export types for convenience
 export { AgentRunOptions, AgentRunResult } from './CursorAgentRunner';
 
+// Re-export AgentInstaller for convenience (no ServiceLocator required)
+export { AgentInstaller } from './AgentInstaller';
+
+/**
+ * Result of an installation operation
+ */
+export interface InstallResult {
+    success: boolean;
+    message: string;
+    requiresRestart?: boolean;
+}
+
+/**
+ * MCP configuration to install
+ */
+export interface McpInstallConfig {
+    name: string;           // e.g., "UnityMCP"
+    url?: string;           // For HTTP transport
+    command?: string;       // For stdio transport
+    args?: string[];
+}
+
 /**
  * Interface that all agent backends must implement
  */
@@ -48,6 +70,38 @@ export interface IAgentBackend {
      * Dispose resources used by this backend
      */
     dispose(): Promise<void>;
+    
+    /**
+     * Install the CLI for this backend (e.g., Cursor CLI)
+     * May show instructions or trigger installation
+     */
+    installCLI(): Promise<InstallResult>;
+    
+    /**
+     * Install/configure an MCP server for this backend
+     */
+    installMCP(config: McpInstallConfig): Promise<InstallResult>;
+    
+    /**
+     * Get the MCP config file path for this backend
+     */
+    getMcpConfigPath(): string;
+    
+    /**
+     * Check if a specific MCP is already configured
+     */
+    isMcpConfigured(name: string): boolean;
+    
+    /**
+     * Remove an MCP configuration
+     */
+    removeMCP(name: string): Promise<InstallResult>;
+    
+    /**
+     * Kill orphaned agent processes from previous runs
+     * Returns the number of processes killed
+     */
+    killOrphanAgents(): Promise<number>;
 }
 
 /**
@@ -226,5 +280,47 @@ export class AgentRunner implements IAgentBackend {
      */
     hasActiveAgents(): boolean {
         return this.ensureBackend().getRunningAgents().length > 0;
+    }
+    
+    /**
+     * Install the CLI for the current backend
+     */
+    async installCLI(): Promise<InstallResult> {
+        return this.ensureBackend().installCLI();
+    }
+    
+    /**
+     * Install/configure an MCP server for the current backend
+     */
+    async installMCP(config: McpInstallConfig): Promise<InstallResult> {
+        return this.ensureBackend().installMCP(config);
+    }
+    
+    /**
+     * Get the MCP config path for the current backend
+     */
+    getMcpConfigPath(): string {
+        return this.ensureBackend().getMcpConfigPath();
+    }
+    
+    /**
+     * Check if a specific MCP is configured
+     */
+    isMcpConfigured(name: string): boolean {
+        return this.ensureBackend().isMcpConfigured(name);
+    }
+    
+    /**
+     * Remove an MCP configuration
+     */
+    async removeMCP(name: string): Promise<InstallResult> {
+        return this.ensureBackend().removeMCP(name);
+    }
+    
+    /**
+     * Kill orphaned agent processes from previous runs
+     */
+    async killOrphanAgents(): Promise<number> {
+        return this.ensureBackend().killOrphanAgents();
     }
 }

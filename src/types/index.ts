@@ -360,9 +360,9 @@ Session/workflow IDs are injected at runtime.`,
 - Plan for EditMode vs PlayMode test requirements`
     },
 
-    analyst_architect: {
-        id: 'analyst_architect',
-        name: 'Implementation Analyst',
+    analyst_implementation: {
+        id: 'analyst_implementation',
+        name: 'Implement Analyst',
         description: 'Reviews plans for implementation feasibility, code quality, and dependency patterns',
         isBuiltIn: true,
         defaultModel: 'gpt-5.1-codex-high',
@@ -417,7 +417,7 @@ Review the plan for implementation feasibility, code quality, and dependency pat
 ## Output Format (REQUIRED)
 
 Write feedback INLINE in the plan using this format:
-\`[Feedback from analyst_architect][CRITICAL|MINOR] Your feedback here\`
+\`[Feedback from analyst_implementation][CRITICAL|MINOR] Your feedback here\`
 
 Place feedback directly after the paragraph/task it relates to.
 
@@ -425,7 +425,7 @@ At the END of the plan, add a summary section:
 
 \`\`\`markdown
 ---
-## Feedback Summary: analyst_architect
+## Feedback Summary: analyst_implementation
 
 ### Verdict: [PASS|CRITICAL|MINOR]
 
@@ -459,7 +459,7 @@ apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analy
         allowedCliCommands: ['apc agent complete'],
         rules: [
             'Write feedback INLINE in the plan file',
-            'Use [Feedback from analyst_architect][LEVEL] prefix',
+            'Use [Feedback from analyst_implementation][LEVEL] prefix',
             'Flag singleton patterns as CRITICAL',
             'Prefer ServiceLocator for dependencies',
             'Be specific about file paths and issues',
@@ -477,7 +477,7 @@ apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analy
 
     analyst_quality: {
         id: 'analyst_quality',
-        name: 'Testing & Quality Analyst',
+        name: 'Quality Analyst',
         description: 'Reviews plans for testing strategy, quality assurance, and context needs',
         isBuiltIn: true,
         defaultModel: 'gpt-5.1-codex-high',
@@ -600,9 +600,9 @@ apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analy
     // NOTE: error_analyst role removed - ErrorResolutionWorkflow now uses engineer role
     // for combined analyze+fix in a single AI session (fire-and-forget pattern)
     
-    analyst_reviewer: {
-        id: 'analyst_reviewer',
-        name: 'Architecture & Strategy Analyst',
+    analyst_architecture: {
+        id: 'analyst_architecture',
+        name: 'Architect Analyst',
         description: 'Reviews plans for architecture, integration, dependency patterns, and planning quality',
         isBuiltIn: true,
         defaultModel: 'gpt-5.1-codex-high',
@@ -664,7 +664,7 @@ Flag tasks needing context with: \`[NEEDS_CONTEXT: T2, T4]\`
 ## Output Format (REQUIRED)
 
 Write feedback INLINE in the plan using this format:
-\`[Feedback from analyst_reviewer][CRITICAL|MINOR] Your feedback here\`
+\`[Feedback from analyst_architecture][CRITICAL|MINOR] Your feedback here\`
 
 Place feedback directly after the paragraph/task it relates to.
 
@@ -672,7 +672,7 @@ At the END of the plan, add a summary section:
 
 \`\`\`markdown
 ---
-## Feedback Summary: analyst_reviewer
+## Feedback Summary: analyst_architecture
 
 ### Verdict: [PASS|CRITICAL|MINOR]
 
@@ -713,7 +713,7 @@ apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analy
         allowedCliCommands: ['apc agent complete'],
         rules: [
             'Write feedback INLINE in the plan file',
-            'Use [Feedback from analyst_reviewer][LEVEL] prefix',
+            'Use [Feedback from analyst_architecture][LEVEL] prefix',
             'Flag singleton patterns as CRITICAL',
             'Prefer ServiceLocator for dependencies',
             'Flag tasks needing context with [NEEDS_CONTEXT: Tx]',
@@ -774,7 +774,7 @@ export class SystemPromptConfig {
         this.decisionInstructions = data.decisionInstructions;
     }
 
-    toJSON(): object {
+    toJSON(): Record<string, unknown> {
         return {
             id: this.id,
             name: this.name,

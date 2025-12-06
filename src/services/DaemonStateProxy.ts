@@ -8,12 +8,19 @@
 
 import { VsCodeClient } from '../vscode/VsCodeClient';
 import { TypedEventEmitter } from './TypedEventEmitter';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+import * as crypto from 'crypto';
 import {
     PlanningSession,
     AgentStatus,
     AgentRole
 } from '../types';
 import { WorkflowProgress, FailedTask, CompletedWorkflowSummary } from '../types/workflow';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Client', 'DaemonStateProxy');
 
 // Agent assignment interface (was from TaskManager, now defined here for extension use)
 export interface AgentAssignment {
@@ -74,6 +81,8 @@ export interface DaemonStateProxyOptions {
     vsCodeClient: VsCodeClient;
     /** Whether Unity features are enabled */
     unityEnabled?: boolean;
+    /** Workspace root for locating daemon port file (for auto-reconnect) */
+    workspaceRoot?: string;
 }
 
 // ============================================================================
@@ -92,6 +101,7 @@ export interface ConnectionHealthInfo {
 export class DaemonStateProxy {
     private vsCodeClient: VsCodeClient;
     private unityEnabled: boolean;
+    private workspaceRoot?: string;
     
     // Connection health monitoring
     private healthCheckTimer: NodeJS.Timeout | null = null;
@@ -99,6 +109,7 @@ export class DaemonStateProxy {
     private lastPingSuccess: boolean = true;
     private lastPingTime?: number;
     private currentHealthState: ConnectionHealthState = 'unknown';
+    private isReconnecting: boolean = false;
     
     // Cached status from events
     private lastCoordinatorStatus?: CoordinatorStatusInfo;
@@ -110,6 +121,7 @@ export class DaemonStateProxy {
     constructor(options: DaemonStateProxyOptions) {
         this.vsCodeClient = options.vsCodeClient;
         this.unityEnabled = options.unityEnabled ?? true;
+        this.workspaceRoot = options.workspaceRoot;
         
         // Listen to coordinator and Unity status events
         this.setupEventListeners();
@@ -193,6 +205,16 @@ export class DaemonStateProxy {
     }
     
     /**
+     * Subscribe to daemon events
+     * @param event Event name to subscribe to
+     * @param callback Callback function
+     * @returns Unsubscribe function
+     */
+    subscribe(event: string, callback: (data: any) => void): () => void {
+        return this.vsCodeClient.subscribe(event, callback);
+    }
+    
+    /**
      * Get current connection health info
      */
     getConnectionHealth(): ConnectionHealthInfo {
@@ -211,7 +233,7 @@ export class DaemonStateProxy {
     startConnectionMonitor(intervalMs: number = 15000): void {
         this.stopConnectionMonitor();
         
-        console.log(`[DaemonStateProxy] Starting connection monitor (interval: ${intervalMs / 1000}s)`);
+        log.info(`Starting connection monitor (interval: ${intervalMs / 1000}s)`);
         
         // Do initial health check
         this.performHealthCheck();
@@ -228,18 +250,142 @@ export class DaemonStateProxy {
         if (this.healthCheckTimer) {
             clearInterval(this.healthCheckTimer);
             this.healthCheckTimer = null;
-            console.log('[DaemonStateProxy] Connection monitor stopped');
+            log.debug('Connection monitor stopped');
         }
     }
     
     /**
-     * Perform a health check ping
+     * Get workspace hash for daemon port file identification
+     */
+    private getWorkspaceHash(): string {
+        if (!this.workspaceRoot) return '';
+        return crypto.createHash('md5').update(this.workspaceRoot).digest('hex').substring(0, 8);
+    }
+    
+    /**
+     * Get the daemon port file path
+     */
+    private getPortPath(): string {
+        if (!this.workspaceRoot) return '';
+        return path.join(os.tmpdir(), `apc_daemon_${this.getWorkspaceHash()}.port`);
+    }
+    
+    /**
+     * Read daemon port from port file (if exists)
+     */
+    private readDaemonPort(): number | null {
+        const portPath = this.getPortPath();
+        if (!portPath || !fs.existsSync(portPath)) {
+            return null;
+        }
+        try {
+            return parseInt(fs.readFileSync(portPath, 'utf-8').trim(), 10);
+        } catch {
+            return null;
+        }
+    }
+    
+    /**
+     * Attempt to reconnect to daemon
+     */
+    private async attemptReconnect(): Promise<boolean> {
+        if (this.isReconnecting) return false;
+        
+        const port = this.readDaemonPort();
+        if (!port) {
+            return false;
+        }
+        
+        this.isReconnecting = true;
+        log.info(`Attempting to reconnect to daemon on port ${port}...`);
+        
+        try {
+            await this.vsCodeClient.connect(`ws://127.0.0.1:${port}`);
+            log.info(`Successfully reconnected to daemon`);
+            this.consecutiveFailures = 0;
+            this.currentHealthState = 'healthy';
+            this.lastPingSuccess = true;
+            this._onConnectionHealthChanged.fire(this.getConnectionHealth());
+            this.isReconnecting = false;
+            return true;
+        } catch (err) {
+            log.warn(`Reconnect failed: ${err instanceof Error ? err.message : String(err)}`);
+            this.isReconnecting = false;
+            return false;
+        }
+    }
+    
+    /**
+     * Manually trigger a reconnection attempt.
+     * Called by UI "Retry Now" button.
+     * @returns true if reconnection succeeded
+     */
+    async manualReconnect(): Promise<{ success: boolean; error?: string }> {
+        if (this.vsCodeClient.isConnected()) {
+            // Already connected, just verify with ping
+            try {
+                const pingSuccess = await this.vsCodeClient.ping(5000);
+                if (pingSuccess) {
+                    this.consecutiveFailures = 0;
+                    this.currentHealthState = 'healthy';
+                    this._onConnectionHealthChanged.fire(this.getConnectionHealth());
+                    return { success: true };
+                }
+            } catch (e) {
+                // Fall through to reconnect
+            }
+        }
+        
+        const reconnected = await this.attemptReconnect();
+        if (reconnected) {
+            return { success: true };
+        }
+        
+        const port = this.readDaemonPort();
+        if (!port) {
+            return { 
+                success: false, 
+                error: 'Daemon not running (no port file found). Click "Start Daemon" to start it.' 
+            };
+        }
+        
+        return { 
+            success: false, 
+            error: 'Failed to connect to daemon. It may still be starting up - try again in a few seconds.' 
+        };
+    }
+    
+    /**
+     * Perform a health check ping (with auto-reconnect on failure)
      */
     private async performHealthCheck(): Promise<void> {
         const previousState = this.currentHealthState;
         
+        // If not connected, try to reconnect first
+        if (!this.vsCodeClient.isConnected()) {
+            const reconnected = await this.attemptReconnect();
+            if (!reconnected) {
+                this.consecutiveFailures++;
+                this.lastPingSuccess = false;
+                this.lastPingTime = Date.now();
+                
+                if (this.consecutiveFailures >= 2) {
+                    this.currentHealthState = 'unhealthy';
+                }
+                
+                // Emit event if health state changed
+                if (previousState !== this.currentHealthState) {
+                    log.info(`Connection health changed: ${previousState} -> ${this.currentHealthState}`);
+                    this._onConnectionHealthChanged.fire(this.getConnectionHealth());
+                }
+                return;
+            }
+        }
+        
         try {
-            const pingSuccess = await this.vsCodeClient.ping(5000);
+            // Increased timeout to 10s to handle daemon being busy with async operations
+            // Even though dependency checks are async, localhost can have transient delays
+            const pingSuccess = await this.vsCodeClient.ping(10000);
             this.lastPingTime = Date.now();
             this.lastPingSuccess = pingSuccess;
             
@@ -248,8 +394,8 @@ export class DaemonStateProxy {
                 this.currentHealthState = 'healthy';
             } else {
                 this.consecutiveFailures++;
-                // Consider unhealthy after 2 consecutive failures
-                if (this.consecutiveFailures >= 2) {
+                // More lenient: 3 failures before marking unhealthy
+                if (this.consecutiveFailures >= 3) {
                     this.currentHealthState = 'unhealthy';
                 }
             }
@@ -258,7 +404,7 @@ export class DaemonStateProxy {
             this.lastPingSuccess = false;
             this.lastPingTime = Date.now();
             
-            if (this.consecutiveFailures >= 2) {
+            if (this.consecutiveFailures >= 3) {
                 this.currentHealthState = 'unhealthy';
             }
         }
@@ -294,7 +440,7 @@ export class DaemonStateProxy {
             const response = await this.vsCodeClient.listSessions();
             return (response.sessions || []) as unknown as PlanningSession[];
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get sessions from daemon:', err);
+            log.warn('Failed to get sessions from daemon:', err);
             return [];
         }
     }
@@ -311,7 +457,7 @@ export class DaemonStateProxy {
             const response: { session: PlanningSession } = await this.vsCodeClient.send('session.get', { id: sessionId });
             return response.session;
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get session from daemon:', err);
+            log.warn('Failed to get session from daemon:', err);
             return undefined;
         }
     }
@@ -339,7 +485,7 @@ export class DaemonStateProxy {
                 busy: response.busy.map(b => b.name)
             };
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get pool status from daemon:', err);
+            log.warn('Failed to get pool status from daemon:', err);
             return { total: 0, available: [], busy: [] };
         }
     }
@@ -356,7 +502,7 @@ export class DaemonStateProxy {
             const response = await this.vsCodeClient.getPoolStatus();
             return response.available;
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get available agents from daemon:', err);
+            log.warn('Failed to get available agents from daemon:', err);
             return [];
         }
     }
@@ -379,7 +525,7 @@ export class DaemonStateProxy {
                 task: b.task
             }));
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get busy agents from daemon:', err);
+            log.warn('Failed to get busy agents from daemon:', err);
             return [];
         }
     }
@@ -398,7 +544,7 @@ export class DaemonStateProxy {
                 await this.vsCodeClient.send('pool.bench', { sessionId });
             return response.agents || [];
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get bench agents from daemon:', err);
+            log.warn('Failed to get bench agents from daemon:', err);
             return [];
         }
     }
@@ -416,7 +562,7 @@ export class DaemonStateProxy {
             // Pool status should have allocated agents
             return response.allocated || [];
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get bench agents from daemon:', err);
+            log.warn('Failed to get bench agents from daemon:', err);
             return [];
         }
     }
@@ -433,7 +579,7 @@ export class DaemonStateProxy {
             const response: { agent?: AgentStatus } = await this.vsCodeClient.send('pool.agent.status', { name: agentName });
             return response.agent;
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get agent status from daemon:', err);
+            log.warn('Failed to get agent status from daemon:', err);
             return undefined;
         }
     }
@@ -450,7 +596,7 @@ export class DaemonStateProxy {
             const response: { role?: AgentRole } = await this.vsCodeClient.send('pool.role', { id: roleId });
             return response.role;
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get role from daemon:', err);
+            log.warn('Failed to get role from daemon:', err);
             return undefined;
         }
     }
@@ -471,7 +617,7 @@ export class DaemonStateProxy {
             const response: { assignments?: AgentAssignment[] } = await this.vsCodeClient.send('task.assignments');
             return response.assignments || [];
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get assignments from daemon:', err);
+            log.warn('Failed to get assignments from daemon:', err);
             return [];
         }
     }
@@ -521,7 +667,7 @@ export class DaemonStateProxy {
             }
             return undefined;
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get session state from daemon:', err);
+            log.warn('Failed to get session state from daemon:', err);
             return undefined;
         }
     }
@@ -538,7 +684,7 @@ export class DaemonStateProxy {
             const response: { failedTasks?: FailedTask[] } = await this.vsCodeClient.send('session.failed_tasks', { id: sessionId });
             return response.failedTasks || [];
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get failed tasks from daemon:', err);
+            log.warn('Failed to get failed tasks from daemon:', err);
             return [];
         }
     }
@@ -577,7 +723,7 @@ export class DaemonStateProxy {
             this.lastUnityStatus = status;
             return status;
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get Unity status from daemon:', err);
+            log.warn('Failed to get Unity status from daemon:', err);
             return undefined;
         }
     }
@@ -617,7 +763,7 @@ export class DaemonStateProxy {
             }
             return response.status;
         } catch (err) {
-            console.warn('[DaemonStateProxy] Failed to get coordinator status from daemon:', err);
+            log.warn('Failed to get coordinator status from daemon:', err);
             return undefined;
         }
     }
@@ -655,4 +801,92 @@ export class DaemonStateProxy {
         }
         return this.vsCodeClient.cancelWorkflow(sessionId, workflowId);
     }
+    
+    // ========================================================================
+    // Dependency Status
+    // ========================================================================
+    
+    /**
+     * Get dependency status from daemon
+     */
+    async getDependencyStatus(): Promise<{
+        missingDependencies: Array<{
+            name: string;
+            description: string;
+            installUrl?: string;
+            installCommand?: string;
+            installType: 'url' | 'command' | 'apc-cli' | 'vscode-command' | 'cursor-agent-cli';
+        }>;
+        missingCount: number;
+        hasCriticalMissing: boolean;
+    } | undefined> {
+        if (!this.vsCodeClient.isConnected()) {
+            return undefined;
+        }
+        
+        try {
+            const response: {
+                missingDependencies?: Array<{
+                    name: string;
+                    description: string;
+                    installUrl?: string;
+                    installCommand?: string;
+                    installType: 'url' | 'command' | 'apc-cli' | 'vscode-command' | 'cursor-agent-cli';
+                }>;
+                missingCount?: number;
+                hasCriticalMissing?: boolean;
+            } = await this.vsCodeClient.send('deps.status');
+            
+            return {
+                missingDependencies: response.missingDependencies || [],
+                missingCount: response.missingCount || 0,
+                hasCriticalMissing: response.hasCriticalMissing || false
+            };
+        } catch (err) {
+            log.warn('Failed to get dependency status from daemon:', err);
+            return undefined;
+        }
     }
+    
+    /**
+     * Refresh dependency status on daemon
+     */
+    async refreshDependencies(): Promise<{
+        missingDependencies: Array<{
+            name: string;
+            description: string;
+            installUrl?: string;
+            installCommand?: string;
+            installType: 'url' | 'command' | 'apc-cli' | 'vscode-command' | 'cursor-agent-cli';
+        }>;
+        missingCount: number;
+        hasCriticalMissing: boolean;
+    } | undefined> {
+        if (!this.vsCodeClient.isConnected()) {
+            return undefined;
+        }
+        
+        try {
+            const response: {
+                missingDependencies?: Array<{
+                    name: string;
+                    description: string;
+                    installUrl?: string;
+                    installCommand?: string;
+                    installType: 'url' | 'command' | 'apc-cli' | 'vscode-command';
+                }>;
+                missingCount?: number;
+                hasCriticalMissing?: boolean;
+            } = await this.vsCodeClient.send('deps.refresh');
+            
+            return {
+                missingDependencies: response.missingDependencies || [],
+                missingCount: response.missingCount || 0,
+                hasCriticalMissing: response.hasCriticalMissing || false
+            };
+        } catch (err) {
+            log.warn('Failed to refresh dependencies on daemon:', err);
+            return undefined;
+        }
+    }
+}

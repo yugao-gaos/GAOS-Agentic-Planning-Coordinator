@@ -8,6 +8,9 @@ import { AgentRunner } from '../AgentBackend';
 import { ProcessManager } from '../ProcessManager';
 import { StateManager } from '../StateManager';
 import { ServiceLocator } from '../ServiceLocator';
+import { Logger } from '../../utils/Logger';
+
+const log = Logger.create('Daemon', 'PauseManager');
 
 /**
  * Saved workflow state for resumption
@@ -106,7 +109,7 @@ export class WorkflowPauseManager {
         },
         options: PauseOptions
     ): Promise<SavedWorkflowState> {
-        console.log(`[PauseManager] Pausing workflow ${workflowId} (reason: ${options.reason})`);
+        log.info(`Pausing workflow ${workflowId} (reason: ${options.reason})`);
         
         // Get agent partial output before killing
         let agentPartialOutput: string | undefined;
@@ -118,7 +121,7 @@ export class WorkflowPauseManager {
             // Kill the agent process
             if (options.forceKill) {
                 await this.agentRunner.stop(currentState.agentRunId);
-                console.log(`[PauseManager] Killed agent ${currentState.agentRunId}`);
+                log.debug(`Killed agent ${currentState.agentRunId}`);
             }
         }
         
@@ -161,7 +164,7 @@ export class WorkflowPauseManager {
         this.savedStates.set(workflowId, savedState);
         await this.persistState(savedState);
         
-        console.log(`[PauseManager] State saved for ${workflowId}`);
+        log.debug(`State saved for ${workflowId}`);
         return savedState;
     }
     
@@ -178,7 +181,7 @@ export class WorkflowPauseManager {
     async loadSavedState(workflowId: string, sessionId: string, stateManager?: StateManager): Promise<SavedWorkflowState | undefined> {
         const sm = stateManager || this.stateManager;
         if (!sm) {
-            console.error('[PauseManager] No StateManager available');
+            log.error('No StateManager available');
             return undefined;
         }
         
@@ -197,7 +200,7 @@ export class WorkflowPauseManager {
     async loadAllSavedStates(sessionId: string, stateManager?: StateManager): Promise<Map<string, SavedWorkflowState>> {
         const sm = stateManager || this.stateManager;
         if (!sm) {
-            console.error('[PauseManager] No StateManager available');
+            log.error('No StateManager available');
             return new Map();
         }
         
@@ -335,24 +338,20 @@ export class WorkflowPauseManager {
      * Persist saved state to disk using StateManager
      */
     private async persistState(state: SavedWorkflowState): Promise<void> {
-        if (this.stateManager) {
-            // Use StateManager for proper persistence
-            this.stateManager.savePausedWorkflow(
-                state.sessionId,
-                state.workflowId,
-                state
+        if (!this.stateManager) {
+            throw new Error(
+                'Cannot persist paused workflow: StateManager not available. ' +
+                'Paused workflows require StateManager for proper persistence. ' +
+                'Please ensure the system is properly initialized.'
             );
-        } else {
-            // Fallback to temp location if StateManager not set
-            const tempDir = path.join(require('os').tmpdir(), 'apc_paused_workflows');
-            if (!fs.existsSync(tempDir)) {
-                fs.mkdirSync(tempDir, { recursive: true });
-            }
-            
-            const statePath = path.join(tempDir, `${state.workflowId}.json`);
-            fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
-            console.warn('[PauseManager] StateManager not set, using temp directory');
         }
+        
+        // Use StateManager for proper persistence
+        this.stateManager.savePausedWorkflow(
+            state.sessionId,
+            state.workflowId,
+            state
+        );
     }
     
     /**

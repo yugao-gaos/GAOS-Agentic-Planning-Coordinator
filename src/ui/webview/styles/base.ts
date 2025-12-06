@@ -62,6 +62,19 @@ body {
     background: var(--vscode-toolbar-hoverBackground);
 }
 
+.icon-btn:disabled,
+.icon-btn.disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+.icon-btn:disabled:hover,
+.icon-btn.disabled:hover {
+    background: transparent;
+    opacity: 0.3;
+}
+
 .icon-btn svg {
     width: 14px;
     height: 14px;

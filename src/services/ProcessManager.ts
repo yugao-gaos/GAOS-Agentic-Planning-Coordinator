@@ -51,6 +51,9 @@ export class ProcessManager {
     private pausedStates: Map<string, ProcessState> = new Map();
     private outputManager: OutputChannelManager;
     private stateDir: string = '';
+    
+    // PID registry for orphan detection (written BEFORE spawn to catch crashes)
+    private pidRegistryPath: string = '';
 
     private readonly GRACEFUL_TIMEOUT_MS = 5000;  // 5 seconds to gracefully stop
     private readonly FORCE_KILL_TIMEOUT_MS = 2000;  // 2 more seconds before SIGKILL
@@ -65,6 +68,16 @@ export class ProcessManager {
 
     constructor() {
         this.outputManager = ServiceLocator.resolve(OutputChannelManager);
+        
+        // Set up PID registry directory
+        const pidDir = path.join(os.tmpdir(), 'apc_process_pids');
+        if (!fs.existsSync(pidDir)) {
+            fs.mkdirSync(pidDir, { recursive: true });
+        }
+        this.pidRegistryPath = path.join(pidDir, `${process.pid}_pids.json`);
+        
+        // Clean up orphans from previous crashes on startup
+        this.cleanupOrphansOnStartup();
     }
 
     /**
@@ -108,6 +121,107 @@ export class ProcessManager {
         this.onStuckCallbacks.clear();
         this.onTimeoutCallbacks.clear();
         this.log('Cleared all process manager callbacks');
+    }
+    
+    /**
+     * Clean up orphaned processes from previous crashes
+     * Scans PID registry files and kills any processes that are still running
+     */
+    private cleanupOrphansOnStartup(): void {
+        const pidDir = path.join(os.tmpdir(), 'apc_process_pids');
+        if (!fs.existsSync(pidDir)) {
+            return;
+        }
+        
+        let totalOrphans = 0;
+        const files = fs.readdirSync(pidDir);
+        
+        for (const file of files) {
+            if (!file.endsWith('_pids.json')) continue;
+            
+            const filePath = path.join(pidDir, file);
+            try {
+                const content = fs.readFileSync(filePath, 'utf-8');
+                const pids: number[] = JSON.parse(content);
+                
+                // Kill each orphaned process
+                for (const pid of pids) {
+                    if (this.isProcessRunning(pid)) {
+                        this.log(`Found orphan process PID ${pid}, killing...`);
+                        try {
+                            process.kill(pid, 'SIGTERM');
+                            totalOrphans++;
+                        } catch (err) {
+                            // Process already dead or no permission
+                        }
+                    }
+                }
+                
+                // Clean up registry file
+                fs.unlinkSync(filePath);
+            } catch (err) {
+                this.log(`Failed to process PID registry ${file}: ${err}`);
+            }
+        }
+        
+        if (totalOrphans > 0) {
+            this.log(`🧹 Cleaned up ${totalOrphans} orphaned processes from previous crash`);
+        }
+    }
+    
+    /**
+     * Check if a process is running (cross-platform)
+     */
+    private isProcessRunning(pid: number): boolean {
+        try {
+            // Signal 0 checks if process exists without actually sending a signal
+            process.kill(pid, 0);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+    
+    /**
+     * Register a PID in the orphan registry (BEFORE spawn)
+     * This ensures we can clean it up even if Node crashes mid-spawn
+     */
+    private registerPID(pid: number): void {
+        try {
+            let pids: number[] = [];
+            if (fs.existsSync(this.pidRegistryPath)) {
+                const content = fs.readFileSync(this.pidRegistryPath, 'utf-8');
+                pids = JSON.parse(content);
+            }
+            
+            pids.push(pid);
+            fs.writeFileSync(this.pidRegistryPath, JSON.stringify(pids, null, 2));
+        } catch (err) {
+            this.log(`Warning: Failed to register PID ${pid}: ${err}`);
+        }
+    }
+    
+    /**
+     * Unregister a PID from the orphan registry (after graceful exit)
+     */
+    private unregisterPID(pid: number): void {
+        try {
+            if (!fs.existsSync(this.pidRegistryPath)) return;
+            
+            const content = fs.readFileSync(this.pidRegistryPath, 'utf-8');
+            let pids: number[] = JSON.parse(content);
+            
+            pids = pids.filter(p => p !== pid);
+            
+            if (pids.length === 0) {
+                // No more PIDs, remove file
+                fs.unlinkSync(this.pidRegistryPath);
+            } else {
+                fs.writeFileSync(this.pidRegistryPath, JSON.stringify(pids, null, 2));
+            }
+        } catch (err) {
+            this.log(`Warning: Failed to unregister PID ${pid}: ${err}`);
+        }
     }
 
     /**
@@ -154,6 +268,12 @@ export class ProcessManager {
         };
 
         const proc = spawn(command, args, spawnOptions);
+        
+        // CRITICAL: Register PID immediately after spawn (before anything can crash)
+        // This ensures we can clean up the process even if Node crashes
+        if (proc.pid) {
+            this.registerPID(proc.pid);
+        }
 
         const state: ProcessState = {
             id,
@@ -206,6 +326,11 @@ export class ProcessManager {
             // Clear timers
             if (managed.timeoutId) clearTimeout(managed.timeoutId);
             if (managed.healthCheckId) clearInterval(managed.healthCheckId);
+            
+            // CRITICAL: Unregister PID from orphan registry (graceful exit)
+            if (proc.pid) {
+                this.unregisterPID(proc.pid);
+            }
             
             this.processes.delete(id);
             managed.onExit?.(code);
@@ -316,6 +441,12 @@ export class ProcessManager {
             }
             if (managed.timeoutId) clearTimeout(managed.timeoutId);
             if (managed.healthCheckId) clearInterval(managed.healthCheckId);
+            
+            // CRITICAL: Unregister PID from orphan registry
+            if (proc.pid) {
+                this.unregisterPID(proc.pid);
+            }
+            
             this.processes.delete(id);
             this.log(`External process ${id} exited with code ${code}`);
         });
@@ -370,6 +501,10 @@ export class ProcessManager {
             const cleanup = () => {
                 if (!resolved) {
                     resolved = true;
+                    // CRITICAL: Unregister PID when manually stopping
+                    if (proc.pid) {
+                        this.unregisterPID(proc.pid);
+                    }
                     this.processes.delete(id);
                     this.cleanupPausedState(id);
                     resolve(true);

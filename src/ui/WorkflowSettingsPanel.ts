@@ -1,6 +1,11 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import { Logger } from '../utils/Logger';
+import { VsCodeClient } from '../vscode/VsCodeClient';
+import { getSettingsCommonStyles } from './webview/styles/settingsCommon';
+
+const log = Logger.create('Client', 'WorkflowSettings');
 import { 
     WorkflowType,
     ContextGatheringPresetConfig, 
@@ -24,6 +29,21 @@ import {
     getConfigPath as getContextConfigPath
 } from '../services/workflows/ContextGatheringPresets';
 
+/**
+ * Custom workflow info from daemon
+ */
+interface CustomWorkflowInfo {
+    type: string;
+    name: string;
+    version: string;
+    description: string;
+    parameters: Array<{ name: string; type: string; required: boolean; default?: any; description?: string }>;
+    variables: Array<{ id: string; type: string; default?: any }>;
+    nodeCount: number;
+    filePath: string;
+    requiresUnity: boolean;
+}
+
 // ============================================================================
 // WorkflowSettingsPanel
 // ============================================================================
@@ -41,6 +61,7 @@ export class WorkflowSettingsPanel {
     private readonly panel: vscode.WebviewPanel;
     private readonly extensionUri: vscode.Uri;
     private readonly workspaceRoot: string;
+    private readonly vsCodeClient: VsCodeClient;
     private disposables: vscode.Disposable[] = [];
     
     // Cached data
@@ -50,10 +71,12 @@ export class WorkflowSettingsPanel {
     private constructor(
         panel: vscode.WebviewPanel,
         extensionUri: vscode.Uri,
+        vsCodeClient: VsCodeClient,
         workspaceRoot: string
     ) {
         this.panel = panel;
         this.extensionUri = extensionUri;
+        this.vsCodeClient = vsCodeClient;
         this.workspaceRoot = workspaceRoot;
         
         // Load settings
@@ -86,7 +109,7 @@ export class WorkflowSettingsPanel {
     /**
      * Show the workflow settings panel (create if doesn't exist, or reveal)
      */
-    public static show(extensionUri: vscode.Uri, workspaceRoot: string): void {
+    public static show(extensionUri: vscode.Uri, vsCodeClient: VsCodeClient, workspaceRoot: string): void {
         const column = vscode.window.activeTextEditor
             ? vscode.window.activeTextEditor.viewColumn
             : undefined;
@@ -109,7 +132,7 @@ export class WorkflowSettingsPanel {
             }
         );
 
-        WorkflowSettingsPanel.currentPanel = new WorkflowSettingsPanel(panel, extensionUri, workspaceRoot);
+        WorkflowSettingsPanel.currentPanel = new WorkflowSettingsPanel(panel, extensionUri, vsCodeClient, workspaceRoot);
     }
 
     /**
@@ -155,6 +178,28 @@ export class WorkflowSettingsPanel {
                 break;
             case 'openConfigFile':
                 await this.openConfigFile(message.configType);
+                break;
+            
+            // Custom workflow management
+            case 'getCustomWorkflows':
+                await this.sendCustomWorkflows();
+                break;
+            case 'createNewWorkflow':
+                await this.createNewWorkflow();
+                break;
+            case 'openNodeGraphEditor':
+                await vscode.commands.executeCommand('apc.openNodeGraphEditor', 
+                    message.filePath ? vscode.Uri.file(message.filePath) : undefined
+                );
+                break;
+            case 'openYamlFile':
+                if (message.filePath) {
+                    const uri = vscode.Uri.file(message.filePath);
+                    await vscode.window.showTextDocument(uri);
+                }
+                break;
+            case 'deleteCustomWorkflow':
+                await this.deleteCustomWorkflow(message.type);
                 break;
         }
     }
@@ -341,7 +386,7 @@ export class WorkflowSettingsPanel {
                 if (fs.existsSync(workflowPath)) fs.unlinkSync(workflowPath);
                 if (fs.existsSync(contextPath)) fs.unlinkSync(contextPath);
             } catch (e) {
-                console.error('[WorkflowSettings] Failed to delete config files:', e);
+                log.error('Failed to delete config files:', e);
             }
             
             vscode.window.showInformationMessage('Workflow settings reset to defaults');
@@ -429,6 +474,118 @@ export class WorkflowSettingsPanel {
         await vscode.window.showTextDocument(uri);
     }
 
+    // =========================================================================
+    // Custom Workflow Management
+    // =========================================================================
+
+    /**
+     * Fetch and send custom workflows to the webview
+     */
+    private async sendCustomWorkflows(): Promise<void> {
+        try {
+            if (!this.vsCodeClient.isConnected()) {
+                this.panel.webview.postMessage({ 
+                    command: 'setCustomWorkflows', 
+                    workflows: [],
+                    error: 'Daemon not connected'
+                });
+                return;
+            }
+            
+            const response = await this.vsCodeClient.send('workflow.custom.list', {});
+            const workflows = (response as any)?.data || [];
+            
+            this.panel.webview.postMessage({ 
+                command: 'setCustomWorkflows', 
+                workflows 
+            });
+        } catch (e: any) {
+            log.error('Failed to fetch custom workflows:', e);
+            this.panel.webview.postMessage({ 
+                command: 'setCustomWorkflows', 
+                workflows: [],
+                error: e.message
+            });
+        }
+    }
+
+    /**
+     * Create a new custom workflow
+     */
+    private async createNewWorkflow(): Promise<void> {
+        const name = await vscode.window.showInputBox({
+            prompt: 'Enter workflow name',
+            placeHolder: 'my_custom_workflow',
+            validateInput: (value) => {
+                if (!value || value.trim().length === 0) {
+                    return 'Name is required';
+                }
+                if (!/^[a-zA-Z][a-zA-Z0-9_\- ]*$/.test(value)) {
+                    return 'Name must start with a letter and contain only letters, numbers, underscores, hyphens, and spaces';
+                }
+                return null;
+            }
+        });
+
+        if (!name) return;
+
+        try {
+            if (!this.vsCodeClient.isConnected()) {
+                throw new Error('Daemon not connected');
+            }
+            
+            log.info(`Creating workflow: ${name}`);
+            const response = await this.vsCodeClient.send('workflow.custom.create', { name });
+            log.info(`Response received:`, response);
+            
+            const filePath = (response as any)?.data?.filePath;
+            
+            if (filePath) {
+                log.info(`Workflow created at: ${filePath}`);
+                vscode.window.showInformationMessage(`Custom workflow "${name}" created at ${filePath}`);
+                
+                // Open in editor
+                await vscode.commands.executeCommand('apc.openNodeGraphEditor', vscode.Uri.file(filePath));
+                
+                // Refresh the list
+                await this.sendCustomWorkflows();
+            } else {
+                log.warn(`No filePath in response:`, response);
+                vscode.window.showWarningMessage(`Workflow may have been created but no file path returned`);
+            }
+        } catch (e: any) {
+            log.error(`Failed to create workflow:`, e);
+            vscode.window.showErrorMessage(`Failed to create workflow: ${e.message}`);
+        }
+    }
+
+    /**
+     * Delete a custom workflow
+     */
+    private async deleteCustomWorkflow(workflowType: string): Promise<void> {
+        const confirm = await vscode.window.showWarningMessage(
+            `Delete custom workflow "${workflowType}"? This action cannot be undone.`,
+            { modal: true },
+            'Delete'
+        );
+
+        if (confirm !== 'Delete') return;
+
+        try {
+            if (!this.vsCodeClient.isConnected()) {
+                throw new Error('Daemon not connected');
+            }
+            
+            await this.vsCodeClient.send('workflow.custom.delete', { type: workflowType });
+            vscode.window.showInformationMessage(`Custom workflow "${workflowType}" deleted`);
+            
+            // Refresh the list
+            await this.sendCustomWorkflows();
+        } catch (e: any) {
+            vscode.window.showErrorMessage(`Failed to delete workflow: ${e.message}`);
+        }
+    }
+
     /**
      * Update the webview content
      */
@@ -478,6 +635,9 @@ export class WorkflowSettingsPanel {
         const customPresetsJson = JSON.stringify(customPresets);
         const defaultMappingsJson = JSON.stringify(DEFAULT_EXTENSION_MAP);
         const overrideMappingsJson = JSON.stringify(overrideMappings);
+        
+        // Debug logging
+        log.debug('Workflow data being embedded:', workflowDataJson);
 
         return `<!DOCTYPE html>
 <html lang="en">
@@ -487,60 +647,14 @@ export class WorkflowSettingsPanel {
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
     <title>Workflow Settings</title>
     <style>
-        :root {
-            --bg-color: var(--vscode-editor-background);
-            --fg-color: var(--vscode-editor-foreground);
-            --border-color: var(--vscode-panel-border);
-            --input-bg: var(--vscode-input-background);
-            --input-fg: var(--vscode-input-foreground);
-            --input-border: var(--vscode-input-border);
-            --button-bg: var(--vscode-button-background);
-            --button-fg: var(--vscode-button-foreground);
-            --button-hover: var(--vscode-button-hoverBackground);
-            --tab-active: var(--vscode-tab-activeBackground);
-            --tab-inactive: var(--vscode-tab-inactiveBackground);
-            --success-color: var(--vscode-terminal-ansiGreen);
-            --warning-color: var(--vscode-editorWarning-foreground);
-        }
+${getSettingsCommonStyles()}
         
-        * { box-sizing: border-box; }
-        
-        body {
-            font-family: var(--vscode-font-family);
-            font-size: var(--vscode-font-size);
-            color: var(--fg-color);
-            background: var(--bg-color);
-            margin: 0;
-            padding: 20px;
-        }
-        
-        h1 { margin: 0 0 20px 0; font-size: 1.5em; font-weight: 500; }
-        h2 { margin: 24px 0 12px 0; font-size: 1.1em; font-weight: 500; opacity: 0.8; }
-        h3 { margin: 16px 0 8px 0; font-size: 1em; font-weight: 500; }
-        
-        .header-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 20px;
-        }
-        
-        .header-actions {
-            display: flex;
-            gap: 8px;
-        }
-        
-        /* Workflow tabs (vertical sidebar style) */
-        .layout {
-            display: flex;
-            gap: 20px;
-        }
-        
+        /* Panel-specific styles */
         .sidebar {
             width: 200px;
-            flex-shrink: 0;
         }
         
+        /* Normalize workflow tabs to use sidebar-tab classes */
         .workflow-tabs {
             display: flex;
             flex-direction: column;
@@ -583,11 +697,6 @@ export class WorkflowSettingsPanel {
             margin-top: 2px;
         }
         
-        .main-content {
-            flex: 1;
-            min-width: 0;
-        }
-        
         .tab-content {
             display: none;
         }
@@ -596,41 +705,12 @@ export class WorkflowSettingsPanel {
             display: block;
         }
         
-        .section {
-            background: var(--input-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 4px;
-            padding: 16px;
-            margin-bottom: 16px;
-        }
-        
-        .section-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 12px;
-        }
-        
-        .section-title {
-            font-weight: 500;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-        
-        .badge {
-            font-size: 0.75em;
-            padding: 2px 6px;
-            border-radius: 3px;
-            background: var(--border-color);
-        }
-        
+        /* Workflow-specific badges */
         .badge.modified { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
         .badge.default { background: rgba(100, 100, 100, 0.2); opacity: 0.6; }
-        .badge.builtin { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
-        .badge.custom { background: rgba(34, 197, 94, 0.2); color: #4ade80; }
         .badge.unity { background: rgba(168, 85, 247, 0.2); color: #c084fc; }
         
+        /* Workflow-specific styles */
         .workflow-meta {
             display: grid;
             grid-template-columns: 100px 1fr;
@@ -642,74 +722,10 @@ export class WorkflowSettingsPanel {
             opacity: 0.6;
         }
         
-        .form-group {
-            margin-bottom: 12px;
-        }
-        
-        .form-group label {
-            display: block;
-            margin-bottom: 4px;
-            font-size: 0.9em;
-            opacity: 0.8;
-        }
-        
-        .form-group .hint {
-            font-size: 0.85em;
-            opacity: 0.6;
-            margin-top: 4px;
-        }
-        
-        input, textarea, select {
-            width: 100%;
-            padding: 8px;
-            background: var(--bg-color);
-            color: var(--input-fg);
-            border: 1px solid var(--input-border);
-            border-radius: 4px;
-            font-family: inherit;
-            font-size: inherit;
-        }
-        
         textarea {
             min-height: 150px;
-            resize: vertical;
             font-family: var(--vscode-editor-font-family, monospace);
             font-size: 0.9em;
-        }
-        
-        textarea.prompt-large {
-            min-height: 200px;
-        }
-        
-        button {
-            padding: 8px 16px;
-            background: var(--button-bg);
-            color: var(--button-fg);
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: inherit;
-        }
-        
-        button:hover { background: var(--button-hover); }
-        button.secondary {
-            background: transparent;
-            border: 1px solid var(--border-color);
-            color: var(--fg-color);
-        }
-        button.danger {
-            background: rgba(239, 68, 68, 0.2);
-            color: #f87171;
-        }
-        button:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-        
-        .button-row {
-            display: flex;
-            gap: 8px;
-            margin-top: 12px;
         }
         
         /* Context gathering specific */
@@ -796,7 +812,21 @@ export class WorkflowSettingsPanel {
     
     <div class="layout">
         <div class="sidebar">
+            <div style="margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid var(--border-color);">
+                <span style="font-size: 0.75em; text-transform: uppercase; opacity: 0.5; letter-spacing: 0.5px;">Built-in Workflows</span>
+            </div>
             <div class="workflow-tabs" id="workflow-tabs"></div>
+            
+            <div style="margin: 16px 0 12px 0; padding-top: 12px; border-top: 1px solid var(--border-color);">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-size: 0.75em; text-transform: uppercase; opacity: 0.5; letter-spacing: 0.5px;">Custom Workflows</span>
+                    <button class="secondary" style="padding: 4px 8px; font-size: 0.8em;" 
+                            onclick="createNewWorkflow()">+ New</button>
+                </div>
+            </div>
+            <div class="workflow-tabs" id="custom-workflow-tabs">
+                <div class="empty-state" style="padding: 12px; font-size: 0.9em;">Loading...</div>
+            </div>
         </div>
         
         <div class="main-content" id="main-content"></div>
@@ -805,6 +835,9 @@ export class WorkflowSettingsPanel {
     <script>
         const vscode = acquireVsCodeApi();
         
+        console.log('=== Workflow Settings Script Starting ===');
+        console.log('VS Code API acquired:', !!vscode);
+        
         // Data
         const workflows = ${workflowDataJson};
         const builtInPresets = ${builtInPresetsJson};
@@ -812,7 +845,44 @@ export class WorkflowSettingsPanel {
         const defaultMappings = ${defaultMappingsJson};
         const overrideMappings = ${overrideMappingsJson};
         
-        let activeWorkflow = workflows[0].type;
+        console.log('Data loaded - workflows:', workflows.length, 'builtInPresets:', builtInPresets.length);
+        
+        // Safety check: If workflows is empty or undefined, show error immediately
+        if (!workflows || workflows.length === 0) {
+            console.error('CRITICAL: No workflows loaded!');
+            const mainContent = document.getElementById('main-content');
+            if (mainContent) {
+                mainContent.innerHTML = '<div class="section"><h2 style="color: var(--warning-color);">No Workflows Available</h2><p>The workflow data failed to load. This indicates a configuration issue.</p><p>workflows data: ' + JSON.stringify(workflows) + '</p></div>';
+            }
+        }
+        
+        let activeWorkflow = workflows.length > 0 ? workflows[0].type : 'task_implementation';
+        let customWorkflows = [];
+        let isCustomWorkflowActive = false;
+        
+        // Debug logging
+        console.log('Workflow Settings Panel initialized');
+        console.log('Available workflows:', workflows);
+        console.log('Active workflow:', activeWorkflow);
+        
+        // Listen for messages from extension
+        window.addEventListener('message', event => {
+            const message = event.data;
+            if (message.command === 'setCustomWorkflows') {
+                customWorkflows = message.workflows || [];
+                renderCustomWorkflowTabs();
+                // Re-render content if a custom workflow is active
+                if (isCustomWorkflowActive) {
+                    const cw = customWorkflows.find(x => x.type === activeWorkflow);
+                    if (cw) {
+                        renderCustomWorkflowContent(cw);
+                    }
+                }
+            }
+        });
+        
+        // Request custom workflows on load
+        vscode.postMessage({ command: 'getCustomWorkflows' });
         
         // Render tabs
         function renderTabs() {
@@ -829,16 +899,143 @@ export class WorkflowSettingsPanel {
             container.querySelectorAll('.workflow-tab').forEach(tab => {
                 tab.onclick = () => {
                     activeWorkflow = tab.dataset.type;
+                    isCustomWorkflowActive = false;
                     renderTabs();
+                    renderCustomWorkflowTabs();
                     renderContent();
                 };
             });
         }
         
+        // Render custom workflow tabs
+        function renderCustomWorkflowTabs() {
+            const container = document.getElementById('custom-workflow-tabs');
+            if (customWorkflows.length === 0) {
+                container.innerHTML = '<div class="empty-state" style="padding: 12px; font-size: 0.85em;">No custom workflows<br><span style="opacity: 0.6; font-size: 0.9em;">Click + New to create one</span></div>';
+                return;
+            }
+            
+            container.innerHTML = customWorkflows.map(w => \`
+                <button class="workflow-tab \${w.type === activeWorkflow && isCustomWorkflowActive ? 'active' : ''}" 
+                        data-type="\${w.type}" data-custom="true">
+                    <div class="tab-name">\${w.name}</div>
+                    <div class="tab-type">\${w.type}</div>
+                </button>
+            \`).join('');
+            
+            container.querySelectorAll('.workflow-tab').forEach(tab => {
+                tab.onclick = () => {
+                    activeWorkflow = tab.dataset.type;
+                    isCustomWorkflowActive = true;
+                    renderTabs();
+                    renderCustomWorkflowTabs();
+                    const cw = customWorkflows.find(x => x.type === activeWorkflow);
+                    if (cw) renderCustomWorkflowContent(cw);
+                };
+            });
+        }
+        
+        // Render custom workflow content
+        function renderCustomWorkflowContent(w) {
+            const container = document.getElementById('main-content');
+            container.innerHTML = \`
+                <div class="section">
+                    <div class="section-header">
+                        <div class="section-title">
+                            \${w.name}
+                            <span class="badge custom">Custom</span>
+                            \${w.requiresUnity ? '<span class="badge unity">Requires Unity</span>' : ''}
+                        </div>
+                        <button onclick="openEditor('\${escapeHtml(w.filePath)}')">📝 Open Editor</button>
+                    </div>
+                    <p style="opacity: 0.8; margin: 0 0 16px 0;">\${w.description || 'No description'}</p>
+                    
+                    <dl class="workflow-meta">
+                        <dt>Type:</dt><dd><code>\${w.type}</code></dd>
+                        <dt>Version:</dt><dd>\${w.version || '1.0'}</dd>
+                        <dt>Nodes:</dt><dd>\${w.nodeCount || 0}</dd>
+                        <dt>File:</dt><dd style="word-break: break-all;"><code>\${w.filePath}</code></dd>
+                    </dl>
+                </div>
+                
+                \${w.parameters && w.parameters.length > 0 ? \`
+                <div class="section">
+                    <div class="section-title">Parameters</div>
+                    <p class="hint" style="margin-bottom: 12px;">
+                        These parameters can be passed when dispatching this workflow.
+                    </p>
+                    <table class="mapping-table">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Type</th>
+                                <th>Required</th>
+                                <th>Default</th>
+                                <th>Description</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            \${w.parameters.map(p => \`
+                                <tr>
+                                    <td><code>\${p.name}</code></td>
+                                    <td>\${p.type}</td>
+                                    <td>\${p.required ? '✓' : ''}</td>
+                                    <td>\${p.default !== undefined ? JSON.stringify(p.default) : '-'}</td>
+                                    <td style="opacity: 0.7;">\${p.description || ''}</td>
+                                </tr>
+                            \`).join('')}
+                        </tbody>
+                    </table>
+                </div>
+                \` : ''}
+                
+                \${w.variables && w.variables.length > 0 ? \`
+                <div class="section">
+                    <div class="section-title">Variables</div>
+                    <p class="hint" style="margin-bottom: 12px;">
+                        Internal variables used during workflow execution.
+                    </p>
+                    <table class="mapping-table">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Type</th>
+                                <th>Default</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            \${w.variables.map(v => \`
+                                <tr>
+                                    <td><code>\${v.id}</code></td>
+                                    <td>\${v.type}</td>
+                                    <td>\${v.default !== undefined ? JSON.stringify(v.default) : '-'}</td>
+                                </tr>
+                            \`).join('')}
+                        </tbody>
+                    </table>
+                </div>
+                \` : ''}
+                
+                <div class="section">
+                    <div class="section-title">Actions</div>
+                    <div class="button-row">
+                        <button onclick="openEditor('\${escapeHtml(w.filePath)}')">Open in Node Graph Editor</button>
+                        <button class="secondary" onclick="openYamlFile('\${escapeHtml(w.filePath)}')">Edit YAML Directly</button>
+                        <button class="danger" onclick="deleteWorkflow('\${w.type}')">Delete Workflow</button>
+                    </div>
+                </div>
+            \`;
+        }
+        
         // Render main content
         function renderContent() {
             const w = workflows.find(x => x.type === activeWorkflow);
-            if (!w) return;
+            if (!w) {
+                console.error('No workflow found for type:', activeWorkflow, 'Available workflows:', workflows);
+                const container = document.getElementById('main-content');
+                container.innerHTML = '<div class="section"><p style="color: var(--warning-color);">Error: Could not load workflow data. Please check the console.</p></div>';
+                return;
+            }
             
             const container = document.getElementById('main-content');
             
@@ -1154,9 +1351,41 @@ export class WorkflowSettingsPanel {
             vscode.postMessage({ command: 'openConfigFile', configType: type });
         }
         
+        // Custom workflow actions
+        function createNewWorkflow() {
+            vscode.postMessage({ command: 'createNewWorkflow' });
+        }
+        
+        function openEditor(filePath) {
+            vscode.postMessage({ command: 'openNodeGraphEditor', filePath: filePath });
+        }
+        
+        function openYamlFile(filePath) {
+            vscode.postMessage({ command: 'openYamlFile', filePath: filePath });
+        }
+        
+        function deleteWorkflow(type) {
+            if (confirm('Delete this custom workflow? This action cannot be undone.')) {
+                vscode.postMessage({ command: 'deleteCustomWorkflow', type: type });
+            }
+        }
+        
         // Initial render
-        renderTabs();
-        renderContent();
+        try {
+            console.log('Starting initial render...');
+            renderTabs();
+            console.log('Tabs rendered');
+            renderContent();
+            console.log('Content rendered');
+            renderCustomWorkflowTabs();
+            console.log('Custom workflow tabs rendered');
+        } catch (error) {
+            console.error('Error during initial render:', error);
+            const mainContent = document.getElementById('main-content');
+            if (mainContent) {
+                mainContent.innerHTML = '<div class="section"><h2 style="color: var(--warning-color);">Error Initializing Workflow Settings</h2><p>Check the console for details: ' + error.message + '</p></div>';
+            }
+        }
     </script>
 </body>
 </html>`;

@@ -63,7 +63,7 @@ interface UnityEditorStatus {
  * - Play mode control - only one can run at a time
  * 
  * POLLING AGENT:
- * - A long-running cursor agent that polls Unity state every 5 seconds
+ * - A long-running cursor-agent process that polls Unity state every 5 seconds
  * - Lives at least 1 minute when tasks are in queue
  * - Max lifetime 15 minutes (then restarts if needed)
  * - Notifies manager via CLI: apc unity notify-status
@@ -170,7 +170,7 @@ export class UnityControlManager {
         // Need to create via MCP
         this.log('Temp scene not found, will create via MCP when Unity is available');
 
-        // For now, we'll try to create it via a cursor agent call
+        // For now, we'll try to create it via cursor-agent CLI call
         // This is a one-time setup operation
         try {
             const result = await this.runCursorAgentCommand(
@@ -822,7 +822,7 @@ export class UnityControlManager {
     }
 
     /**
-     * Run a cursor agent command using AgentRunner
+     * Run cursor-agent CLI command using AgentRunner
      * Provides consistent timeout handling and retry support
      */
     private async runCursorAgentCommand(prompt: string, retries: number = 2): Promise<string> {

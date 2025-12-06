@@ -7,9 +7,9 @@
  * Starting the daemon:
  * 
  *   CLI:
- *     apc system run --headless     # Headless mode (automation)
- *     apc system run --vscode       # VS Code mode
- *     apc system run --interactive  # Interactive CLI mode
+ *     apc daemon run --headless     # Headless mode (automation)
+ *     apc daemon run --vscode       # VS Code mode
+ *     apc daemon run --interactive  # Interactive CLI mode
  * 
  *   Programmatic:
  *     import { startDaemon } from './daemon';

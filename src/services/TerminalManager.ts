@@ -1,7 +1,12 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
 import { AgentTerminal } from '../types';
 import { ITerminalManager, IAgentTerminalInfo } from './ITerminalManager';
+import { getLogStreamService, disposeLogStreamService, LogStreamService } from './LogStreamService';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Client', 'TerminalManager');
 
 interface CoordinatorTerminal {
     coordinatorId: string;
@@ -10,22 +15,36 @@ interface CoordinatorTerminal {
 }
 
 /**
+ * Config provider function type for getting daemon config values
+ */
+export type ConfigProvider = () => Promise<{ autoOpenTerminals?: boolean }>;
+
+/**
  * VS Code Terminal Manager - Creates terminals that tail log files
  * 
  * This is the VS Code-specific implementation of ITerminalManager.
  * For headless/daemon mode, use HeadlessTerminalManager instead.
+ * 
+ * Cross-platform: Uses Node.js LogStreamService for file streaming
+ * instead of Unix-specific tail -f commands.
  */
 export class TerminalManager implements ITerminalManager {
     private agentTerminals: Map<string, AgentTerminal> = new Map();
     private coordinatorTerminals: Map<string, CoordinatorTerminal> = new Map();
     private agentOutputChannels: Map<string, vscode.OutputChannel> = new Map();
     private disposables: vscode.Disposable[] = [];
+    private logStreamService: LogStreamService;
+    private configProvider: ConfigProvider | null = null;
+    
+    // Cached config values (updated when provider is set or refreshConfig is called)
+    private cachedConfig: { autoOpenTerminals: boolean } = { autoOpenTerminals: true };
     
     // Debounce map to prevent duplicate streaming commands (agentName -> timestamp)
     private lastStreamingStart: Map<string, number> = new Map();
     private static readonly STREAMING_DEBOUNCE_MS = 2000; // 2 seconds
 
     constructor() {
+        this.logStreamService = getLogStreamService();
         // Listen for terminal close events
         this.disposables.push(
             vscode.window.onDidCloseTerminal(terminal => {
@@ -34,12 +53,114 @@ export class TerminalManager implements ITerminalManager {
                     if (agentTerminal.terminal === terminal) {
                         // Don't remove from map - we want to track that the terminal was closed
                         // but the agent process may still be running
-                        console.log(`Terminal closed for agent: ${name}`);
+                        log.debug(`Terminal closed for agent: ${name}`);
                         break;
                     }
                 }
             })
         );
+    }
+
+    /**
+     * Set the config provider for getting daemon config values.
+     * This should be called once the VsCodeClient is connected.
+     * Automatically refreshes cached config values.
+     */
+    setConfigProvider(provider: ConfigProvider): void {
+        this.configProvider = provider;
+        this.refreshConfig();
+    }
+
+    /**
+     * Refresh cached config values from daemon.
+     * Call this when daemon config changes.
+     */
+    async refreshConfig(): Promise<void> {
+        if (this.configProvider) {
+            try {
+                const config = await this.configProvider();
+                this.cachedConfig.autoOpenTerminals = config.autoOpenTerminals ?? true;
+            } catch {
+                // Keep existing cached values on error
+            }
+        }
+    }
+
+    /**
+     * Get whether terminals should auto-open.
+     * Uses cached daemon config, falls back to VS Code settings.
+     */
+    private shouldAutoOpenTerminals(): boolean {
+        // If we have a daemon config provider, use cached value
+        if (this.configProvider) {
+            return this.cachedConfig.autoOpenTerminals;
+        }
+        // Fall back to VS Code settings (for backwards compatibility during startup)
+        const config = vscode.workspace.getConfiguration('agenticPlanning');
+        return config.get<boolean>('autoOpenTerminals', true);
+    }
+
+    /**
+     * Ensure directory exists for a file path (cross-platform)
+     */
+    private ensureDirectoryExists(filePath: string): void {
+        const dir = path.dirname(filePath);
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+        }
+    }
+
+    /**
+     * Ensure file exists (create if not exists, cross-platform)
+     */
+    private ensureFileExists(filePath: string): void {
+        this.ensureDirectoryExists(filePath);
+        if (!fs.existsSync(filePath)) {
+            fs.writeFileSync(filePath, '');
+        }
+    }
+
+    /**
+     * Start streaming a log file to a terminal using Node.js (cross-platform)
+     */
+    private startLogStreaming(terminal: vscode.Terminal, logFile: string, agentName: string): void {
+        // Stop any existing stream for this file
+        this.logStreamService.stopStreaming(logFile);
+        
+        // Ensure the log file and directory exist
+        this.ensureFileExists(logFile);
+        
+        // Show header in terminal
+        terminal.sendText(`echo ""`);
+        terminal.sendText(`echo "🔴 Streaming: ${logFile}"`);
+        terminal.sendText(`echo ""`);
+        
+        // Start streaming with the LogStreamService
+        this.logStreamService.startStreaming(logFile, (content) => {
+            // Send each chunk to the terminal
+            // Split by lines and send each line to avoid issues with large chunks
+            const lines = content.split('\n');
+            for (const line of lines) {
+                if (line) {
+                    // Use echo to display the content in the terminal
+                    // Escape special characters for shell safety
+                    const escaped = this.escapeForTerminal(line);
+                    terminal.sendText(`echo "${escaped}"`, true);
+                }
+            }
+        }, false); // Don't show existing content on start
+    }
+
+    /**
+     * Escape a string for safe echo in terminal (cross-platform)
+     */
+    private escapeForTerminal(text: string): string {
+        // Escape backslashes, double quotes, and dollar signs
+        return text
+            .replace(/\\/g, '\\\\')
+            .replace(/"/g, '\\"')
+            .replace(/\$/g, '\\$')
+            .replace(/`/g, '\\`');
     }
 
     /**
@@ -55,53 +176,52 @@ export class TerminalManager implements ITerminalManager {
         const now = Date.now();
         
         // Log every call to help debug duplicate events
-        console.log(`[TerminalManager] createAgentTerminal called for ${agentName} at ${now}`);
-        console.log(`[TerminalManager]   sessionId=${sessionId}, logFile=${logFile?.substring(logFile.lastIndexOf('/') + 1)}`);
+        log.debug(`createAgentTerminal called for ${agentName} at ${now}`);
+        const logFileName = logFile ? path.basename(logFile) : 'none';
+        log.debug(`  sessionId=${sessionId}, logFile=${logFileName}`);
         
         // Debounce: skip if we recently started streaming for this agent
         const lastStart = this.lastStreamingStart.get(agentName);
         if (lastStart && (now - lastStart) < TerminalManager.STREAMING_DEBOUNCE_MS) {
-            console.log(`[TerminalManager] DEBOUNCE: Skipping duplicate for ${agentName} (last: ${now - lastStart}ms ago)`);
+            log.debug(`DEBOUNCE: Skipping duplicate for ${agentName} (last: ${now - lastStart}ms ago)`);
             const existing = this.agentTerminals.get(agentName);
             if (existing && this.isTerminalAlive(existing.terminal)) {
                 return existing.terminal;
             }
-            console.log(`[TerminalManager] DEBOUNCE: But terminal not alive, will recreate`);
+            log.debug(`DEBOUNCE: But terminal not alive, will recreate`);
         }
         
         // Check if terminal already exists and is still valid
         const existing = this.agentTerminals.get(agentName);
         const terminalAlive = existing ? this.isTerminalAlive(existing.terminal) : false;
-        console.log(`[TerminalManager]   existing=${!!existing}, isAlive=${terminalAlive}, window.terminals.length=${vscode.window.terminals.length}`);
+        log.debug(`  existing=${!!existing}, isAlive=${terminalAlive}, window.terminals.length=${vscode.window.terminals.length}`);
         
         if (existing && terminalAlive) {
-            console.log(`[TerminalManager]   REUSING existing terminal for ${agentName}`);
+            log.debug(`  REUSING existing terminal for ${agentName}`);
             // Update the stored info in case sessionId/logFile changed
             existing.sessionId = sessionId;
             existing.logFile = logFile;
             existing.terminal.show();
             
-            // Restart tailing with the new log file
-            // Use mkdir -p to ensure directory exists
+            // Restart streaming with the new log file (cross-platform)
             if (logFile) {
                 this.lastStreamingStart.set(agentName, now);
-                existing.terminal.sendText(
-                    `pkill -INT -f "tail -f.*${path.basename(logFile)}" 2>/dev/null; ` +
-                    `mkdir -p "$(dirname '${logFile}')" 2>/dev/null; ` +
-                    `printf "\\n🔴 Streaming: ${logFile}\\n\\n"; ` +
-                    `touch "${logFile}" && tail -f "${logFile}"`
-                );
+                this.startLogStreaming(existing.terminal, logFile, agentName);
             }
             return existing.terminal;
         }
 
         // If existing terminal is dead, dispose it first
         if (existing) {
-            console.log(`[TerminalManager]   Cleaning up dead terminal reference for ${agentName}`);
+            log.debug(`  Cleaning up dead terminal reference for ${agentName}`);
+            // Stop any streaming for the old log file
+            if (existing.logFile) {
+                this.logStreamService.stopStreaming(existing.logFile);
+            }
             this.agentTerminals.delete(agentName);
         }
 
-        console.log(`[TerminalManager]   CREATING new terminal for ${agentName}`);
+        log.debug(`  CREATING new terminal for ${agentName}`);
         // Create new terminal with proper agent name
         const terminal = vscode.window.createTerminal({
             name: terminalName,
@@ -118,22 +238,15 @@ export class TerminalManager implements ITerminalManager {
             logFile
         });
 
-        // Show the terminal
-        const config = vscode.workspace.getConfiguration('agenticPlanning');
-        if (config.get<boolean>('autoOpenTerminals', true)) {
+        // Show the terminal if autoOpenTerminals is enabled
+        if (this.shouldAutoOpenTerminals()) {
             terminal.show(false); // false = don't take focus
         }
 
-        // Start tailing the log file immediately if provided
-        // This ensures the terminal shows streaming output from the start
-        // Use mkdir -p to create the directory if it doesn't exist (workflow may not have created it yet)
+        // Start streaming the log file immediately if provided (cross-platform)
         if (logFile) {
             this.lastStreamingStart.set(agentName, Date.now());
-            terminal.sendText(
-                `mkdir -p "$(dirname '${logFile}')" 2>/dev/null; ` +
-                `printf "\\n🔴 Streaming: ${logFile}\\n\\n"; ` +
-                `touch "${logFile}" && tail -f "${logFile}"`
-            );
+            this.startLogStreaming(terminal, logFile, agentName);
         }
 
         return terminal;
@@ -145,22 +258,41 @@ export class TerminalManager implements ITerminalManager {
     startLogTail(agentName: string): void {
         const agentTerminal = this.agentTerminals.get(agentName);
         if (!agentTerminal) {
-            console.warn(`No terminal found for agent: ${agentName}`);
+            log.warn(`No terminal found for agent: ${agentName}`);
             return;
         }
 
         if (!this.isTerminalAlive(agentTerminal.terminal)) {
-            console.warn(`Terminal for ${agentName} is not alive`);
+            log.warn(`Terminal for ${agentName} is not alive`);
             return;
         }
 
-        // Kill existing tail, show current content, then start fresh tail - all in one command
-        agentTerminal.terminal.sendText(
-            `pkill -INT -f "tail -f.*${path.basename(agentTerminal.logFile)}" 2>/dev/null; ` +
-            `cat "${agentTerminal.logFile}" 2>/dev/null; ` +
-            `printf "\\n--- Live stream started ---\\n"; ` +
-            `tail -f "${agentTerminal.logFile}"`
-        );
+        // Stop any existing stream and start fresh (cross-platform)
+        if (agentTerminal.logFile) {
+            this.logStreamService.stopStreaming(agentTerminal.logFile);
+            
+            // Show existing content first
+            if (fs.existsSync(agentTerminal.logFile)) {
+                try {
+                    const content = fs.readFileSync(agentTerminal.logFile, 'utf-8');
+                    if (content) {
+                        agentTerminal.terminal.sendText(`echo "--- Existing log content ---"`);
+                        const lines = content.split('\n');
+                        for (const line of lines) {
+                            if (line) {
+                                const escaped = this.escapeForTerminal(line);
+                                agentTerminal.terminal.sendText(`echo "${escaped}"`, true);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // Ignore read errors
+                }
+            }
+            
+            agentTerminal.terminal.sendText(`echo "--- Live stream started ---"`);
+            this.startLogStreaming(agentTerminal.terminal, agentTerminal.logFile, agentName);
+        }
     }
     
     /**
@@ -172,26 +304,23 @@ export class TerminalManager implements ITerminalManager {
     }
 
     /**
-     * Start streaming the log file in terminal with tail -f
+     * Start streaming the log file in terminal
      * This shows live output as CursorAgentRunner writes to the log
+     * Cross-platform implementation using Node.js LogStreamService
      */
     startStreamingLog(agentName: string, logFile: string): void {
         const agentTerminal = this.agentTerminals.get(agentName);
         if (!agentTerminal || !this.isTerminalAlive(agentTerminal.terminal)) {
-            console.warn(`No terminal found for agent: ${agentName}`);
+            log.warn(`No terminal found for agent: ${agentName}`);
             return;
         }
 
-        // Kill any existing tail, clear, show header, then start fresh tail - all in one command
-        // Using pkill to kill any tail process in this terminal's process group
-        // Use mkdir -p to ensure directory exists
-        agentTerminal.terminal.sendText(
-            `pkill -INT -f "tail -f.*${path.basename(logFile)}" 2>/dev/null; ` +
-            `mkdir -p "$(dirname '${logFile}')" 2>/dev/null; ` +
-            `clear; ` +
-            `printf "\\n🔴 Streaming: ${logFile}\\n\\n"; ` +
-            `touch "${logFile}" && tail -f "${logFile}"`
-        );
+        // Stop any existing stream for this file
+        this.logStreamService.stopStreaming(logFile);
+        
+        // Clear terminal and start streaming (cross-platform)
+        agentTerminal.terminal.sendText('clear || cls');
+        this.startLogStreaming(agentTerminal.terminal, logFile, agentName);
         agentTerminal.terminal.show();
     }
 
@@ -232,16 +361,9 @@ export class TerminalManager implements ITerminalManager {
         
         if (agentTerminal && this.isTerminalAlive(agentTerminal.terminal)) {
             agentTerminal.terminal.show();
-            // Ensure tailing is started if we have a log file
+            // Ensure streaming is started if we have a log file (cross-platform)
             if (agentTerminal.logFile) {
-                // Kill existing tail, then restart - all in one command
-                // Use mkdir -p to ensure directory exists
-                agentTerminal.terminal.sendText(
-                    `pkill -INT -f "tail -f.*${path.basename(agentTerminal.logFile)}" 2>/dev/null; ` +
-                    `mkdir -p "$(dirname '${agentTerminal.logFile}')" 2>/dev/null; ` +
-                    `printf "\\n📄 Streaming: ${agentTerminal.logFile}\\n\\n"; ` +
-                    `touch "${agentTerminal.logFile}" && tail -f "${agentTerminal.logFile}"`
-                );
+                this.startLogStreaming(agentTerminal.terminal, agentTerminal.logFile, agentName);
             }
             return true;
         }
@@ -255,20 +377,23 @@ export class TerminalManager implements ITerminalManager {
                 message: `Agent ${agentName} - Reconnected | Session: ${agentTerminal.sessionId}`
             });
 
+            // Stop any existing stream for old log file
+            if (agentTerminal.logFile) {
+                this.logStreamService.stopStreaming(agentTerminal.logFile);
+            }
+
             this.agentTerminals.set(agentName, {
                 ...agentTerminal,
                 terminal
             });
 
             terminal.show();
-            // Only tail if log file path exists
-            // Use mkdir -p to ensure directory exists
+            
+            // Start streaming if log file path exists (cross-platform)
             if (agentTerminal.logFile) {
-                terminal.sendText(
-                    `mkdir -p "$(dirname '${agentTerminal.logFile}')" 2>/dev/null; ` +
-                    `printf "\\n📄 Reconnecting to: ${agentTerminal.logFile}\\n\\n"; ` +
-                    `touch "${agentTerminal.logFile}" && tail -f "${agentTerminal.logFile}"`
-                );
+                terminal.sendText(`echo "📄 Reconnecting to: ${agentTerminal.logFile}"`);
+                terminal.sendText(`echo ""`);
+                this.startLogStreaming(terminal, agentTerminal.logFile, agentName);
             }
             return true;
         }
@@ -281,8 +406,14 @@ export class TerminalManager implements ITerminalManager {
      */
     closeAgentTerminal(agentName: string): void {
         const agentTerminal = this.agentTerminals.get(agentName);
-        if (agentTerminal && this.isTerminalAlive(agentTerminal.terminal)) {
-            agentTerminal.terminal.dispose();
+        if (agentTerminal) {
+            // Stop streaming for this log file
+            if (agentTerminal.logFile) {
+                this.logStreamService.stopStreaming(agentTerminal.logFile);
+            }
+            if (this.isTerminalAlive(agentTerminal.terminal)) {
+                agentTerminal.terminal.dispose();
+            }
         }
         this.agentTerminals.delete(agentName);
     }
@@ -292,6 +423,10 @@ export class TerminalManager implements ITerminalManager {
      */
     closeAllTerminals(): void {
         for (const [name, agentTerminal] of this.agentTerminals) {
+            // Stop streaming for this log file
+            if (agentTerminal.logFile) {
+                this.logStreamService.stopStreaming(agentTerminal.logFile);
+            }
             if (this.isTerminalAlive(agentTerminal.terminal)) {
                 agentTerminal.terminal.dispose();
             }
@@ -383,22 +518,40 @@ export class TerminalManager implements ITerminalManager {
     startCoordinatorLogTail(coordinatorId: string): void {
         const coordTerminal = this.coordinatorTerminals.get(coordinatorId);
         if (!coordTerminal) {
-            console.warn(`No terminal found for coordinator: ${coordinatorId}`);
+            log.warn(`No terminal found for coordinator: ${coordinatorId}`);
             return;
         }
 
         if (!this.isTerminalAlive(coordTerminal.terminal)) {
-            console.warn(`Terminal for ${coordinatorId} is not alive`);
+            log.warn(`Terminal for ${coordinatorId} is not alive`);
             return;
         }
 
-        // Kill existing tail, show existing content, then start fresh tail - all in one command
-        coordTerminal.terminal.sendText(
-            `pkill -INT -f "tail -f.*${path.basename(coordTerminal.logFile)}" 2>/dev/null; ` +
-            `cat "${coordTerminal.logFile}" 2>/dev/null; ` +
-            `printf "\\n--- Live stream started ---\\n"; ` +
-            `tail -f "${coordTerminal.logFile}"`
-        );
+        // Stop any existing stream and start fresh (cross-platform)
+        if (coordTerminal.logFile) {
+            this.logStreamService.stopStreaming(coordTerminal.logFile);
+            
+            // Show existing content first
+            if (fs.existsSync(coordTerminal.logFile)) {
+                try {
+                    const content = fs.readFileSync(coordTerminal.logFile, 'utf-8');
+                    if (content) {
+                        const lines = content.split('\n');
+                        for (const line of lines) {
+                            if (line) {
+                                const escaped = this.escapeForTerminal(line);
+                                coordTerminal.terminal.sendText(`echo "${escaped}"`, true);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // Ignore read errors
+                }
+            }
+            
+            coordTerminal.terminal.sendText(`echo "--- Live stream started ---"`);
+            this.startLogStreaming(coordTerminal.terminal, coordTerminal.logFile, coordinatorId);
+        }
     }
 
     /**
@@ -406,8 +559,14 @@ export class TerminalManager implements ITerminalManager {
      */
     closeCoordinatorTerminal(coordinatorId: string): void {
         const coordTerminal = this.coordinatorTerminals.get(coordinatorId);
-        if (coordTerminal && this.isTerminalAlive(coordTerminal.terminal)) {
-            coordTerminal.terminal.dispose();
+        if (coordTerminal) {
+            // Stop streaming for this log file
+            if (coordTerminal.logFile) {
+                this.logStreamService.stopStreaming(coordTerminal.logFile);
+            }
+            if (this.isTerminalAlive(coordTerminal.terminal)) {
+                coordTerminal.terminal.dispose();
+            }
         }
         this.coordinatorTerminals.delete(coordinatorId);
     }
@@ -431,18 +590,23 @@ export class TerminalManager implements ITerminalManager {
                 message: `Coordinator ${coordinatorId} - Reconnected`
             });
 
+            // Stop any existing stream for old log file
+            if (coordTerminal.logFile) {
+                this.logStreamService.stopStreaming(coordTerminal.logFile);
+            }
+
             this.coordinatorTerminals.set(coordinatorId, {
                 ...coordTerminal,
                 terminal
             });
 
             terminal.show();
+            
+            // Start streaming if log file path exists (cross-platform)
             if (coordTerminal.logFile) {
-                terminal.sendText(
-                    `mkdir -p "$(dirname '${coordTerminal.logFile}')" 2>/dev/null; ` +
-                    `printf "\\n📄 Reconnecting to: ${coordTerminal.logFile}\\n\\n"; ` +
-                    `touch "${coordTerminal.logFile}" && tail -f "${coordTerminal.logFile}"`
-                );
+                terminal.sendText(`echo "📄 Reconnecting to: ${coordTerminal.logFile}"`);
+                terminal.sendText(`echo ""`);
+                this.startLogStreaming(terminal, coordTerminal.logFile, coordinatorId);
             }
             return true;
         }
@@ -471,7 +635,7 @@ export class TerminalManager implements ITerminalManager {
         // Clean up stale agent terminals
         for (const [name, agentTerminal] of this.agentTerminals) {
             if (!this.isTerminalAlive(agentTerminal.terminal)) {
-                console.log(`Cleaning up stale terminal reference for agent: ${name}`);
+                log.debug(`Cleaning up stale terminal reference for agent: ${name}`);
                 this.agentTerminals.delete(name);
             }
         }
@@ -479,7 +643,7 @@ export class TerminalManager implements ITerminalManager {
         // Clean up stale coordinator terminals
         for (const [id, coordTerminal] of this.coordinatorTerminals) {
             if (!this.isTerminalAlive(coordTerminal.terminal)) {
-                console.log(`Cleaning up stale terminal reference for coordinator: ${id}`);
+                log.debug(`Cleaning up stale terminal reference for coordinator: ${id}`);
                 this.coordinatorTerminals.delete(id);
             }
         }
@@ -493,11 +657,18 @@ export class TerminalManager implements ITerminalManager {
         
         // Close coordinator terminals
         for (const [id, coordTerminal] of this.coordinatorTerminals) {
+            // Stop streaming for this log file
+            if (coordTerminal.logFile) {
+                this.logStreamService.stopStreaming(coordTerminal.logFile);
+            }
             if (this.isTerminalAlive(coordTerminal.terminal)) {
                 coordTerminal.terminal.dispose();
             }
         }
         this.coordinatorTerminals.clear();
+        
+        // Dispose the log stream service
+        disposeLogStreamService();
     }
 }
 

@@ -251,9 +251,11 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
         if (result.success) {
             // Plan was streamed to file; verify it exists
             if (!fs.existsSync(this.planPath)) {
-                // Fallback: extract from output if streaming didn't produce plan
-                const planContent = this.extractPlanFromOutput(result.output);
-                fs.writeFileSync(this.planPath, planContent);
+                throw new Error(
+                    `Plan streaming failed: expected plan file at '${this.planPath}' not created. ` +
+                    `This indicates the agent did not properly stream the plan to the file. ` +
+                    `Check agent logs for streaming errors.`
+                );
             }
             this.log('✓ Plan revised');
         } else {
@@ -265,16 +267,16 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
         this.log('');
         this.log('🔍 PHASE: CODEX REVIEW');
         
-        const role = this.getRole('analyst_architect');
+        const role = this.getRole('analyst_implementation');
         const prompt = this.buildReviewPrompt(role);
         
-        this.log(`Running analyst_architect (${role?.defaultModel || 'gpt-5.1-codex-high'})...`);
+        this.log(`Running analyst_implementation (${role?.defaultModel || 'gpt-5.1-codex-high'})...`);
         
         // Use CLI callback for structured completion
         const result = await this.runAgentTaskWithCallback(
-            'analyst_architect_review',
+            'analyst_implementation_review',
             prompt,
-            'analyst_architect',
+            'analyst_implementation',
             {
                 expectedStage: 'analysis',
                 timeout: role?.timeoutMs || 300000,
@@ -297,20 +299,12 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
                 : this.analystVerdict === 'critical' ? '❌' : '⚠️';
             this.log(`${icon} Codex verdict via CLI callback: ${this.analystVerdict.toUpperCase()}`);
         } else {
-            // Fallback: parse output
-            if (result.success && result.rawOutput) {
-                this.analystOutput = result.rawOutput;
-                this.parseAnalystResult();
-                
-                const icon = this.analystVerdict === 'pass' ? '✅' 
-                    : this.analystVerdict === 'critical' ? '❌' : '⚠️';
-                this.log(`${icon} Codex verdict via output parsing: ${this.analystVerdict.toUpperCase()}`);
-            } else {
-                // Analyst failed - DON'T silently pass, mark as critical
-                this.log('❌ Codex review FAILED - marking as CRITICAL (requires investigation)');
-                this.analystVerdict = 'critical';
-                this.analystOutput = `### Review Result: CRITICAL\n\n#### Critical Issues\n- Codex analyst failed to complete review\n- Error: ${result.payload?.error || 'Unknown error'}\n\n#### Minor Suggestions\n- None\n`;
-            }
+            // No callback received - agent must use CLI callback
+            throw new Error(
+                'Analyst did not use CLI callback (`apc agent complete`). ' +
+                'All agents must report results via CLI callback for structured data. ' +
+                'Legacy output parsing is no longer supported.'
+            );
         }
     }
     
@@ -329,9 +323,11 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
         if (result.success) {
             // Plan was streamed to file; verify it exists
             if (!fs.existsSync(this.planPath)) {
-                // Fallback: extract from output if streaming didn't produce plan
-                const planContent = this.extractPlanFromOutput(result.output);
-                fs.writeFileSync(this.planPath, planContent);
+                throw new Error(
+                    `Plan finalization streaming failed: expected plan file at '${this.planPath}' not created. ` +
+                    `This indicates the agent did not properly stream the plan to the file. ` +
+                    `Check agent logs for streaming errors.`
+                );
             }
             this.log('✓ Revision finalized');
         }
@@ -399,7 +395,7 @@ ${this.userFeedback}
     
     private buildReviewPrompt(role: AgentRole | undefined): string {
         if (!role?.promptTemplate) {
-            throw new Error('Missing prompt template for analyst_architect role');
+            throw new Error('Missing prompt template for analyst_implementation role');
         }
         const basePrompt = role.promptTemplate;
         

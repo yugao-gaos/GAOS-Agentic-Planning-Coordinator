@@ -1,8 +1,11 @@
 import * as vscode from 'vscode';
-import { DependencyService } from '../services/DependencyService';
+import { DependencyService, DependencyStatus } from '../services/DependencyService';
 import { DaemonStateProxy } from '../services/DaemonStateProxy';
 import { ROLE_WORKFLOW_MAP } from '../types/constants';
 import { ServiceLocator } from '../services/ServiceLocator';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Client', 'SidebarView');
 
 // Import modular webview components
 import { 
@@ -36,10 +39,83 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     
     /** Track active workflow IDs to prevent stale queries */
     private trackedWorkflows: Set<string> = new Set();
+    
+    /** Track initialization progress */
+    private initializationStep: string = 'Starting...';
+    private initializationPhase: string = 'starting';
+    private isDaemonReady: boolean = false;
+    private healthMonitoringStarted: boolean = false;
 
     constructor(private readonly _extensionUri: vscode.Uri) {
         this.dependencyService = ServiceLocator.resolve(DependencyService);
-        this.dependencyService.onStatusChanged(() => this.refresh());
+        // DON'T refresh on dependency status changes during initialization!
+        // This fires when checking dependencies (during daemon startup)
+        // which triggers UI rebuild and wipes out progress messages
+        this.dependencyService.onStatusChanged(() => {
+            // Only refresh if daemon is ready
+            if (this.isDaemonReady) {
+                this.refresh();
+            }
+        });
+    }
+    
+    /**
+     * Smart refresh: Enable cache for fast verification, then refresh
+     * Used after installations - only rechecks failed dependencies, uses cache for passed ones
+     */
+    private async smartRefresh(): Promise<void> {
+        log.info('[smartRefresh] Starting dependency refresh...');
+        
+        // Enable cache for fast post-install verification
+        if (this.stateProxy) {
+            try {
+                const vsCodeClient = (this.stateProxy as any).vsCodeClient;
+                if (vsCodeClient && vsCodeClient.isConnected()) {
+                    log.info('[smartRefresh] Enabling cache for next check...');
+                    await vsCodeClient.send('system.enableCacheForNextCheck', {});
+                    log.info('[smartRefresh] Cache enabled');
+                } else {
+                    log.warn('[smartRefresh] VsCodeClient not available or not connected');
+                }
+            } catch (err) {
+                log.warn('[smartRefresh] Failed to enable cache:', err);
+            }
+        } else {
+            log.warn('[smartRefresh] StateProxy not initialized');
+        }
+        
+        // Refresh dependencies (using cached results for speed)
+        log.info('[smartRefresh] Executing refreshDependencies command...');
+        await vscode.commands.executeCommand('agenticPlanning.refreshDependencies');
+        log.info('[smartRefresh] RefreshDependencies command completed');
+        
+        log.info('[smartRefresh] Refreshing UI...');
+        this.refresh();
+        log.info('[smartRefresh] Refresh completed');
+    }
+    
+    /**
+     * Show standard post-installation notification with smart refresh option
+     * Consistent UX across all installation types
+     */
+    private showInstallationNotification(depName: string): void {
+        vscode.window.showInformationMessage(
+            `Installing ${depName}... Click Refresh when complete.`,
+            'Refresh Now'
+        ).then(async (choice) => {
+            if (choice === 'Refresh Now') {
+                log.info(`[Refresh Button] User clicked refresh after installing ${depName}`);
+                try {
+                    await this.smartRefresh();
+                    log.info(`[Refresh Button] Refresh completed successfully`);
+                    vscode.window.showInformationMessage('Dependencies refreshed successfully');
+                } catch (err) {
+                    const errorMsg = err instanceof Error ? err.message : String(err);
+                    log.error(`[Refresh Button] Failed to refresh:`, errorMsg);
+                    vscode.window.showErrorMessage(`Failed to refresh dependencies: ${errorMsg}`);
+                }
+            }
+        });
     }
     
     /**
@@ -55,21 +131,138 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
      * Set the daemon state proxy for local/remote state routing
      */
     public setStateProxy(proxy: DaemonStateProxy): void {
+        // Clean up old subscriptions to prevent duplicates
+        this.disposables.forEach(d => d.dispose());
+        this.disposables = [];
+        
         this.stateProxy = proxy;
         this.unityEnabled = proxy.isUnityEnabled();
+        this.isConnecting = true;  // Mark as connecting
+        
+        // Reset daemon ready state when setting new proxy (reconnection)
+        this.isDaemonReady = false;
+        this.healthMonitoringStarted = false;
+        this.initializationStep = 'Starting...';
+        this.initializationPhase = 'starting';
         
         // Subscribe to connection health changes
-        proxy.onConnectionHealthChanged((health) => {
-            console.log('[SidebarViewProvider] Connection health changed:', health.state);
-            this.debouncedRefresh();
+        // BUT: Don't refresh during initialization - it wipes out progress updates!
+        const healthSubscription = proxy.onConnectionHealthChanged((health) => {
+            log.info('Connection health changed:', health.state);
+            // Only refresh if daemon is already ready (not during initialization)
+            if (this.isDaemonReady && this.healthMonitoringStarted) {
+                this.debouncedRefresh();
+            }
         });
+        this.disposables.push(healthSubscription);
         
-        this.refresh();
+        // Subscribe to dependency check progress for real-time updates
+        // Note: subscribe() returns unsubscribe function, we need to wrap it
+        const depsListUnsubscribe = proxy.subscribe('deps.list', (data: any) => {
+            log.debug(`Dependency list received: ${data.dependencies?.length || 0} items`);
+            if (this._view && data.dependencies) {
+                this._view.webview.postMessage({
+                    type: 'dependencyList',
+                    dependencies: data.dependencies
+                });
+            }
+        });
+        this.disposables.push({ dispose: depsListUnsubscribe });
+        
+        const depsProgressUnsubscribe = proxy.subscribe('deps.progress', (data: any) => {
+            log.debug(`Dependency progress: ${data.name} - ${data.status.installed ? 'installed' : 'missing'}`);
+            this.updateDependencyProgress(data.name, data.status);
+        });
+        this.disposables.push({ dispose: depsProgressUnsubscribe });
+        
+        // Subscribe to daemon.ready event - refresh when services are fully initialized
+        const readyUnsubscribe = proxy.subscribe('daemon.ready', (data: any) => {
+            log.info('Daemon services ready - refreshing UI and enabling health monitoring');
+            this.isDaemonReady = true;  // Mark daemon as ready
+            
+            // NOW start health monitoring - daemon is fully initialized
+            // This prevents health check refreshes from wiping out initialization progress
+            if (!this.healthMonitoringStarted) {
+                log.debug('Starting health monitoring now that daemon is ready');
+                this.healthMonitoringStarted = true;
+            }
+            
+            this.refresh();
+        });
+        this.disposables.push({ dispose: readyUnsubscribe });
+        
+        // Subscribe to daemon.progress event - update UI with initialization steps
+        const daemonProgressUnsubscribe = proxy.subscribe('daemon.progress', (data: any) => {
+            log.debug(`Daemon progress: ${data.step} (phase: ${data.phase})`);
+            this.updateInitializationProgress(data.step, data.phase);
+            // Don't refresh - postMessage updates DOM directly
+            // Refresh only on state transitions (daemon.ready)
+        });
+        this.disposables.push({ dispose: daemonProgressUnsubscribe });
+        
+        // Subscribe to daemon.starting event - update progress, no refresh needed
+        const startingUnsubscribe = proxy.subscribe('daemon.starting', (data: any) => {
+            log.info('Daemon starting');
+            this.updateInitializationProgress('Daemon services starting...', 'starting');
+            // No refresh - postMessage updates DOM directly
+        });
+        this.disposables.push({ dispose: startingUnsubscribe });
+        
+        // Subscribe to client.connected event - handle reconnection to already-ready daemon
+        const clientConnectedUnsubscribe = proxy.subscribe('client.connected', async (data: any) => {
+            log.info('Client connected to daemon');
+            // Check if daemon is already ready (no initialization events will be sent)
+            // Wait for cached events to arrive and be processed
+            setTimeout(async () => {
+                if (this.stateProxy) {
+                    const isReady = await this.stateProxy.isDaemonReady();
+                    if (isReady && !this.isDaemonReady) {
+                        log.info('Connected to already-ready daemon - no daemon.ready event received, setting state manually');
+                        this.isDaemonReady = true;
+                        this.healthMonitoringStarted = true;
+                        this.refresh();
+                    }
+                }
+            }, 500); // Wait 500ms for cached events to be processed (increased from 200ms)
+        });
+        this.disposables.push({ dispose: clientConnectedUnsubscribe });
+        
+        // Check if client is already connected when proxy is set (happens during extension activation)
+        // If so, cached events may be in-flight or already delivered
+        // We need to explicitly check daemon status after a delay to ensure we don't get stuck
+        if (proxy.isDaemonConnected()) {
+            log.info('Proxy set with already-connected client - will check daemon ready state after events settle');
+            setTimeout(async () => {
+                if (this.stateProxy) {
+                    const isReady = await this.stateProxy.isDaemonReady();
+                    if (isReady && !this.isDaemonReady) {
+                        log.warn('Daemon was already ready but daemon.ready event was not processed - manually triggering ready state');
+                        this.isDaemonReady = true;
+                        this.healthMonitoringStarted = true;
+                        this.refresh();
+                    } else if (isReady && this.isDaemonReady) {
+                        log.debug('Daemon ready state already set from event - all good');
+                    } else {
+                        log.debug('Daemon not ready yet, waiting for daemon.ready event');
+                    }
+                }
+            }, 300); // Wait 300ms to allow daemon cached events (sent at T+50ms) to be processed
+        }
+        
+        // Initial refresh: Delay slightly to allow client.connected and cached events to be processed first
+        // This prevents race condition where refresh() happens before daemon.ready event arrives
+        // Daemon sends cached events at T+50ms after connection opens
+        log.debug('Proxy set - scheduling initial refresh after connection events settle');
+        setTimeout(() => {
+            log.debug('Performing initial refresh');
+            this.refresh();
+        }, 150); // Wait 150ms to allow daemon cached events (sent at T+50ms, processed at ~T+60-100ms) to arrive
     }
     
     private refreshDebounceTimer?: NodeJS.Timeout;
     private periodicRefreshTimer?: NodeJS.Timeout;
-    private lastSystemStatus: 'checking' | 'ready' | 'missing' | 'daemon_missing' = 'checking';
+    private lastSystemStatus: 'initializing' | 'connecting' | 'checking' | 'ready' | 'missing' | 'daemon_missing' = 'initializing';
+    private isConnecting: boolean = false;  // Track connection attempt
     
     private debouncedRefresh(): void {
         if (this.refreshDebounceTimer) {
@@ -82,11 +275,18 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     
     /**
      * Start periodic refresh with adaptive interval.
-     * - 1 second when system is not ready (checking/missing/daemon_missing)
-     * - 30 seconds when system is ready
+     * - 30 seconds when system is ready (light maintenance polling)
+     * - NO polling when initializing (rely on broadcasts instead)
      */
     private startPeriodicRefresh(): void {
         this.stopPeriodicRefresh();
+        
+        // Don't poll during initialization/connection/checking - rely on daemon broadcasts
+        if (this.lastSystemStatus === 'initializing' || 
+            this.lastSystemStatus === 'connecting' || 
+            this.lastSystemStatus === 'checking') {
+            return;  // Wait for daemon.ready broadcast
+        }
         
         const interval = this.lastSystemStatus === 'ready' ? 30000 : 1000;
         this.periodicRefreshTimer = setInterval(() => {
@@ -106,6 +306,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         _context: vscode.WebviewViewResolveContext,
         _token: vscode.CancellationToken
     ) {
+        log.info('[resolveWebviewView] Webview is being opened/shown');
         this._view = webviewView;
 
         webviewView.webview.options = {
@@ -119,8 +320,19 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         webviewView.webview.onDidReceiveMessage(async data => {
             switch (data.type) {
                 case 'refresh':
+                    // Immediately set UI to checking state before triggering daemon refresh
+                    this.setCheckingState();
+                    // Trigger daemon dependency refresh and wait for completion
+                    if (this.stateProxy) {
+                        await this.stateProxy.refreshDependencies();
+                    }
+                    // Also trigger the command for any other listeners
                     vscode.commands.executeCommand('agenticPlanning.refreshDependencies');
+                    // Now refresh UI with the actual results
                     this.refresh();
+                    break;
+                case 'stopDaemon':
+                    vscode.commands.executeCommand('agenticPlanning.stopDaemon');
                     break;
                 case 'settings':
                     vscode.commands.executeCommand('agenticPlanning.openSettings');
@@ -241,12 +453,33 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 case 'openCoordinatorLog':
                     this.openLatestCoordinatorLog();
                     break;
+                case 'installDep':
+                    await this.handleInstallDependency(data.depName, data.installType, data.installUrl, data.installCommand);
+                    break;
+                case 'showDepDetails':
+                    this.showDependencyDetails(data.depName, data.depDesc);
+                    break;
+                case 'retryDaemonConnection':
+                    // Trigger manual reconnect attempt via the new command
+                    vscode.commands.executeCommand('agenticPlanning.retryDaemonConnection');
+                    break;
+                case 'startDaemon':
+                    vscode.commands.executeCommand('agenticPlanning.startDaemon');
+                    break;
+                case 'refreshDeps':
+                    // Refresh dependencies on daemon and update UI
+                    if (this.stateProxy) {
+                        await this.stateProxy.refreshDependencies();
+                    }
+                    this.refresh();
+                    break;
             }
         });
 
-        // Start periodic refresh with adaptive interval
-        // Fast (1s) when system not ready, slow (30s) when ready
-        this.startPeriodicRefresh();
+        // Don't start periodic polling immediately - wait for first refresh
+        // to determine actual status (connecting/initializing/ready/missing)
+        // The initial refresh will happen immediately below
+        // After refresh completes, appropriate polling will start based on status
         
         // Handle visibility changes - refresh when sidebar becomes visible again
         webviewView.onDidChangeVisibility(() => {
@@ -266,12 +499,25 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             this.disposables = [];
         });
 
-        this.refresh();
+        // Trigger initial refresh
+        // If daemon is already ready (opening GUI late), refresh immediately
+        // Otherwise, refresh will be triggered by daemon.ready event
+        if (this.stateProxy && this.isDaemonReady) {
+            log.info('[resolveWebviewView] Daemon already ready at view open, refreshing immediately');
+            this.refresh();
+        } else {
+            log.info('[resolveWebviewView] Daemon not ready yet, showing initial state');
+            // Still call refresh to show the "initializing" or "connecting" state
+            this.refresh();
+        }
     }
 
     public refresh(): void {
         if (!this._view) return;
-
+        
+        // Always refresh - _buildStateAsync() handles not querying daemon when not ready
+        // Progress messages are updated via postMessage AND refresh (for state transitions)
+        
         // Use async state building
         this._buildStateAsync().then(async state => {
             // Check if system status changed - restart periodic refresh with new interval
@@ -303,16 +549,109 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             
             this._view?.webview.postMessage({ type: 'updateState', state: extendedState });
         }).catch(err => {
-            console.warn('[SidebarViewProvider] Failed to build state:', err);
+            log.warn('Failed to build state:', err);
+        });
+    }
+    
+    /**
+     * Set UI to checking state immediately (used when refresh button is clicked)
+     */
+    private setCheckingState(): void {
+        if (!this._view) return;
+        
+        // Create a minimal "checking" state to show immediately
+        const checkingState: SidebarState = {
+            systemStatus: 'checking',
+            missingCount: 0,
+            missingDependencies: [],
+            connectionRetries: 0,
+            sessions: [],
+            agents: [],
+            unity: {
+                connected: false,
+                isPlaying: false,
+                isCompiling: false,
+                hasErrors: false,
+                errorCount: 0,
+                queueLength: 0
+            },
+            unityEnabled: this.unityEnabled,
+            coordinatorStatus: {
+                state: 'idle',
+                pendingEvents: 0,
+                evaluationCount: 0
+            },
+            connectionHealth: {
+                state: 'unknown',
+                lastPingSuccess: false,
+                consecutiveFailures: 0
+            }
+        };
+        
+        // Build client state and send to webview
+        const clientState = buildClientState(checkingState);
+        const extendedState = {
+            ...clientState,
+            sessionsHtml: renderSessionsSection([], this.expandedSessions),
+            agentsHtml: renderAgentGrid([]),
+        };
+        
+        this._view.webview.postMessage({ type: 'updateState', state: extendedState });
+    }
+    
+    /**
+     * Update dependency progress in real-time
+     * Called when individual dependency checks complete during daemon startup
+     */
+    private updateDependencyProgress(name: string, status: DependencyStatus): void {
+        if (!this._view) return;
+        
+        // Send progress update to webview for real-time display
+        this._view.webview.postMessage({
+            type: 'dependencyProgress',
+            name,
+            status: {
+                installed: status.installed,
+                description: status.description,
+                version: status.version
+            }
+        });
+    }
+    
+    /**
+     * Update initialization progress in real-time
+     */
+    private updateInitializationProgress(step: string, phase: string): void {
+        if (!this._view) return;
+        
+        // Update local state
+        this.initializationStep = step;
+        this.initializationPhase = phase;
+        
+        // Send progress update to webview for real-time display
+        this._view.webview.postMessage({
+            type: 'initializationProgress',
+            step,
+            phase
         });
     }
     
     private async _buildStateAsync(): Promise<SidebarState> {
-        // Check daemon connection first - this is critical for all operations
-        if (this.stateProxy && !this.stateProxy.isDaemonConnected()) {
+        // Get connection health info
+        const connectionHealth = this.stateProxy?.getConnectionHealth() || {
+            state: 'unknown' as const,
+            lastPingSuccess: false,
+            consecutiveFailures: 0
+        };
+        
+        // If no stateProxy yet, daemon process is starting
+        if (!this.stateProxy) {
             return {
-                systemStatus: 'daemon_missing',
+                systemStatus: 'initializing',
+                initializationStep: 'Starting daemon process...',
                 missingCount: 0,
+                missingDependencies: [],
+                connectionRetries: 0,
                 sessions: [],
                 agents: [],
                 unity: {
@@ -329,11 +668,63 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     pendingEvents: 0,
                     evaluationCount: 0
                 },
-                connectionHealth: {
-                    state: 'unknown',
-                    lastPingSuccess: false,
-                    consecutiveFailures: 0
-                }
+                connectionHealth
+            };
+        }
+        
+        // If we're in connecting phase (proxy set but connection not confirmed)
+        if (this.isConnecting) {
+            this.isConnecting = false;  // Clear flag after first check
+            return {
+                systemStatus: 'connecting',
+                initializationStep: 'Establishing connection...',
+                missingCount: 0,
+                missingDependencies: [],
+                connectionRetries: connectionHealth.consecutiveFailures,
+                sessions: [],
+                agents: [],
+                unity: {
+                    connected: false,
+                    isPlaying: false,
+                    isCompiling: false,
+                    hasErrors: false,
+                    errorCount: 0,
+                    queueLength: 0
+                },
+                unityEnabled: this.unityEnabled,
+                coordinatorStatus: {
+                    state: 'idle',
+                    pendingEvents: 0,
+                    evaluationCount: 0
+                },
+                connectionHealth
+            };
+        }
+        
+        // Check daemon connection - if not connected, show error
+        if (!this.stateProxy.isDaemonConnected()) {
+            return {
+                systemStatus: 'daemon_missing',
+                missingCount: 0,
+                missingDependencies: [],
+                connectionRetries: connectionHealth.consecutiveFailures,
+                sessions: [],
+                agents: [],
+                unity: {
+                    connected: false,
+                    isPlaying: false,
+                    isCompiling: false,
+                    hasErrors: false,
+                    errorCount: 0,
+                    queueLength: 0
+                },
+                unityEnabled: this.unityEnabled,
+                coordinatorStatus: {
+                    state: 'idle',
+                    pendingEvents: 0,
+                    evaluationCount: 0
+                },
+                connectionHealth
             };
         }
         
@@ -344,6 +735,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             return {
                 systemStatus: 'initializing',
                 missingCount: 0,
+                missingDependencies: [],
+                connectionRetries: 0,
                 sessions: [],
                 agents: [],
                 unity: {
@@ -360,29 +753,75 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     pendingEvents: 0,
                     evaluationCount: 0
                 },
-                connectionHealth: {
-                    state: 'unknown',
-                    lastPingSuccess: false,
-                    consecutiveFailures: 0
-                }
+                connectionHealth
             };
         }
 
-        // System Status - check dependencies
-        const statuses = this.dependencyService.getCachedStatus();
-        const platform = process.platform;
-        const relevantStatuses = statuses.filter(s => s.platform === platform || s.platform === 'all');
-        const requiredStatuses = relevantStatuses.filter(s => s.required);
-        const missingDeps = requiredStatuses.filter(s => !s.installed);
-
-        let systemStatus: 'checking' | 'ready' | 'missing' | 'daemon_missing' | 'initializing' = 'checking';
-        if (relevantStatuses.length > 0) {
-            systemStatus = missingDeps.length === 0 ? 'ready' : 'missing';
+        // System Status - fetch dependencies from daemon
+        // Wait for daemon to be fully ready (dependency checks complete) before showing final status
+        let systemStatus: 'initializing' | 'connecting' | 'checking' | 'ready' | 'missing' | 'daemon_missing' = 'checking';
+        let missingCount = 0;
+        let missingDependencies: Array<{
+            name: string;
+            description: string;
+            installUrl?: string;
+            installCommand?: string;
+            installType?: 'url' | 'command' | 'apc-cli' | 'vscode-command' | 'cursor-agent-cli';
+        }> = [];
+        
+        // Check if daemon is fully ready (including dependency checks)
+        const isDaemonReady = this.stateProxy ? await this.stateProxy.isDaemonReady() : false;
+        
+        if (!isDaemonReady && this.stateProxy?.isDaemonConnected()) {
+            // Daemon is connected but not fully ready yet (checking dependencies)
+            systemStatus = 'checking';
+            log.debug('Daemon connected but not ready - dependency checks running');
+        } else if (isDaemonReady) {
+            // Daemon is fully ready - fetch final dependency status
+            const depStatus = await this.stateProxy!.getDependencyStatus();
+            if (depStatus) {
+                missingCount = depStatus.missingCount;
+                missingDependencies = depStatus.missingDependencies;
+                systemStatus = missingCount === 0 ? 'ready' : 'missing';
+            }
+        } else {
+            // Not connected - this should not happen here as we checked earlier
+            throw new Error('Unexpected state: daemon not connected in dependency check');
         }
 
         // Sessions with workflow information
         const sessions: SessionInfo[] = [];
         
+        // Only query daemon state if it's ready - avoid failed API calls during initialization
+        if (!isDaemonReady) {
+            // Daemon not ready yet - return minimal state with 'initializing' status
+            return {
+                systemStatus,
+                missingCount,
+                missingDependencies,
+                connectionRetries: connectionHealth.consecutiveFailures,
+                initializationStep: this.initializationStep, // Include progress message
+                sessions: [], // No sessions until ready
+                agents: [], // No agents until ready
+                unity: {
+                    connected: false,
+                    isPlaying: false,
+                    isCompiling: false,
+                    hasErrors: false,
+                    errorCount: 0,
+                    queueLength: 0
+                },
+                unityEnabled: this.unityEnabled,
+                coordinatorStatus: {
+                    state: 'idle',
+                    pendingEvents: 0,
+                    evaluationCount: 0
+                },
+                connectionHealth
+            };
+        }
+        
+        // Daemon is ready - safe to query all state
         // Get sessions from proxy
         const allSessions = this.stateProxy 
             ? await this.stateProxy.getPlanningSessions()
@@ -431,7 +870,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     for (const [workflowId, progress] of sessionState.activeWorkflows) {
                         // Skip entries with invalid workflow IDs
                         if (!workflowId || typeof workflowId !== 'string') {
-                            console.warn(`[SidebarViewProvider] Skipping workflow with invalid ID:`, workflowId);
+                            log.warn(`Skipping workflow with invalid ID:`, workflowId);
                             continue;
                         }
                         
@@ -465,7 +904,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     // Agent count from pending + completed workflows count (approx)
                     agentCount = sessionState.activeWorkflows.size;
                 } catch (e) {
-                    console.warn(`[SidebarViewProvider] Error processing session state for ${s.id}:`, e);
+                    log.warn(`Error processing session state for ${s.id}:`, e);
                 }
             }
             
@@ -528,7 +967,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     canRetry: f.canRetry
                 }));
             } catch (e) {
-                console.warn(`[SidebarViewProvider] Error getting failed tasks for ${s.id}:`, e);
+                log.warn(`Error getting failed tasks for ${s.id}:`, e);
             }
                 
             // Get agents assigned to this session with workflow context
@@ -574,7 +1013,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                         
                         // Log warning if workflowId doesn't match any active workflow
                         if (!matchedWorkflowId) {
-                            console.warn(`[SidebarViewProvider] Agent ${agent.name} has workflowId=${agent.workflowId} but no matching workflow found in session ${s.id}`);
+                            log.warn(`Agent ${agent.name} has workflowId=${agent.workflowId} but no matching workflow found in session ${s.id}`);
                         }
                     }
                     
@@ -779,29 +1218,15 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     coordinatorStatus = status;
                 }
             } catch (e) {
-                console.warn('[SidebarViewProvider] Failed to get coordinator status:', e);
+                log.warn('Failed to get coordinator status:', e);
             }
-        }
-
-        // Get connection health
-        let connectionHealth: ConnectionHealthInfo = {
-            state: 'unknown',
-            lastPingSuccess: true,
-            consecutiveFailures: 0
-        };
-        
-        if (this.stateProxy) {
-            const health = this.stateProxy.getConnectionHealth();
-            connectionHealth = {
-                state: health.state,
-                lastPingSuccess: health.lastPingSuccess,
-                consecutiveFailures: health.consecutiveFailures
-            };
         }
 
         return {
             systemStatus,
-            missingCount: missingDeps.length,
+            missingCount,
+            missingDependencies,
+            connectionRetries: 0,
             sessions,
             agents,
             unity,
@@ -809,6 +1234,214 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             coordinatorStatus,
             connectionHealth
         };
+    }
+    
+    /**
+     * Determine install type for a dependency
+     */
+    private getInstallType(dep: { name: string; installUrl?: string; installCommand?: string }): 'url' | 'command' | 'apc-cli' | 'vscode-command' | 'cursor-agent-cli' {
+        if (dep.name.includes('APC CLI')) {
+            return 'apc-cli';
+        }
+        // Check for Cursor Agent CLI first (before basic Cursor CLI)
+        if (dep.name.includes('Cursor Agent CLI')) {
+            return 'cursor-agent-cli';
+        }
+        // Then check for basic Cursor CLI
+        if (dep.name === 'Cursor CLI') {
+            return 'vscode-command';
+        }
+        if (dep.installUrl) {
+            return 'url';
+        }
+        if (dep.installCommand) {
+            return 'command';
+        }
+        return 'url';
+    }
+    
+    /**
+     * Show dependency details in a popup
+     */
+    private showDependencyDetails(depName: string, depDesc: string): void {
+        // Extract URLs from description
+        const urlRegex = /(https?:\/\/[^\s]+)/g;
+        const urls = depDesc.match(urlRegex) || [];
+        
+        // Create buttons for URLs
+        const buttons: string[] = [];
+        if (urls.length > 0) {
+            buttons.push('Open Documentation');
+        }
+        buttons.push('OK');
+        
+        // Show modal with description (respects VS Code's theme automatically)
+        vscode.window.showInformationMessage(
+            `${depName}\n\n${depDesc}`,
+            { modal: true },
+            ...buttons
+        ).then(async (choice) => {
+            if (choice === 'Open Documentation' && urls.length > 0 && urls[0]) {
+                // Open the first URL found
+                await vscode.env.openExternal(vscode.Uri.parse(urls[0]));
+            }
+        });
+    }
+    
+    /**
+     * Handle dependency installation based on type
+     */
+    private async handleInstallDependency(
+        depName: string, 
+        installType: string, 
+        installUrl?: string, 
+        installCommand?: string
+    ): Promise<void> {
+        log.info(`Installing dependency: ${depName} (type: ${installType})`);
+        
+        try {
+            switch (installType) {
+                case 'apc-cli': {
+                    // Use VS Code command for APC CLI installation
+                    // The command handles its own user feedback and refreshes
+                    await vscode.commands.executeCommand('agenticPlanning.installCli');
+                    
+                    // The command already handles both client and daemon refresh
+                    // Just refresh the sidebar UI
+                    this.refresh();
+                    break;
+                }
+                case 'cursor-agent-cli': {
+                    // Check if this is a login command (auth issue) or install
+                    const isLogin = installCommand === 'cursor-agent login';
+                    const platform = process.platform;
+                    
+                    if (isLogin) {
+                        // Open login terminal
+                        const terminal = vscode.window.createTerminal('cursor-agent login');
+                        terminal.show();
+                        
+                        if (platform === 'win32') {
+                            terminal.sendText('wsl -d Ubuntu bash -c "~/.local/bin/cursor-agent login"');
+                        } else {
+                            terminal.sendText('cursor-agent login');
+                        }
+                        
+                        this.showInstallationNotification('cursor-agent login');
+                    } else {
+                        // Run setup script directly - no dialog, just do it
+                        const scriptPath = vscode.Uri.joinPath(
+                            this._extensionUri,
+                            'out',
+                            'scripts',
+                            'install-cursor-agent.ps1'
+                        );
+                        const fullPath = scriptPath.fsPath;
+                        
+                        // Verify script exists
+                        const fs = require('fs');
+                        if (!fs.existsSync(fullPath)) {
+                            vscode.window.showErrorMessage(
+                                `Setup script not found at: ${fullPath}\n\nPlease run "npm run compile" to build the extension.`
+                            );
+                            return;
+                        }
+                        
+                        // Create terminal and run script immediately
+                        const terminal = vscode.window.createTerminal({
+                            name: 'Cursor Agent Setup',
+                            hideFromUser: false
+                        });
+                        terminal.show();
+                        
+                        if (platform === 'win32') {
+                            const command = `Start-Process powershell.exe -Verb RunAs -ArgumentList '-ExecutionPolicy','Bypass','-NoProfile','-File','"${fullPath}"'`;
+                            terminal.sendText(command);
+                            log.info(`Running setup script: ${fullPath}`);
+                        } else {
+                            const command = `sudo bash "${fullPath.replace('.ps1', '.sh')}"`;
+                            terminal.sendText(command);
+                            log.info(`Running setup script: ${command}`);
+                        }
+                        
+                        this.showInstallationNotification(depName);
+                    }
+                    break;
+                }
+                case 'vscode-command': {
+                    // Execute VS Code command (e.g., install cursor CLI)
+                    if (installUrl?.startsWith('cursor://')) {
+                        await vscode.env.openExternal(vscode.Uri.parse(installUrl));
+                    } else {
+                        vscode.window.showInformationMessage(
+                            `To install ${depName}: Open Command Palette (Ctrl+Shift+P) → "Install cursor command"`
+                        );
+                    }
+                    break;
+                }
+                case 'url': {
+                    // Special case: MCP for Unity - auto-configure directly
+                    if (depName.includes('MCP for Unity')) {
+                        log.info(`Auto-configuring MCP for Unity`);
+                        await vscode.commands.executeCommand('agenticPlanning.autoConfigureMcp');
+                        this.showInstallationNotification(depName);
+                        break;
+                    }
+                    
+                    // Open URL in browser
+                    if (installUrl) {
+                        log.info(`Opening install URL for ${depName}: ${installUrl}`);
+                        await vscode.env.openExternal(vscode.Uri.parse(installUrl));
+                        this.showInstallationNotification(depName);
+                    } else {
+                        vscode.window.showWarningMessage(`No installation URL available for ${depName}`);
+                    }
+                    break;
+                }
+                case 'command': {
+                    // Run command directly in terminal
+                    if (installCommand) {
+                        const terminal = vscode.window.createTerminal({
+                            name: `Install ${depName}`,
+                            hideFromUser: false
+                        });
+                        terminal.show();
+                        terminal.sendText(installCommand);
+                        this.showInstallationNotification(depName);
+                    } else {
+                        vscode.window.showWarningMessage(`No install command available for ${depName}`);
+                    }
+                    break;
+                }
+                case 'unity-mcp': {
+                    // Install Unity MCP via VS Code command
+                    log.info('Installing Unity MCP via command...');
+                    
+                    try {
+                        await vscode.commands.executeCommand('agenticPlanning.autoConfigureMcp');
+                        this.showInstallationNotification(depName);
+                    } catch (error) {
+                        const errorMsg = error instanceof Error ? error.message : String(error);
+                        log.error('Unity MCP installation failed:', errorMsg);
+                        vscode.window.showErrorMessage(`Failed to install Unity MCP: ${errorMsg}`);
+                    }
+                    break;
+                }
+                case 'retry': {
+                    // Retry dependency check (refresh dependencies)
+                    log.info(`Retrying dependency check for ${depName}...`);
+                    vscode.window.showInformationMessage(`Retrying ${depName} connectivity check...`);
+                    await vscode.commands.executeCommand('agenticPlanning.refreshDependencies');
+                    break;
+                }
+                default:
+                    log.warn(`Unknown install type: ${installType} for ${depName}`);
+                    vscode.window.showWarningMessage(`Unknown install type: ${installType}`);
+            }
+        } catch (err) {
+            log.error(`Failed to install ${depName}:`, err);
+            vscode.window.showErrorMessage(`Failed to install ${depName}: ${err}`);
+        }
     }
     
     /**
@@ -863,8 +1496,12 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 latestFile = files.find((f: string) => f.endsWith('.log'));
             }
             if (!latestFile) {
-                // Fallback to any file
-                latestFile = files[0];
+                // No appropriate log file found
+                throw new Error(
+                    'No coordinator log files found in logs directory. ' +
+                    'Expected files with .output or .log extension. ' +
+                    `Directory: ${logDir}`
+                );
             }
             
             const latestPath = require('path').join(logDir, latestFile);
@@ -872,7 +1509,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             await vscode.window.showTextDocument(uri, { preview: false });
             
         } catch (err) {
-            console.error('[SidebarViewProvider] Failed to open coordinator log:', err);
+            log.error('Failed to open coordinator log:', err);
             vscode.window.showErrorMessage(`Failed to open coordinator log: ${err}`);
         }
     }

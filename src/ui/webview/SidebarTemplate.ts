@@ -6,6 +6,7 @@ import { getSidebarStyles } from './styles';
 import { getSidebarScript } from './scripts';
 import { 
     renderStatusBar, 
+    renderSystemContextBox,
     renderSessionsSection,
     renderAgentGrid,
     getAgentBadgeText,
@@ -23,6 +24,9 @@ export interface ClientState extends SidebarState {
     unityBadgeText: string;
     unityBadgeBackground: string;
     unityBadgeClassName?: string;
+    systemContextHtml: string;  // Pre-rendered context box HTML
+    sessionsHtml?: string;      // Pre-rendered sessions HTML
+    agentsHtml?: string;        // Pre-rendered agents HTML
 }
 
 /**
@@ -37,7 +41,17 @@ export function buildClientState(state: SidebarState): ClientState {
         unityBadgeText: unityBadgeInfo.text,
         unityBadgeBackground: unityBadgeInfo.background,
         unityBadgeClassName: unityBadgeInfo.className,
+        systemContextHtml: renderSystemContextBox(state)
+        // Note: sessionsHtml and agentsHtml require expansion state, 
+        // so they're not pre-rendered here - client handles them
     };
+}
+
+/**
+ * Check if system is in a ready state for creating new sessions.
+ */
+function isSystemReady(systemStatus?: string): boolean {
+    return systemStatus === 'ready';
 }
 
 /**
@@ -62,6 +76,13 @@ export function getSidebarHtml(initialState?: SidebarState, expandedSessionIds?:
     const agentBadgeText = initialState 
         ? getAgentBadgeText(initialState.agents) 
         : '0/0';
+    
+    // Determine if new session button should be disabled
+    const systemReady = isSystemReady(initialState?.systemStatus);
+    const newSessionDisabled = !systemReady;
+    const newSessionTitle = systemReady 
+        ? 'New Session' 
+        : 'System not ready - check dependencies';
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -76,7 +97,8 @@ ${getSidebarStyles()}
     <!-- Status Bar with Unity Compact Box -->
     ${renderStatusBar(
         initialState?.unity, 
-        initialState?.unityEnabled
+        initialState?.unityEnabled,
+        initialState?.systemStatus
     )}
 
     <div class="main-content">
@@ -84,7 +106,7 @@ ${getSidebarStyles()}
         <div class="section scrollable" style="flex: 2;">
             <div class="section-header">
                 <span>Planning Sessions</span>
-                <button class="icon-btn" id="newSessionBtn" title="New Session">
+                <button class="icon-btn${newSessionDisabled ? ' disabled' : ''}" id="newSessionBtn" title="${newSessionTitle}"${newSessionDisabled ? ' disabled' : ''}>
                     ${ICONS.add}
                 </button>
             </div>
@@ -105,7 +127,7 @@ ${getSidebarStyles()}
                         ${ICONS.workflow}
                     </button>
                     <button class="icon-btn" id="roleSettingsBtn" title="Configure Agent Roles">
-                        ${ICONS.gear}
+                        ${ICONS.person}
                     </button>
                 </span>
             </div>

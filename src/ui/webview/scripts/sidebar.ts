@@ -13,25 +13,53 @@ export function getSidebarScript(): string {
         let expandedSessions = new Set();
         let expandedCoordinators = new Set();
         let expandedHistories = new Set();
+        
+        // Cooldown state for buttons (prevents double-clicks)
+        let lastNewSessionClick = 0;
+        const COOLDOWN_MS = 500; // 500ms cooldown after click
 
         // Element references
         const statusDot = document.getElementById('statusDot');
         const statusText = document.getElementById('statusText');
         const statusInfo = document.getElementById('statusInfo');
-        const coordinatorDot = document.getElementById('coordinatorDot');
-        const coordinatorText = document.getElementById('coordinatorText');
+        const systemContextBox = document.getElementById('systemContextBox');
         const sessionsContent = document.getElementById('sessionsContent');
         const agentGrid = document.getElementById('agentGrid');
         const agentBadge = document.getElementById('agentBadge');
-        const unityBadge = document.getElementById('unityBadge');
-        const unityQueue = document.getElementById('unityQueue');
-        const unityCompactBox = document.getElementById('unityCompactBox');
-        const unityCurrentTask = document.getElementById('unityCurrentTask');
 
         // Button handlers
         document.getElementById('refreshBtn').onclick = () => vscode.postMessage({ type: 'refresh' });
+        document.getElementById('stopDaemonBtn').onclick = () => {
+            vscode.postMessage({ type: 'stopDaemon' });
+        };
         document.getElementById('settingsBtn').onclick = () => vscode.postMessage({ type: 'settings' });
-        document.getElementById('newSessionBtn').onclick = () => vscode.postMessage({ type: 'newSession' });
+        
+        const newSessionBtn = document.getElementById('newSessionBtn');
+        newSessionBtn.onclick = () => {
+            // Only trigger if not disabled
+            if (!newSessionBtn.disabled && !newSessionBtn.classList.contains('disabled')) {
+                // Cooldown: First click executes immediately, subsequent clicks ignored
+                const now = Date.now();
+                if (now - lastNewSessionClick < COOLDOWN_MS) {
+                    console.log('Button on cooldown, ignoring rapid click');
+                    return;
+                }
+                lastNewSessionClick = now; // Record first click time
+                
+                console.log('New session button clicked - opening agent chat');
+                
+                // Visual feedback - temporarily disable button during cooldown
+                newSessionBtn.disabled = true;
+                newSessionBtn.style.opacity = '0.5';
+                setTimeout(() => {
+                    newSessionBtn.disabled = false;
+                    newSessionBtn.style.opacity = '';
+                }, COOLDOWN_MS);
+                
+                // Execute immediately (not delayed)
+                vscode.postMessage({ type: 'newSession' });
+            }
+        };
         
         const roleSettingsBtn = document.getElementById('roleSettingsBtn');
         if (roleSettingsBtn) {
@@ -42,12 +70,6 @@ export function getSidebarScript(): string {
         if (workflowSettingsBtn) {
             workflowSettingsBtn.onclick = () => vscode.postMessage({ type: 'openWorkflowSettings' });
         }
-        
-        statusInfo.onclick = () => {
-            if (statusDot.classList.contains('missing')) {
-                vscode.postMessage({ type: 'showMissing' });
-            }
-        };
         
         // Coordinator info click handler - open latest log
         const coordinatorInfo = document.getElementById('coordinatorInfo');
@@ -307,33 +329,228 @@ export function getSidebarScript(): string {
         }
 
         /**
+         * Render missing dependencies box (legacy, not used - rendered server-side now)
+         */
+        function renderMissingDepsBox(missingDeps) {
+            const warningIcon = '<svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M7.56 1h.88l6.54 12.26-.44.74H1.44L1 13.26 7.56 1zM8 2.28L2.28 13H13.7L8 2.28zM8.625 12v-1h-1.25v1h1.25zm-1.25-2V6h1.25v4h-1.25z"/></svg>';
+            let depItems = '';
+            for (let i = 0; i < missingDeps.length; i++) {
+                const dep = missingDeps[i];
+                
+                // Determine button label based on dependency type and description
+                const isAuthIssue = dep.description && 
+                    (dep.description.includes('Authentication required') || 
+                     dep.description.includes('Login required') ||
+                     dep.description.includes('cursor-agent login'));
+                
+                let actionLabel = 'Install';
+                if (isAuthIssue) {
+                    actionLabel = 'Login';
+                } else if (dep.installType === 'url') {
+                    actionLabel = 'Open URL';
+                } else if (dep.installType === 'vscode-command') {
+                    actionLabel = 'Setup';
+                } else if (dep.installType === 'retry') {
+                    actionLabel = 'Retry';
+                }
+                
+                depItems += '<div class="dep-item">' +
+                    '<div class="dep-info">' +
+                    '<span class="dep-icon">' + warningIcon + '</span>' +
+                    '<span class="dep-name">' + escapeHtml(dep.name) + '</span>' +
+                    '</div>' +
+                    '<div class="dep-actions">' +
+                    '<button class="dep-btn dep-btn-secondary" ' +
+                    'data-action="details" ' +
+                    'data-dep-name="' + escapeHtml(dep.name) + '" ' +
+                    'data-dep-desc="' + escapeHtml(dep.description) + '" ' +
+                    'title="View detailed information">' +
+                    'Details</button>' +
+                    '<button class="dep-btn dep-btn-primary" ' +
+                    'data-action="install" ' +
+                    'data-dep-name="' + escapeHtml(dep.name) + '" ' +
+                    'data-install-type="' + (dep.installType || 'url') + '" ' +
+                    'data-install-url="' + escapeHtml(dep.installUrl || '') + '" ' +
+                    'data-install-command="' + escapeHtml(dep.installCommand || '') + '" ' +
+                    'title="' + actionLabel + ' ' + escapeHtml(dep.name) + '">' +
+                    actionLabel + '</button>' +
+                    '</div></div>';
+            }
+            
+            return '<div class="context-box context-box-warning">' +
+                '<div class="context-header">' +
+                '<span class="context-icon">' + warningIcon + '</span>' +
+                '<span class="context-title">Missing Dependencies (' + missingDeps.length + ')</span>' +
+                '</div>' +
+                '<div class="context-body">' +
+                '<div class="deps-list">' + depItems + '</div>' +
+                '</div></div>';
+        }
+        
+        function renderSystemReadyBox(coordinator, unity, unityEnabled) {
+            const coordStatus = coordinator || { state: 'idle', pendingEvents: 0 };
+            const coordText = getCoordinatorDisplayText(coordStatus);
+            const coordClass = coordStatus.state;
+            
+            let unityHtml = '';
+            if (unityEnabled && unity) {
+                const unityBadge = getUnityBadgeStyle(unity);
+                const queueText = unity.queueLength > 0 ? '(' + unity.queueLength + ' queued)' : '';
+                unityHtml = '<div class="ready-item">' +
+                    '<span class="ready-label">Unity</span>' +
+                    '<div class="ready-value">' +
+                    '<span class="unity-badge" style="background: ' + unityBadge.background + ';">' + unityBadge.text + '</span>' +
+                    (queueText ? '<span class="unity-queue">' + queueText + '</span>' : '') +
+                    '</div></div>';
+            }
+            
+            return '<div class="context-box context-box-ready">' +
+                '<div class="ready-info">' +
+                '<div class="ready-item clickable" id="coordinatorInfo" title="Click to open latest coordinator log">' +
+                '<span class="ready-label">Coordinator</span>' +
+                '<div class="ready-value">' +
+                '<div class="coordinator-dot ' + coordClass + '" id="coordinatorDot"></div>' +
+                '<span class="coordinator-text" id="coordinatorText">' + coordText + '</span>' +
+                '</div></div>' +
+                unityHtml +
+                '</div></div>';
+        }
+        
+        function getUnityBadgeStyle(unity) {
+            if (!unity.connected) {
+                return { text: 'Offline', background: 'rgba(107, 114, 128, 0.3)' };
+            }
+            if (unity.isCompiling) {
+                return { text: 'Compiling', background: 'rgba(0, 122, 204, 0.3)' };
+            }
+            if (unity.currentTask) {
+                const taskType = unity.currentTask.type;
+                if (taskType === 'test_editmode' || taskType === 'test_playmode') {
+                    return { text: 'Testing', background: 'rgba(234, 179, 8, 0.3)' };
+                }
+                if (taskType === 'prep_editor') {
+                    return { text: 'Compiling', background: 'rgba(0, 122, 204, 0.3)' };
+                }
+                return { text: 'Running', background: 'rgba(115, 201, 145, 0.3)' };
+            }
+            if (unity.isPlaying) {
+                return { text: 'Playing', background: 'rgba(115, 201, 145, 0.3)' };
+            }
+            return { text: 'Idle', background: 'rgba(107, 114, 128, 0.3)' };
+        }
+        
+        /**
+         * Attach handlers to context box buttons.
+         */
+        function attachContextBoxHandlers() {
+            // Retry connection button
+            const retryBtn = document.getElementById('retryConnectionBtn');
+            if (retryBtn) {
+                retryBtn.onclick = () => vscode.postMessage({ type: 'retryDaemonConnection' });
+            }
+            
+            // Start daemon button
+            const startBtn = document.getElementById('startDaemonBtn');
+            if (startBtn) {
+                startBtn.onclick = () => vscode.postMessage({ type: 'startDaemon' });
+            }
+            
+            // Coordinator info click (open log)
+            const coordInfo = document.getElementById('coordinatorInfo');
+            if (coordInfo) {
+                coordInfo.onclick = () => vscode.postMessage({ type: 'openCoordinatorLog' });
+            }
+            
+            // Install buttons
+            // Handle dependency action buttons (Details and Install/Login/etc)
+            document.querySelectorAll('.dep-btn').forEach(function(btn) {
+                btn.onclick = function() {
+                    const action = btn.getAttribute('data-action');
+                    const depName = btn.getAttribute('data-dep-name');
+                    
+                    if (action === 'details') {
+                        // Show details popup
+                        const depDesc = btn.getAttribute('data-dep-desc');
+                        vscode.postMessage({ 
+                            type: 'showDepDetails', 
+                            depName: depName,
+                            depDesc: depDesc
+                        });
+                    } else if (action === 'install') {
+                        // Install/Login action
+                        const installType = btn.getAttribute('data-install-type');
+                        const installUrl = btn.getAttribute('data-install-url');
+                        const installCommand = btn.getAttribute('data-install-command');
+                        vscode.postMessage({ 
+                            type: 'installDep', 
+                            depName: depName,
+                            installType: installType,
+                            installUrl: installUrl,
+                            installCommand: installCommand
+                        });
+                    }
+                };
+            });
+        }
+
+        /**
+         * Check if system is ready for creating new sessions.
+         */
+        function isSystemReady(systemStatus) {
+            return systemStatus === 'ready';
+        }
+
+        /**
          * Update the UI with new state.
          */
         function updateState(state) {
-            // Status bar
+            // Status bar title
             statusDot.className = 'status-dot ' + state.systemStatus;
             if (state.systemStatus === 'ready') {
                 statusText.textContent = 'Ready';
-                statusInfo.style.cursor = 'default';
             } else if (state.systemStatus === 'daemon_missing') {
-                statusText.textContent = 'Daemon Missing';
-                statusInfo.style.cursor = 'pointer';
+                statusText.textContent = 'Disconnected';
             } else if (state.systemStatus === 'initializing') {
                 statusText.textContent = 'Initializing...';
-                statusInfo.style.cursor = 'default';
             } else if (state.systemStatus === 'missing') {
                 statusText.textContent = state.missingCount + ' Missing';
-                statusInfo.style.cursor = 'pointer';
             } else {
                 statusText.textContent = 'Checking...';
-                statusInfo.style.cursor = 'default';
             }
             
-            // Coordinator status
-            if (coordinatorDot && coordinatorText) {
-                const coordStatus = state.coordinatorStatus || { state: 'idle', pendingEvents: 0 };
-                coordinatorDot.className = 'coordinator-dot ' + coordStatus.state;
-                coordinatorText.textContent = getCoordinatorDisplayText(coordStatus);
+            // Update button visibility based on daemon readiness
+            // Refresh: Only when daemon is fully ready to handle requests
+            // Stop: Only when daemon is actually running
+            const refreshBtn = document.getElementById('refreshBtn');
+            const stopDaemonBtn = document.getElementById('stopDaemonBtn');
+            const canRefresh = state.systemStatus === 'ready' || state.systemStatus === 'missing';
+            const canStopDaemon = state.systemStatus === 'ready' || state.systemStatus === 'missing';
+            
+            if (refreshBtn) {
+                refreshBtn.style.display = canRefresh ? '' : 'none';
+            }
+            if (stopDaemonBtn) {
+                stopDaemonBtn.style.display = canStopDaemon ? '' : 'none';
+            }
+            
+            // Update new session button disabled state based on system status
+            const newSessionBtn = document.getElementById('newSessionBtn');
+            if (newSessionBtn) {
+                const systemReady = isSystemReady(state.systemStatus);
+                newSessionBtn.disabled = !systemReady;
+                if (systemReady) {
+                    newSessionBtn.classList.remove('disabled');
+                    newSessionBtn.title = 'New Session';
+                } else {
+                    newSessionBtn.classList.add('disabled');
+                    newSessionBtn.title = 'System not ready - check dependencies';
+                }
+            }
+            
+            // Render dynamic context box - use pre-rendered HTML from server
+            if (systemContextBox && state.systemContextHtml) {
+                systemContextBox.innerHTML = state.systemContextHtml;
+                attachContextBoxHandlers();
             }
             
             // Connection health warning
@@ -366,57 +583,6 @@ export function getSidebarScript(): string {
             }
             agentBadge.textContent = state.agentBadgeText || '0/0';
             attachAgentHandlers();
-
-            // Unity compact box
-            if (!state.unityEnabled || !state.unity) {
-                if (unityCompactBox) {
-                    unityCompactBox.style.display = 'none';
-                }
-            } else {
-                if (unityCompactBox) {
-                    unityCompactBox.style.display = 'flex';
-                }
-                
-                if (state.unity && unityBadge) {
-                    unityBadge.textContent = state.unityBadgeText || 'Idle';
-                    unityBadge.style.background = state.unityBadgeBackground || 'rgba(107, 114, 128, 0.3)';
-                    
-                    // Apply animation className
-                    if (state.unityBadgeClassName) {
-                        unityBadge.className = 'unity-compact-badge ' + state.unityBadgeClassName;
-                    } else {
-                        unityBadge.className = 'unity-compact-badge';
-                    }
-                }
-                
-                if (state.unity && unityQueue) {
-                    unityQueue.textContent = state.unity.queueLength + ' task' + (state.unity.queueLength !== 1 ? 's' : '');
-                    unityQueue.className = 'unity-compact-queue' + (state.unity.queueLength > 0 ? ' warning' : '');
-                }
-                
-                // Update current task if element exists
-                if (state.unity && state.unity.currentTask && unityCurrentTask) {
-                    const taskType = formatTaskType(state.unity.currentTask.type);
-                    const phase = state.unity.currentTask.phase ? ' (' + state.unity.currentTask.phase + ')' : '';
-                    unityCurrentTask.innerHTML = '<span class="unity-compact-current">' + taskType + phase + '</span>';
-                    unityCurrentTask.style.display = 'flex';
-                } else if (unityCurrentTask) {
-                    unityCurrentTask.style.display = 'none';
-                }
-            }
-            
-            /**
-             * Format task type for display.
-             */
-            function formatTaskType(type) {
-                const typeMap = {
-                    'prep_editor': 'Compile',
-                    'test_editmode': 'Test (Edit)',
-                    'test_playmode': 'Test (Play)',
-                    'exec_editmode': 'Execute'
-                };
-                return typeMap[type] || type;
-            }
         }
 
         // Listen for state updates from extension
@@ -424,8 +590,112 @@ export function getSidebarScript(): string {
             const message = event.data;
             if (message.type === 'updateState') {
                 updateState(message.state);
+            } else if (message.type === 'dependencyList') {
+                // Received full list of dependencies that will be checked
+                initializeDependencyList(message.dependencies);
+            } else if (message.type === 'dependencyProgress') {
+                // Real-time dependency check progress update
+                updateDependencyProgress(message.name, message.status);
+            } else if (message.type === 'initializationProgress') {
+                // Real-time daemon initialization progress
+                updateInitializationProgress(message.step, message.phase);
             }
         });
+        
+        /**
+         * Initialize the dependency list with all items in "pending" state.
+         * Called when deps.list event is received from daemon.
+         */
+        function initializeDependencyList(dependencies) {
+            const contextBox = document.getElementById('systemContextBox');
+            if (!contextBox) return;
+            
+            // Only show list if we're in checking or initializing state
+            const isChecking = statusText.textContent === 'Checking...' || 
+                              statusText.textContent === 'Initializing...';
+            if (!isChecking) return;
+            
+            // Find or create context body
+            let contextBody = contextBox.querySelector('.context-body');
+            if (!contextBody) return;
+            
+            // Create progress list container
+            let progressList = contextBox.querySelector('.progress-list');
+            if (!progressList) {
+                progressList = document.createElement('div');
+                progressList.className = 'progress-list';
+                progressList.style.cssText = 'margin-top: 8px; font-size: 12px; color: var(--vscode-descriptionForeground);';
+                contextBody.appendChild(progressList);
+            }
+            
+            // Clear existing items
+            progressList.innerHTML = '';
+            
+            // Add all dependencies with "pending" icon
+            for (let i = 0; i < dependencies.length; i++) {
+                const depName = dependencies[i];
+                const progressItem = document.createElement('div');
+                progressItem.style.cssText = 'padding: 2px 0; display: flex; align-items: center;';
+                progressItem.dataset.depName = depName;
+                progressItem.innerHTML = 
+                    '<span style="color: var(--vscode-descriptionForeground); margin-right: 6px; font-weight: bold;">○</span>' +
+                    '<span>' + escapeHtml(depName) + '</span>';
+                progressList.appendChild(progressItem);
+            }
+        }
+        
+        /**
+         * Update initialization progress in real-time.
+         * Shows daemon initialization steps during startup.
+         */
+        function updateInitializationProgress(step, phase) {
+            // Update the progress text in the initialization box
+            const progressEl = document.getElementById('initialization-progress');
+            if (progressEl) {
+                progressEl.textContent = step;
+            }
+        }
+        
+        /**
+         * Update dependency progress in real-time.
+         * Shows individual dependency check results during daemon startup.
+         */
+        function updateDependencyProgress(name, status) {
+            // Update the context box to show progress
+            const contextBox = document.getElementById('systemContextBox');
+            if (!contextBox) return;
+            
+            // Find progress list
+            let progressList = contextBox.querySelector('.progress-list');
+            if (!progressList) return; // Should have been created by initializeDependencyList
+            
+            // Find existing item by data-dep-name attribute
+            const existingItem = progressList.querySelector('[data-dep-name="' + name + '"]');
+            
+            if (existingItem) {
+                // Update existing item
+                const icon = status.installed ? '✓' : '✗';
+                const color = status.installed ? 'var(--vscode-testing-iconPassed)' : 'var(--vscode-testing-iconFailed)';
+                const version = status.version ? ' ' + status.version : '';
+                
+                existingItem.innerHTML = 
+                    '<span style="color: ' + color + '; margin-right: 6px; font-weight: bold;">' + icon + '</span>' +
+                    '<span>' + escapeHtml(name) + version + '</span>';
+            } else {
+                // Fallback: add new item if not found (shouldn't happen if deps.list was sent first)
+                const icon = status.installed ? '✓' : '✗';
+                const color = status.installed ? 'var(--vscode-testing-iconPassed)' : 'var(--vscode-testing-iconFailed)';
+                const version = status.version ? ' ' + status.version : '';
+                
+                const progressItem = document.createElement('div');
+                progressItem.style.cssText = 'padding: 2px 0; display: flex; align-items: center;';
+                progressItem.dataset.depName = name;
+                progressItem.innerHTML = 
+                    '<span style="color: ' + color + '; margin-right: 6px; font-weight: bold;">' + icon + '</span>' +
+                    '<span>' + escapeHtml(name) + version + '</span>';
+                progressList.appendChild(progressItem);
+            }
+        }
     `;
 }
 

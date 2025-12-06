@@ -25,6 +25,9 @@ import {
     AgentRolesResponse,
     UnityStatusResponse
 } from './Protocol';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Client', 'ApcClient');
 
 // ============================================================================
 // Client Interface
@@ -204,9 +207,10 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
         }
         
         try {
-            // Use a simple status request as a ping
+            // Use daemon.status (not 'status') for health checks
+            // daemon.status works immediately, even before services are initialized
             const result = await Promise.race([
-                this.send('status'),
+                this.send('daemon.status'),
                 new Promise<never>((_, reject) => 
                     setTimeout(() => reject(new Error('Ping timeout')), timeoutMs)
                 )
@@ -264,7 +268,7 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
     
     sendAsync(cmd: string, params?: Record<string, unknown>): void {
         if (!this.isConnected()) {
-            console.warn('Not connected to APC daemon, dropping async message');
+            log.warn('Not connected to APC daemon, dropping async message');
             return;
         }
         
@@ -278,7 +282,7 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
         try {
             this.sendRaw(JSON.stringify({ type: 'request', payload: request }));
         } catch (err) {
-            console.error('Failed to send async message:', err);
+            log.error('Failed to send async message:', err);
         }
     }
     
@@ -331,10 +335,10 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
             } else if (message.type === 'event') {
                 this.handleEvent(message.payload as ApcEvent);
             } else {
-                console.warn('Unknown message type:', message.type);
+                log.warn('Unknown message type:', message.type);
             }
         } catch (err) {
-            console.error('Failed to parse message:', err);
+            log.error('Failed to parse message:', err);
         }
     }
     
@@ -383,7 +387,7 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
             await this.connect();
             this.reconnectAttempts = 0;
         } catch (err) {
-            console.warn(`Reconnect attempt ${this.reconnectAttempts} failed:`, err);
+            log.warn(`Reconnect attempt ${this.reconnectAttempts} failed:`, err);
             this.attemptReconnect();
         }
     }

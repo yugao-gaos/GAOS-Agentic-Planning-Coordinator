@@ -448,6 +448,8 @@ export type ApcEventType =
     | 'unity.statusChanged'
     
     // System events
+    | 'daemon.starting'
+    | 'daemon.progress'
     | 'daemon.ready'
     | 'daemon.shutdown'
     | 'client.connected'

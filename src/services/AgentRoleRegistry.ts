@@ -1,5 +1,8 @@
 import { AgentRole, DefaultRoleConfigs, getDefaultRole, SystemPromptConfig, DefaultSystemPrompts, getDefaultSystemPrompt, CoordinatorPromptConfig, DefaultCoordinatorPrompt } from '../types';
 import { StateManager } from './StateManager';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Daemon', 'AgentRoleRegistry');
 
 /**
  * Manages all agent roles (built-in + custom), system prompts, and coordinator config.
@@ -31,7 +34,7 @@ export class AgentRoleRegistry {
      */
     setUnityEnabled(enabled: boolean): void {
         this._unityEnabled = enabled;
-        console.log(`[AgentRoleRegistry] Unity features ${enabled ? 'enabled' : 'disabled'}`);
+        log.info(`Unity features ${enabled ? 'enabled' : 'disabled'}`);
     }
     
     /**
@@ -63,7 +66,7 @@ export class AgentRoleRegistry {
             try {
                 callback();
             } catch (e) {
-                console.error('Error in roles changed callback:', e);
+                log.error('Error in roles changed callback:', e);
             }
         }
     }
@@ -76,7 +79,7 @@ export class AgentRoleRegistry {
             try {
                 callback();
             } catch (e) {
-                console.error('Error in system prompts changed callback:', e);
+                log.error('Error in system prompts changed callback:', e);
             }
         }
     }
@@ -105,7 +108,7 @@ export class AgentRoleRegistry {
             this.roles.set(roleData.id, AgentRole.fromJSON(roleData));
         }
 
-        console.log(`[AgentRoleRegistry] Loaded ${this.roles.size} roles (${Object.keys(DefaultRoleConfigs).length} built-in, ${customRoles.length} custom)`);
+        log.info(`Loaded ${this.roles.size} roles (${Object.keys(DefaultRoleConfigs).length} built-in, ${customRoles.length} custom)`);
     }
 
     /**
@@ -125,7 +128,7 @@ export class AgentRoleRegistry {
             }
         }
 
-        console.log(`[AgentRoleRegistry] Loaded ${this.systemPrompts.size} system prompts`);
+        log.info(`Loaded ${this.systemPrompts.size} system prompts`);
     }
 
     // ========================================================================
@@ -173,6 +176,7 @@ export class AgentRoleRegistry {
     updateRole(role: AgentRole): void {
         this.roles.set(role.id, role);
         this.persistRole(role);
+        this.reload();
         this.notifyRolesChanged();
     }
 
@@ -183,16 +187,17 @@ export class AgentRoleRegistry {
     resetToDefault(roleId: string): AgentRole | undefined {
         const defaults = DefaultRoleConfigs[roleId];
         if (!defaults) {
-            console.warn(`[AgentRoleRegistry] Cannot reset non-built-in role: ${roleId}`);
+            log.warn(`Cannot reset non-built-in role: ${roleId}`);
             return undefined;
         }
         
         const role = new AgentRole(defaults);
         this.roles.set(roleId, role);
         this.stateManager.clearRoleConfig(roleId);
+        this.reload();
         this.notifyRolesChanged();
         
-        console.log(`[AgentRoleRegistry] Reset role to default: ${roleId}`);
+        log.info(`Reset role to default: ${roleId}`);
         return role;
     }
 
@@ -209,9 +214,10 @@ export class AgentRoleRegistry {
         const role = new AgentRole({ ...data, isBuiltIn: false });
         this.roles.set(role.id, role);
         this.persistRole(role);
+        this.reload();
         this.notifyRolesChanged();
 
-        console.log(`[AgentRoleRegistry] Created custom role: ${role.id}`);
+        log.info(`Created custom role: ${role.id}`);
         return role;
     }
 
@@ -232,6 +238,7 @@ export class AgentRoleRegistry {
 
         this.roles.delete(roleId);
         this.stateManager.deleteRoleConfig(roleId);
+        this.reload();
         this.notifyRolesChanged();
 
         console.log(`[AgentRoleRegistry] Deleted custom role: ${roleId}`);
@@ -256,8 +263,13 @@ export class AgentRoleRegistry {
      */
     reload(): void {
         this.roles.clear();
+        this.systemPrompts.clear();
         this.loadRoles();
+        this.loadSystemPrompts();
+        this.loadCoordinatorPrompt();
         this.notifyRolesChanged();
+        this.notifySystemPromptsChanged();
+        this.notifyCoordinatorPromptChanged();
     }
 
     /**
@@ -273,9 +285,9 @@ export class AgentRoleRegistry {
             'context_gatherer',
             // Planning roles  
             'planner',
-            'analyst_architect',
+            'analyst_implementation',
             'analyst_quality',
-            'analyst_reviewer'
+            'analyst_architecture'
             // Note: error_analyst removed - ErrorResolutionWorkflow uses engineer role
         ];
         
@@ -468,6 +480,7 @@ export class AgentRoleRegistry {
     updateSystemPrompt(config: SystemPromptConfig): void {
         this.systemPrompts.set(config.id, config);
         this.stateManager.saveSystemPromptConfig(config.id, config.toJSON());
+        this.reloadSystemPrompts();
         this.notifySystemPromptsChanged();
         
         console.log(`[AgentRoleRegistry] Updated system prompt: ${config.id}`);
@@ -487,6 +500,7 @@ export class AgentRoleRegistry {
         const config = new SystemPromptConfig(defaults);
         this.systemPrompts.set(promptId, config);
         this.stateManager.clearSystemPromptConfig(promptId);
+        this.reloadSystemPrompts();
         this.notifySystemPromptsChanged();
         
         console.log(`[AgentRoleRegistry] Reset system prompt to default: ${promptId}`);
@@ -577,6 +591,7 @@ export class AgentRoleRegistry {
     updateCoordinatorPrompt(config: Partial<CoordinatorPromptConfig>): void {
         this.coordinatorPrompt = { ...this.coordinatorPrompt, ...config };
         this.stateManager.saveCoordinatorPromptConfig(this.coordinatorPrompt);
+        this.loadCoordinatorPrompt();
         this.notifyCoordinatorPromptChanged();
         console.log(`[AgentRoleRegistry] Updated coordinator prompt config`);
     }
@@ -587,9 +602,68 @@ export class AgentRoleRegistry {
     resetCoordinatorPromptToDefault(): CoordinatorPromptConfig {
         this.coordinatorPrompt = { ...DefaultCoordinatorPrompt };
         this.stateManager.clearCoordinatorPromptConfig();
+        this.loadCoordinatorPrompt();
         this.notifyCoordinatorPromptChanged();
         console.log(`[AgentRoleRegistry] Reset coordinator prompt to default`);
         return this.coordinatorPrompt;
+    }
+
+    // ========================================================================
+    // Unity Polling Agent Prompt Methods
+    // ========================================================================
+    
+    private static readonly POLLING_PROMPT_ID = 'unity_polling';
+    
+    /**
+     * Get the Unity polling agent prompt
+     * Returns both the current (possibly customized) prompt and the default
+     */
+    getPollingPrompt(): { currentPrompt: string; defaultPrompt: string } {
+        const defaultConfig = DefaultSystemPrompts[AgentRoleRegistry.POLLING_PROMPT_ID];
+        const defaultPrompt = defaultConfig?.promptTemplate || '';
+        
+        const currentConfig = this.systemPrompts.get(AgentRoleRegistry.POLLING_PROMPT_ID);
+        const currentPrompt = currentConfig?.promptTemplate || defaultPrompt;
+        
+        return { currentPrompt, defaultPrompt };
+    }
+    
+    /**
+     * Update the Unity polling agent prompt
+     */
+    updatePollingPrompt(prompt: string): void {
+        let config = this.systemPrompts.get(AgentRoleRegistry.POLLING_PROMPT_ID);
+        if (!config) {
+            // Create from defaults if not exists
+            const defaults = DefaultSystemPrompts[AgentRoleRegistry.POLLING_PROMPT_ID];
+            config = new SystemPromptConfig(defaults || { 
+                id: AgentRoleRegistry.POLLING_PROMPT_ID, 
+                name: 'Unity Polling Agent' 
+            });
+        }
+        
+        // Update the prompt template
+        config.promptTemplate = prompt;
+        this.systemPrompts.set(AgentRoleRegistry.POLLING_PROMPT_ID, config);
+        this.stateManager.saveSystemPromptConfig(AgentRoleRegistry.POLLING_PROMPT_ID, config.toJSON());
+        this.notifySystemPromptsChanged();
+        
+        console.log(`[AgentRoleRegistry] Updated Unity polling agent prompt`);
+    }
+    
+    /**
+     * Reset the Unity polling agent prompt to default
+     */
+    resetPollingPromptToDefault(): { currentPrompt: string; defaultPrompt: string } {
+        const defaults = DefaultSystemPrompts[AgentRoleRegistry.POLLING_PROMPT_ID];
+        if (defaults) {
+            const config = new SystemPromptConfig(defaults);
+            this.systemPrompts.set(AgentRoleRegistry.POLLING_PROMPT_ID, config);
+            this.stateManager.clearSystemPromptConfig(AgentRoleRegistry.POLLING_PROMPT_ID);
+            this.notifySystemPromptsChanged();
+            console.log(`[AgentRoleRegistry] Reset Unity polling agent prompt to default`);
+        }
+        return this.getPollingPrompt();
     }
 
     // ========================================================================

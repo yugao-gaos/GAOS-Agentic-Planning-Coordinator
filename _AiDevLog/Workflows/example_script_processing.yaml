@@ -1,0 +1,196 @@
+# Example: Custom Business Logic with ScriptNode
+# This demonstrates how to use ScriptNode for custom data processing,
+# validation, and decision-making in workflows.
+
+name: Data Processing Pipeline
+version: 1.0
+description: |
+  Demonstrates ScriptNode for custom data transformations and validation.
+  Shows how to process data, make decisions, and format outputs.
+
+parameters:
+  - name: input_array
+    type: array
+    required: true
+    description: Array of items to process
+
+variables:
+  - id: processed_count
+    type: number
+    default: 0
+  - id: failed_count
+    type: number
+    default: 0
+
+nodes:
+  - id: start
+    type: start
+    position: { x: 100, y: 200 }
+
+  # Validate input data
+  - id: validate_input
+    type: script
+    config:
+      script: |
+        const items = inputData.input_array || [];
+        
+        if (!Array.isArray(items)) {
+          throw new Error('Input must be an array');
+        }
+        
+        if (items.length === 0) {
+          log('Warning: Empty input array', 'warn');
+        }
+        
+        log(`Validating ${items.length} items`);
+        
+        return {
+          valid: items.length > 0,
+          count: items.length
+        };
+      timeout: 2000
+    position: { x: 300, y: 200 }
+
+  # Check if valid
+  - id: check_valid
+    type: if_condition
+    config:
+      condition: "validate_input.valid == true"
+    position: { x: 500, y: 200 }
+
+  # Process each item (simplified - in real case use ForLoop)
+  - id: process_items
+    type: script
+    config:
+      script: |
+        const items = inputData.input_array || [];
+        const results = [];
+        let successCount = 0;
+        let failCount = 0;
+        
+        for (const item of items) {
+          try {
+            // Custom processing logic
+            const processed = {
+              original: item,
+              processed: String(item).toUpperCase(),
+              timestamp: new Date().toISOString(),
+              valid: typeof item === 'string' && item.length > 0
+            };
+            
+            results.push(processed);
+            
+            if (processed.valid) {
+              successCount++;
+            } else {
+              failCount++;
+            }
+          } catch (error) {
+            log(`Failed to process item: ${error}`, 'error');
+            failCount++;
+          }
+        }
+        
+        // Store counts in workflow variables
+        context.setVariable('processed_count', successCount);
+        context.setVariable('failed_count', failCount);
+        
+        log(`Processed ${successCount} successfully, ${failCount} failed`);
+        
+        return {
+          results: results,
+          summary: {
+            total: items.length,
+            success: successCount,
+            failed: failCount
+          }
+        };
+      timeout: 10000
+    position: { x: 700, y: 200 }
+
+  # Format output
+  - id: format_output
+    type: script
+    config:
+      script: |
+        const summary = inputData.summary;
+        const successRate = (summary.success / summary.total * 100).toFixed(1);
+        
+        const message = `Processing complete!
+        Total: ${summary.total}
+        Success: ${summary.success} (${successRate}%)
+        Failed: ${summary.failed}`;
+        
+        log(message, 'info');
+        
+        return {
+          report: message,
+          success_rate: parseFloat(successRate),
+          all_succeeded: summary.failed === 0
+        };
+    position: { x: 900, y: 200 }
+
+  # Log final result
+  - id: log_result
+    type: log
+    config:
+      message: |
+        Pipeline complete!
+        Success rate: {{format_output.success_rate}}%
+        All succeeded: {{format_output.all_succeeded}}
+      level: info
+    position: { x: 1100, y: 200 }
+
+  # Handle empty input
+  - id: log_empty
+    type: log
+    config:
+      message: "No items to process - skipping"
+      level: warn
+    position: { x: 500, y: 350 }
+
+  - id: end
+    type: end
+    position: { x: 1300, y: 200 }
+
+connections:
+  # Start -> Validate
+  - from: { nodeId: start, portId: trigger }
+    to: { nodeId: validate_input, portId: trigger }
+  - from: { nodeId: start, portId: workflow_input }
+    to: { nodeId: validate_input, portId: inputData }
+
+  # Validate -> Check
+  - from: { nodeId: validate_input, portId: done }
+    to: { nodeId: check_valid, portId: trigger }
+
+  # If valid -> Process
+  - from: { nodeId: check_valid, portId: true }
+    to: { nodeId: process_items, portId: trigger }
+  - from: { nodeId: start, portId: workflow_input }
+    to: { nodeId: process_items, portId: inputData }
+
+  # Process -> Format
+  - from: { nodeId: process_items, portId: done }
+    to: { nodeId: format_output, portId: trigger }
+  - from: { nodeId: process_items, portId: result }
+    to: { nodeId: format_output, portId: inputData }
+
+  # Format -> Log -> End
+  - from: { nodeId: format_output, portId: done }
+    to: { nodeId: log_result, portId: trigger }
+  - from: { nodeId: log_result, portId: done }
+    to: { nodeId: end, portId: trigger }
+
+  # If not valid -> Log empty -> End
+  - from: { nodeId: check_valid, portId: false }
+    to: { nodeId: log_empty, portId: trigger }
+  - from: { nodeId: log_empty, portId: done }
+    to: { nodeId: end, portId: trigger }
+
+editor:
+  zoom: 0.7
+  panX: 0
+  panY: 0
+
+

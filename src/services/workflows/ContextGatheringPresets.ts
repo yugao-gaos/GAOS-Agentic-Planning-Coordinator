@@ -7,6 +7,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ContextGatheringPresetConfig, ContextPresetUserConfig } from '../../types/workflow';
 import { getFolderStructureManager } from '../FolderStructureManager';
+import { Logger } from '../../utils/Logger';
+
+const log = Logger.create('Daemon', 'ContextPresets');
 
 // ============================================================================
 // BUILT-IN PRESETS
@@ -505,13 +508,8 @@ const CONFIG_FILENAME = 'context_presets.json';
  * Uses FolderStructureManager for customizable path
  */
 export function getConfigPath(workspaceRoot: string): string {
-    try {
-        const folderStructure = getFolderStructureManager();
-        return path.join(folderStructure.getFolderPath('config'), CONFIG_FILENAME);
-    } catch {
-        // Fallback if FolderStructureManager not initialized
-        return path.join(workspaceRoot, '_AiDevLog', 'Config', CONFIG_FILENAME);
-    }
+    const folderStructure = getFolderStructureManager();
+    return path.join(folderStructure.getFolderPath('config'), CONFIG_FILENAME);
 }
 
 // ============================================================================
@@ -534,7 +532,7 @@ export function loadUserConfig(workspaceRoot: string): ContextPresetUserConfig |
         const config = JSON.parse(content) as ContextPresetUserConfig;
         return config;
     } catch (error) {
-        console.warn(`[ContextGatheringPresets] Failed to load user config: ${error}`);
+        log.warn(`Failed to load user config: ${error}`);
         return null;
     }
 }
@@ -556,7 +554,7 @@ export function saveUserConfig(workspaceRoot: string, config: ContextPresetUserC
         fs.writeFileSync(configPath, content, 'utf-8');
         return true;
     } catch (error) {
-        console.error(`[ContextGatheringPresets] Failed to save user config: ${error}`);
+        log.error(`Failed to save user config: ${error}`);
         return false;
     }
 }

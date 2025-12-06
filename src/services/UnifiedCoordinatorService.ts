@@ -11,6 +11,9 @@ import { AgentRoleRegistry } from './AgentRoleRegistry';
 import { UnityControlManager } from './UnityControlManager';
 import { OutputChannelManager } from './OutputChannelManager';
 import { ServiceLocator } from './ServiceLocator';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Daemon', 'Coordinator');
 // Note: RevisionImpactAnalyzer is used in PlanningRevisionWorkflow, not here
 import { 
     WorkflowRegistry, 
@@ -948,15 +951,17 @@ export class UnifiedCoordinatorService {
         this.agentRequestQueue.push(request);
         this.agentRequestQueue.sort((a, b) => a.priority - b.priority);
         
-        // Try to fulfill requests
-        this.processAgentQueue();
+        // Try to fulfill requests (async, but don't wait - fire and forget)
+        this.processAgentQueue().catch(err => {
+            this.log(`Error processing agent queue: ${err}`);
+        });
     }
     
     /**
      * Handle agent release from workflow
      */
     private handleAgentReleased(agentName: string): void {
-        console.log(`[UnifiedCoordinatorService] handleAgentReleased called for ${agentName}`);
+        log.debug(`handleAgentReleased called for ${agentName}`);
         const taskManager = ServiceLocator.resolve(TaskManager);
         
         // Sync with TaskManager - release the agent assignment
@@ -975,19 +980,21 @@ export class UnifiedCoordinatorService {
             const broadcaster = ServiceLocator.resolve(EventBroadcaster);
             const poolStatus = this.agentPoolService.getPoolStatus();
             const busyAgents = this.agentPoolService.getBusyAgents();
-            console.log(`[UnifiedCoordinatorService] Broadcasting pool.changed: available=${poolStatus.available.length}, busy=${busyAgents.length}`);
+            log.debug(`Broadcasting pool.changed: available=${poolStatus.available.length}, busy=${busyAgents.length}`);
             broadcaster.poolChanged(
                 poolStatus.total,
                 poolStatus.available,
                 busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId }))
             );
-            console.log(`[UnifiedCoordinatorService] pool.changed broadcast complete`);
+            log.debug(`pool.changed broadcast complete`);
         } catch (e) {
-            console.error(`[UnifiedCoordinatorService] Failed to broadcast pool.changed:`, e);
+            log.error(`Failed to broadcast pool.changed:`, e);
         }
         
-        // Try to fulfill pending requests
-        this.processAgentQueue();
+        // Try to fulfill pending requests (async, fire and forget)
+        this.processAgentQueue().catch(err => {
+            this.log(`Error processing agent queue: ${err}`);
+        });
         
         // Notify sessions that could use the agent (have ready tasks without running workflows)
         // This avoids triggering evaluations for sessions that can't benefit
@@ -1014,7 +1021,7 @@ export class UnifiedCoordinatorService {
      * Handle agent demotion to bench from workflow
      */
     private handleAgentDemotedToBench(agentName: string): void {
-        console.log(`[UnifiedCoordinatorService] handleAgentDemotedToBench called for ${agentName}`);
+        log.debug(`handleAgentDemotedToBench called for ${agentName}`);
         
         // Demote from busy to bench (allocated but not busy)
         this.agentPoolService.demoteAgentToBench(agentName);
@@ -1025,14 +1032,14 @@ export class UnifiedCoordinatorService {
             const broadcaster = ServiceLocator.resolve(EventBroadcaster);
             const poolStatus = this.agentPoolService.getPoolStatus();
             const busyAgents = this.agentPoolService.getBusyAgents();
-            console.log(`[UnifiedCoordinatorService] Broadcasting pool.changed after bench demotion: available=${poolStatus.available.length}, busy=${busyAgents.length}`);
+            log.debug(`Broadcasting pool.changed after bench demotion: available=${poolStatus.available.length}, busy=${busyAgents.length}`);
             broadcaster.poolChanged(
                 poolStatus.total,
                 poolStatus.available,
                 busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId }))
             );
         } catch (e) {
-            console.error(`[UnifiedCoordinatorService] Failed to broadcast pool.changed:`, e);
+            log.error(`Failed to broadcast pool.changed:`, e);
         }
         
         // Note: We don't trigger coordinator evaluation here because the agent is still
@@ -1046,8 +1053,10 @@ export class UnifiedCoordinatorService {
      * - This method ONLY allocates agents to bench
      * - It does NOT auto-promote to busy
      * - Workflows must explicitly call AgentPoolService.promoteAgentToBusy() when work starts
+     * 
+     * THREAD SAFETY: Now async to support mutex-protected allocation
      */
-    private processAgentQueue(): void {
+    private async processAgentQueue(): Promise<void> {
         const taskManager = ServiceLocator.resolve(TaskManager);
         
         while (this.agentRequestQueue.length > 0) {
@@ -1082,8 +1091,8 @@ export class UnifiedCoordinatorService {
             }
             
             if (!agentName) {
-                // No agents on this workflow's bench - allocate new agent
-                const allocated = this.agentPoolService.allocateAgents(
+                // No agents on this workflow's bench - allocate new agent (now async with mutex)
+                const allocated = await this.agentPoolService.allocateAgents(
                     sessionId,
                     request.workflowId,  // This workflow owns the agent
                     1, 
@@ -1130,9 +1139,9 @@ export class UnifiedCoordinatorService {
             'context_gatherer': 'context',
             'code_reviewer': 'reviewer',
             'planner': 'engineer',  // Planner uses engineer role for tracking
-            'analyst_architect': 'reviewer',
+            'analyst_implementation': 'reviewer',
             'analyst_quality': 'reviewer',
-            'analyst_reviewer': 'reviewer'
+            'analyst_architecture': 'reviewer'
         };
         return mapping[roleId] || 'engineer';
     }
@@ -1260,9 +1269,11 @@ export class UnifiedCoordinatorService {
             this._onWorkflowProgress.fire(progress);
         }));
         
-        // Completion
+        // Completion (auto-cleanup after completion)
         disposables.push(workflow.onComplete.event(async (result) => {
             await this.handleWorkflowComplete(sessionId, workflow.id, result);
+            // Cleanup event listeners immediately after completion
+            this.disposeWorkflowListeners(sessionId, workflow.id);
         }));
         
         // Agent requests
@@ -1300,6 +1311,56 @@ export class UnifiedCoordinatorService {
         
         // Store disposables for cleanup
         state.workflowDisposables.set(workflow.id, disposables);
+    }
+    
+    /**
+     * Dispose event listeners for a specific workflow
+     * CRITICAL: Prevents memory leaks by cleaning up all event subscriptions
+     */
+    private disposeWorkflowListeners(sessionId: string, workflowId: string): void {
+        const state = this.sessions.get(sessionId);
+        if (!state) return;
+        
+        const disposables = state.workflowDisposables.get(workflowId);
+        if (disposables) {
+            let disposedCount = 0;
+            for (const disposable of disposables) {
+                try {
+                    disposable.dispose();
+                    disposedCount++;
+                } catch (err) {
+                    this.log(`Warning: Error disposing listener for workflow ${workflowId}: ${err}`);
+                }
+            }
+            
+            // Remove from map
+            state.workflowDisposables.delete(workflowId);
+            this.log(`🧹 Cleaned up ${disposedCount} event listeners for workflow ${workflowId.substring(0, 8)}`);
+        }
+    }
+    
+    /**
+     * Dispose all event listeners for a session
+     * Called when session is removed or cleaned up
+     */
+    private disposeSessionListeners(sessionId: string): void {
+        const state = this.sessions.get(sessionId);
+        if (!state) return;
+        
+        let totalDisposed = 0;
+        for (const [workflowId, disposables] of state.workflowDisposables) {
+            for (const disposable of disposables) {
+                try {
+                    disposable.dispose();
+                    totalDisposed++;
+                } catch (err) {
+                    this.log(`Warning: Error disposing listener for workflow ${workflowId}: ${err}`);
+                }
+            }
+        }
+        
+        state.workflowDisposables.clear();
+        this.log(`🧹 Cleaned up ${totalDisposed} event listeners for session ${sessionId}`);
     }
     
     /**
@@ -1439,7 +1500,7 @@ export class UnifiedCoordinatorService {
             this.log(`Broadcast workflow.completed for ${workflowId.substring(0, 8)}`);
         } catch (e) {
             // Broadcaster may not be available in some contexts
-            console.warn(`[UnifiedCoordinatorService] Failed to broadcast workflow.completed:`, e);
+            log.warn(`Failed to broadcast workflow.completed:`, e);
         }
         
         // Save workflow to persistent history
@@ -1649,7 +1710,7 @@ export class UnifiedCoordinatorService {
         
         if (!failedTask.canRetry) {
             this.log(`Cannot retry task: ${taskId} is marked as non-retriable`);
-            console.warn(`[Coordinator] Task "${taskId}" cannot be retried (permanent error).`);
+            log.warn(`Task "${taskId}" cannot be retried (permanent error).`);
             return null;
         }
         
@@ -1686,7 +1747,7 @@ export class UnifiedCoordinatorService {
         } catch (error) {
             const errorMsg = error instanceof Error ? error.message : String(error);
             this.log(`❌ Failed to retry task ${taskId}: ${errorMsg}`);
-            console.error(`[Coordinator] Failed to retry task: ${errorMsg}`);
+            log.error(`Failed to retry task: ${errorMsg}`);
             return null;
         }
     }
@@ -1791,14 +1852,8 @@ export class UnifiedCoordinatorService {
                     
                     state.archivedWorkflows.set(workflowId, archived);
                     
-                    // Dispose event listeners first to prevent memory leaks
-                    const disposables = state.workflowDisposables.get(workflowId);
-                    if (disposables) {
-                        for (const disposable of disposables) {
-                            disposable.dispose();
-                        }
-                        state.workflowDisposables.delete(workflowId);
-                    }
+                    // Dispose event listeners using helper method (prevents memory leaks)
+                    this.disposeWorkflowListeners(sessionId, workflowId);
                     
                     // Dispose workflow before removing to clean up internal state
                     workflow.dispose();
@@ -1809,7 +1864,7 @@ export class UnifiedCoordinatorService {
         }
         
         if (cleaned > 0) {
-            this.log(`Cleaned up ${cleaned} old completed workflows for session ${sessionId}`);
+            this.log(`🧹 Cleaned up ${cleaned} old workflows for session ${sessionId} (freed event listeners + workflow state)`);
             
             // Broadcast cleanup event so UI can update
             try {
@@ -2389,20 +2444,15 @@ export class UnifiedCoordinatorService {
         for (const sessionId of sessionsToRemove) {
             const state = this.sessions.get(sessionId);
             if (state) {
-                // Dispose all event listeners first
-                for (const [workflowId, disposables] of state.workflowDisposables) {
-                    for (const disposable of disposables) {
-                        disposable.dispose();
-                    }
-                }
-                state.workflowDisposables.clear();
+                // Dispose all event listeners using helper method
+                this.disposeSessionListeners(sessionId);
                 
                 // Dispose all workflows
                 for (const workflow of state.workflows.values()) {
                     workflow.dispose();
                 }
                 this.sessions.delete(sessionId);
-                this.log(`Cleaned up old completed session ${sessionId}`);
+                this.log(`🧹 Cleaned up old completed session ${sessionId}`);
             }
         }
     }
@@ -2425,12 +2475,12 @@ export class UnifiedCoordinatorService {
         
         // Safety limit: if we have more than 100 pending signals, something is wrong
         if (this.completionSignals.size > 100) {
-            console.warn(`[UnifiedCoordinatorService] Large number of pending completion signals: ${this.completionSignals.size}`);
+            log.warn(`Large number of pending completion signals: ${this.completionSignals.size}`);
             // Log the first few for debugging
             let count = 0;
             for (const key of this.completionSignals.keys()) {
                 if (count++ < 5) {
-                    console.warn(`  - ${key}`);
+                    log.warn(`  - ${key}`);
                 }
             }
         }

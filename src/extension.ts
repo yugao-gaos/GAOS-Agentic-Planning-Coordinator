@@ -1,18 +1,21 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { TerminalManager } from './services/TerminalManager';
 import { DependencyService } from './services/DependencyService';
-import { PlanningSessionsProvider, PlanningSessionItem } from './ui/PlanningSessionsProvider';
-import { AgentPoolProvider } from './ui/AgentPoolProvider';
+import { getFolderStructureManager } from './services/FolderStructureManager';
 import { RoleSettingsPanel } from './ui/RoleSettingsPanel';
 import { WorkflowSettingsPanel } from './ui/WorkflowSettingsPanel';
 import { DependencyMapPanel } from './ui/DependencyMapPanel';
 import { HistoryViewPanel } from './ui/HistoryViewPanel';
 import { SidebarViewProvider } from './ui/SidebarViewProvider';
+import { NodeGraphEditorPanel } from './ui/NodeGraphEditorPanel';
 import { DaemonManager } from './vscode/DaemonManager';
 import { VsCodeClient } from './vscode/VsCodeClient';
 import { DaemonStateProxy } from './services/DaemonStateProxy';
 import { ServiceLocator } from './services/ServiceLocator';
-import { ProcessManager } from './services/ProcessManager';
+import { Logger } from './utils/Logger';
+
+const log = Logger.create('Client', 'Extension');
 
 // Module-level references (kept minimal - only what must be local)
 let terminalManager: TerminalManager;
@@ -28,11 +31,11 @@ let globalVsCodeClient: VsCodeClient | null = null;
 
 function getOrCreateDaemonClient(port: number): VsCodeClient {
     if (globalVsCodeClient && globalVsCodeClient.isConnected()) {
-        console.log('[APC] Reusing existing daemon connection');
+        log.debug('Reusing existing daemon connection');
         return globalVsCodeClient;
     }
     
-    console.log('[APC] Creating new daemon connection');
+    log.debug('Creating new daemon connection');
     globalVsCodeClient = new VsCodeClient({ 
         clientId: `vscode-${process.pid}`, // Include process PID
         url: `ws://127.0.0.1:${port}`
@@ -43,67 +46,167 @@ function getOrCreateDaemonClient(port: number): VsCodeClient {
 
 /**
  * Open agent chat in Cursor/VS Code, paste clipboard content, and send.
- * Uses platform-specific automation (AppleScript, PowerShell, xdotool).
+ * Tries multiple approaches:
+ * 1. Keyboard automation (most reliable for NEW chat window)
+ * 2. Cursor-specific VS Code commands (as fallback)
+ * 3. Shows manual instructions as final fallback
+ * 
+ * Note: We prioritize keyboard automation because it reliably opens a NEW chat,
+ * whereas some VS Code commands might reuse existing chat windows.
  */
-function openAgentChat(): void {
+async function openAgentChat(): Promise<void> {
     const { exec } = require('child_process');
+    const isMac = process.platform === 'darwin';
+    const modifierKey = isMac ? 'Cmd' : 'Ctrl';
+    
+    log.info('Opening new agent chat window...');
+    
+    // FIRST: Try keyboard automation (most reliable for opening NEW chat)
+    // The Ctrl+Shift+L (or Cmd+Shift+L) keyboard shortcut reliably opens a NEW agent chat
+    let automationAttempted = false;
     
     if (process.platform === 'darwin') {
-        // macOS: Use AppleScript - open chat, paste, and press Enter
+        // macOS: Use AppleScript to send keyboard shortcut with proper timing
+        automationAttempted = true;
         const script = `
             tell application "Cursor" to activate
-            delay 0.2
-            tell application "System Events" to key code 53
             delay 0.3
             tell application "System Events" to keystroke "l" using {command down, shift down}
-            delay 0.5
+            delay 1.2
             tell application "System Events" to keystroke "v" using command down
-            delay 0.3
+            delay 0.5
             tell application "System Events" to key code 36
         `;
         exec(`osascript -e '${script}'`, (error: Error | null) => {
             if (error) {
-                vscode.window.showWarningMessage(
-                    'Could not open chat automatically. Press Cmd+Shift+L and paste (Cmd+V).'
+                log.warn('AppleScript automation failed:', error);
+                vscode.window.showInformationMessage(
+                    `Planning prompt copied to clipboard!\n\nPress ${modifierKey}+Shift+L to open NEW Agent chat, then ${modifierKey}+V to paste and Enter to submit.`,
+                    'OK'
                 );
+            } else {
+                log.info('AppleScript automation succeeded - new chat opened and submitted');
             }
         });
     } else if (process.platform === 'win32') {
-        // Windows: Use PowerShell with SendKeys - open chat, paste, and press Enter
+        // Windows: Use PowerShell to send keyboard shortcut with proper timing
+        automationAttempted = true;
+        const timestamp = Date.now();
         const psScript = `
-            Add-Type -AssemblyName System.Windows.Forms
-            Start-Sleep -Milliseconds 200
-            [System.Windows.Forms.SendKeys]::SendWait('{ESC}')
-            Start-Sleep -Milliseconds 300
-            [System.Windows.Forms.SendKeys]::SendWait('^+l')
-            Start-Sleep -Milliseconds 500
-            [System.Windows.Forms.SendKeys]::SendWait('^v')
-            Start-Sleep -Milliseconds 300
-            [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
-        `;
-        exec(`powershell -Command "${psScript.replace(/\n/g, ' ')}"`, (error: Error | null) => {
-            if (error) {
-                vscode.window.showWarningMessage(
-                    'Could not open chat automatically. Press Ctrl+Shift+L and paste (Ctrl+V).'
-                );
-            }
-        });
+Add-Type -AssemblyName System.Windows.Forms
+Start-Sleep -Milliseconds 400
+[System.Windows.Forms.SendKeys]::SendWait("^+l")
+Start-Sleep -Milliseconds 1200
+[System.Windows.Forms.SendKeys]::SendWait("^v")
+Start-Sleep -Milliseconds 500
+[System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+`;
+        // Write script to temp file
+        const fs = require('fs');
+        const path = require('path');
+        const tempFile = path.join(require('os').tmpdir(), `apc_chat_${timestamp}.ps1`);
+        
+        try {
+            fs.writeFileSync(tempFile, psScript, 'utf8');
+            exec(`powershell -ExecutionPolicy Bypass -File "${tempFile}"`, (error: Error | null) => {
+                // Clean up temp file
+                try { fs.unlinkSync(tempFile); } catch { /* ignore */ }
+                
+                if (error) {
+                    log.warn('PowerShell automation failed:', error);
+                    vscode.window.showInformationMessage(
+                        `Planning prompt copied to clipboard!\n\nPress ${modifierKey}+Shift+L to open NEW Agent chat, then ${modifierKey}+V to paste and Enter to submit.\n\nTip: "cursor agent" CLI available for terminal interaction.`,
+                        'OK'
+                    );
+                } else {
+                    log.info('PowerShell automation succeeded - new chat opened and submitted');
+                }
+            });
+        } catch (writeError) {
+            log.error('Failed to write PowerShell script:', writeError);
+            vscode.window.showInformationMessage(
+                `Planning prompt copied to clipboard!\n\nPress ${modifierKey}+Shift+L to open NEW Agent chat, then ${modifierKey}+V to paste and Enter to submit.\n\nTip: "cursor agent" CLI available for terminal interaction.`,
+                'OK'
+            );
+        }
     } else {
-        // Linux: Use xdotool if available - open chat, paste, and press Enter
+        // Linux: Use xdotool if available with proper timing
         exec('which xdotool', (err: Error | null) => {
             if (!err) {
-                exec('sleep 0.2 && xdotool key Escape && sleep 0.3 && xdotool key ctrl+shift+l && sleep 0.5 && xdotool key ctrl+v && sleep 0.3 && xdotool key Return');
+                automationAttempted = true;
+                exec('sleep 0.4 && xdotool key ctrl+shift+l && sleep 1.2 && xdotool key ctrl+v && sleep 0.5 && xdotool key Return', (error: Error | null) => {
+                    if (error) {
+                        log.warn('xdotool automation failed:', error);
+                        vscode.window.showInformationMessage(
+                            `Planning prompt copied to clipboard! Press ${modifierKey}+Shift+L to open NEW Agent chat, then ${modifierKey}+V to paste and Enter to submit.`
+                        );
+                    } else {
+                        log.info('xdotool automation succeeded - new chat opened and submitted');
+                    }
+                });
             } else {
+                log.warn('xdotool not found, showing manual instructions');
                 vscode.window.showInformationMessage(
-                    'Prompt copied! Press Ctrl+Shift+L to open chat, then Ctrl+V to paste.'
+                    `Planning prompt copied to clipboard! Press ${modifierKey}+Shift+L to open NEW Agent chat, then ${modifierKey}+V to paste and Enter to submit.`
                 );
             }
         });
     }
+    
+    // If no automation attempted, try VS Code commands as fallback
+    if (!automationAttempted) {
+        log.info('No platform automation available, trying VS Code commands...');
+        try {
+            const commands = await vscode.commands.getCommands(true);
+            
+            // Try known Cursor command patterns that explicitly create NEW chats
+            const knownCommands = [
+                'aichat.newchataction',
+                'aichat.newAgentChat',
+                'aichat.newChat',
+                'composer.newComposerSession',
+                'composer.new'
+            ];
+            
+            for (const cmdName of knownCommands) {
+                if (commands.includes(cmdName)) {
+                    log.info(`Found and executing command: ${cmdName}`);
+                    try {
+                        await vscode.commands.executeCommand(cmdName);
+                        // If command succeeded, paste clipboard content
+                        setTimeout(async () => {
+                            try {
+                                await vscode.commands.executeCommand('editor.action.clipboardPasteAction');
+                                log.info('Successfully opened chat and pasted content via command');
+                            } catch (pasteError) {
+                                log.warn('Failed to paste content:', pasteError);
+                            }
+                        }, 500);
+                        return;
+                    } catch (cmdError) {
+                        log.warn(`Command ${cmdName} failed:`, cmdError);
+                    }
+                }
+            }
+            
+            // Log available commands for debugging
+            const chatCommands = commands.filter(cmd => 
+                cmd.toLowerCase().includes('aichat') ||
+                cmd.toLowerCase().includes('composer') ||
+                cmd.toLowerCase().includes('chat')
+            );
+            
+            if (chatCommands.length > 0) {
+                log.info('Available chat commands:', chatCommands.slice(0, 20).join(', '));
+            }
+        } catch (e) {
+            log.debug('Could not discover/execute Cursor commands:', e);
+        }
+    }
 }
 
 export async function activate(context: vscode.ExtensionContext) {
-    console.log('[APC] ===== ACTIVATION START =====');
+    log.info('===== ACTIVATION START =====');
 
     // Get workspace root
     const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -111,35 +214,25 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.window.showWarningMessage('Agentic Planning: No workspace folder open');
         return;
     }
-    console.log(`[APC] Step 1: Workspace root = ${workspaceRoot}`);
+    log.info(`Step 1: Workspace root = ${workspaceRoot}`);
+    
+    // Initialize FolderStructureManager early (needed by settings panels)
+    // Uses standard _AiDevLog directory
+    getFolderStructureManager(workspaceRoot);
+    log.info(`Step 1a: FolderStructureManager initialized with workingDir = ${path.join(workspaceRoot, '_AiDevLog')}`);
     
     // Register extension-local services only (NO daemon services!)
     // Extension is a pure GUI client - all state comes from daemon
-    // Note: AgentRunner is in daemon - workflows spawn agents there
-    console.log('[APC] Step 2: Registering extension-local services...');
+    // Note: Process management (including orphan cleanup) is handled by daemon
+    log.debug('Step 2: Registering extension-local services...');
     ServiceLocator.register(DependencyService, () => new DependencyService());
-    ServiceLocator.register(ProcessManager, () => new ProcessManager());
     ServiceLocator.markInitialized();
-    console.log('[APC] Step 2: Extension-local services registered');
-    
-    // Kill orphan cursor-agent processes from previous sessions
-    console.log('[APC] Step 2b: Cleaning up orphan cursor-agent processes...');
-    try {
-        const processManager = ServiceLocator.resolve(ProcessManager);
-        const killedCount = await processManager.killOrphanCursorAgents();
-        if (killedCount > 0) {
-            console.log(`[APC] Step 2b: Killed ${killedCount} orphan cursor-agent processes`);
-        } else {
-            console.log('[APC] Step 2b: No orphan cursor-agent processes found');
-        }
-    } catch (err) {
-        console.warn(`[APC] Step 2b: Failed to cleanup orphans: ${err}`);
-    }
+    log.debug('Step 2: Extension-local services registered (no AgentRunner - connectivity tests run in daemon)');
     
     // ========================================================================
     // ARCHITECTURE GUARD: Verify extension hasn't registered daemon services
     // ========================================================================
-    console.log('[APC] Step 2a: Verifying architecture guards...');
+    log.debug('Step 3: Verifying architecture guards...');
     
     // List of services that should ONLY exist in daemon, NEVER in extension
     const daemonOnlyServices = [
@@ -163,14 +256,14 @@ export async function activate(context: vscode.ExtensionContext) {
     
     if (violations.length > 0) {
         const errorMsg = `FATAL ARCHITECTURE VIOLATION: Extension registered daemon-only services: ${violations.join(', ')}`;
-        console.error(`[APC] ${errorMsg}`);
+        log.error(errorMsg);
         vscode.window.showErrorMessage(errorMsg);
         throw new Error(errorMsg);
     }
     
-    console.log('[APC] Step 2a: Architecture guards passed ✓');
-    console.log(`[APC] Extension services: ${registeredServices.join(', ')}`);
-    console.log('[APC] (All core business logic runs in daemon)');
+    log.debug('Step 2a: Architecture guards passed');
+    log.debug(`Extension services: ${registeredServices.join(', ')}`);
+    log.debug('(All core business logic runs in daemon)');
 
     // Initialize local-only services
     terminalManager = new TerminalManager();
@@ -182,81 +275,39 @@ export async function activate(context: vscode.ExtensionContext) {
     const unityFeaturesEnabled = config.get<boolean>('enableUnityFeatures', true);
     dependencyService.setUnityEnabled(unityFeaturesEnabled);
     
-    // Start periodic dependency checks (every 30 seconds)
-    dependencyService.startPeriodicCheck(30000);
+    // Note: NO periodic checks in extension
+    // - Extension queries daemon API (daemon checks on startup)
+    // - User can manually refresh via UI button
+    // - Daemon re-checks after install/uninstall operations
+    // - Extension DependencyService can't run connectivity tests (no AgentRunner)
+    // - Only daemon can run real MCP connectivity tests via cursor-agent CLI
 
     // Create UI providers
-    console.log('[APC] Step 3: Creating sidebar provider...');
+    log.debug('Step 3: Creating sidebar provider...');
     const sidebarProvider = new SidebarViewProvider(context.extensionUri);
     sidebarProvider.setUnityEnabled(unityFeaturesEnabled);
-    console.log('[APC] Step 3: Sidebar provider created');
+    log.debug('Step 3: Sidebar provider created');
     
     // ========================================================================
-    // Daemon Connection - This is the main state source
+    // EARLY UI Registration - Show UI before daemon connection
+    // This allows users to see connection status, dependency checks, etc.
     // ========================================================================
-    console.log('[APC] Step 4: Starting daemon connection...');
+    log.debug('Step 4: Registering webview provider early...');
+    context.subscriptions.push(
+        vscode.window.registerWebviewViewProvider(SidebarViewProvider.viewType, sidebarProvider)
+    );
+    log.debug('Step 4: Webview provider registered (UI now visible with "connecting" status)');
     
-    // Initialize daemon manager and ensure daemon is running
+    // ========================================================================
+    // Daemon Connection - Runs in background so UI is responsive
+    // ========================================================================
+    log.debug('Step 5: Starting daemon connection in background...');
+    
+    // Initialize daemon manager
     daemonManager = new DaemonManager(workspaceRoot, context.extensionPath);
     
-    try {
-        console.log('[APC] Step 4a: Calling ensureDaemonRunning...');
-        const daemonResult = await daemonManager.ensureDaemonRunning();
-        console.log(`[APC] Step 4b: Daemon on port ${daemonResult.port} (wasStarted: ${daemonResult.wasStarted}, isExternal: ${daemonResult.isExternal})`);
-        
-        // Create and connect VS Code client using singleton
-        vsCodeClient = getOrCreateDaemonClient(daemonResult.port);
-        
-        // Set up notification callbacks
-        vsCodeClient.setNotificationCallbacks({
-            showInfo: (msg) => vscode.window.showInformationMessage(msg),
-            showWarning: (msg) => vscode.window.showWarningMessage(msg),
-            showError: (msg) => vscode.window.showErrorMessage(msg)
-        });
-        
-        // Connect to daemon with retry (daemon may still be starting up)
-        console.log('[APC] Step 4c: Connecting to daemon...');
-        const maxRetries = 5;
-        let lastError: Error | undefined;
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                await vsCodeClient.connect();
-                console.log(`[APC] Step 4d: Connected to daemon (attempt ${attempt})`);
-                break;
-            } catch (err) {
-                lastError = err as Error;
-                console.log(`[APC] Connection attempt ${attempt}/${maxRetries} failed: ${lastError.message}`);
-                if (attempt < maxRetries) {
-                    // Wait before retry (100ms, 200ms, 400ms, 800ms)
-                    await new Promise(r => setTimeout(r, 100 * Math.pow(2, attempt - 1)));
-                }
-            }
-        }
-        if (!vsCodeClient.isConnected()) {
-            throw lastError || new Error('Failed to connect to daemon');
-        }
-        console.log('Agentic Planning: Connected to daemon');
-        
-        // If daemon was external (started by CLI), show info
-        if (daemonResult.isExternal) {
-            vscode.window.showInformationMessage(
-                'Connected to existing APC daemon (started externally). State is shared with CLI.'
-            );
-        }
-        
-        // Create DaemonStateProxy - all state reads go through this
-        daemonStateProxy = new DaemonStateProxy({
-            vsCodeClient,
-            unityEnabled: unityFeaturesEnabled
-        });
-        console.log('[APC] DaemonStateProxy created (daemon-only mode)');
-        
-        // Start connection health monitoring (every 15 seconds)
-        daemonStateProxy.startConnectionMonitor(15000);
-        
-        // Pass proxy to providers
-        sidebarProvider.setStateProxy(daemonStateProxy);
-        
+    // Helper function to set up event subscriptions after connection
+    const setupEventSubscriptions = () => {
         // Clean up any existing event subscriptions (prevents duplicates on hot reload)
         for (const unsubscribe of eventSubscriptions) {
             try {
@@ -283,7 +334,7 @@ export async function activate(context: vscode.ExtensionContext) {
         // Create agent terminal when an agent is allocated
         eventSubscriptions.push(
             vsCodeClient.subscribe('agent.allocated', (data: unknown) => {
-                console.log(`[APC Extension] agent.allocated event received:`, JSON.stringify(data));
+                log.debug(`agent.allocated event received:`, JSON.stringify(data));
                 const allocData = data as { agentName: string; sessionId: string; roleId: string; logFile?: string };
                 if (allocData.agentName && allocData.sessionId) {
                     terminalManager.createAgentTerminal(
@@ -312,7 +363,7 @@ export async function activate(context: vscode.ExtensionContext) {
         // Subscribe to workflow completion events to update UI
         eventSubscriptions.push(
             vsCodeClient.subscribe('workflow.completed', (data: unknown) => {
-                console.log('[APC] Workflow completed, refreshing UI');
+                log.debug('Workflow completed, refreshing UI');
                 const completionData = data as { workflowId: string };
                 // Remove from tracked workflows to prevent stale queries
                 if (completionData.workflowId && sidebarProvider) {
@@ -329,7 +380,7 @@ export async function activate(context: vscode.ExtensionContext) {
         // Subscribe to workflow cleanup events
         eventSubscriptions.push(
             vsCodeClient.subscribe('workflows.cleaned', () => {
-                console.log('[APC] Workflows cleaned up, refreshing UI');
+                log.debug('Workflows cleaned up, refreshing UI');
                 sidebarProvider?.refresh();
             })
         );
@@ -337,7 +388,7 @@ export async function activate(context: vscode.ExtensionContext) {
         // Subscribe to disconnection events to update UI
         eventSubscriptions.push(
             vsCodeClient.subscribe('disconnected', () => {
-                console.log('[APC] Daemon disconnected, refreshing UI');
+                log.warn('Daemon disconnected, refreshing UI');
                 sidebarProvider?.refresh();
             })
         );
@@ -346,63 +397,42 @@ export async function activate(context: vscode.ExtensionContext) {
         if (unityFeaturesEnabled) {
             eventSubscriptions.push(
                 vsCodeClient.subscribe('unity.statusChanged', () => {
-                    console.log('[APC] Unity status changed, refreshing UI');
+                    log.debug('Unity status changed, refreshing UI');
                     sidebarProvider?.refresh();
                 })
             );
             
             eventSubscriptions.push(
                 vsCodeClient.subscribe('unity.pipelineStarted', () => {
-                    console.log('[APC] Unity pipeline started, refreshing UI');
+                    log.debug('Unity pipeline started, refreshing UI');
                     sidebarProvider?.refresh();
                 })
             );
             
             eventSubscriptions.push(
                 vsCodeClient.subscribe('unity.pipelineCompleted', () => {
-                    console.log('[APC] Unity pipeline completed, refreshing UI');
+                    log.debug('Unity pipeline completed, refreshing UI');
                     sidebarProvider?.refresh();
                 })
             );
         }
         
-    } catch (daemonError) {
-        console.error('Agentic Planning: Failed to connect to daemon:', daemonError);
-        vscode.window.showWarningMessage(
-            'Could not connect to APC daemon. Run "apc system run --headless" or restart Cursor.'
-        );
-        
-        // Create proxy with unconnected client - UI will show "daemon missing"
-        vsCodeClient = new VsCodeClient({ clientId: 'vscode-extension' });
-        daemonStateProxy = new DaemonStateProxy({
-            vsCodeClient,
-            unityEnabled: unityFeaturesEnabled
-        });
-        // Start connection health monitoring (even if disconnected - will check periodically)
-        daemonStateProxy.startConnectionMonitor(15000);
-        sidebarProvider.setStateProxy(daemonStateProxy);
-    }
-    
-    // Note: Agent temp file cleanup is now handled by daemon
-    // (AgentRunner lives in daemon where agents are actually spawned)
-    
-    // Listen for task.failedFinal events from daemon via WebSocket
-    // (Don't use local EventBroadcaster - extension doesn't have daemon services)
-    eventSubscriptions.push(
-        vsCodeClient.subscribe('task.failedFinal', async (data: unknown) => {
-            const failedData = data as { 
-                errorType?: string; 
-                taskId?: string; 
-                clarityQuestion?: string; 
-                lastError?: string; 
-                sessionId?: string; 
-                attempts?: number; 
-                canRetry?: boolean 
-            };
-            const isNeedsClarity = failedData.errorType === 'needs_clarity';
-            
-            const prompt = isNeedsClarity 
-                ? `Engineer needs clarity on task "${failedData.taskId}":
+        // Listen for task.failedFinal events from daemon via WebSocket
+        eventSubscriptions.push(
+            vsCodeClient.subscribe('task.failedFinal', async (data: unknown) => {
+                const failedData = data as { 
+                    errorType?: string; 
+                    taskId?: string; 
+                    clarityQuestion?: string; 
+                    lastError?: string; 
+                    sessionId?: string; 
+                    attempts?: number; 
+                    canRetry?: boolean 
+                };
+                const isNeedsClarity = failedData.errorType === 'needs_clarity';
+                
+                const prompt = isNeedsClarity 
+                    ? `Engineer needs clarity on task "${failedData.taskId}":
 ${failedData.clarityQuestion || failedData.lastError}
 
 Session: ${failedData.sessionId}
@@ -414,7 +444,7 @@ After running "apc plan revise", the revision process takes about 80 seconds to 
 - Wait 80 seconds before checking status the first time
 - Then poll every 30 seconds: sleep 30 && apc plan status ${failedData.sessionId}
 - Do NOT poll more frequently - the multi-agent debate takes time!`
-                : `Task "${failedData.taskId}" failed after ${failedData.attempts} attempt(s).
+                    : `Task "${failedData.taskId}" failed after ${failedData.attempts} attempt(s).
 
 Error: ${failedData.lastError}
 Session: ${failedData.sessionId}
@@ -430,51 +460,177 @@ If you revise the plan, the revision process takes about 80 seconds to complete.
 - Then poll every 30 seconds: sleep 30 && apc plan status ${failedData.sessionId}
 - Do NOT poll more frequently - the multi-agent debate takes time!`;
 
-            // Copy prompt to clipboard and open agent chat
-            await vscode.env.clipboard.writeText(prompt);
-            openAgentChat();
+                // Copy prompt to clipboard and open agent chat
+                await vscode.env.clipboard.writeText(prompt);
+                await openAgentChat();
+                
+                // Also show a notification
+                const action = isNeedsClarity ? 'Needs Clarity' : 'Task Failed';
+                vscode.window.showWarningMessage(
+                    `${action}: ${failedData.taskId} - ${failedData.lastError?.substring(0, 50)}...`,
+                    'View in Chat'
+                ).then(selection => {
+                    if (selection === 'View in Chat') {
+                        // Chat was already opened, just show info
+                        vscode.window.showInformationMessage('Check the agent chat for details and next steps.');
+                    }
+                });
+            })
+        );
+        
+        // Listen for daemon.ready event - daemon broadcasts this after all services (including dependency checks) are initialized
+        // Flow:
+        // 1. Daemon starts (standalone.ts::initializeServices)
+        // 2. Checks dependencies (DependencyService::checkAllDependencies)
+        // 3. Initializes all services (AgentPoolService, UnifiedCoordinatorService, etc.)
+        // 4. Calls daemon.setServicesReady() which broadcasts 'daemon.ready'
+        // 5. Extension receives event and shows "Coordinator ready!" message
+        // This ensures we don't show "ready" before dependency checks complete
+        eventSubscriptions.push(
+            vsCodeClient.subscribe('daemon.ready', (data: unknown) => {
+                log.info('Daemon is fully ready - all services initialized and dependencies checked');
+                
+                // NOW start connection health monitoring - daemon is fully initialized
+                // Starting it earlier causes health changes that trigger refreshes
+                // which wipe out initialization progress messages
+                if (daemonStateProxy && !daemonStateProxy['healthCheckTimer']) {
+                    log.info('Starting connection health monitoring now that daemon is ready');
+                    daemonStateProxy.startConnectionMonitor(15000);
+                }
+                
+                vscode.window.showInformationMessage('Agentic Planning Coordinator ready!');
+                sidebarProvider?.refresh();
+            })
+        );
+    };
+    
+    // Connect to daemon in background - don't block UI
+    // Use immediately-invoked async function to handle the connection
+    (async () => {
+        try {
+            const connectionStartTime = Date.now();
+            log.debug('Step 5a: Calling ensureDaemonRunning...');
+            const daemonResult = await daemonManager.ensureDaemonRunning();
+            log.info(`Step 5b: Daemon on port ${daemonResult.port} (wasStarted: ${daemonResult.wasStarted}, isExternal: ${daemonResult.isExternal}, took ${Date.now() - connectionStartTime}ms)`);
             
-            // Also show a notification
-            const action = isNeedsClarity ? 'Needs Clarity' : 'Task Failed';
-            vscode.window.showWarningMessage(
-                `${action}: ${failedData.taskId} - ${failedData.lastError?.substring(0, 50)}...`,
-                'View in Chat'
-            ).then(selection => {
-                if (selection === 'View in Chat') {
-                    // Chat was already opened, just show info
-                    vscode.window.showInformationMessage('Check the agent chat for details and next steps.');
-                }
+            // Create and connect VS Code client using singleton
+            const connectStartTime = Date.now();
+            vsCodeClient = getOrCreateDaemonClient(daemonResult.port);
+            
+            // Set up notification callbacks
+            vsCodeClient.setNotificationCallbacks({
+                showInfo: (msg) => vscode.window.showInformationMessage(msg),
+                showWarning: (msg) => vscode.window.showWarningMessage(msg),
+                showError: (msg) => vscode.window.showErrorMessage(msg)
             });
-        })
-    );
-
-    console.log('[APC] Step 5: Registering webview provider...');
-    context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider(SidebarViewProvider.viewType, sidebarProvider)
-    );
-    console.log('[APC] Step 5: Webview provider registered');
-
-    // Check dependencies on startup
-    dependencyService.checkAllDependencies().then(statuses => {
-        const platform = process.platform;
-        const relevantStatuses = statuses.filter(s => s.required && (s.platform === platform || s.platform === 'all'));
-        const missingDeps = relevantStatuses.filter(s => !s.installed);
-        
-        // Refresh the system status view
-        sidebarProvider.refresh();
-        
-        if (missingDeps.length > 0) {
-            const names = missingDeps.map(d => d.name).join(', ');
-            vscode.window.showWarningMessage(
-                `Agentic Planning: Missing dependencies: ${names}. Check System Status panel.`,
-                'Show System Status'
-            ).then(selection => {
-                if (selection === 'Show System Status') {
-                    vscode.commands.executeCommand('agenticPlanning.systemStatusView.focus');
+            
+            // Connect to daemon with retry (daemon may still be starting up)
+            log.debug('Step 5c: Connecting to daemon...');
+            const maxRetries = 5;
+            let lastError: Error | undefined;
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    await vsCodeClient.connect();
+                    log.info(`Step 5d: Connected to daemon (took ${Date.now() - connectStartTime}ms, ${attempt} attempt(s))`);
+                    break;
+                } catch (err) {
+                    lastError = err as Error;
+                    log.warn(`Connection attempt ${attempt}/${maxRetries} failed: ${lastError.message}`);
+                    if (attempt < maxRetries) {
+                        // Wait before retry (100ms, 200ms, 400ms, 800ms)
+                        await new Promise(r => setTimeout(r, 100 * Math.pow(2, attempt - 1)));
+                    }
+                    // Refresh UI to show retry count
+                    sidebarProvider.refresh();
                 }
+            }
+            if (!vsCodeClient.isConnected()) {
+                throw lastError || new Error('Failed to connect to daemon');
+            }
+            log.info(`Total connection time: ${Date.now() - connectionStartTime}ms (daemon start + connection)`);
+            
+            // Set up config provider for TerminalManager to use daemon config
+            terminalManager.setConfigProvider(async () => {
+                const config = await vsCodeClient.getConfig() as { autoOpenTerminals?: boolean };
+                return { autoOpenTerminals: config?.autoOpenTerminals };
             });
+            
+            // If daemon was external (started by CLI), show info
+            if (daemonResult.isExternal) {
+                vscode.window.showInformationMessage(
+                    'Connected to existing APC daemon (started externally). State is shared with CLI.'
+                );
+            }
+            
+            // Create DaemonStateProxy - all state reads go through this
+            daemonStateProxy = new DaemonStateProxy({
+                vsCodeClient,
+                unityEnabled: unityFeaturesEnabled,
+                workspaceRoot
+            });
+            log.debug('DaemonStateProxy created (daemon-only mode)');
+            
+            // DON'T start connection health monitoring yet - wait for daemon.ready
+            // Starting it immediately causes health changes during initialization
+            // which triggers UI refreshes that wipe out progress messages
+            // The health monitor will be started when daemon.ready fires
+            
+            // Pass proxy to providers - this transitions UI from "connecting" to real state
+            sidebarProvider.setStateProxy(daemonStateProxy);
+            
+            // Set up event subscriptions
+            setupEventSubscriptions();
+            
+        } catch (daemonError) {
+            log.error('Failed to connect to daemon:', daemonError);
+            vscode.window.showWarningMessage(
+                'Could not connect to APC daemon. Run "apc daemon run --headless" or restart Cursor.'
+            );
+            
+            // Create proxy with unconnected client - UI will show "daemon missing"
+            // Auto-reconnect will attempt to connect once daemon port file appears
+            vsCodeClient = new VsCodeClient({ clientId: 'vscode-extension' });
+            daemonStateProxy = new DaemonStateProxy({
+                vsCodeClient,
+                unityEnabled: unityFeaturesEnabled,
+                workspaceRoot
+            });
+            // DON'T start health monitoring yet - will start when daemon.ready fires
+            sidebarProvider.setStateProxy(daemonStateProxy);
+            
+            // Set up event subscriptions (will activate when connection is established)
+            setupEventSubscriptions();
         }
-    });
+    })();
+    
+    // Note: Agent temp file cleanup is now handled by daemon
+    // (AgentRunner lives in daemon where agents are actually spawned)
+    
+    log.debug('Step 6: Daemon connection initiated in background');
+
+    // Note: Dependency checking is now daemon-only
+    // Extension queries daemon via API instead of running local checks
+    // This avoids duplicate work and ensures single source of truth
+
+    // ========================================================================
+    // Auto-update APC CLI if needed (dev → installed transition)
+    // ========================================================================
+    (async () => {
+        try {
+            const apcStatus = await dependencyService['checkApcCli']();
+            if (!apcStatus.installed && apcStatus.description?.includes('needs update')) {
+                log.info('APC CLI needs update - auto-updating to current extension path...');
+                const result = await dependencyService.installApcCli(context.extensionPath);
+                if (result.success) {
+                    log.info('✅ APC CLI auto-updated successfully');
+                } else {
+                    log.warn(`Failed to auto-update APC CLI: ${result.message}`);
+                }
+            }
+        } catch (err) {
+            log.warn('Failed to check/update APC CLI:', err);
+        }
+    })();
 
     // ========================================================================
     // Register Commands - All operations go through daemon via VsCodeClient
@@ -517,13 +673,13 @@ Let's get started!`;
 
             // Copy prompt to clipboard and open agent chat
             await vscode.env.clipboard.writeText(planningPrompt);
-            openAgentChat();
+            await openAgentChat();
         }),
 
         // Execution commands - all go through daemon
-        vscode.commands.registerCommand('agenticPlanning.startExecution', async (item?: PlanningSessionItem) => {
-            if (!vsCodeClient.isConnected()) {
-                vscode.window.showErrorMessage('Not connected to daemon. Run "apc system run --headless" first.');
+        vscode.commands.registerCommand('agenticPlanning.startExecution', async (item?: { session?: { id: string } }) => {
+            if (!vsCodeClient?.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
                 return;
             }
             
@@ -557,7 +713,12 @@ Let's get started!`;
             sidebarProvider.refresh();
         }),
 
-        vscode.commands.registerCommand('agenticPlanning.pauseExecution', async (item?: PlanningSessionItem) => {
+        vscode.commands.registerCommand('agenticPlanning.pauseExecution', async (item?: { session?: { id: string } }) => {
+            if (!vsCodeClient?.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
+                return;
+            }
+            
             const sessionId = item?.session?.id;
             if (!sessionId) {
                 vscode.window.showWarningMessage('No session selected');
@@ -572,7 +733,12 @@ Let's get started!`;
             sidebarProvider.refresh();
         }),
 
-        vscode.commands.registerCommand('agenticPlanning.resumeExecution', async (item?: PlanningSessionItem) => {
+        vscode.commands.registerCommand('agenticPlanning.resumeExecution', async (item?: { session?: { id: string } }) => {
+            if (!vsCodeClient?.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
+                return;
+            }
+            
             const sessionId = item?.session?.id;
             if (!sessionId) {
                 vscode.window.showWarningMessage('No session selected');
@@ -587,7 +753,12 @@ Let's get started!`;
             sidebarProvider.refresh();
         }),
 
-        vscode.commands.registerCommand('agenticPlanning.stopExecution', async (item?: PlanningSessionItem) => {
+        vscode.commands.registerCommand('agenticPlanning.stopExecution', async (item?: { session?: { id: string } }) => {
+            if (!vsCodeClient?.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
+                return;
+            }
+            
             const sessionId = item?.session?.id;
             if (!sessionId) {
                 vscode.window.showWarningMessage('No session selected');
@@ -612,6 +783,11 @@ Let's get started!`;
         }),
         
         vscode.commands.registerCommand('agenticPlanning.retryFailedTask', async (args?: { sessionId?: string; taskId?: string }) => {
+            if (!vsCodeClient?.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
+                return;
+            }
+            
             const sessionId = args?.sessionId;
             const taskId = args?.taskId;
             
@@ -662,29 +838,31 @@ Let's get started!`;
             );
         }),
         
-        // Role settings command - uses daemon API for roles
+        // Role settings command - uses daemon API when available, falls back to defaults
         vscode.commands.registerCommand('apc.openRoleSettings', async () => {
-            if (!vsCodeClient.isConnected()) {
-                vscode.window.showErrorMessage('Not connected to daemon');
-                return;
+            if (vsCodeClient.isConnected()) {
+                // Use daemon-based role management
+                RoleSettingsPanel.showWithClient(vsCodeClient, context.extensionUri);
+            } else {
+                // Use local registry mode (will fallback to defaults if no registry available)
+                RoleSettingsPanel.showWithRegistry(undefined, context.extensionUri);
             }
-            // Pass vsCodeClient to RoleSettingsPanel for daemon-based role management
-            RoleSettingsPanel.showWithClient(vsCodeClient, context.extensionUri);
         }),
         
-        // Daemon settings command - manage daemon configuration
+        // Daemon settings command - manage daemon configuration (works offline)
         vscode.commands.registerCommand('apc.openDaemonSettings', async () => {
-            if (!vsCodeClient.isConnected()) {
-                vscode.window.showErrorMessage('Not connected to daemon. Run "apc system run --headless" first.');
-                return;
-            }
-            const { DaemonSettingsPanel } = await import('./ui/DaemonSettingsPanel');
-            DaemonSettingsPanel.show(context.extensionUri, vsCodeClient);
+            const { SystemSettingsPanel } = await import('./ui/SystemSettingsPanel');
+            SystemSettingsPanel.show(context.extensionUri, vsCodeClient, workspaceRoot);
         }),
         
-        // Workflow settings command
-        vscode.commands.registerCommand('apc.openWorkflowSettings', () => {
-            WorkflowSettingsPanel.show(context.extensionUri, workspaceRoot);
+        // Workflow settings command (works offline)
+        vscode.commands.registerCommand('apc.openWorkflowSettings', async () => {
+            WorkflowSettingsPanel.show(context.extensionUri, vsCodeClient, workspaceRoot);
+        }),
+        
+        // Node Graph Editor command for custom workflows
+        vscode.commands.registerCommand('apc.openNodeGraphEditor', async (uri?: vscode.Uri) => {
+            NodeGraphEditorPanel.createOrShow(context.extensionUri, workspaceRoot, uri?.fsPath);
         }),
         
         // Dependency map command - shows task dependencies visualization
@@ -746,6 +924,11 @@ Let's get started!`;
 
         // Planning session management commands
         vscode.commands.registerCommand('agenticPlanning.stopPlanningSession', async (item?: { session?: { id: string } }) => {
+            if (!vsCodeClient?.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
+                return;
+            }
+            
             const sessionId = item?.session?.id;
             if (!sessionId) {
                 vscode.window.showWarningMessage('No session selected');
@@ -770,6 +953,11 @@ Let's get started!`;
         }),
         
         vscode.commands.registerCommand('agenticPlanning.removePlanningSession', async (item?: { session?: { id: string } }) => {
+            if (!vsCodeClient?.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
+                return;
+            }
+            
             const sessionId = item?.session?.id;
             if (!sessionId) {
                 vscode.window.showWarningMessage('No session selected');
@@ -794,6 +982,11 @@ Let's get started!`;
         }),
         
         vscode.commands.registerCommand('agenticPlanning.resumePlanningSession', async (item?: { session?: { id: string } }) => {
+            if (!vsCodeClient?.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
+                return;
+            }
+            
             const sessionId = item?.session?.id;
             if (!sessionId) {
                 vscode.window.showWarningMessage('No session selected');
@@ -819,6 +1012,11 @@ Let's get started!`;
         
         // Revise plan - opens AI chat for revision
         vscode.commands.registerCommand('agenticPlanning.revisePlan', async (item?: { session?: { id: string } }) => {
+            if (!vsCodeClient?.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
+                return;
+            }
+            
             const sessionId = item?.session?.id;
             if (!sessionId) {
                 vscode.window.showWarningMessage('No session selected');
@@ -859,11 +1057,16 @@ After running "apc plan revise", the revision process takes about 80 seconds to 
 
             // Copy to clipboard and open agent chat
             await vscode.env.clipboard.writeText(revisionPrompt);
-            openAgentChat();
+            await openAgentChat();
         }),
         
         // Approve plan and auto-start execution
         vscode.commands.registerCommand('agenticPlanning.approvePlan', async (item?: { session?: { id: string } }) => {
+            if (!vsCodeClient?.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
+                return;
+            }
+            
             const sessionId = item?.session?.id;
             if (!sessionId) {
                 vscode.window.showWarningMessage('No session selected');
@@ -967,72 +1170,34 @@ After running "apc plan revise", the revision process takes about 80 seconds to 
             }
         }),
 
-        // Kill stuck processes command
+        // Kill stuck/orphan processes command (delegates to daemon)
         vscode.commands.registerCommand('agenticPlanning.killStuckProcesses', async () => {
-            const processManager = ServiceLocator.resolve(ProcessManager);
-            
-            vscode.window.withProgress({
-                location: vscode.ProgressLocation.Notification,
-                title: 'Killing stuck processes...',
-                cancellable: false
-            }, async (progress) => {
-                // Kill tracked stuck processes
-                progress.report({ message: 'Checking tracked processes...' });
-                const killedTracked = await processManager.killStuckProcesses();
-                
-                // Kill orphan cursor-agent processes
-                progress.report({ message: 'Checking orphan processes...' });
-                const killedOrphans = await processManager.killOrphanCursorAgents();
-                
-                const total = killedTracked.length + killedOrphans;
-                if (total > 0) {
-                    vscode.window.showInformationMessage(
-                        `Killed ${total} stuck/orphan processes (${killedTracked.length} tracked, ${killedOrphans} orphans)`
-                    );
-                } else {
-                    vscode.window.showInformationMessage('No stuck processes found');
+            // Process management is handled by daemon - trigger via API if connected
+            if (vsCodeClient?.isConnected()) {
+                try {
+                    const result = await vsCodeClient.killOrphanProcesses();
+                    if (result.killed > 0) {
+                        vscode.window.showInformationMessage(
+                            `Killed ${result.killed} orphan cursor-agent processes`
+                        );
+                    } else {
+                        vscode.window.showInformationMessage('No orphan processes found');
+                    }
+                    sidebarProvider.refresh();
+                } catch (err) {
+                    vscode.window.showWarningMessage(`Failed to kill processes: ${err}`);
                 }
-                
-                sidebarProvider.refresh();
-            });
+            } else {
+                vscode.window.showWarningMessage('Not connected to daemon. Process cleanup happens automatically on daemon startup.');
+            }
         }),
 
-        // Show running processes command
+        // Show running processes command (process tracking is in daemon)
         vscode.commands.registerCommand('agenticPlanning.showRunningProcesses', async () => {
-            const processManager = ServiceLocator.resolve(ProcessManager);
-            
-            const processes = processManager.getRunningProcessInfo();
-            
-            if (processes.length === 0) {
-                vscode.window.showInformationMessage('No running processes tracked by ProcessManager');
-                return;
-            }
-            
-            const items = processes.map(p => ({
-                label: `${p.isStuck ? '⚠️ ' : '✅ '}${p.id}`,
-                description: `Runtime: ${Math.round(p.runtimeMs / 1000)}s, Last activity: ${Math.round(p.timeSinceActivityMs / 1000)}s ago`,
-                detail: p.command,
-                process: p
-            }));
-            
-            const selected = await vscode.window.showQuickPick(items, {
-                placeHolder: 'Select a process to kill (or press Escape to cancel)',
-                title: `Running Processes (${processes.length})`
-            });
-            
-            if (selected) {
-                const confirm = await vscode.window.showWarningMessage(
-                    `Kill process ${selected.process.id}?`,
-                    { modal: true },
-                    'Kill'
-                );
-                
-                if (confirm === 'Kill') {
-                    await processManager.stopProcess(selected.process.id, true);
-                    vscode.window.showInformationMessage(`Process ${selected.process.id} killed`);
-                    sidebarProvider.refresh();
-                }
-            }
+            // Process tracking is managed by the daemon
+            vscode.window.showInformationMessage(
+                'Process tracking is managed by the daemon. Check daemon logs for running process details.'
+            );
         }),
 
         // Dependency commands
@@ -1042,9 +1207,69 @@ After running "apc plan revise", the revision process takes about 80 seconds to 
                 title: 'Checking dependencies...',
                 cancellable: false
             }, async () => {
-                await dependencyService.checkAllDependencies();
+                // Trigger daemon to refresh dependencies (authoritative check)
+                if (vsCodeClient.isConnected()) {
+                    try {
+                        await vsCodeClient.send('deps.refresh');
+                        log.info('Daemon refreshed dependencies');
+                    } catch (err) {
+                        log.warn('Failed to refresh via daemon:', err);
+                        vscode.window.showWarningMessage('Failed to refresh dependencies from daemon');
+                    }
+                } else {
+                    vscode.window.showWarningMessage('Daemon not connected - cannot refresh dependencies');
+                }
                 sidebarProvider.refresh();
             });
+        }),
+        vscode.commands.registerCommand('agenticPlanning.stopDaemon', async () => {
+            log.info('[stopDaemon] Stop daemon command invoked');
+            
+            // Check if daemon is running first
+            if (!vsCodeClient.isConnected()) {
+                log.warn('[stopDaemon] Daemon is not connected/running');
+                vscode.window.showWarningMessage('Daemon is not running');
+                return;
+            }
+            
+            const action = await vscode.window.showWarningMessage(
+                'Stop the daemon? This will pause all running workflows and disconnect all clients. The daemon will auto-restart when needed.',
+                { modal: true },
+                'Stop Daemon',
+                'Cancel'
+            );
+            
+            log.info(`[stopDaemon] User choice: ${action}`);
+            
+            if (action === 'Stop Daemon') {
+                try {
+                    log.info('[stopDaemon] Starting daemon shutdown...');
+                    
+                    await vscode.window.withProgress({
+                        location: vscode.ProgressLocation.Notification,
+                        title: 'Stopping daemon...',
+                        cancellable: false
+                    }, async (progress) => {
+                        progress.report({ message: 'Sending shutdown signal...' });
+                        
+                        await daemonManager.stopDaemon();
+                        
+                        progress.report({ message: 'Daemon stopped' });
+                        log.info('[stopDaemon] Daemon stopped successfully');
+                    });
+                    
+                    vscode.window.showInformationMessage('✓ Daemon stopped successfully');
+                    
+                    // Refresh UI to show disconnected state
+                    sidebarProvider.refresh();
+                } catch (err) {
+                    const errorMsg = err instanceof Error ? err.message : String(err);
+                    log.error('[stopDaemon] Failed to stop daemon:', errorMsg);
+                    vscode.window.showErrorMessage(`Failed to stop daemon: ${errorMsg}`);
+                }
+            } else {
+                log.info('[stopDaemon] User cancelled stop operation');
+            }
         }),
         vscode.commands.registerCommand('agenticPlanning.openDependencyInstall', async (dep?: { installUrl?: string; name: string }) => {
             if (dep?.installUrl) {
@@ -1101,21 +1326,52 @@ After running "apc plan revise", the revision process takes about 80 seconds to 
         vscode.commands.registerCommand('agenticPlanning.installCli', async () => {
             const result = await dependencyService.installApcCli(context.extensionPath);
             
-            // Always refresh status after install attempt
-            await dependencyService.checkAllDependencies();
-            sidebarProvider.refresh();
+            // Refresh via daemon (authoritative dependency check)
+            if (vsCodeClient.isConnected()) {
+                try {
+                    // Enable cache for fast post-install verification
+                    await vsCodeClient.send('system.enableCacheForNextCheck', {});
+                    
+                    await vsCodeClient.send('deps.refresh');
+                    log.info('Daemon dependency check completed after APC CLI installation');
+                    sidebarProvider.refresh();
+                } catch (err) {
+                    log.warn('Failed to refresh dependencies on daemon:', err);
+                    vscode.window.showWarningMessage('Installed but failed to refresh status');
+                }
+            } else {
+                vscode.window.showWarningMessage('CLI installed but daemon not connected - restart extension to update status');
+            }
             
             if (result.success) {
-                // Check if PATH setup is needed
-                if (result.message.includes('Add to PATH')) {
-                    const action = await vscode.window.showInformationMessage(
-                        'APC CLI installed! Add ~/.local/bin to PATH to use it.',
-                        'Copy PATH Command'
-                    );
-                    if (action === 'Copy PATH Command') {
-                        const shellConfig = process.platform === 'darwin' ? '~/.zshrc' : '~/.bashrc';
-                        await vscode.env.clipboard.writeText(`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ${shellConfig} && source ${shellConfig}`);
-                        vscode.window.showInformationMessage('Copied! Paste in terminal, then restart terminal.');
+                // Check if PATH setup is needed (Windows or Unix)
+                if (result.message.includes('Add to PATH') || result.message.includes('~/bin')) {
+                    const isWindows = process.platform === 'win32';
+                    if (isWindows) {
+                        const action = await vscode.window.showInformationMessage(
+                            'APC CLI installed! Add ~/bin to your PATH to use it from any terminal.',
+                            'Copy PATH Instructions'
+                        );
+                        if (action === 'Copy PATH Instructions') {
+                            await vscode.env.clipboard.writeText(
+                                'Add %USERPROFILE%\\bin to your PATH:\n' +
+                                '1. Search "Environment Variables" in Windows\n' +
+                                '2. Edit PATH under User variables\n' +
+                                '3. Add: %USERPROFILE%\\bin\n' +
+                                '4. Restart your terminal'
+                            );
+                            vscode.window.showInformationMessage('Instructions copied! Follow the steps to add to PATH.');
+                        }
+                    } else {
+                        const action = await vscode.window.showInformationMessage(
+                            'APC CLI installed! Add ~/.local/bin to PATH to use it.',
+                            'Copy PATH Command'
+                        );
+                        if (action === 'Copy PATH Command') {
+                            const shellConfig = process.platform === 'darwin' ? '~/.zshrc' : '~/.bashrc';
+                            await vscode.env.clipboard.writeText(`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ${shellConfig} && source ${shellConfig}`);
+                            vscode.window.showInformationMessage('Copied! Paste in terminal, then restart terminal.');
+                        }
                     }
                 } else {
                     vscode.window.showInformationMessage('APC CLI installed successfully! Try: apc help');
@@ -1123,32 +1379,244 @@ After running "apc plan revise", the revision process takes about 80 seconds to 
             } else {
                 vscode.window.showErrorMessage(result.message);
             }
+            
+            // Return result so callers can check success
+            return result;
         }),
         vscode.commands.registerCommand('agenticPlanning.uninstallCli', async () => {
             const result = await dependencyService.uninstallApcCli();
             if (result.success) {
                 vscode.window.showInformationMessage(result.message);
-                await dependencyService.checkAllDependencies();
-                sidebarProvider.refresh();
+                
+                // Refresh via daemon (authoritative dependency check)
+                if (vsCodeClient.isConnected()) {
+                    try {
+                        await vsCodeClient.send('deps.refresh');
+                        log.info('Daemon dependency check completed after APC CLI uninstallation');
+                        sidebarProvider.refresh();
+                    } catch (err) {
+                        log.warn('Failed to refresh dependencies on daemon:', err);
+                        vscode.window.showWarningMessage('Uninstalled but failed to refresh status');
+                    }
+                } else {
+                    vscode.window.showWarningMessage('CLI uninstalled but daemon not connected - restart extension to update status');
+                }
             } else {
                 vscode.window.showErrorMessage(result.message);
             }
         }),
 
-        // Open APC settings
-        vscode.commands.registerCommand('agenticPlanning.openSettings', () => {
-            vscode.commands.executeCommand('workbench.action.openSettings', 'agenticPlanning');
+        // Daemon connection commands
+        vscode.commands.registerCommand('agenticPlanning.startDaemon', async () => {
+            await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: 'Starting daemon...',
+                cancellable: false
+            }, async (progress) => {
+                try {
+                    progress.report({ message: 'Checking if daemon is running...' });
+                    
+                    // First check if already connected
+                    if (vsCodeClient.isConnected()) {
+                        vscode.window.showInformationMessage('Already connected to daemon.');
+                        return;
+                    }
+                    
+                    // Try to start/ensure daemon is running
+                    progress.report({ message: 'Starting daemon process...' });
+                    const daemonResult = await daemonManager.ensureDaemonRunning();
+                    
+                    // Now connect the client
+                    progress.report({ message: 'Connecting to daemon...' });
+                    
+                    // Create new client if needed (getOrCreateDaemonClient is in this file)
+                    vsCodeClient = getOrCreateDaemonClient(daemonResult.port);
+                    
+                    // Set up notification callbacks
+                    vsCodeClient.setNotificationCallbacks({
+                        showInfo: (msg) => vscode.window.showInformationMessage(msg),
+                        showWarning: (msg) => vscode.window.showWarningMessage(msg),
+                        showError: (msg) => vscode.window.showErrorMessage(msg)
+                    });
+                    
+                    // Connect with retry
+                    const maxRetries = 5;
+                    let connected = false;
+                    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                        try {
+                            await vsCodeClient.connect();
+                            connected = true;
+                            break;
+                        } catch (err) {
+                            if (attempt < maxRetries) {
+                                progress.report({ message: `Connecting... (attempt ${attempt}/${maxRetries})` });
+                                await new Promise(r => setTimeout(r, 500));
+                            }
+                        }
+                    }
+                    
+                    if (!connected) {
+                        throw new Error('Failed to connect after multiple attempts');
+                    }
+                    
+                    // Update state proxy with new client
+                    if (daemonStateProxy) {
+                        daemonStateProxy.dispose();
+                    }
+                    // DaemonStateProxy is already imported at top of file
+                    daemonStateProxy = new DaemonStateProxy({
+                        vsCodeClient,
+                        unityEnabled: unityFeaturesEnabled,
+                        workspaceRoot
+                    });
+                    // DON'T start health monitoring yet - will start when daemon.ready fires
+                    sidebarProvider.setStateProxy(daemonStateProxy);
+                    
+                    // Set up event subscriptions
+                    setupEventSubscriptions();
+                    
+                    sidebarProvider.refresh();
+                    vscode.window.showInformationMessage(
+                        daemonResult.wasStarted 
+                            ? 'Daemon started and connected!' 
+                            : 'Connected to existing daemon.'
+                    );
+                    
+                } catch (err) {
+                    const errorMsg = err instanceof Error ? err.message : String(err);
+                    log.error('Failed to start daemon:', errorMsg);
+                    vscode.window.showErrorMessage(`Failed to start daemon: ${errorMsg}`);
+                    sidebarProvider.refresh();
+                }
+            });
+        }),
+        
+        vscode.commands.registerCommand('agenticPlanning.retryDaemonConnection', async () => {
+            await vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: 'Reconnecting to daemon...',
+                cancellable: false
+            }, async (progress) => {
+                try {
+                    // First try manual reconnect through state proxy
+                    if (daemonStateProxy) {
+                        progress.report({ message: 'Attempting reconnection...' });
+                        const result = await daemonStateProxy.manualReconnect();
+                        
+                        if (result.success) {
+                            sidebarProvider.refresh();
+                            vscode.window.showInformationMessage('Reconnected to daemon!');
+                            return;
+                        }
+                        
+                        // If reconnect failed because daemon not running, suggest starting it
+                        if (result.error?.includes('not running')) {
+                            const action = await vscode.window.showWarningMessage(
+                                result.error,
+                                'Start Daemon'
+                            );
+                            if (action === 'Start Daemon') {
+                                vscode.commands.executeCommand('agenticPlanning.startDaemon');
+                            }
+                            return;
+                        }
+                        
+                        // Other failure
+                        vscode.window.showWarningMessage(result.error || 'Reconnection failed');
+                    } else {
+                        // No state proxy, try starting daemon
+                        vscode.commands.executeCommand('agenticPlanning.startDaemon');
+                    }
+                    
+                    sidebarProvider.refresh();
+                } catch (err) {
+                    const errorMsg = err instanceof Error ? err.message : String(err);
+                    log.error('Reconnection failed:', errorMsg);
+                    vscode.window.showErrorMessage(`Reconnection failed: ${errorMsg}`);
+                    sidebarProvider.refresh();
+                }
+            });
+        }),
+
+        // Open APC System Settings panel (our own settings, not VS Code settings)
+        vscode.commands.registerCommand('agenticPlanning.openSettings', async () => {
+            if (!vsCodeClient.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. System settings require a running daemon.');
+                return;
+            }
+            const { SystemSettingsPanel} = await import('./ui/SystemSettingsPanel');
+            SystemSettingsPanel.show(context.extensionUri, vsCodeClient, workspaceRoot);
+        }),
+
+        // Auto-configure MCP for Unity (CoplayDev/unity-mcp)
+        // Now performs BOTH steps: MCP config + Unity package installation
+        // Returns: { configured: boolean } to indicate if configuration was written
+        vscode.commands.registerCommand('agenticPlanning.autoConfigureMcp', async (): Promise<{ configured: boolean }> => {
+            try {
+                // Install directly without confirmation (user already clicked "Install" button)
+                if (!vsCodeClient.isConnected()) {
+                    vscode.window.showErrorMessage('Daemon not connected. Please start the daemon first.');
+                    return { configured: false };
+                }
+                
+                vscode.window.showInformationMessage('Installing Unity MCP (this may take a moment)...');
+                
+                log.info('Sending system.installUnityMcp request to daemon...');
+                const response = await vsCodeClient.send('system.installUnityMcp', {});
+                log.info('Received response from daemon:', response);
+                const installResult = response as any;  // Response IS the result, no .data wrapper
+                log.info('Install result:', installResult);
+                
+                if (installResult?.success) {
+                    // Show success message with next steps
+                    const selection = await vscode.window.showInformationMessage(
+                        `✅ Unity MCP Installation Complete!\n\n${installResult.message}\n\nNext steps:\n1. In Unity: Window → MCP for Unity → Start Local HTTP Server\n2. Agents will use the MCP immediately`,
+                        'OK',
+                        'Open Documentation'
+                    );
+                    
+                    if (selection === 'Open Documentation') {
+                        vscode.env.openExternal(vscode.Uri.parse('https://github.com/CoplayDev/unity-mcp'));
+                    }
+                    
+                    // Refresh dependencies via daemon (authoritative check)
+                    if (vsCodeClient.isConnected()) {
+                        try {
+                            await vsCodeClient.send('deps.refresh');
+                            sidebarProvider.refresh();
+                        } catch (err) {
+                            log.warn('Failed to refresh daemon dependencies:', err);
+                        }
+                    }
+                    
+                    return { configured: true };
+                } else {
+                    const errorDetail = installResult?.message || 'No error message provided';
+                    log.error('Installation failed with result:', installResult);
+                    vscode.window.showErrorMessage(`Installation failed:\n${errorDetail}`);
+                    return { configured: false };
+                }
+            } catch (err) {
+                const errorMsg = err instanceof Error ? err.message : String(err);
+                const errorStack = err instanceof Error ? err.stack : 'No stack trace';
+                log.error('Failed to install Unity MCP - Exception caught:', { message: errorMsg, stack: errorStack, err });
+                vscode.window.showErrorMessage(`Installation error: ${errorMsg}`);
+                return { configured: false };
+            }
         })
     );
 
-    // Register CLI terminal profile
+    // Register CLI terminal profile (cross-platform)
     context.subscriptions.push(
         vscode.window.registerTerminalProfileProvider('agenticPlanning.cli', {
             provideTerminalProfile(): vscode.TerminalProfile {
+                const isWindows = process.platform === 'win32';
                 return new vscode.TerminalProfile({
                     name: 'Agentic CLI',
-                    shellPath: '/bin/bash',
-                    shellArgs: ['-c', 'echo "Agentic Planning CLI ready. Use: apc <command>"']
+                    shellPath: isWindows ? 'powershell.exe' : '/bin/bash',
+                    shellArgs: isWindows 
+                        ? ['-NoProfile', '-Command', 'Write-Host "Agentic Planning CLI ready. Use: apc <command>"']
+                        : ['-c', 'echo "Agentic Planning CLI ready. Use: apc <command>"']
                 });
             }
         })
@@ -1173,18 +1641,19 @@ After running "apc plan revise", the revision process takes about 80 seconds to 
         })
     );
 
-    console.log('Agentic Planning Coordinator activated successfully');
-    vscode.window.showInformationMessage('Agentic Planning Coordinator ready!');
+    log.info('Agentic Planning Coordinator activated successfully');
+    // Note: "Coordinator ready!" message is now shown when daemon.ready event is received
+    // This ensures the message only appears after all services (including dependency checks) are initialized
 }
 
 export async function deactivate() {
-    console.log('Agentic Planning Coordinator deactivating...');
+    log.info('Agentic Planning Coordinator deactivating...');
     
     // Stop periodic dependency checks
     try {
         const dependencyService = ServiceLocator.resolve(DependencyService);
         dependencyService.stopPeriodicCheck();
-        console.log('Dependency periodic check stopped');
+        log.debug('Dependency periodic check stopped');
     } catch (e) {
         // Ignore if service not available
     }
@@ -1193,14 +1662,14 @@ export async function deactivate() {
     if (daemonStateProxy) {
         try {
             daemonStateProxy.dispose();
-            console.log('DaemonStateProxy disposed');
+            log.debug('DaemonStateProxy disposed');
         } catch (e) {
             // Ignore cleanup errors
         }
     }
     
     // Clean up event subscriptions first (prevents memory leaks and duplicate handlers)
-    console.log(`Cleaning up ${eventSubscriptions.length} event subscriptions`);
+    log.debug(`Cleaning up ${eventSubscriptions.length} event subscriptions`);
     for (const unsubscribe of eventSubscriptions) {
         try {
             unsubscribe();
@@ -1215,9 +1684,9 @@ export async function deactivate() {
     if (vsCodeClient) {
         try {
             vsCodeClient.dispose();
-            console.log('VsCodeClient disconnected');
+            log.debug('VsCodeClient disconnected');
         } catch (e) {
-            console.error('Error disconnecting VsCodeClient:', e);
+            log.error('Error disconnecting VsCodeClient:', e);
         }
     }
     
@@ -1225,9 +1694,9 @@ export async function deactivate() {
     if (daemonManager) {
         try {
             await daemonManager.dispose();
-            console.log('DaemonManager disposed');
+            log.debug('DaemonManager disposed');
         } catch (e) {
-            console.error('Error disposing DaemonManager:', e);
+            log.error('Error disposing DaemonManager:', e);
         }
     }
     
@@ -1235,32 +1704,21 @@ export async function deactivate() {
     if (terminalManager) {
         try {
             terminalManager.dispose();
-            console.log('TerminalManager disposed');
+            log.debug('TerminalManager disposed');
         } catch (e) {
-            console.error('Error disposing TerminalManager:', e);
+            log.error('Error disposing TerminalManager:', e);
         }
     }
     
-    // Kill any orphan cursor-agent processes before disposing
-    try {
-        if (ServiceLocator.isRegistered(ProcessManager)) {
-            const processManager = ServiceLocator.resolve(ProcessManager);
-            const killed = await processManager.killOrphanCursorAgents();
-            if (killed > 0) {
-                console.log(`Killed ${killed} orphan cursor-agent processes`);
-            }
-        }
-    } catch (e) {
-        // Ignore cleanup errors
-    }
+    // Note: Orphan process cleanup is handled by daemon, not extension
     
     // Dispose all ServiceLocator-managed services in reverse registration order
     try {
         await ServiceLocator.dispose();
-        console.log('ServiceLocator disposed all services');
+        log.debug('ServiceLocator disposed all services');
     } catch (e) {
-        console.error('Error disposing ServiceLocator:', e);
+        log.error('Error disposing ServiceLocator:', e);
     }
     
-    console.log('Agentic Planning Coordinator deactivated');
+    log.info('Agentic Planning Coordinator deactivated');
 }

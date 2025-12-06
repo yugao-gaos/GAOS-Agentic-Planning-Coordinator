@@ -10,6 +10,9 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Daemon', 'DaemonConfig');
 
 // ============================================================================
 // Configuration Interface
@@ -22,9 +25,6 @@ import * as path from 'path';
 export interface CoreConfig {
     /** Workspace root path */
     workspaceRoot: string;
-    
-    /** Working directory for plans, logs, state (_AiDevLog by default) */
-    workingDirectory: string;
     
     /** Total number of agents in the pool */
     agentPoolSize: number;
@@ -43,19 +43,22 @@ export interface CoreConfig {
     
     /** Log level */
     logLevel: 'debug' | 'info' | 'warn' | 'error';
+    
+    /** Whether to automatically open terminal for each agent when started */
+    autoOpenTerminals: boolean;
 }
 
 /**
  * Default configuration values
  */
 export const DEFAULT_CONFIG: Omit<CoreConfig, 'workspaceRoot'> = {
-    workingDirectory: '_AiDevLog',
     agentPoolSize: 10,
     defaultBackend: 'cursor',
     stateUpdateInterval: 5000,
     enableUnityFeatures: true,  // Unity enabled by default
     port: 19840,
-    logLevel: 'info'
+    logLevel: 'info',
+    autoOpenTerminals: true
 };
 
 // ============================================================================
@@ -100,7 +103,7 @@ export class ConfigLoader {
             try {
                 callback(this.getConfig());
             } catch (err) {
-                console.error('ConfigLoader: Error in change callback:', err);
+                log.error('Error in change callback:', err);
             }
         }
     }
@@ -169,10 +172,10 @@ export class ConfigLoader {
     }
     
     /**
-     * Get the full working directory path
+     * Get the full working directory path (always workspaceRoot/_AiDevLog)
      */
     getWorkingDir(): string {
-        return path.join(this.config.workspaceRoot, this.config.workingDirectory);
+        return path.join(this.config.workspaceRoot, '_AiDevLog');
     }
     
     /**
@@ -191,7 +194,7 @@ export class ConfigLoader {
                 const fileConfig = JSON.parse(fs.readFileSync(this.configPath, 'utf-8'));
                 Object.assign(config, this.sanitizeConfig(fileConfig));
             } catch (err) {
-                console.warn(`Failed to load config from ${this.configPath}:`, err);
+                log.warn(`Failed to load config from ${this.configPath}:`, err);
             }
         }
         
@@ -206,10 +209,6 @@ export class ConfigLoader {
      */
     private sanitizeConfig(raw: any): Partial<CoreConfig> {
         const sanitized: Partial<CoreConfig> = {};
-        
-        if (typeof raw.workingDirectory === 'string') {
-            sanitized.workingDirectory = raw.workingDirectory;
-        }
         
         if (typeof raw.agentPoolSize === 'number' && raw.agentPoolSize >= 1 && raw.agentPoolSize <= 20) {
             sanitized.agentPoolSize = raw.agentPoolSize;
@@ -235,6 +234,10 @@ export class ConfigLoader {
             sanitized.logLevel = raw.logLevel;
         }
         
+        if (typeof raw.autoOpenTerminals === 'boolean') {
+            sanitized.autoOpenTerminals = raw.autoOpenTerminals;
+        }
+        
         return sanitized;
     }
     
@@ -242,11 +245,6 @@ export class ConfigLoader {
      * Apply environment variable overrides
      */
     private applyEnvironmentOverrides(config: CoreConfig): void {
-        // APC_WORKING_DIR
-        if (process.env.APC_WORKING_DIR) {
-            config.workingDirectory = process.env.APC_WORKING_DIR;
-        }
-        
         // APC_POOL_SIZE
         if (process.env.APC_POOL_SIZE) {
             const size = parseInt(process.env.APC_POOL_SIZE, 10);
@@ -297,7 +295,7 @@ export class ConfigLoader {
             
             fs.writeFileSync(this.configPath, JSON.stringify(toSave, null, 2));
         } catch (err) {
-            console.error(`ConfigLoader: Failed to save config to ${this.configPath}:`, err);
+            log.error(`Failed to save config to ${this.configPath}:`, err);
         }
     }
     
@@ -323,10 +321,10 @@ export class ConfigLoader {
                 // Copy (don't move) for safety
                 const content = fs.readFileSync(cacheConfigPath, 'utf-8');
                 fs.writeFileSync(this.configPath, content);
-                console.log('ConfigLoader: Migrated config from .cache/ to .config/');
+                log.info('Migrated config from .cache/ to .config/');
                 return;
             } catch (e) {
-                console.warn('ConfigLoader: Failed to migrate from .cache/:', e);
+                log.warn('Failed to migrate from .cache/:', e);
             }
         }
         
@@ -340,9 +338,9 @@ export class ConfigLoader {
                 }
                 const content = fs.readFileSync(oldConfigPath, 'utf-8');
                 fs.writeFileSync(this.configPath, content);
-                console.log('ConfigLoader: Migrated config from old location to .config/');
+                log.info('Migrated config from old location to .config/');
             } catch (e) {
-                console.warn('ConfigLoader: Failed to migrate from old location:', e);
+                log.warn('Failed to migrate from old location:', e);
             }
         }
         
@@ -372,7 +370,7 @@ export class ConfigLoader {
             const newRolesDir = path.join(newConfigDir, 'roles');
             if (fs.existsSync(oldRolesDir) && !fs.existsSync(newRolesDir)) {
                 fs.cpSync(oldRolesDir, newRolesDir, { recursive: true });
-                console.log('ConfigLoader: Migrated Roles/ to .config/roles/');
+                log.info('Migrated Roles/ to .config/roles/');
             }
             
             // Migrate SystemPrompts/ -> system_prompts/
@@ -380,7 +378,7 @@ export class ConfigLoader {
             const newSystemPromptsDir = path.join(newConfigDir, 'system_prompts');
             if (fs.existsSync(oldSystemPromptsDir) && !fs.existsSync(newSystemPromptsDir)) {
                 fs.cpSync(oldSystemPromptsDir, newSystemPromptsDir, { recursive: true });
-                console.log('ConfigLoader: Migrated SystemPrompts/ to .config/system_prompts/');
+                log.info('Migrated SystemPrompts/ to .config/system_prompts/');
             }
             
             // Migrate workflow_settings.json -> workflows.json
@@ -388,7 +386,7 @@ export class ConfigLoader {
             const newWorkflowSettings = path.join(newConfigDir, 'workflows.json');
             if (fs.existsSync(oldWorkflowSettings) && !fs.existsSync(newWorkflowSettings)) {
                 fs.copyFileSync(oldWorkflowSettings, newWorkflowSettings);
-                console.log('ConfigLoader: Migrated workflow_settings.json to .config/workflows.json');
+                log.info('Migrated workflow_settings.json to .config/workflows.json');
             }
             
             // Migrate context_presets.json
@@ -396,12 +394,12 @@ export class ConfigLoader {
             const newContextPresets = path.join(newConfigDir, 'context_presets.json');
             if (fs.existsSync(oldContextPresets) && !fs.existsSync(newContextPresets)) {
                 fs.copyFileSync(oldContextPresets, newContextPresets);
-                console.log('ConfigLoader: Migrated context_presets.json to .config/');
+                log.info('Migrated context_presets.json to .config/');
             }
             
-            console.log('ConfigLoader: Config migration to .config/ complete (old files preserved)');
+            log.info('Config migration to .config/ complete (old files preserved)');
         } catch (e) {
-            console.warn('ConfigLoader: Failed to migrate other configs:', e);
+            log.warn('Failed to migrate other configs:', e);
         }
     }
 }
@@ -514,8 +512,16 @@ export function writeDaemonInfo(workspaceRoot: string, pid: number, port: number
     const pidPath = getDaemonPidPath(workspaceRoot);
     const portPath = getDaemonPortPath(workspaceRoot);
     
-    fs.writeFileSync(pidPath, pid.toString());
-    fs.writeFileSync(portPath, port.toString());
+    try {
+        fs.writeFileSync(pidPath, pid.toString());
+        fs.writeFileSync(portPath, port.toString());
+        console.log(`[DaemonConfig] Wrote daemon info: PID=${pid}, Port=${port}`);
+        console.log(`[DaemonConfig] PID file: ${pidPath}`);
+        console.log(`[DaemonConfig] Port file: ${portPath}`);
+    } catch (error) {
+        console.error(`[DaemonConfig] Failed to write daemon info files:`, error);
+        throw error;
+    }
 }
 
 /**

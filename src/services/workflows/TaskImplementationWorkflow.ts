@@ -324,13 +324,12 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
                 throw new Error(`Engineer implementation failed for ${this.taskId}: ${error}`);
             }
         } else {
-            // Legacy fallback: parse output
-            if (result.success) {
-                this.filesModified = this.extractFilesFromOutput(result.rawOutput || '');
-                this.log(`✓ Implementation complete via output parsing (${this.filesModified.length} files)`);
-            } else {
-                throw new Error(`Engineer implementation failed for ${this.taskId}`);
-            }
+            // No callback received - agent must use CLI callback
+            throw new Error(
+                'Engineer did not use CLI callback (`apc agent complete`). ' +
+                'All agents must report results via CLI callback for structured data. ' +
+                'Legacy output parsing is no longer supported.'
+            );
         }
         
         // Demote engineer to bench after work (reviewer will work next)
@@ -380,21 +379,18 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
                 this.reviewFeedback = result.payload?.feedback || (Array.isArray(result.payload?.issues) ? result.payload.issues.join('\n') : '') || 'See review comments';
                 this.log(`⚠️ Changes requested via CLI callback`);
             } else {
-                // Fallback: treat non-approved as changes_requested
+                // Unexpected result - treat as changes_requested
                 this.reviewResult = 'changes_requested';
-                this.reviewFeedback = result.payload?.message || 'Review feedback unavailable';
+                this.reviewFeedback = result.payload?.message || 'Review result unclear';
                 this.log(`⚠️ Review result unclear, treating as changes_requested`);
             }
         } else {
-            // Legacy fallback: treat success as approved
-            if (result.success) {
-                this.reviewResult = 'approved';
-                this.log(`✓ Review approved (legacy fallback)`);
-            } else {
-                this.reviewResult = 'changes_requested';
-                this.reviewFeedback = result.rawOutput || 'Review failed';
-                this.log(`⚠️ Review failed, requesting changes`);
-            }
+            // No callback received - agent must use CLI callback
+            throw new Error(
+                'Reviewer did not use CLI callback (`apc agent complete`). ' +
+                'All agents must report results via CLI callback for structured data. ' +
+                'Legacy output parsing is no longer supported.'
+            );
         }
         
         // Demote reviewer to bench after work

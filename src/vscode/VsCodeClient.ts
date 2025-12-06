@@ -22,6 +22,9 @@ import {
     PoolStatusResponse,
     UnityStatusResponse
 } from '../client/Protocol';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Client', 'VsCodeClient');
 
 /**
  * VS Code specific client options
@@ -129,7 +132,7 @@ export class VsCodeClient extends BaseApcClient {
                 });
                 
                 this.ws.on('error', (err) => {
-                    console.error('[VsCodeClient] WebSocket error:', err);
+                    log.error('WebSocket error:', err);
                     this.emit('error', err);
                     
                     if (this.state === 'connecting') {
@@ -224,6 +227,15 @@ export class VsCodeClient extends BaseApcClient {
      */
     async getUnityStatus(): Promise<UnityStatusResponse> {
         return this.send<UnityStatusResponse>('unity.status');
+    }
+    
+    /**
+     * Kill orphan cursor-agent processes
+     * Delegates to daemon's ProcessManager
+     */
+    async killOrphanProcesses(): Promise<{ killed: number }> {
+        const response = await this.send<{ killedCount: number }>('process.kill-orphans');
+        return { killed: response.killedCount };
     }
     
     /**
@@ -714,7 +726,7 @@ export class VsCodeClient extends BaseApcClient {
             }
             
             if (cleanedCount > 0) {
-                console.log(`[VsCodeClient] Cleaned up ${cleanedCount} stale cache entries`);
+                log.debug(`Cleaned up ${cleanedCount} stale cache entries`);
             }
         }, VsCodeClient.CACHE_CLEANUP_INTERVAL_MS);
     }

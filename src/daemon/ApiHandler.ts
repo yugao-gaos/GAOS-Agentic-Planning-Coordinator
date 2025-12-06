@@ -21,6 +21,10 @@ import {
 } from '../client/Protocol';
 import { EventBroadcaster } from './EventBroadcaster';
 import { ServiceLocator } from '../services/ServiceLocator';
+import { DependencyService, DependencyStatus } from '../services/DependencyService';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Daemon', 'ApiHandler');
 
 // ============================================================================
 // Service Interface
@@ -39,6 +43,11 @@ export interface ApiServices {
     unityManager?: IUnityApi;
     taskManager?: ITaskManagerApi;
     roleRegistry?: IRoleRegistryApi;
+    /** Daemon instance for cache management and state control */
+    daemon?: {
+        clearInitializationCache(): void;
+        setDependencyCheckComplete(): void;
+    };
 }
 
 /**
@@ -63,6 +72,8 @@ export interface IStateManagerApi {
     getPlanningSession(id: string): PlanningSessionData | undefined;
     deletePlanningSession(id: string): void;
     getSessionTasksFilePath(sessionId: string): string;
+    getWorkspaceRoot(): string;
+    getWorkingDir(): string;
 }
 
 /**
@@ -103,8 +114,17 @@ export interface IAgentPoolApi {
  */
 export interface IRoleRegistryApi {
     getRole(roleId: string): RoleData | undefined;
+    getAllRoles(): RoleData[];
     updateRole(roleId: string, updates: Record<string, unknown>): void;
     resetRoleToDefault(roleId: string): boolean;
+    getCoordinatorPrompt(): Record<string, unknown>;
+    updateCoordinatorPrompt(config: Record<string, unknown>): void;
+    resetCoordinatorPromptToDefault(): void;
+    getAllSystemPrompts(): Array<{ toJSON(): Record<string, unknown> }>;
+    // Polling prompt methods
+    getPollingPrompt(): { currentPrompt: string; defaultPrompt: string };
+    updatePollingPrompt(prompt: string): void;
+    resetPollingPromptToDefault(): { currentPrompt: string; defaultPrompt: string };
 }
 
 /**
@@ -314,6 +334,32 @@ export class ApiHandler {
     }
     
     /**
+     * Check if critical dependencies are missing (blocks workflow/execution operations)
+     * Returns error message if critical deps missing, undefined if OK
+     */
+    private checkCriticalDependencies(): string | undefined {
+        try {
+            const depService = ServiceLocator.resolve(DependencyService);
+            const allDeps = depService.getCachedStatus();
+            const platform = process.platform;
+            const relevantDeps = allDeps.filter(d => d.platform === platform || d.platform === 'all');
+            const missingDeps = relevantDeps.filter(d => d.required && !d.installed);
+            const criticalMissing = missingDeps.filter(d => 
+                d.name.includes('Python') || d.name.includes('APC CLI')
+            );
+            
+            if (criticalMissing.length > 0) {
+                const names = criticalMissing.map(d => d.name).join(', ');
+                return `Cannot start: Missing critical dependencies (${names}). Check System panel for installation instructions.`;
+            }
+            return undefined;
+        } catch {
+            // DependencyService not available, allow operation
+            return undefined;
+        }
+    }
+    
+    /**
      * Handle an incoming request and return a response
      */
     async handleRequest(request: ApcRequest): Promise<ApcResponse> {
@@ -388,6 +434,15 @@ export class ApiHandler {
             
             case 'folders':
                 return this.handleFolders(action, params);
+            
+            case 'deps':
+                return this.handleDeps(action, params);
+            
+            case 'prompts':
+                return this.handlePrompts(action, params);
+            
+            case 'system':
+                return this.handleSystem(action, params);
             
             default:
                 throw new Error(`Unknown command category: ${category}`);
@@ -654,6 +709,12 @@ export class ApiHandler {
         
         switch (action) {
             case 'start': {
+                // Check for critical missing dependencies before starting execution
+                const criticalDepError = this.checkCriticalDependencies();
+                if (criticalDepError) {
+                    throw new Error(criticalDepError);
+                }
+                
                 const workflowIds = await this.services.coordinator.startExecution(sessionId);
                 return {
                     data: { sessionId, workflowIds },
@@ -709,6 +770,12 @@ export class ApiHandler {
     private async handleWorkflow(action: string, params: Record<string, unknown>): Promise<{ data?: unknown; message?: string }> {
         switch (action) {
             case 'dispatch': {
+                // Check for critical missing dependencies before dispatching workflow
+                const criticalDepError = this.checkCriticalDependencies();
+                if (criticalDepError) {
+                    throw new Error(criticalDepError);
+                }
+                
                 const input = (params.input || {}) as Record<string, unknown>;
                 const workflowId = await this.services.coordinator.dispatchWorkflow(
                     params.sessionId as string,
@@ -766,6 +833,78 @@ export class ApiHandler {
                 return { message: `Workflow summary updated for ${params.workflowId}` };
             }
             
+            // Custom workflow management
+            case 'custom.list': {
+                try {
+                    const { ScriptableWorkflowRegistry } = await import('../services/workflows/ScriptableWorkflowRegistry');
+                    const scriptableRegistry = ServiceLocator.resolve(ScriptableWorkflowRegistry);
+                    const workflows = scriptableRegistry.getAllWorkflowInfo().map(info => ({
+                        type: info.workflowType,
+                        name: info.graph.name,
+                        version: info.graph.version,
+                        description: info.graph.description || '',
+                        parameters: info.graph.parameters || [],
+                        variables: info.graph.variables || [],
+                        nodeCount: info.graph.nodes?.length || 0,
+                        filePath: info.filePath,
+                        requiresUnity: info.graph.nodes?.some(n => 
+                            n.type === 'event' && n.config?.event_type?.includes('unity')
+                        ) || false
+                    }));
+                    return { data: workflows };
+                } catch (e: any) {
+                    log.warn('ScriptableWorkflowRegistry not available:', e.message);
+                    return { data: [] };
+                }
+            }
+            
+            case 'custom.create': {
+                try {
+                    log.info('workflow.custom.create received, params:', params);
+                    const { ScriptableWorkflowRegistry } = await import('../services/workflows/ScriptableWorkflowRegistry');
+                    const scriptableRegistry = ServiceLocator.resolve(ScriptableWorkflowRegistry);
+                    log.info('ScriptableWorkflowRegistry resolved');
+                    
+                    const name = params.name as string;
+                    if (!name) {
+                        throw new Error('Workflow name is required');
+                    }
+                    log.info(`Creating workflow template: ${name}`);
+                    
+                    const filePath = await scriptableRegistry.createWorkflowTemplate(name);
+                    log.info(`Workflow template created: ${filePath}`);
+                    
+                    return { 
+                        data: { filePath, name },
+                        message: `Custom workflow "${name}" created` 
+                    };
+                } catch (e: any) {
+                    log.error('Failed to create custom workflow:', e);
+                    throw new Error(`Failed to create custom workflow: ${e.message}`);
+                }
+            }
+            
+            case 'custom.delete': {
+                try {
+                    const { ScriptableWorkflowRegistry } = await import('../services/workflows/ScriptableWorkflowRegistry');
+                    const scriptableRegistry = ServiceLocator.resolve(ScriptableWorkflowRegistry);
+                    const workflowType = params.type as string;
+                    if (!workflowType) {
+                        throw new Error('Workflow type is required');
+                    }
+                    const info = scriptableRegistry.getWorkflowInfo(workflowType);
+                    if (!info) {
+                        throw new Error(`Workflow "${workflowType}" not found`);
+                    }
+                    // Delete the file - the watcher will unregister it
+                    const fs = await import('fs');
+                    await fs.promises.unlink(info.filePath);
+                    return { message: `Custom workflow "${workflowType}" deleted` };
+                } catch (e: any) {
+                    throw new Error(`Failed to delete custom workflow: ${e.message}`);
+                }
+            }
+            
             default:
                 throw new Error(`Unknown workflow action: ${action}`);
         }
@@ -798,13 +937,11 @@ export class ApiHandler {
             case 'bench': {
                 const sessionId = params.sessionId as string | undefined;
                 const agentPoolService = this.services.agentPoolService as IAgentPoolApi & { getAgentsOnBench?: (sessionId?: string) => Array<{ name: string; roleId: string; sessionId: string }> };
-                if (agentPoolService.getAgentsOnBench) {
-                    const agents = agentPoolService.getAgentsOnBench(sessionId);
-                    return { data: { agents } };
-                } else {
-                    // Fallback: return empty array if method doesn't exist
-                    return { data: { agents: [] } };
+                if (!agentPoolService.getAgentsOnBench) {
+                    throw new Error('getAgentsOnBench method not available in AgentPoolService');
                 }
+                const agents = agentPoolService.getAgentsOnBench(sessionId);
+                return { data: { agents } };
             }
             
             default:
@@ -951,7 +1088,7 @@ export class ApiHandler {
         // e.g., "ps_000001_T1" with session "ps_000001" → "T1"
         if (taskId && sessionId && taskId.startsWith(`${sessionId}_`)) {
             const normalizedId = taskId.slice(sessionId.length + 1);
-            console.log(`[ApiHandler] Normalized task ID: "${taskId}" → "${normalizedId}" (stripped session prefix)`);
+            log.debug(`Normalized task ID: "${taskId}" → "${normalizedId}" (stripped session prefix)`);
             taskId = normalizedId;
         }
         
@@ -960,7 +1097,7 @@ export class ApiHandler {
             const typeStr = String(type || 'implementation').toLowerCase();
             // Map common mistakes to valid types
             if (typeStr === 'bugfix' || typeStr === 'bug_fix' || typeStr === 'fix') {
-                console.log(`[ApiHandler] Normalized task type: "${type}" → "error_fix"`);
+                log.debug(`Normalized task type: "${type}" → "error_fix"`);
                 return 'error_fix';
             }
             if (typeStr === 'implementation' || typeStr === 'impl' || typeStr === 'feature') {
@@ -970,7 +1107,7 @@ export class ApiHandler {
                 return 'error_fix';
             }
             // Default to implementation if unknown
-            console.log(`[ApiHandler] Unknown task type "${type}", defaulting to "implementation"`);
+            log.debug(`Unknown task type "${type}", defaulting to "implementation"`);
             return 'implementation';
         };
         
@@ -981,16 +1118,16 @@ export class ApiHandler {
                 
                 // If no tasks in memory, try reloading from disk (daemon may have started before tasks were created)
                 if (allTasks.length === 0) {
-                    console.log('[ApiHandler] No tasks in memory, attempting reload from disk...');
+                    log.debug('No tasks in memory, attempting reload from disk...');
                     try {
                         // TaskManager exposes reloadPersistedTasks for this purpose
                         if (this.services.taskManager.reloadPersistedTasks) {
                             this.services.taskManager.reloadPersistedTasks();
                             allTasks = this.services.taskManager.getAllTasks();
-                            console.log(`[ApiHandler] Reloaded ${allTasks.length} tasks from disk`);
+                            log.debug(`Reloaded ${allTasks.length} tasks from disk`);
                         }
                     } catch (e) {
-                        console.warn('[ApiHandler] Failed to reload tasks:', e);
+                        log.warn('Failed to reload tasks:', e);
                     }
                 }
                 
@@ -1074,6 +1211,12 @@ export class ApiHandler {
                     throw new Error('Missing id parameter');
                 }
                 
+                // Check for critical missing dependencies before starting workflow
+                const criticalDepError = this.checkCriticalDependencies();
+                if (criticalDepError) {
+                    throw new Error(criticalDepError);
+                }
+                
                 const workflowType = (params.workflow || 'task_implementation') as string;
                 
                 // Get the task to verify it exists
@@ -1106,7 +1249,7 @@ export class ApiHandler {
                 } else if (task.status === 'in_progress') {
                     // Task is in_progress, check if it's actually running or orphaned
                     // For now, allow restart of in_progress tasks
-                    console.log(`[ApiHandler] Task ${taskId} is in_progress, allowing restart`);
+                    log.debug(`Task ${taskId} is in_progress, allowing restart`);
                 }
                 // If status is 'created' or was recovered from orphaned 'in_progress', proceed
                 
@@ -1128,7 +1271,7 @@ export class ApiHandler {
                     }
                 } else {
                     // This workflow can proceed with incomplete dependencies
-                    console.log(`[ApiHandler] Workflow '${workflowType}' does not require complete dependencies - allowing start`);
+                    log.debug(`Workflow '${workflowType}' does not require complete dependencies - allowing start`);
                 }
                 
                 // Start workflow for this task via coordinator
@@ -1370,6 +1513,18 @@ export class ApiHandler {
                 return { data: this.agentRoles() };
             }
             
+            case 'getAll': {
+                // Return both roles and system prompts for the UI panel
+                const roles = this.services.roleRegistry.getAllRoles();
+                const systemPrompts = this.services.roleRegistry.getAllSystemPrompts().map(p => p.toJSON());
+                return { 
+                    data: {
+                        roles,
+                        systemPrompts
+                    }
+                };
+            }
+            
             case 'get': {
                 if (!params.roleId) {
                     throw new Error('Missing roleId parameter');
@@ -1481,15 +1636,83 @@ export class ApiHandler {
     }
     
     // ========================================================================
+    // Prompts Handler
+    // ========================================================================
+    
+    private async handlePrompts(action: string, params: Record<string, unknown>): Promise<{ data?: unknown; message?: string }> {
+        if (!this.services.roleRegistry) {
+            throw new Error('Role registry not available');
+        }
+        
+        switch (action) {
+            case 'getCoordinator': {
+                const coordinatorPrompt = this.services.roleRegistry.getCoordinatorPrompt();
+                return { 
+                    data: { coordinatorPrompt }
+                };
+            }
+            
+            case 'updateCoordinator': {
+                const config = params.config as Record<string, unknown>;
+                if (!config) {
+                    throw new Error('Missing config parameter');
+                }
+                this.services.roleRegistry.updateCoordinatorPrompt(config);
+                return { message: 'Coordinator prompt updated successfully' };
+            }
+            
+            case 'resetCoordinator': {
+                this.services.roleRegistry.resetCoordinatorPromptToDefault();
+                const coordinatorPrompt = this.services.roleRegistry.getCoordinatorPrompt();
+                return { 
+                    data: { coordinatorPrompt },
+                    message: 'Coordinator prompt reset to defaults'
+                };
+            }
+            
+            case 'getPolling': {
+                const pollingPrompt = this.services.roleRegistry.getPollingPrompt();
+                return { 
+                    data: pollingPrompt
+                };
+            }
+            
+            case 'updatePolling': {
+                const prompt = params.prompt as string;
+                if (typeof prompt !== 'string') {
+                    throw new Error('Missing or invalid prompt parameter');
+                }
+                this.services.roleRegistry.updatePollingPrompt(prompt);
+                return { message: 'Polling agent prompt updated successfully' };
+            }
+            
+            case 'resetPolling': {
+                this.services.roleRegistry.resetPollingPromptToDefault();
+                const pollingPrompt = this.services.roleRegistry.getPollingPrompt();
+                return { 
+                    data: pollingPrompt,
+                    message: 'Polling agent prompt reset to default'
+                };
+            }
+            
+            default:
+                throw new Error(`Unknown prompts action: ${action}`);
+        }
+    }
+    
+    // ========================================================================
     // Config Handler
     // ========================================================================
     
     private async handleConfig(action: string, params: Record<string, unknown>): Promise<{ data?: unknown; message?: string }> {
         const { ConfigLoader } = await import('./DaemonConfig');
         
-        // Get config loader instance from state manager
-        const stateManager = this.services.stateManager as any;
-        const workspaceRoot = stateManager.getWorkspaceRoot?.() || stateManager.workspaceRoot;
+        // Get workspace root from state manager
+        const workspaceRoot = this.services.stateManager.getWorkspaceRoot();
+        
+        if (!workspaceRoot) {
+            throw new Error('Workspace root not available');
+        }
         
         const configLoader = new ConfigLoader(workspaceRoot);
         
@@ -1549,9 +1772,8 @@ export class ApiHandler {
     private async handleFolders(action: string, params: Record<string, unknown>): Promise<{ data?: unknown; message?: string }> {
         const { getFolderStructureManager } = await import('../services/FolderStructureManager');
         
-        // Get folder structure manager from state manager
-        const stateManager = this.services.stateManager as any;
-        const workingDir = stateManager.getWorkingDir?.();
+        // Get working directory from state manager
+        const workingDir = this.services.stateManager.getWorkingDir();
         
         if (!workingDir) {
             throw new Error('Working directory not available from state manager');
@@ -1608,6 +1830,129 @@ export class ApiHandler {
     }
     
     // ========================================================================
+    // Dependency Management
+    // ========================================================================
+    
+    /**
+     * Handle dependency-related commands
+     */
+    private async handleDeps(action: string, params: Record<string, unknown>): Promise<{ data?: unknown; message?: string }> {
+        let depService: DependencyService;
+        try {
+            depService = ServiceLocator.resolve(DependencyService);
+        } catch {
+            throw new Error('DependencyService not available');
+        }
+        
+        switch (action) {
+            case 'status': {
+                const allDeps = depService.getCachedStatus();
+                const platform = process.platform;
+                const dependencies = allDeps.filter(d => d.platform === platform || d.platform === 'all');
+                const missingDeps = dependencies.filter(d => d.required && !d.installed);
+                const missingCount = missingDeps.length;
+                const hasCriticalMissing = missingDeps.some(d => 
+                    d.name.includes('Python') || d.name.includes('APC CLI')
+                );
+                
+                // Map to client-friendly format with install info
+                const missingDependencies = missingDeps.map(d => ({
+                    name: d.name,
+                    description: d.description,
+                    installUrl: d.installUrl,
+                    installCommand: d.installCommand,
+                    // Use installType from DependencyService if present, otherwise compute it
+                    installType: d.installType || this.getInstallType(d)
+                }));
+                
+                return { 
+                    data: { 
+                        dependencies,
+                        missingDependencies,
+                        missingCount,
+                        hasCriticalMissing
+                    } 
+                };
+            }
+            
+            case 'refresh': {
+                // Clear initialization cache before re-checking dependencies
+                // This allows late-joining clients to see fresh dependency check results
+                // and sets daemon back to 'initializing_services' state
+                if (this.services.daemon) {
+                    this.services.daemon.clearInitializationCache();
+                }
+                
+                // Broadcast the full list of dependencies upfront (same as initial startup)
+                const dependencyList = depService.getDependencyList();
+                this.broadcaster.broadcast('deps.list' as any, { dependencies: dependencyList });
+                
+                // Re-check all dependencies (progress will be broadcast via callback)
+                // This will WAIT for the 15+ second Unity MCP connectivity test
+                const freshDeps = await depService.checkAllDependencies();
+                const platform = process.platform;
+                const dependencies = freshDeps.filter(d => d.platform === platform || d.platform === 'all');
+                const missingDeps = dependencies.filter(d => d.required && !d.installed);
+                const missingCount = missingDeps.length;
+                const hasCriticalMissing = missingDeps.some(d => 
+                    d.name.includes('Python') || d.name.includes('APC CLI')
+                );
+                
+                const missingDependencies = missingDeps.map(d => ({
+                    name: d.name,
+                    description: d.description,
+                    installUrl: d.installUrl,
+                    installCommand: d.installCommand,
+                    installType: this.getInstallType(d)
+                }));
+                
+                // Mark dependency check as complete - sets daemon back to 'ready' state
+                // and re-broadcasts daemon.ready event so UI updates
+                if (this.services.daemon) {
+                    this.services.daemon.setDependencyCheckComplete();
+                }
+                
+                return { 
+                    data: { 
+                        dependencies,
+                        missingDependencies,
+                        missingCount,
+                        hasCriticalMissing
+                    },
+                    message: 'Dependencies refreshed'
+                };
+            }
+            
+            default:
+                throw new Error(`Unknown deps action: ${action}`);
+        }
+    }
+    
+    /**
+     * Determine the install type for a dependency
+     */
+    private getInstallType(dep: DependencyStatus): 'url' | 'command' | 'apc-cli' | 'vscode-command' | 'cursor-agent-cli' {
+        if (dep.name.includes('APC CLI')) {
+            return 'apc-cli';
+        }
+        // Check for Cursor Agent CLI first (before basic Cursor CLI)
+        if (dep.name.includes('Cursor Agent CLI')) {
+            return 'cursor-agent-cli';
+        }
+        // Then check for basic Cursor CLI
+        if (dep.name === 'Cursor CLI') {
+            return 'vscode-command';
+        }
+        if (dep.installUrl) {
+            return 'url';
+        }
+        if (dep.installCommand) {
+            return 'command';
+        }
+        return 'url';
+    }
+    
+    // ========================================================================
     // Process Management
     // ========================================================================
     
@@ -1630,7 +1975,7 @@ export class ApiHandler {
             }
             
             case 'count': {
-                // Count cursor agent processes
+                // Count cursor-agent processes
                 const { execSync } = require('child_process');
                 try {
                     const count = parseInt(
@@ -1643,8 +1988,74 @@ export class ApiHandler {
                 }
             }
             
+            case 'network-diagnostics': {
+                // Run network diagnostics to help troubleshoot fetch failures
+                const { runNetworkDiagnostics, formatDiagnosticsReport } = await import('../utils/networkDiagnostics');
+                const report = await runNetworkDiagnostics();
+                return {
+                    data: report,
+                    message: formatDiagnosticsReport(report)
+                };
+            }
+            
             default:
                 throw new Error(`Unknown process action: ${action}`);
+        }
+    }
+    
+    // ========================================================================
+    // System Management
+    // ========================================================================
+    
+    /**
+     * Handle system-level commands (installation, configuration, etc.)
+     */
+    private async handleSystem(action: string, params: Record<string, unknown>): Promise<{ data?: unknown; message?: string }> {
+        switch (action) {
+            case 'installUnityMcp': {
+                try {
+                    log.info('[ApiHandler] Processing installUnityMcp request...');
+                    const { DependencyService } = await import('../services/DependencyService');
+                    const depService = ServiceLocator.resolve(DependencyService);
+                    log.info('[ApiHandler] Calling installUnityMcpComplete...');
+                    const result = await depService.installUnityMcpComplete();
+                    log.info('[ApiHandler] installUnityMcpComplete result:', result);
+                    
+                    return { 
+                        data: result,
+                        message: result.success ? 'Installation completed' : 'Installation failed'
+                    };
+                } catch (e: any) {
+                    log.error('[ApiHandler] installUnityMcp exception:', e);
+                    return {
+                        data: { success: false, message: e.message || String(e) },
+                        message: `Installation failed: ${e.message || String(e)}`
+                    };
+                }
+            }
+            
+            case 'enableCacheForNextCheck': {
+                try {
+                    log.info('[ApiHandler] Processing enableCacheForNextCheck request...');
+                    const { DependencyService } = await import('../services/DependencyService');
+                    const depService = ServiceLocator.resolve(DependencyService);
+                    depService.enableCacheForNextCheck();
+                    
+                    return { 
+                        data: { success: true },
+                        message: 'Cache enabled for next dependency check'
+                    };
+                } catch (e: any) {
+                    log.error('[ApiHandler] enableCacheForNextCheck exception:', e);
+                    return {
+                        data: { success: false, message: e.message || String(e) },
+                        message: `Failed to enable cache: ${e.message || String(e)}`
+                    };
+                }
+            }
+            
+            default:
+                throw new Error(`Unknown system action: ${action}`);
         }
     }
     

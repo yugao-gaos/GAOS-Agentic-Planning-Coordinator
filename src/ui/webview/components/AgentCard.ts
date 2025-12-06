@@ -43,7 +43,7 @@ function renderBusyAgent(agent: AgentInfo): string {
         // Non-task workflow: show type
         workflowLine = agent.workflowType;
     } else if (agent.currentPhase) {
-        // Fallback to phase if no workflow info
+        // Show phase if no workflow info (acceptable display fallback)
         workflowLine = agent.currentPhase;
     }
     

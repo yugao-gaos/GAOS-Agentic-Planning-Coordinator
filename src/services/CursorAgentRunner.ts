@@ -5,9 +5,14 @@ import { spawn, ChildProcess, execSync } from 'child_process';
 import { ProcessManager, ProcessState } from './ProcessManager';
 import { IAgentBackend } from './AgentBackend';
 import { ServiceLocator } from './ServiceLocator';
+import { Logger } from '../utils/Logger';
+import { CursorSetupScripts } from './cursor/CursorSetupScripts';
+import * as vscode from 'vscode';
+
+const log = Logger.create('Daemon', 'AgentRunner');
 
 /**
- * Result from running a cursor agent
+ * Result from running cursor-agent CLI
  */
 export interface AgentRunResult {
     success: boolean;
@@ -18,7 +23,7 @@ export interface AgentRunResult {
 }
 
 /**
- * Options for running a cursor agent
+ * Options for running cursor-agent CLI
  */
 export interface AgentRunOptions {
     /** Unique identifier for this agent run */
@@ -45,13 +50,19 @@ export interface AgentRunOptions {
     metadata?: Record<string, any>;
     /** Use simple mode without streaming JSON output (for coordinator) */
     simpleMode?: boolean;
+    /** Number of retry attempts for transient failures (default: 2) */
+    maxRetries?: number;
+    /** Delay between retries in milliseconds (default: 3000) */
+    retryDelayMs?: number;
 }
 
 /**
- * Runs Cursor CLI agents with proper process management and streaming output parsing.
- * This is the canonical way to run cursor agents in the extension.
+ * Runs cursor-agent CLI with proper process management and streaming output parsing.
+ * This is the canonical way to run cursor-agent in the extension.
  * 
  * Implements IAgentBackend for use with the AgentRunner abstraction layer.
+ * 
+ * Note: On Windows, cursor-agent requires WSL (Windows Subsystem for Linux).
  * 
  * Obtain via ServiceLocator:
  *   const runner = ServiceLocator.resolve(CursorAgentRunner);
@@ -155,9 +166,87 @@ export class CursorAgentRunner implements IAgentBackend {
     }
 
     /**
-     * Run a cursor agent with the given prompt and options
+     * Check if an error is likely a transient network failure that could be retried
+     */
+    private isTransientError(error: string | undefined, exitCode: number | null): boolean {
+        if (!error) return false;
+        
+        const transientPatterns = [
+            /fetch failed/i,
+            /ECONNREFUSED/i,
+            /ECONNRESET/i,
+            /ETIMEDOUT/i,
+            /ENOTFOUND/i,
+            /socket hang up/i,
+            /network error/i,
+            /request timeout/i,
+            /502|503|504/,  // Gateway errors
+        ];
+        
+        return transientPatterns.some(pattern => pattern.test(error));
+    }
+    
+    /**
+     * Run cursor-agent CLI with the given prompt and options
+     * Includes automatic retry logic for transient network failures
      */
     async run(options: AgentRunOptions): Promise<AgentRunResult> {
+        const {
+            maxRetries = 2,
+            retryDelayMs = 3000,
+            onProgress,
+            logFile
+        } = options;
+        
+        let lastResult: AgentRunResult | null = null;
+        
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            if (attempt > 0) {
+                const C = this.COLORS;
+                onProgress?.(`🔄 Retry attempt ${attempt}/${maxRetries} after transient failure...`);
+                if (logFile) {
+                    this.appendToLog(logFile, `\n${C.yellow}🔄 Retry attempt ${attempt}/${maxRetries} after transient failure${C.reset}\n`);
+                }
+                // Wait before retry with exponential backoff
+                await new Promise(resolve => setTimeout(resolve, retryDelayMs * attempt));
+            }
+            
+            // Modify ID for retries to avoid conflicts
+            const runOptions = attempt > 0 
+                ? { ...options, id: `${options.id}_retry${attempt}` }
+                : options;
+            
+            lastResult = await this.runOnce(runOptions);
+            
+            // If successful or not a transient error, return immediately
+            if (lastResult.success || !this.isTransientError(lastResult.error, lastResult.exitCode)) {
+                return lastResult;
+            }
+            
+            // Log the transient failure
+            const C = this.COLORS;
+            if (attempt < maxRetries) {
+                onProgress?.(`⚠️ Transient failure detected: ${lastResult.error?.substring(0, 100)}...`);
+                if (logFile) {
+                    this.appendToLog(logFile, `\n${C.yellow}⚠️ Transient failure: ${lastResult.error}${C.reset}\n`);
+                }
+            }
+        }
+        
+        // All retries exhausted
+        const C = this.COLORS;
+        onProgress?.(`❌ All ${maxRetries + 1} attempts failed`);
+        if (logFile) {
+            this.appendToLog(logFile, `\n${C.red}❌ All ${maxRetries + 1} attempts failed${C.reset}\n`);
+        }
+        
+        return lastResult!;
+    }
+    
+    /**
+     * Run cursor-agent CLI once (internal implementation)
+     */
+    private async runOnce(options: AgentRunOptions): Promise<AgentRunResult> {
         const {
             id,
             prompt,
@@ -186,36 +275,68 @@ export class CursorAgentRunner implements IAgentBackend {
         const promptFile = path.join(tempDir, `prompt_${id}_${Date.now()}.txt`);
         fs.writeFileSync(promptFile, prompt);
 
-        // Build the shell command
-        // Using cat to pipe prompt avoids escaping issues with complex prompts
+        // Build cursor-agent flags (common across platforms)
         // Always use stream-json format - text mode doesn't produce capturable stdout
         // simpleMode affects how we PARSE the output, not the output format
-        const cursorFlags = `--model "${model}" -p --force --approve-mcps --output-format stream-json --stream-partial-output`;
-        const shellCmd = `cat "${promptFile}" | cursor agent ${cursorFlags} 2>&1; rm -f "${promptFile}"`;
+        // --approve-mcps: Auto-approve MCP servers (required for Unity MCP)
+        const cursorFlags = `--model "${model}" -p --force --output-format stream-json --approve-mcps`;
         
         // Rotate log file if needed (1MB max, keep 3 backups)
         if (logFile) {
             this.rotateLogIfNeeded(logFile);
-            this.appendToLog(logFile, `[DEBUG] Shell command: ${shellCmd}\n`);
-            this.appendToLog(logFile, `[DEBUG] simpleMode: ${simpleMode}\n`);
         }
 
-        onProgress?.(`🚀 Starting cursor agent (${model})...`);
+        onProgress?.(`🚀 Starting cursor-agent (${model})...`);
         if (logFile) {
             const C = this.COLORS;
             this.appendToLog(logFile, `${C.cyan}${C.bold}🚀 Agent started: ${new Date().toISOString()}${C.reset}\n`);
             this.appendToLog(logFile, `${C.gray}Model: ${model}${C.reset}\n`);
             this.appendToLog(logFile, `${C.gray}Process ID: ${id}${C.reset}\n`);
+            this.appendToLog(logFile, `${C.gray}Platform: ${process.platform}${C.reset}\n`);
             this.appendToLog(logFile, `${C.gray}---${C.reset}\n\n`);
         }
 
         return new Promise((resolve) => {
-            const proc = spawn('bash', ['-c', shellCmd], {
-                cwd,
-                stdio: ['pipe', 'pipe', 'pipe'],
-                env: { ...process.env },
-                detached: true  // Create process group for reliable cleanup
-            });
+            let proc: ChildProcess;
+            
+            if (process.platform === 'win32') {
+                // Windows: Use WSL to run cursor-agent (cursor-agent requires Unix environment)
+                // Use Ubuntu distribution and pipe prompt file content
+                // IMPORTANT: Use absolute path to cursor-agent since PATH may not be configured yet
+                const cursorAgentPath = '$HOME/.local/bin/cursor-agent';
+                const wslPromptPath = promptFile.replace(/\\/g, '/').replace(/^[A-Z]:/, (match) => `/mnt/${match.toLowerCase().charAt(0)}`);
+                const bashCmd = `cat "${wslPromptPath}" | ${cursorAgentPath} ${cursorFlags} 2>&1; rm -f "${wslPromptPath}"`;
+                
+                if (logFile) {
+                    this.appendToLog(logFile, `[DEBUG] WSL bash command: ${bashCmd}\n`);
+                    this.appendToLog(logFile, `[DEBUG] Prompt file (Windows): ${promptFile}\n`);
+                    this.appendToLog(logFile, `[DEBUG] Prompt file (WSL): ${wslPromptPath}\n`);
+                    this.appendToLog(logFile, `[DEBUG] simpleMode: ${simpleMode}\n`);
+                }
+                
+                proc = spawn('wsl', ['-d', 'Ubuntu', 'bash', '-c', bashCmd], {
+                    cwd,
+                    stdio: ['pipe', 'pipe', 'pipe'],
+                    env: { ...process.env },
+                    windowsHide: true  // Hide WSL window
+                });
+            } else {
+                // macOS/Linux: Use bash with cat to pipe prompt
+                // Try cursor-agent in PATH first, then check ~/.local/bin
+                // Note: Using || for command chaining here is acceptable as it's shell-level command fallback
+                // within a single operation, not data-level fallback masking errors
+                const shellCmd = `cat "${promptFile}" | (cursor-agent ${cursorFlags} 2>&1 || $HOME/.local/bin/cursor-agent ${cursorFlags} 2>&1); rm -f "${promptFile}"`;
+                if (logFile) {
+                    this.appendToLog(logFile, `[DEBUG] Shell command: ${shellCmd}\n`);
+                    this.appendToLog(logFile, `[DEBUG] simpleMode: ${simpleMode}\n`);
+                }
+                proc = spawn('bash', ['-c', shellCmd], {
+                    cwd,
+                    stdio: ['pipe', 'pipe', 'pipe'],
+                    env: { ...process.env },
+                    detached: true  // Create process group for reliable cleanup on Unix
+                });
+            }
 
             if (proc.pid) {
                 onStart?.(proc.pid);
@@ -454,7 +575,7 @@ export class CursorAgentRunner implements IAgentBackend {
 
 
     /**
-     * Parse a single line of cursor agent output
+     * Parse a single line of cursor-agent output
      * @param line The JSON line to parse
      * @param runId The ID of the current run (for delta tracking)
      * @param handlers Output handlers
@@ -868,10 +989,10 @@ export class CursorAgentRunner implements IAgentBackend {
             }
             
             if (cleanedCount > 0) {
-                console.log(`[CursorAgentRunner] Cleaned up ${cleanedCount} old temp files`);
+                log.debug(`Cleaned up ${cleanedCount} old temp files`);
             }
         } catch (e) {
-            console.error('[CursorAgentRunner] Error cleaning temp files:', e);
+            log.error('Error cleaning temp files:', e);
         }
         
         return cleanedCount;
@@ -885,17 +1006,137 @@ export class CursorAgentRunner implements IAgentBackend {
     }
     
     /**
+     * Check if cursor-agent is authenticated
+     * Returns true if logged in, false otherwise
+     */
+    async checkLoginStatus(): Promise<{ loggedIn: boolean; error?: string }> {
+        try {
+            const { exec } = require('child_process');
+            const { promisify } = require('util');
+            const execAsync = promisify(exec);
+            
+            let result: { stdout: string; stderr: string };
+            
+            if (process.platform === 'win32') {
+                // On Windows, check in WSL
+                result = await execAsync('wsl -d Ubuntu bash -c "~/.local/bin/cursor-agent status 2>&1"', { timeout: 5000 });
+            } else {
+                // On macOS/Linux
+                result = await execAsync('cursor-agent status 2>&1', { timeout: 5000 });
+            }
+            
+            const output = result.stdout + result.stderr;
+            
+            // If status command succeeds and doesn't mention authentication, we're logged in
+            if (output.includes('Authenticated') || output.includes('Logged in') || (!output.includes('Authentication required') && !output.includes('login'))) {
+                return { loggedIn: true };
+            } else {
+                return { loggedIn: false, error: 'Not authenticated' };
+            }
+        } catch (error: any) {
+            // If command fails, check the error message
+            const errorMsg = error.message || '';
+            if (errorMsg.includes('Authentication required') || errorMsg.includes('login')) {
+                return { loggedIn: false, error: 'Authentication required' };
+            }
+            // Other errors - assume not logged in to be safe
+            return { loggedIn: false, error: 'Unable to check login status' };
+        }
+    }
+    
+    /**
+     * Interactive login - opens terminal for user to login
+     * @param interactive If true, opens terminal; if false, returns instruction message
+     */
+    async login(interactive: boolean = true): Promise<{ success: boolean; message: string }> {
+        if (!interactive) {
+            const platform = process.platform;
+            const loginCmd = platform === 'win32' 
+                ? 'wsl -d Ubuntu bash -c "$HOME/.local/bin/cursor-agent login"'
+                : 'cursor-agent login';
+            
+            return {
+                success: false,
+                message: `Please run: ${loginCmd}\n\nOr set CURSOR_API_KEY environment variable.`
+            };
+        }
+        
+        // Interactive mode - open terminal
+        const vscode = require('vscode');
+        const platform = process.platform;
+        
+        try {
+            const terminal = vscode.window.createTerminal({
+                name: 'cursor-agent login',
+                cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
+            });
+            
+            terminal.show();
+            
+            if (platform === 'win32') {
+                terminal.sendText('wsl -d Ubuntu bash -c "$HOME/.local/bin/cursor-agent login"');
+            } else {
+                terminal.sendText('cursor-agent login');
+            }
+            
+            return {
+                success: true,
+                message: 'Login terminal opened. Please complete authentication and try again.'
+            };
+        } catch (error: any) {
+            return {
+                success: false,
+                message: `Failed to open login terminal: ${error.message}`
+            };
+        }
+    }
+    
+    /**
+     * Check if cursor-agent is available AND authenticated
+     * This is a complete readiness check
+     */
+    async isAvailableAndAuthenticated(): Promise<{ available: boolean; authenticated: boolean; error?: string }> {
+        const available = await this.isAvailable();
+        if (!available) {
+            return { available: false, authenticated: false, error: 'cursor-agent not installed' };
+        }
+        
+        const loginStatus = await this.checkLoginStatus();
+        return {
+            available: true,
+            authenticated: loginStatus.loggedIn,
+            error: loginStatus.error
+        };
+    }
+    
+    /**
      * Check if Cursor CLI is available on the system
      * Implements IAgentBackend.isAvailable()
+     * 
+     * IMPORTANT: This uses the SAME detection logic as DependencyService.checkCursorAgentCli()
+     * to ensure consistency across the codebase
      */
     async isAvailable(): Promise<boolean> {
         try {
             if (process.platform === 'win32') {
-                execSync('where cursor', { stdio: 'ignore' });
+                // On Windows, check if cursor-agent exists in WSL
+                // Use the EXACT SAME check as DependencyService for consistency
+                const { execSync } = require('child_process');
+                const result = execSync(
+                    'wsl -d Ubuntu bash -c "if [ -f ~/.local/bin/cursor-agent ]; then ~/.local/bin/cursor-agent --version 2>&1; else echo NOT_FOUND; fi"',
+                    { encoding: 'utf8', stdio: 'pipe', timeout: 5000 }
+                );
+                
+                // Check if it returned a version (not NOT_FOUND)
+                if (result && !result.includes('NOT_FOUND') && result.trim()) {
+                    return true;
+                }
+                return false;
             } else {
-                execSync('which cursor', { stdio: 'ignore' });
+                // On macOS/Linux, check if cursor-agent is in PATH
+                execSync('which cursor-agent', { stdio: 'ignore' });
+                return true;
             }
-            return true;
         } catch {
             return false;
         }
@@ -906,7 +1147,7 @@ export class CursorAgentRunner implements IAgentBackend {
      * Implements IAgentBackend.dispose()
      */
     async dispose(): Promise<void> {
-        console.log('[CursorAgentRunner] Disposing...');
+        log.info('Disposing...');
         
         // Stop all active runs
         const runningIds = this.getRunningAgents();
@@ -917,7 +1158,235 @@ export class CursorAgentRunner implements IAgentBackend {
         // Clean up any leftover temp files
         this.cleanupTempFiles(0); // Clean all temp files on dispose
         
-        console.log('[CursorAgentRunner] Disposed');
+        log.info('Disposed');
+    }
+    
+    /**
+     * Install the Cursor CLI
+     * Cursor CLI is installed via Cursor app itself - show instructions
+     */
+    /**
+     * Install the Cursor CLI (cursor-agent).
+     * This delegates to the cursor-specific setup scripts.
+     * 
+     * Note: This method provides information/instructions rather than direct installation
+     * because installation requires admin privileges and user interaction.
+     * The actual installation is triggered via UI (DependencyService + SidebarViewProvider).
+     */
+    async installCLI(): Promise<{ success: boolean; message: string; requiresRestart?: boolean }> {
+        const isAvailable = await this.isAvailable();
+        if (isAvailable) {
+            return { success: true, message: 'Cursor Agent CLI (cursor-agent) is already installed and available.' };
+        }
+        
+        // For Windows, cursor-agent needs WSL setup
+        if (process.platform === 'win32') {
+            return {
+                success: false,
+                message: 'Cursor Agent CLI requires WSL setup on Windows.\n\n' +
+                         'Click "Install" in the Dependencies panel to run the automated installer.\n' +
+                         'The installer will:\n' +
+                         '• Install/configure WSL and Ubuntu\n' +
+                         '• Install cursor-agent CLI\n' +
+                         '• Install Node.js in WSL\n' +
+                         '• Setup apc CLI in WSL',
+                requiresRestart: false
+            };
+        }
+        
+        // For Unix-like systems, provide installation instructions
+        return {
+            success: false,
+            message: 'Cursor Agent CLI not found.\n\n' +
+                     'Installation options:\n' +
+                     '1. Via Cursor app: Command Palette > "Install cursor command"\n' +
+                     '2. Via script: Run the install-cursor-agent.sh script from the extension',
+            requiresRestart: true
+        };
+    }
+    
+    /**
+     * Install/configure an MCP server in Cursor's mcp.json
+     * If already configured, verifies and updates if URL is different
+     */
+    async installMCP(config: { name: string; url?: string; command?: string; args?: string[] }): Promise<{ success: boolean; message: string; requiresRestart?: boolean }> {
+        try {
+            const configPath = this.getMcpConfigPath();
+            
+            // Read existing config or create new
+            let mcpConfig: any = { mcpServers: {} };
+            let mcpServers: Record<string, any> = {};
+            
+            if (fs.existsSync(configPath)) {
+                try {
+                const content = fs.readFileSync(configPath, 'utf8');
+                mcpConfig = JSON.parse(content);
+                mcpServers = mcpConfig.mcpServers || {};
+                } catch (parseError) {
+                    log.warn(`MCP config exists but is invalid JSON, will recreate: ${parseError}`);
+                    // Invalid JSON - start fresh
+                    mcpConfig = { mcpServers: {} };
+                    mcpServers = {};
+                }
+            }
+            
+            // Build new config entry
+            let newMcpConfig: any;
+            if (config.url) {
+                // HTTP transport
+                newMcpConfig = { url: config.url };
+            } else if (config.command) {
+                // stdio transport
+                newMcpConfig = {
+                    command: config.command,
+                    args: config.args || []
+                };
+            } else {
+                return { success: false, message: 'Invalid MCP config: must have either url or command' };
+            }
+            
+            // Check if already configured with same config
+            if (mcpServers[config.name]) {
+                const existing = mcpServers[config.name];
+                const isSame = config.url 
+                    ? existing.url === config.url
+                    : existing.command === config.command && JSON.stringify(existing.args) === JSON.stringify(config.args);
+                
+                if (isSame) {
+                    return { 
+                        success: true, 
+                        message: `MCP '${config.name}' already configured correctly.`,
+                        requiresRestart: false
+                    };
+                } else {
+                    // Different config - update it
+                    mcpServers[config.name] = newMcpConfig;
+                    mcpConfig.mcpServers = mcpServers;
+                    
+                    // Ensure directory exists
+                    const configDir = path.dirname(configPath);
+                    if (!fs.existsSync(configDir)) {
+                        fs.mkdirSync(configDir, { recursive: true });
+                    }
+                    
+                    // Write config
+                    fs.writeFileSync(configPath, JSON.stringify(mcpConfig, null, 2));
+                    
+                    return {
+                        success: true,
+                        message: `MCP '${config.name}' configuration updated. Agents will use new config immediately.`,
+                        requiresRestart: false
+                    };
+                }
+            }
+            
+            // Not configured - add it
+            mcpServers[config.name] = newMcpConfig;
+            mcpConfig.mcpServers = mcpServers;
+            
+            // Ensure directory exists
+            const configDir = path.dirname(configPath);
+            if (!fs.existsSync(configDir)) {
+                fs.mkdirSync(configDir, { recursive: true });
+            }
+            
+            // Write config
+            fs.writeFileSync(configPath, JSON.stringify(mcpConfig, null, 2));
+            
+            return {
+                success: true,
+                message: `MCP '${config.name}' configured successfully. Agents will use it immediately on next run.`,
+                requiresRestart: false
+            };
+        } catch (error) {
+            return {
+                success: false,
+                message: `Failed to install MCP: ${error instanceof Error ? error.message : String(error)}`
+            };
+        }
+    }
+    
+    /**
+     * Get the MCP config file path for Cursor
+     * 
+     * IMPORTANT: On Windows, cursor-agent runs in WSL, so the config must be in WSL home directory!
+     */
+    getMcpConfigPath(): string {
+        if (process.platform === 'win32') {
+            // On Windows, cursor-agent runs in WSL, so config must be in WSL home
+            // Get the actual WSL username dynamically
+            try {
+                const { execSync } = require('child_process');
+                const wslUsername = execSync('wsl -d Ubuntu bash -c "whoami"', { encoding: 'utf8' }).trim();
+                return `\\\\wsl$\\Ubuntu\\home\\${wslUsername}\\.cursor\\mcp.json`;
+            } catch (error) {
+                const errorMsg = error instanceof Error ? error.message : String(error);
+                log.error(`Failed to detect WSL username: ${errorMsg}`);
+                throw new Error(
+                    `Cannot detect WSL username for MCP config path. ` +
+                    `Please ensure WSL (Ubuntu) is properly installed and accessible. ` +
+                    `Error: ${errorMsg}`
+                );
+            }
+        } else if (process.platform === 'darwin') {
+            const home = os.homedir();
+            return path.join(home, 'Library', 'Application Support', 'Cursor', 'User', 'globalStorage', 'cursor.mcp', 'mcp.json');
+        } else {
+            const home = os.homedir();
+            return path.join(home, '.config', 'Cursor', 'User', 'globalStorage', 'cursor.mcp', 'mcp.json');
+        }
+    }
+    
+    /**
+     * Check if a specific MCP is already configured
+     */
+    isMcpConfigured(name: string): boolean {
+        try {
+            const configPath = this.getMcpConfigPath();
+            if (!fs.existsSync(configPath)) {
+                return false;
+            }
+            
+            const content = fs.readFileSync(configPath, 'utf8');
+            const mcpConfig = JSON.parse(content);
+            return Boolean(mcpConfig?.mcpServers?.[name]);
+        } catch {
+            return false;
+        }
+    }
+    
+    /**
+     * Remove an MCP configuration
+     */
+    async removeMCP(name: string): Promise<{ success: boolean; message: string; requiresRestart?: boolean }> {
+        try {
+            const configPath = this.getMcpConfigPath();
+            
+            if (!fs.existsSync(configPath)) {
+                return { success: true, message: `MCP '${name}' was not configured.` };
+            }
+            
+            const content = fs.readFileSync(configPath, 'utf8');
+            const mcpConfig = JSON.parse(content);
+            
+            if (!mcpConfig?.mcpServers?.[name]) {
+                return { success: true, message: `MCP '${name}' was not configured.` };
+            }
+            
+            delete mcpConfig.mcpServers[name];
+            fs.writeFileSync(configPath, JSON.stringify(mcpConfig, null, 2));
+            
+            return {
+                success: true,
+                message: `MCP '${name}' removed successfully. Restart Cursor to apply.`,
+                requiresRestart: true
+            };
+        } catch (error) {
+            return {
+                success: false,
+                message: `Failed to remove MCP: ${error instanceof Error ? error.message : String(error)}`
+            };
+        }
     }
 
     private killProcess(id: string, proc: ChildProcess): void {
@@ -928,18 +1397,44 @@ export class CursorAgentRunner implements IAgentBackend {
         }
         
         try {
-            if (proc.pid && process.platform !== 'win32') {
-                // Kill the entire process group
-                try {
-                    process.kill(-proc.pid, 'SIGTERM');
-                } catch {
-                    process.kill(proc.pid, 'SIGKILL');
+            if (proc.pid) {
+                if (process.platform === 'win32') {
+                    // Windows: Use taskkill to terminate the process tree
+                    try {
+                        execSync(`taskkill /PID ${proc.pid} /T /F`, { 
+                            stdio: 'ignore',
+                            windowsHide: true 
+                        });
+                    } catch {
+                        // Process may already be dead, try direct kill
+                        try {
+                            proc.kill();
+                        } catch {
+                            // Ignore - process already dead
+                        }
+                    }
+                } else {
+                    // Unix: Kill the entire process group using negative PID
+                    try {
+                        process.kill(-proc.pid, 'SIGTERM');
+                    } catch {
+                        try {
+                            process.kill(proc.pid, 'SIGKILL');
+                        } catch {
+                            // Ignore - process already dead
+                        }
+                    }
                 }
             } else {
-                proc.kill('SIGKILL');
+                // No PID available, try direct kill
+                try {
+                    proc.kill();
+                } catch {
+                    // Ignore - process already dead
+                }
             }
         } catch (e) {
-            console.error(`Error killing process ${id}:`, e);
+            log.error(`Error killing process ${id}:`, e);
         }
         this.activeRuns.delete(id);
     }
@@ -983,9 +1478,9 @@ export class CursorAgentRunner implements IAgentBackend {
             // Move current log to .1
             fs.renameSync(logFile, `${logFile}.1`);
             
-            console.log(`[CursorAgentRunner] Log rotated: ${logFile} (${Math.round(stats.size / 1024)}KB -> 0KB, kept ${maxBackups} backups)`);
+            log.debug(`Log rotated: ${logFile} (${Math.round(stats.size / 1024)}KB -> 0KB, kept ${maxBackups} backups)`);
         } catch (e) {
-            console.error(`[CursorAgentRunner] Error rotating log file ${logFile}:`, e);
+            log.error(`Error rotating log file ${logFile}:`, e);
         }
     }
 
@@ -1005,7 +1500,7 @@ export class CursorAgentRunner implements IAgentBackend {
             // No fsync needed - writeSync to file descriptor is sufficient for real-time streaming
             fs.writeSync(fd, text, null, 'utf8');
         } catch (e) {
-            console.error(`Error writing to log file ${logFile}:`, e);
+            log.error(`Error writing to log file ${logFile}:`, e);
         }
     }
     
@@ -1016,9 +1511,18 @@ export class CursorAgentRunner implements IAgentBackend {
                 fs.closeSync(fd);
                 this.logFileDescriptors.delete(logFile);
             } catch (e) {
-                console.error(`Error closing log file ${logFile}:`, e);
+                log.error(`Error closing log file ${logFile}:`, e);
             }
         }
+    }
+    
+    /**
+     * Kill orphaned cursor-agent processes from previous runs
+     * Returns the number of processes killed
+     */
+    async killOrphanAgents(): Promise<number> {
+        const { killOrphanCursorAgents } = await import('../utils/orphanCleanup');
+        return await killOrphanCursorAgents(new Set(), '[CursorAgentRunner]');
     }
 }
 

@@ -1,0 +1,215 @@
+# Example: Parallel Review Workflow
+# This demonstrates a workflow that runs multiple reviewers in parallel
+# and collects their results before making a decision.
+
+name: Parallel Code Review
+version: 1.0
+description: |
+  Runs multiple code reviewers in parallel, collects their feedback,
+  and makes an approval decision based on majority consensus.
+
+parameters:
+  - name: code_path
+    type: string
+    required: true
+    description: Path to the code file to review
+  - name: min_approvals
+    type: number
+    default: 2
+    description: Minimum number of approvals required
+
+variables:
+  - id: approval_count
+    type: number
+    default: 0
+  - id: rejection_count
+    type: number
+    default: 0
+
+nodes:
+  # Start node - receives workflow input
+  - id: start
+    type: start
+    position:
+      x: 100
+      y: 200
+
+  # Log the start of review
+  - id: log_start
+    type: log
+    config:
+      message: "Starting parallel review for: {{parameters.code_path}}"
+      level: info
+    position:
+      x: 300
+      y: 200
+
+  # Branch into 3 parallel reviewers
+  - id: branch_reviewers
+    type: branch
+    config:
+      branchCount: 3
+      passData: true
+    position:
+      x: 500
+      y: 200
+
+  # Reviewer 1
+  - id: request_reviewer_1
+    type: agent_request
+    config:
+      role: code_reviewer
+    position:
+      x: 700
+      y: 50
+
+  - id: review_1
+    type: agentic_work
+    config:
+      promptTemplate: |
+        Review the code at {{parameters.code_path}}.
+        Focus on: code quality, best practices, potential bugs.
+        Provide a clear APPROVED or CHANGES_REQUESTED verdict.
+      model: claude-sonnet-4-20250514
+      releaseAfter: true
+    timeout_ms: 300000
+    on_error:
+      strategy: skip
+      skip_default_value:
+        result: "SKIPPED"
+    position:
+      x: 900
+      y: 50
+
+  # Reviewer 2
+  - id: request_reviewer_2
+    type: agent_request
+    config:
+      role: code_reviewer
+    position:
+      x: 700
+      y: 200
+
+  - id: review_2
+    type: agentic_work
+    config:
+      promptTemplate: |
+        Review the code at {{parameters.code_path}}.
+        Focus on: architecture, maintainability, testing.
+        Provide a clear APPROVED or CHANGES_REQUESTED verdict.
+      model: claude-sonnet-4-20250514
+      releaseAfter: true
+    timeout_ms: 300000
+    position:
+      x: 900
+      y: 200
+
+  # Reviewer 3
+  - id: request_reviewer_3
+    type: agent_request
+    config:
+      role: code_reviewer
+    position:
+      x: 700
+      y: 350
+
+  - id: review_3
+    type: agentic_work
+    config:
+      promptTemplate: |
+        Review the code at {{parameters.code_path}}.
+        Focus on: security, performance, edge cases.
+        Provide a clear APPROVED or CHANGES_REQUESTED verdict.
+      model: claude-sonnet-4-20250514
+      releaseAfter: true
+    timeout_ms: 300000
+    position:
+      x: 900
+      y: 350
+
+  # Sync all reviews
+  - id: sync_reviews
+    type: sync
+    config:
+      inputCount: 3
+      mode: wait_all
+    position:
+      x: 1100
+      y: 200
+
+  # Log combined results
+  - id: log_results
+    type: log
+    config:
+      message: "All reviews completed. Processing results..."
+      level: info
+      includeData: true
+    position:
+      x: 1300
+      y: 200
+
+  # End with results
+  - id: end
+    type: end
+    config:
+      outputKey: review_results
+      success: true
+    position:
+      x: 1500
+      y: 200
+
+# Connections define the flow
+connections:
+  # Start -> Log -> Branch
+  - from: start.trigger
+    to: log_start.trigger
+  - from: log_start.trigger
+    to: branch_reviewers.trigger
+
+  # Branch to reviewers (parallel)
+  - from: branch_reviewers.out_0
+    to: request_reviewer_1.trigger
+  - from: branch_reviewers.out_1
+    to: request_reviewer_2.trigger
+  - from: branch_reviewers.out_2
+    to: request_reviewer_3.trigger
+
+  # Agent request to work
+  - from: request_reviewer_1.agent
+    to: review_1.agent
+  - from: request_reviewer_1.trigger
+    to: review_1.trigger
+  
+  - from: request_reviewer_2.agent
+    to: review_2.agent
+  - from: request_reviewer_2.trigger
+    to: review_2.trigger
+  
+  - from: request_reviewer_3.agent
+    to: review_3.agent
+  - from: request_reviewer_3.trigger
+    to: review_3.trigger
+
+  # Reviews to sync
+  - from: review_1.result
+    to: sync_reviews.in_0
+  - from: review_2.result
+    to: sync_reviews.in_1
+  - from: review_3.result
+    to: sync_reviews.in_2
+
+  # Sync -> Log -> End
+  - from: sync_reviews.results
+    to: log_results.data
+  - from: sync_reviews.trigger
+    to: log_results.trigger
+  - from: log_results.trigger
+    to: end.trigger
+  - from: sync_reviews.results
+    to: end.input
+
+editor:
+  zoom: 0.8
+  panX: 50
+  panY: 50
+

@@ -12,6 +12,7 @@ import { ApcRequest, ApcResponse, ApcEvent, ApcMessage } from '../client/Protoco
 import { ApiHandler, ApiServices } from './ApiHandler';
 import { EventBroadcaster } from './EventBroadcaster';
 import { ServiceLocator } from '../services/ServiceLocator';
+import { DependencyService, DependencyStatus } from '../services/DependencyService';
 import {
     CoreConfig,
     ConfigLoader,
@@ -21,6 +22,10 @@ import {
     getDaemonPort,
     isDaemonRunning
 } from './DaemonConfig';
+import { Logger } from '../utils/Logger';
+import { ScriptableWorkflowRegistry } from '../services/workflows/ScriptableWorkflowRegistry';
+
+const log = Logger.create('Daemon', 'ApcDaemon');
 
 // ============================================================================
 // Types
@@ -80,6 +85,13 @@ export class ApcDaemon {
     private verbose: boolean;
     private services: ApiServices | null = null;
     
+    /** Cache of initialization progress messages for late-joining clients */
+    private initializationHistory: Array<{
+        event: string;
+        data: any;
+        timestamp: string;
+    }> = [];
+    
     /** Idle shutdown timer - daemon shuts down after 60s with no clients */
     private idleShutdownTimer: NodeJS.Timeout | null = null;
     private static readonly IDLE_SHUTDOWN_MS = 60000;  // 60 seconds
@@ -99,6 +111,22 @@ export class ApcDaemon {
         
         // Register broadcast handler
         this.broadcaster.onBroadcast((event, targetClients) => {
+            // Cache ALL initialization-related events for late-joining clients
+            if (this.readyState !== 'ready') {
+                const cacheableEvents = ['daemon.starting', 'daemon.progress', 'deps.list', 'deps.progress'];
+                if (cacheableEvents.includes(event.event)) {
+                    this.initializationHistory.push({
+                        event: event.event,
+                        data: event.data,
+                        timestamp: event.timestamp || new Date().toISOString()
+                    });
+                    // Keep only last 100 messages to prevent memory bloat
+                    if (this.initializationHistory.length > 100) {
+                        this.initializationHistory.shift();
+                    }
+                }
+            }
+            
             this.broadcastEvent(event, targetClients);
         });
     }
@@ -124,9 +152,17 @@ export class ApcDaemon {
         this.state = 'starting';
         this.startTime = Date.now();
         
+        // Clear initialization history on fresh start
+        this.initializationHistory = [];
+        
         try {
             // Initialize API handler if services provided
             if (this.services) {
+                // Add daemon reference for cache management and state control
+                this.services.daemon = {
+                    clearInitializationCache: () => this.clearInitializationCache(),
+                    setDependencyCheckComplete: () => this.setDependencyCheckComplete()
+                };
                 this.apiHandler = new ApiHandler(this.services);
             }
             
@@ -176,7 +212,7 @@ export class ApcDaemon {
             this.log('info', `Workspace: ${this.config.workspaceRoot}`);
             
             // Broadcast starting event (WebSocket ready, but services may not be)
-            this.readyState = this.config.services ? 'initializing_services' : 'ready';
+            this.readyState = this.services ? 'initializing_services' : 'initializing_services';
             this.broadcaster.broadcast('daemon.starting', {
                 version: '0.1.0',
                 port: this.config.port,
@@ -185,14 +221,9 @@ export class ApcDaemon {
                 readyState: this.readyState
             });
             
-            // If no services provided (testing/minimal mode), mark as ready immediately
-            if (!this.config.services) {
-                this.readyState = 'ready';
-                this.broadcaster.broadcast('daemon.ready', {
-                    version: '0.1.0',
-                    servicesReady: false
-                });
-            }
+            // Don't mark as ready yet - wait for services to be set
+            // Services will be initialized in background (start.ts)
+            // and setServices() will call setServicesReady() when done
             
         } catch (err) {
             this.state = 'stopped';
@@ -209,11 +240,58 @@ export class ApcDaemon {
         if (this.readyState !== 'ready') {
             this.readyState = 'ready';
             this.log('info', 'All services initialized - daemon is fully ready');
-            this.broadcaster.broadcast('daemon.ready', {
-                version: '0.1.0',
-                servicesReady: true,
-                readyState: 'ready'
+            
+            // Cache the daemon.ready event BEFORE broadcasting so late-joining clients receive it
+            const readyEvent = {
+                event: 'daemon.ready',
+                data: {
+                    version: '0.1.0',
+                    servicesReady: true,
+                    readyState: 'ready' as const
+                },
+                timestamp: new Date().toISOString()
+            };
+            this.initializationHistory.push(readyEvent);
+            
+            // Broadcast the ready event
+            this.broadcaster.broadcast('daemon.ready', readyEvent.data);
+            
+            // Keep initialization history for late-joining clients
+            // It will only be cleared on daemon restart or dependency refresh
+        }
+    }
+    
+    /**
+     * Clear initialization history cache.
+     * Called when dependency refresh starts to prepare for new initialization events.
+     */
+    clearInitializationCache(): void {
+        this.log('info', 'Clearing initialization cache for fresh dependency check');
+        this.initializationHistory = [];
+        
+        // Temporarily set readyState back to 'initializing_services' during refresh
+        // This ensures clients see "Checking..." state while dependencies are being verified
+        if (this.readyState === 'ready') {
+            this.readyState = 'initializing_services';
+            this.log('debug', 'Set readyState to initializing_services for dependency refresh');
+            
+            // Broadcast that we're re-checking dependencies
+            this.broadcaster.broadcast('daemon.progress', {
+                step: 'Re-checking system dependencies...',
+                phase: 'checking_dependencies',
+                timestamp: new Date().toISOString()
             });
+        }
+    }
+    
+    /**
+     * Mark dependency check as complete after a refresh.
+     * Called by ApiHandler after deps.refresh completes.
+     */
+    setDependencyCheckComplete(): void {
+        if (this.readyState === 'initializing_services') {
+            // Set back to ready and re-broadcast daemon.ready event
+            this.setServicesReady();
         }
     }
     
@@ -223,8 +301,16 @@ export class ApcDaemon {
      */
     setServices(services: ApiServices): void {
         this.services = services;
-        this.apiHandler = new ApiHandler(services, this.broadcaster);
+        // Add daemon reference for cache management and state control
+        this.services.daemon = {
+            clearInitializationCache: () => this.clearInitializationCache(),
+            setDependencyCheckComplete: () => this.setDependencyCheckComplete()
+        };
+        this.apiHandler = new ApiHandler(services);
         this.log('info', 'Services registered with daemon');
+        
+        // If services are set after daemon started, mark as ready
+        this.setServicesReady();
     }
     
     /**
@@ -250,6 +336,17 @@ export class ApcDaemon {
             } catch (err) {
                 this.log('warn', `Graceful shutdown error: ${err}`);
             }
+        }
+        
+        // Stop ScriptableWorkflowRegistry file watcher
+        try {
+            if (ServiceLocator.isRegistered(ScriptableWorkflowRegistry)) {
+                const scriptableRegistry = ServiceLocator.resolve(ScriptableWorkflowRegistry);
+                scriptableRegistry.stopWatching();
+                this.log('info', 'ScriptableWorkflowRegistry file watcher stopped');
+            }
+        } catch (err) {
+            this.log('warn', `ScriptableWorkflowRegistry cleanup error: ${err}`);
         }
         
         // Broadcast shutdown event
@@ -283,6 +380,19 @@ export class ApcDaemon {
                 this.httpServer!.close(() => resolve());
             });
             this.httpServer = null;
+        }
+        
+        // Kill any orphan cursor-agent processes
+        // This ensures clean shutdown with no lingering processes
+        if (this.services?.processManager) {
+            try {
+                const killedCount = await this.services.processManager.killOrphanCursorAgents();
+                if (killedCount > 0) {
+                    this.log('info', `Killed ${killedCount} orphan cursor-agent processes during shutdown`);
+                }
+            } catch (err) {
+                this.log('warn', `Failed to kill orphan processes: ${err}`);
+            }
         }
         
         // Cleanup PID files
@@ -373,6 +483,50 @@ export class ApcDaemon {
             totalClients: this.clients.size
         });
         
+        // Send cached initialization history to new client
+        // This includes both in-progress initialization events AND the final daemon.ready event
+        // Late-joining clients (connecting after daemon is ready) need the daemon.ready event
+        if (this.initializationHistory.length > 0) {
+            const statusMsg = this.readyState === 'ready' 
+                ? `📋 Sending cached initialization state (daemon ready) to new client ${clientId}`
+                : `📋 Replaying ${this.initializationHistory.length} initialization steps to new client ${clientId}`;
+            this.log('info', statusMsg);
+            
+            // Send history asynchronously with small delay to ensure WebSocket is ready
+            setTimeout(() => {
+                // Double-check client is still connected
+                if (!this.clients.has(clientId)) {
+                    this.log('warn', `Client ${clientId} disconnected before history could be sent`);
+                    return;
+                }
+                
+                const currentClient = this.clients.get(clientId)!;
+                if (currentClient.ws.readyState !== WebSocket.OPEN) {
+                    this.log('warn', `Client ${clientId} WebSocket not OPEN (state: ${currentClient.ws.readyState})`);
+                    return;
+                }
+                
+                try {
+                    // Send all cached messages
+                    let sentCount = 0;
+                    for (const cached of this.initializationHistory) {
+                        const sent = this.sendToClient(currentClient, {
+                            type: 'event',
+                            payload: {
+                                event: cached.event,
+                                data: cached.data,
+                                timestamp: cached.timestamp
+                            }
+                        });
+                        if (sent) sentCount++;
+                    }
+                    this.log('info', `✅ Successfully sent ${sentCount}/${this.initializationHistory.length} cached steps to ${clientId}`);
+                } catch (err) {
+                    this.log('error', `❌ Failed to send initialization history to ${clientId}:`, err);
+                }
+            }, 50); // 50ms delay to ensure WebSocket is fully ready
+        }
+        
         // Handle messages
         ws.on('message', (data) => {
             this.handleMessage(client, data);
@@ -412,6 +566,12 @@ export class ApcDaemon {
     
     /**
      * Handle API request from client
+     * 
+     * IMPORTANT: Commands that are used for connectivity/health checks (like 'status')
+     * MUST be handled before the apiHandler check, because apiHandler is only created
+     * after services are initialized. During the ~15 second dependency check phase,
+     * clients need to ping the daemon to verify connectivity, so 'status' must work
+     * even when services aren't ready yet.
      */
     private async handleRequest(client: ConnectedClient, request: ApcRequest): Promise<void> {
         this.log('debug', `Request from ${client.id}: ${request.cmd}`);
@@ -439,8 +599,28 @@ export class ApcDaemon {
             return;
         }
         
-        // Handle daemon.status (shows ready state)
+        // Handle daemon.status (daemon-level status - always works even during initialization)
+        // This is used for health checks and system monitoring
         if (request.cmd === 'daemon.status') {
+            // Get dependency status if available
+            let dependencies: DependencyStatus[] = [];
+            let missingCount = 0;
+            let hasCriticalMissing = false;
+            
+            try {
+                const depService = ServiceLocator.resolve(DependencyService);
+                const allDeps = depService.getCachedStatus();
+                const platform = process.platform;
+                dependencies = allDeps.filter(d => d.platform === platform || d.platform === 'all');
+                const missingDeps = dependencies.filter(d => d.required && !d.installed);
+                missingCount = missingDeps.length;
+                hasCriticalMissing = missingDeps.some(d => 
+                    d.name.includes('Python') || d.name.includes('APC CLI')
+                );
+            } catch {
+                // DependencyService not registered yet
+            }
+            
             this.sendResponse(client, {
                 id: request.id,
                 success: true,
@@ -449,10 +629,40 @@ export class ApcDaemon {
                     readyState: this.readyState,
                     servicesReady: this.readyState === 'ready',
                     uptime: Date.now() - this.startTime,
-                    clients: this.clients.size
+                    clients: this.clients.size,
+                    // Dependency status
+                    dependencies,
+                    missingCount,
+                    hasCriticalMissing
                 }
             });
             return;
+        }
+        
+        // Handle 'status' (application-level status via ApiHandler)
+        // BUT: Must work for health checks before services are ready
+        // So if apiHandler is null, return a minimal "initializing" status
+        if (request.cmd === 'status') {
+            if (!this.apiHandler) {
+                // Services not ready yet - return minimal status for health checks
+                this.sendResponse(client, {
+                    id: request.id,
+                    success: true,
+                    data: {
+                        activePlanningSessions: 0,
+                        agentPool: {
+                            total: 0,
+                            available: 0,
+                            busy: 0
+                        },
+                        daemonUptime: Date.now() - this.startTime,
+                        connectedClients: this.clients.size,
+                        initializing: true // Flag to indicate services not ready
+                    }
+                });
+                return;
+            }
+            // Services ready - fall through to ApiHandler
         }
         
         // Route to API handler
@@ -576,14 +786,20 @@ export class ApcDaemon {
     
     /**
      * Send a message to a specific client
+     * Returns true if message was sent, false if WebSocket not ready
      */
-    private sendToClient(client: ConnectedClient, message: ApcMessage): void {
+    private sendToClient(client: ConnectedClient, message: ApcMessage): boolean {
         if (client.ws.readyState === WebSocket.OPEN) {
             try {
                 client.ws.send(JSON.stringify(message));
+                return true;
             } catch (err) {
                 this.log('error', `Failed to send to ${client.id}:`, err);
+                return false;
             }
+        } else {
+            this.log('warn', `Cannot send to ${client.id} - WebSocket not OPEN (state: ${client.ws.readyState})`);
+            return false;
         }
     }
     
@@ -659,20 +875,26 @@ export class ApcDaemon {
     }
     
     /**
-     * Log message
+     * Log message using unified Logger
      */
     private log(level: 'debug' | 'info' | 'warn' | 'error', ...args: unknown[]): void {
         const logLevels = { debug: 0, info: 1, warn: 2, error: 3 };
         const configLevel = logLevels[this.config.logLevel] || 1;
         
         if (logLevels[level] >= configLevel || this.verbose) {
-            const prefix = `[ApcDaemon][${level.toUpperCase()}]`;
-            if (level === 'error') {
-                console.error(prefix, ...args);
-            } else if (level === 'warn') {
-                console.warn(prefix, ...args);
-            } else {
-                console.log(prefix, ...args);
+            switch (level) {
+                case 'debug':
+                    log.debug(...args);
+                    break;
+                case 'info':
+                    log.info(...args);
+                    break;
+                case 'warn':
+                    log.warn(...args);
+                    break;
+                case 'error':
+                    log.error(...args);
+                    break;
             }
         }
     }
@@ -680,14 +902,6 @@ export class ApcDaemon {
     // ========================================================================
     // Service Management
     // ========================================================================
-    
-    /**
-     * Set services (can be called after construction)
-     */
-    setServices(services: ApiServices): void {
-        this.services = services;
-        this.apiHandler = new ApiHandler(services);
-    }
     
     /**
      * Get configuration
@@ -720,7 +934,7 @@ export async function runStandalone(workspaceRoot?: string): Promise<ApcDaemon> 
     
     // Handle shutdown signals
     const shutdown = async (signal: string) => {
-        console.log(`\nReceived ${signal}, shutting down...`);
+        log.info(`Received ${signal}, shutting down...`);
         await daemon.stop(signal);
         process.exit(0);
     };

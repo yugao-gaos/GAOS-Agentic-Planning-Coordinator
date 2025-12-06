@@ -95,6 +95,16 @@
         "icon": "$(settings-gear)"
       },
       {
+        "command": "apc.openWorkflowSettings",
+        "title": "APC: Workflow Settings",
+        "icon": "$(workflow)"
+      },
+      {
+        "command": "apc.openNodeGraphEditor",
+        "title": "APC: Open Node Graph Editor",
+        "icon": "$(type-hierarchy)"
+      },
+      {
         "command": "agenticPlanning.refreshPlanningSessions",
         "title": "Refresh",
         "icon": "$(refresh)"
@@ -194,7 +204,8 @@
         "agenticPlanning.workingDirectory": {
           "type": "string",
           "default": "_AiDevLog",
-          "description": "Working directory for plans, logs, and state files"
+          "description": "[DEPRECATED: Use System Settings panel instead] Working directory for plans, logs, and state files. Settings are now stored in _AiDevLog/.config/daemon.json",
+          "deprecationMessage": "This setting has moved to the System Settings panel. Access via the Settings button in the sidebar."
         },
         "agenticPlanning.defaultBackend": {
           "type": "string",
@@ -202,21 +213,23 @@
           "enum": [
             "cursor"
           ],
-          "description": "AI backend for agent sessions (only 'cursor' is currently supported)"
+          "description": "[DEPRECATED: Use System Settings panel instead] AI backend for agent sessions",
+          "deprecationMessage": "This setting has moved to the System Settings panel. Access via the Settings button in the sidebar."
         },
         "agenticPlanning.autoOpenTerminals": {
           "type": "boolean",
           "default": true,
-          "description": "Automatically open terminal for each agent when started"
+          "description": "[DEPRECATED: Use System Settings panel instead] Automatically open terminal for each agent when started",
+          "deprecationMessage": "This setting has moved to the System Settings panel. Access via the Settings button in the sidebar."
         }
       }
     },
-    "menus": {
-    }
+    "menus": {}
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
+    "compile": "tsc -p ./ && npm run copy-scripts",
+    "copy-scripts": "node -e \"require('fs').cpSync('scripts', 'out/scripts', {recursive: true})\"",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
@@ -236,7 +249,9 @@
     "typescript": "^5.3.0"
   },
   "dependencies": {
+    "chokidar": "^5.0.0",
     "uuid": "^13.0.0",
-    "ws": "^8.18.3"
+    "ws": "^8.18.3",
+    "yaml": "^2.8.2"
   }
 }

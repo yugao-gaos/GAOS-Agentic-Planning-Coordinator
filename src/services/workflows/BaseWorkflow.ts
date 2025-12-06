@@ -26,6 +26,9 @@ import { UnityControlManager } from '../UnityControlManager';
 import { OutputChannelManager } from '../OutputChannelManager';
 import { ProcessManager, ProcessState } from '../ProcessManager';
 import { ServiceLocator } from '../ServiceLocator';
+import { Logger } from '../../utils/Logger';
+
+const log = Logger.create('Daemon', 'BaseWorkflow');
 
 /**
  * Result from running an agent task with CLI callback
@@ -186,12 +189,22 @@ export abstract class BaseWorkflow implements IWorkflow {
     private static _apcPath: string | null = null;
     
     /**
+     * Clear the cached apc CLI path.
+     * Call this after installation to force re-resolution on next use.
+     */
+    public static clearApcPathCache(): void {
+        BaseWorkflow._apcPath = null;
+        log.debug('Cleared apc CLI path cache');
+    }
+    
+    /**
      * Get the absolute path to the apc CLI command.
      * 
      * Checks in order:
-     * 1. ~/.local/bin/apc (standard install location)
-     * 2. /usr/local/bin/apc (alternative location)
-     * 3. Falls back to 'apc' (relies on PATH)
+     * 1. Windows: ~/bin/apc.cmd
+     * 2. Unix: ~/.local/bin/apc (standard install location)
+     * 3. Unix: /usr/local/bin/apc (alternative location)
+     * 4. Falls back to 'apc' (relies on PATH)
      * 
      * Result is cached for performance.
      */
@@ -200,24 +213,37 @@ export abstract class BaseWorkflow implements IWorkflow {
             return BaseWorkflow._apcPath;
         }
         
-        // Check standard locations
-        const homeBinPath = path.join(os.homedir(), '.local', 'bin', 'apc');
-        const usrLocalPath = '/usr/local/bin/apc';
+        const platform = process.platform;
         
-        if (fs.existsSync(homeBinPath)) {
-            BaseWorkflow._apcPath = homeBinPath;
-            console.log(`[BaseWorkflow] Using apc at: ${homeBinPath}`);
-            return homeBinPath;
+        if (platform === 'win32') {
+            // Windows: Check ~/bin/apc.cmd
+            const winBinPath = path.join(os.homedir(), 'bin', 'apc.cmd');
+            if (fs.existsSync(winBinPath)) {
+                BaseWorkflow._apcPath = winBinPath;
+                log.debug(`Using apc at: ${winBinPath}`);
+                return winBinPath;
+            }
+        } else {
+            // Unix: Check standard locations
+            const homeBinPath = path.join(os.homedir(), '.local', 'bin', 'apc');
+            const usrLocalPath = '/usr/local/bin/apc';
+            
+            if (fs.existsSync(homeBinPath)) {
+                BaseWorkflow._apcPath = homeBinPath;
+                log.debug(`Using apc at: ${homeBinPath}`);
+                return homeBinPath;
+            }
+            
+            if (fs.existsSync(usrLocalPath)) {
+                BaseWorkflow._apcPath = usrLocalPath;
+                log.debug(`Using apc at: ${usrLocalPath}`);
+                return usrLocalPath;
+            }
         }
         
-        if (fs.existsSync(usrLocalPath)) {
-            BaseWorkflow._apcPath = usrLocalPath;
-            console.log(`[BaseWorkflow] Using apc at: ${usrLocalPath}`);
-            return usrLocalPath;
-        }
-        
-        // Fall back to PATH-based lookup
-        console.log('[BaseWorkflow] apc not found at standard locations, using PATH-based lookup');
+        // Also check PATH in case apc is installed elsewhere
+        // This is explicit secondary check, not a silent fallback
+        log.info('apc not found at standard locations, checking PATH for non-standard installation');
         BaseWorkflow._apcPath = 'apc';
         return 'apc';
     }
@@ -1067,11 +1093,11 @@ ${ctx.partialOutput.slice(-3000)}
         if (index >= 0) {
             this.allocatedAgents.splice(index, 1);
             this.log(`Agent released: ${agentName}`);
-            console.log(`[BaseWorkflow] Firing onAgentReleased for ${agentName}`);
+            log.debug(`Firing onAgentReleased for ${agentName}`);
             this.onAgentReleased.fire(agentName);
-            console.log(`[BaseWorkflow] onAgentReleased fired for ${agentName}`);
+            log.debug(`onAgentReleased fired for ${agentName}`);
         } else {
-            console.log(`[BaseWorkflow] Agent ${agentName} not in allocatedAgents, skipping release`);
+            log.debug(`Agent ${agentName} not in allocatedAgents, skipping release`);
         }
     }
     
@@ -1084,11 +1110,11 @@ ${ctx.partialOutput.slice(-3000)}
         if (index >= 0) {
             this.allocatedAgents.splice(index, 1);
             this.log(`Agent demoted to bench: ${agentName}`);
-            console.log(`[BaseWorkflow] Firing onAgentDemotedToBench for ${agentName}`);
+            log.debug(`Firing onAgentDemotedToBench for ${agentName}`);
             this.onAgentDemotedToBench.fire(agentName);
-            console.log(`[BaseWorkflow] onAgentDemotedToBench fired for ${agentName}`);
+            log.debug(`onAgentDemotedToBench fired for ${agentName}`);
         } else {
-            console.log(`[BaseWorkflow] Agent ${agentName} not in allocatedAgents, skipping demote`);
+            log.debug(`Agent ${agentName} not in allocatedAgents, skipping demote`);
         }
     }
     
@@ -1288,30 +1314,20 @@ ${ctx.partialOutput.slice(-3000)}
                 };
                 
             } else {
-                // Process exited without CLI callback - legacy fallback
+                // Process exited without CLI callback - NOT ALLOWED
                 const processResult = result.result;
-                this.log(`Agent [${taskId}] process exited without CLI callback (legacy mode)`);
+                this.log(`Agent [${taskId}] process exited without CLI callback`);
                 
                 // Cancel the pending callback wait (include taskId for parallel task support)
                 coordinator.cancelPendingSignal(this.id, options.expectedStage, taskId);
                 
-                // If process failed, we treat it as failed
-                if (!processResult.success) {
-                    return {
-                        success: false,
-                        result: 'failed',
-                        rawOutput: processResult.output,
-                        fromCallback: false
-                    };
-                }
-                
-                // Process succeeded but no callback - return raw output for parsing
-                return {
-                    success: true,
-                    result: 'success',
-                    rawOutput: processResult.output,
-                    fromCallback: false
-                };
+                // All agents must use CLI callback for structured data
+                throw new Error(
+                    `Agent [${taskId}] did not use CLI callback (\`apc agent complete\`). ` +
+                    'All agents must report results via CLI callback for structured data. ' +
+                    'Legacy output parsing is no longer supported. ' +
+                    `Process exit code: ${processResult.success ? 'success' : 'failed'}`
+                );
             }
             
         } catch (error) {

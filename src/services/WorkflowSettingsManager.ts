@@ -7,6 +7,9 @@
 
 import * as path from 'path';
 import * as fs from 'fs';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Daemon', 'WorkflowSettingsManager');
 import { 
     WorkflowType,
     WorkflowUserSettings,
@@ -100,13 +103,8 @@ const WORKFLOW_SETTINGS_FILENAME = 'workflow_settings.json';
  * Uses FolderStructureManager for customizable path
  */
 export function getWorkflowSettingsPath(workspaceRoot: string): string {
-    try {
-        const folderStructure = getFolderStructureManager();
-        return path.join(folderStructure.getFolderPath('config'), WORKFLOW_SETTINGS_FILENAME);
-    } catch {
-        // Fallback to default if FolderStructureManager not initialized
-        return path.join(workspaceRoot, '_AiDevLog', 'Config', WORKFLOW_SETTINGS_FILENAME);
-    }
+    const folderStructure = getFolderStructureManager();
+    return path.join(folderStructure.getFolderPath('config'), WORKFLOW_SETTINGS_FILENAME);
 }
 
 /**
@@ -120,7 +118,7 @@ export function loadWorkflowSettings(workspaceRoot: string): WorkflowUserSetting
             return { ...DEFAULT_WORKFLOW_USER_SETTINGS, ...JSON.parse(content) };
         }
     } catch (e) {
-        console.error('[WorkflowSettings] Failed to load config:', e);
+        log.error('Failed to load config:', e);
     }
     return { ...DEFAULT_WORKFLOW_USER_SETTINGS };
 }
@@ -138,7 +136,7 @@ export function saveWorkflowSettings(workspaceRoot: string, settings: WorkflowUs
         fs.writeFileSync(configPath, JSON.stringify(settings, null, 2));
         return true;
     } catch (e) {
-        console.error('[WorkflowSettings] Failed to save config:', e);
+        log.error('Failed to save config:', e);
         return false;
     }
 }

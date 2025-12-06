@@ -313,13 +313,32 @@ export interface UnityPipelineCompletedEventData {
 }
 
 /**
- * Daemon ready event data
+ * Daemon starting event data (WebSocket ready, services may still be initializing)
  */
-export interface DaemonReadyEventData {
+export interface DaemonStartingEventData {
     version: string;
     port: number;
     workspaceRoot: string;
     startedAt: string;
+    readyState: 'initializing_services' | 'ready';
+}
+
+/**
+ * Daemon progress event data (initialization step updates)
+ */
+export interface DaemonProgressEventData {
+    step: string;         // e.g., "StateManager initialized", "Checking dependencies"
+    phase: 'checking_dependencies' | 'initializing_services' | 'ready';
+    timestamp: string;
+}
+
+/**
+ * Daemon ready event data (fully initialized)
+ */
+export interface DaemonReadyEventData {
+    version: string;
+    servicesReady?: boolean;
+    readyState?: 'ready';
 }
 
 /**
@@ -460,6 +479,8 @@ export interface ApcEventMap {
     'unity.pipelineCompleted': UnityPipelineCompletedEventData;
     
     // System events
+    'daemon.starting': DaemonStartingEventData;
+    'daemon.progress': DaemonProgressEventData;
     'daemon.ready': DaemonReadyEventData;
     'daemon.shutdown': DaemonShutdownEventData;
     'client.connected': ClientConnectedEventData;

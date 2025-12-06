@@ -29,6 +29,9 @@ import {
 } from './DaemonConfig';
 import { initializeServices } from './standalone';
 import { bootstrapDaemonServices } from '../services/DaemonBootstrap';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Daemon', 'Start');
 
 // ============================================================================
 // Types
@@ -68,13 +71,13 @@ export async function startDaemon(options: StartOptions): Promise<StartResult> {
     const workspaceRoot = options.workspaceRoot || process.env.APC_WORKSPACE_ROOT || findWorkspaceRoot();
     const verbose = options.verbose || process.env.APC_VERBOSE === 'true';
     
-    console.log(`[APC] Starting daemon in ${options.mode} mode...`);
-    console.log(`[APC] Workspace: ${workspaceRoot}`);
+    log.info(`Starting daemon in ${options.mode} mode...`);
+    log.info(`Workspace: ${workspaceRoot}`);
     
     // Check if daemon is already running
     if (!options.force && isDaemonRunning(workspaceRoot)) {
         const existingPort = getDaemonPort(workspaceRoot);
-        console.log(`[APC] Daemon already running on port ${existingPort}`);
+        log.info(`Daemon already running on port ${existingPort}`);
         return {
             success: true,
             port: existingPort || undefined,
@@ -122,9 +125,9 @@ export async function startDaemon(options: StartOptions): Promise<StartResult> {
         // Get final port
         const finalConfig = daemon.getConfig();
         
-        console.log(`[APC] Daemon started successfully`);
-        console.log(`[APC] Port: ${finalConfig.port}`);
-        console.log(`[APC] Mode: ${options.mode}`);
+        log.info(`Daemon started successfully`);
+        log.info(`Port: ${finalConfig.port}`);
+        log.info(`Mode: ${options.mode}`);
         
         return {
             success: true,
@@ -134,7 +137,7 @@ export async function startDaemon(options: StartOptions): Promise<StartResult> {
         
     } catch (err) {
         const errorMessage = err instanceof Error ? err.message : String(err);
-        console.error(`[APC] Failed to start daemon: ${errorMessage}`);
+        log.error(`Failed to start daemon: ${errorMessage}`);
         return {
             success: false,
             error: errorMessage
@@ -146,7 +149,7 @@ export async function startDaemon(options: StartOptions): Promise<StartResult> {
  * Start daemon in headless mode with all services initialized
  */
 async function startHeadlessMode(config: CoreConfig, verbose: boolean): Promise<ApcDaemon> {
-    console.log('[APC] Initializing services for headless mode...');
+    log.info('Initializing services for headless mode...');
     
     // Initialize all services
     const services = await initializeServices(config);
@@ -165,6 +168,9 @@ async function startHeadlessMode(config: CoreConfig, verbose: boolean): Promise<
     // Start daemon
     await daemon.start();
     
+    // Mark services as ready (since initializeServices doesn't have daemon reference)
+    daemon.setServicesReady();
+    
     return daemon;
 }
 
@@ -172,24 +178,39 @@ async function startHeadlessMode(config: CoreConfig, verbose: boolean): Promise<
  * Start daemon in VS Code mode (services injected later)
  */
 async function startVsCodeMode(config: CoreConfig, verbose: boolean): Promise<ApcDaemon> {
-    console.log('[APC] Starting daemon for VS Code...');
+    log.info('Starting daemon for VS Code...');
     
-    // Initialize services (same as headless mode)
-    // This allows CLI to work even when VS Code started the daemon
-    const services = await initializeServices(config);
+    // Bootstrap essential services FIRST (EventBroadcaster, etc.)
+    // These are needed by the daemon even before full initialization
+    const { bootstrapDaemonServices } = await import('../services/DaemonBootstrap');
+    bootstrapDaemonServices();
+    log.info('Essential services bootstrapped');
     
-    // Create daemon with services
+    // Create daemon without full services (will initialize in background)
     const daemon = new ApcDaemon({
         port: config.port,
         workspaceRoot: config.workspaceRoot,
-        services,
+        services: undefined,  // No full services yet
         verbose
     });
     
-    // Don't setup shutdown handlers - VS Code manages lifecycle
-    
-    // Start daemon
+    // Start daemon FIRST (writes port file, HTTP server starts)
+    // This allows client to connect immediately!
     await daemon.start();
+    log.info('Daemon HTTP server started - client can connect');
+    
+    // Initialize full services in background
+    // Services will broadcast progress via WebSocket as they initialize
+    log.info('Initializing services in background...');
+    initializeServices(config, daemon).then(services => {
+        log.info('Services initialization complete');
+        // Set services on daemon once ready
+        daemon.setServices(services);
+    }).catch(err => {
+        log.error('Services initialization failed:', err);
+    });
+    
+    // Don't setup shutdown handlers - VS Code manages lifecycle
     
     return daemon;
 }
@@ -198,8 +219,8 @@ async function startVsCodeMode(config: CoreConfig, verbose: boolean): Promise<Ap
  * Start daemon in interactive mode (future TUI support)
  */
 async function startInteractiveMode(config: CoreConfig, verbose: boolean): Promise<ApcDaemon> {
-    console.log('[APC] Starting daemon in interactive mode...');
-    console.log('[APC] Note: Interactive TUI is not yet implemented. Using headless mode.');
+    log.info('Starting daemon in interactive mode...');
+    log.info('Note: Interactive TUI is not yet implemented. Using headless mode.');
     
     // For now, same as headless
     // Future: Add TUI components, readline interface, etc.
@@ -211,7 +232,7 @@ async function startInteractiveMode(config: CoreConfig, verbose: boolean): Promi
  */
 function setupShutdownHandlers(daemon: ApcDaemon): void {
     const shutdown = async (signal: string) => {
-        console.log(`\n[APC] Received ${signal}, shutting down...`);
+        log.info(`Received ${signal}, shutting down...`);
         await daemon.stop(signal);
         process.exit(0);
     };
@@ -319,12 +340,12 @@ async function main(): Promise<void> {
     });
     
     if (!result.success) {
-        console.error(`[APC] Failed: ${result.error}`);
+        log.error(`Failed: ${result.error}`);
         process.exit(1);
     }
     
     if (result.alreadyRunning) {
-        console.log(`[APC] Using existing daemon on port ${result.port}`);
+        log.info(`Using existing daemon on port ${result.port}`);
         // For headless mode, we might want to exit since daemon is already running
         // For vscode mode, we continue to let VS Code connect
         if (mode === 'headless') {
@@ -333,13 +354,13 @@ async function main(): Promise<void> {
     }
     
     // Keep process alive
-    console.log('[APC] Daemon is running. Press Ctrl+C to stop.');
+    log.info('Daemon is running. Press Ctrl+C to stop.');
 }
 
 // Run if executed directly
 if (require.main === module) {
     main().catch(err => {
-        console.error('[APC] Fatal error:', err);
+        log.error('Fatal error:', err);
         process.exit(1);
     });
 }

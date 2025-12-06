@@ -278,22 +278,19 @@ export class CoordinatorAgent {
     
     /**
      * Get the global coordinator logs folder path
-     * Uses StateManager if available, falls back to direct path construction
+     * Requires StateManager to be available - no silent fallbacks
      */
     private getGlobalCoordinatorLogsFolder(): string {
         try {
             const stateManager = ServiceLocator.resolve(StateManager);
             return stateManager.getGlobalCoordinatorLogsFolder();
-        } catch {
-            // Fallback if StateManager not available - use default structure
-            const { getFolderStructureManager } = require('./FolderStructureManager');
-            try {
-                const folderStructure = getFolderStructureManager();
-                return path.join(folderStructure.getFolderPath('logs'), 'Coordinator');
-            } catch {
-                // Last resort fallback
-                return path.join(this.workspaceRoot, '_AiDevLog', 'Logs', 'Coordinator');
-            }
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            this.log(`ERROR: Failed to get coordinator logs folder from StateManager: ${errorMsg}`);
+            throw new Error(
+                `Cannot determine coordinator logs folder: StateManager unavailable. ` +
+                `Please ensure the system is properly initialized. Error: ${errorMsg}`
+            );
         }
     }
     
@@ -303,7 +300,7 @@ export class CoordinatorAgent {
      */
     private async checkCapacityAndCleanup(input: CoordinatorInput): Promise<void> {
         try {
-            // Count cursor agent processes
+            // Count cursor-agent processes
             const { execSync } = require('child_process');
             const processCount = parseInt(
                 execSync('ps aux | grep -E "cursor.*(agent|--model)" | grep -v grep | wc -l', 
@@ -322,7 +319,7 @@ export class CoordinatorAgent {
             
             const capacityPercent = (processCount / totalAgentCount) * 100;
             
-            this.log(`[CAPACITY CHECK] ${processCount} cursor agent processes, ${totalAgentCount} agents in pool (${capacityPercent.toFixed(0)}% capacity)`);
+            this.log(`[CAPACITY CHECK] ${processCount} cursor-agent processes, ${totalAgentCount} agents in pool (${capacityPercent.toFixed(0)}% capacity)`);
             
             // If over 100% capacity, cleanup orphans immediately
             if (capacityPercent > 100) {
@@ -609,11 +606,11 @@ ${decisionInstructions}`;
         const plans = input.approvedPlans || [];
         
         if (plans.length === 0) {
-            // Fallback to legacy single plan
-            if (input.planPath) {
-                return `1 plan:\n- Session: ${input.sessionId}\n  Plan: ${input.planPath}\n  Requirement: ${input.planRequirement}`;
-            }
-            return 'No approved plans.';
+            throw new Error(
+                'No approved plans provided to coordinator. ' +
+                'Cannot proceed without plan data. ' +
+                'This indicates a workflow configuration error.'
+            );
         }
         
         return `${plans.length} approved plan(s):\n\n` + plans.map((p, i) => 

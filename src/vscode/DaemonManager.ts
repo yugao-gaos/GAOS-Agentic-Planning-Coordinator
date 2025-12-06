@@ -9,12 +9,18 @@
  */
 
 import * as vscode from 'vscode';
-import { spawn, ChildProcess, execSync } from 'child_process';
+import { spawn, ChildProcess, execSync, SpawnOptions } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
 import * as http from 'http';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Client', 'DaemonManager');
+
+// Platform detection
+const isWindows = process.platform === 'win32';
 
 /**
  * Daemon status information
@@ -75,7 +81,7 @@ export class DaemonManager {
     }
     
     /**
-     * Check if daemon is running
+     * Check if daemon is running (cross-platform)
      */
     isDaemonRunning(): boolean {
         const pidPath = this.getPidPath();
@@ -86,9 +92,26 @@ export class DaemonManager {
         
         try {
             const pid = parseInt(fs.readFileSync(pidPath, 'utf-8').trim(), 10);
-            // Check if process exists (signal 0 just checks existence)
-            process.kill(pid, 0);
-            return true;
+            
+            if (isWindows) {
+                // Windows: Use tasklist to check if process exists
+                try {
+                    const result = execSync(`tasklist /FI "PID eq ${pid}" /NH`, { 
+                        encoding: 'utf-8',
+                        windowsHide: true,
+                        stdio: ['pipe', 'pipe', 'pipe']
+                    });
+                    // If process exists, tasklist returns info about it
+                    // If not, it returns "INFO: No tasks are running..."
+                    return result.includes(pid.toString()) && !result.includes('No tasks');
+                } catch {
+                    return false;
+                }
+            } else {
+                // Unix: Check if process exists (signal 0 just checks existence)
+                process.kill(pid, 0);
+                return true;
+            }
         } catch {
             // Process doesn't exist or we don't have permission
             // Clean up stale PID file
@@ -162,7 +185,7 @@ export class DaemonManager {
             if (port) {
                 // Daemon already running - check if we started it
                 const isOurs = this.daemonProcess !== null;
-                console.log(`[DaemonManager] Daemon already running on port ${port} (${isOurs ? 'ours' : 'external'})`);
+                log.info(`Daemon already running on port ${port} (${isOurs ? 'ours' : 'external'})`);
                 return { 
                     port, 
                     wasStarted: false,
@@ -193,145 +216,127 @@ export class DaemonManager {
         // Use unified start script
         const startScript = path.join(this.extensionPath, 'out', 'daemon', 'start.js');
         
-        console.log(`[DaemonManager] Extension path: ${this.extensionPath}`);
-        console.log(`[DaemonManager] Start script: ${startScript}`);
-        console.log(`[DaemonManager] Workspace root: ${this.workspaceRoot}`);
+        log.debug(`Extension path: ${this.extensionPath}`);
+        log.debug(`Start script: ${startScript}`);
+        log.debug(`Workspace root: ${this.workspaceRoot}`);
         
         // Check if start script exists
         if (!fs.existsSync(startScript)) {
-            // Fallback to legacy entry point
-            const legacyEntry = path.join(this.extensionPath, 'out', 'daemon', 'index.js');
-            console.log(`[DaemonManager] Start script not found, checking legacy: ${legacyEntry}`);
-            if (!fs.existsSync(legacyEntry)) {
-                throw new Error(`Daemon scripts not found at ${startScript}. Run 'npm run compile' first.`);
-            }
-            console.log('[DaemonManager] Using legacy daemon entry (start.js not found)');
-            return this.startDaemonLegacy(legacyEntry);
+            throw new Error(`Daemon start script not found at ${startScript}. Run 'npm run compile' first.`);
         }
         
         // Start daemon with unified starter in --vscode mode
         // In vscode mode, services are NOT initialized by the daemon
         // They will be injected later by the extension
-        console.log('[DaemonManager] Spawning daemon process...');
-        const daemonProcess = spawn('node', [
-            startScript,
-            '--vscode',
-            this.workspaceRoot
-        ], {
-            detached: true,
+        log.info('Spawning daemon process...');
+        
+        // Cross-platform spawn options
+        const spawnOptions: SpawnOptions = {
             stdio: ['ignore', 'pipe', 'pipe'],
             env: {
                 ...process.env,
                 APC_WORKSPACE_ROOT: this.workspaceRoot,
                 APC_MODE: 'vscode'
             }
-        });
+        };
+        
+        if (isWindows) {
+            // Windows: Don't use detached, hide console window
+            spawnOptions.windowsHide = true;
+        } else {
+            // Unix: Use detached for process group management
+            spawnOptions.detached = true;
+        }
+        
+        const daemonProcess = spawn('node', [
+            startScript,
+            '--vscode',
+            this.workspaceRoot
+        ], spawnOptions);
         
         // Store reference for later cleanup
         this.daemonProcess = daemonProcess;
         
+        // Create or reuse dedicated daemon output channel for direct logs
+        // This shows daemon logs WITHOUT client prefix for clarity
+        const daemonOutputChannel = vscode.window.createOutputChannel('APC Daemon Logs');
+        
         // Log daemon output for debugging
+        // Send to TWO places:
+        // 1. Daemon output channel (direct, no client prefix)
+        // 2. Extension log (with prefix, for debugging client-daemon interaction)
         daemonProcess.stdout?.on('data', (data) => {
-            console.log(`[Daemon] ${data.toString().trim()}`);
+            const message = data.toString().trim();
+            // Direct passthrough to daemon channel (no client prefix!)
+            daemonOutputChannel.appendLine(message);
+            // Also log to extension log with prefix for troubleshooting
+            log.debug(`[Daemon stdout] ${message}`);
         });
         
         daemonProcess.stderr?.on('data', (data) => {
-            console.error(`[Daemon Error] ${data.toString().trim()}`);
+            const message = data.toString().trim();
+            // Direct passthrough to daemon channel (no client prefix!)
+            daemonOutputChannel.appendLine(`⚠️ ${message}`);
+            // Also log to extension log with prefix
+            log.error(`[Daemon stderr] ${message}`);
         });
         
         // Handle process exit
         daemonProcess.on('exit', (code, signal) => {
-            console.log(`[DaemonManager] Daemon process exited with code ${code}, signal ${signal}`);
+            log.info(`Daemon process exited with code ${code}, signal ${signal}`);
         });
         
         daemonProcess.on('error', (err) => {
-            console.error(`[DaemonManager] Failed to spawn daemon:`, err);
+            log.error(`Failed to spawn daemon:`, err);
         });
         
         // Unref so VS Code can exit independently (but after we set up handlers)
         daemonProcess.unref();
         
         // Wait for daemon to start and write port file
+        // Daemon should be ready in <1 second (WebSocket starts immediately in vscode mode)
         const port = await this.waitForDaemonReady(5000);
         
         // Start health check
         this.startHealthCheck();
         
-        console.log(`[DaemonManager] Daemon started on port ${port} (vscode mode)`);
+        log.info(`Daemon started on port ${port} (vscode mode)`);
         return port;
     }
     
-    /**
-     * Legacy daemon startup (fallback)
-     */
-    private async startDaemonLegacy(daemonEntry: string): Promise<number> {
-        const daemonProcess = spawn('node', [daemonEntry, this.workspaceRoot], {
-            detached: true,
-            stdio: ['ignore', 'pipe', 'pipe'],
-            env: {
-                ...process.env,
-                APC_WORKSPACE_ROOT: this.workspaceRoot
-            }
-        });
-        
-        daemonProcess.unref();
-        this.daemonProcess = daemonProcess;
-        
-        daemonProcess.stdout?.on('data', (data) => {
-            console.log(`[Daemon] ${data.toString().trim()}`);
-        });
-        
-        daemonProcess.stderr?.on('data', (data) => {
-            console.error(`[Daemon Error] ${data.toString().trim()}`);
-        });
-        
-        const port = await this.waitForDaemonReady(5000);
-        this.startHealthCheck();
-        
-        console.log(`[DaemonManager] Daemon started on port ${port} (legacy mode)`);
-        return port;
-    }
     
     /**
-     * Wait for daemon to be ready (port file written AND daemon responding)
+     * Wait for daemon to be ready (port file written)
      */
     private async waitForDaemonReady(timeoutMs: number): Promise<number> {
         const startTime = Date.now();
         const portPath = this.getPortPath();
         
-        // First wait for port file
+        log.debug('Waiting for daemon to write port file...');
+        
+        // Wait for port file
         let port: number | null = null;
         while (Date.now() - startTime < timeoutMs) {
             if (fs.existsSync(portPath)) {
                 const p = parseInt(fs.readFileSync(portPath, 'utf-8').trim(), 10);
                 if (!isNaN(p)) {
                     port = p;
+                    log.debug(`Port file found: ${port} in ${Date.now() - startTime}ms`);
                     break;
                 }
             }
-            await this.delay(100);
+            await this.delay(50);
         }
         
         if (!port) {
             throw new Error('Daemon failed to start within timeout (no port file)');
         }
         
-        // Now verify daemon is actually responding
-        console.log(`[DaemonManager] Port file found (${port}), verifying daemon is ready...`);
-        while (Date.now() - startTime < timeoutMs) {
-            try {
-                const response = await this.checkDaemonHealth(port);
-                if (response) {
-                    console.log(`[DaemonManager] Daemon health check passed`);
-                    return port;
-                }
-            } catch {
-                // Daemon not ready yet, retry
-            }
-            await this.delay(100);
-        }
+        // Give WebSocket server 200ms to fully bind (port file written before listen completes)
+        await this.delay(200);
         
-        throw new Error('Daemon failed to respond within timeout');
+        log.debug(`Daemon should be ready in ${Date.now() - startTime}ms`);
+        return port;
     }
     
     /**
@@ -342,8 +347,12 @@ export class DaemonManager {
             const req = http.get(`http://127.0.0.1:${port}/health`, (res) => {
                 resolve(res.statusCode === 200);
             });
-            req.on('error', () => resolve(false));
-            req.setTimeout(500, () => {
+            req.on('error', (err) => {
+                log.warn(`Health check error: ${err.message}`);
+                resolve(false);
+            });
+            req.setTimeout(5000, () => { // Increased from 2000ms to 5000ms for very slow startups
+                log.warn('Health check timed out after 5000ms');
                 req.destroy();
                 resolve(false);
             });
@@ -351,58 +360,119 @@ export class DaemonManager {
     }
     
     /**
-     * Stop the daemon
+     * Stop the daemon (cross-platform)
      */
     async stopDaemon(): Promise<void> {
+        log.info('[stopDaemon] Attempting to stop daemon...');
+        
         // Stop health check
         this.stopHealthCheck();
         
         const pidPath = this.getPidPath();
         
         if (!fs.existsSync(pidPath)) {
+            log.warn('[stopDaemon] PID file does not exist, daemon may not be running');
+            // Still clean up any leftover files
+            this.cleanupDaemonFiles();
             return;
         }
         
         try {
-            const pid = parseInt(fs.readFileSync(pidPath, 'utf-8').trim(), 10);
+            const pidContent = fs.readFileSync(pidPath, 'utf-8').trim();
+            const pid = parseInt(pidContent, 10);
             
-            // Send SIGTERM for graceful shutdown
-            process.kill(pid, 'SIGTERM');
+            if (isNaN(pid)) {
+                log.error(`[stopDaemon] Invalid PID in file: ${pidContent}`);
+                this.cleanupDaemonFiles();
+                throw new Error(`Invalid PID in file: ${pidContent}`);
+            }
+            
+            log.info(`[stopDaemon] Found daemon PID: ${pid}`);
+            
+            if (isWindows) {
+                // Windows: Use taskkill for graceful termination
+                try {
+                    log.info('[stopDaemon] Sending SIGTERM via taskkill (Windows)...');
+                    execSync(`taskkill /PID ${pid} /T`, { 
+                        stdio: 'ignore',
+                        windowsHide: true 
+                    });
+                    log.info('[stopDaemon] taskkill command sent');
+                } catch (killErr) {
+                    // Process may already be dead
+                    log.warn('[stopDaemon] taskkill error (process may already be stopped):', killErr);
+                }
+            } else {
+                // Unix: Send SIGTERM for graceful shutdown
+                try {
+                    log.info('[stopDaemon] Sending SIGTERM (Unix)...');
+                    process.kill(pid, 'SIGTERM');
+                    log.info('[stopDaemon] SIGTERM sent');
+                } catch (killErr) {
+                    log.warn('[stopDaemon] kill error (process may already be stopped):', killErr);
+                }
+            }
             
             // Wait for process to exit
+            log.info('[stopDaemon] Waiting for daemon to stop...');
             await this.waitForDaemonStop(5000);
             
-            console.log('[DaemonManager] Daemon stopped');
+            log.info('[stopDaemon] Daemon stopped successfully');
         } catch (err) {
-            console.warn('[DaemonManager] Error stopping daemon:', err);
+            log.error('[stopDaemon] Error stopping daemon:', err);
+            throw err;
+        } finally {
+            // Clean up files even if there were errors
+            log.info('[stopDaemon] Cleaning up daemon files...');
+            this.cleanupDaemonFiles();
         }
-        
-        // Clean up files
-        this.cleanupDaemonFiles();
     }
     
     /**
-     * Wait for daemon to stop
+     * Wait for daemon to stop (cross-platform)
      */
     private async waitForDaemonStop(timeoutMs: number): Promise<void> {
         const startTime = Date.now();
+        let checkCount = 0;
+        
+        log.info(`[waitForDaemonStop] Waiting up to ${timeoutMs}ms for daemon to stop...`);
         
         while (Date.now() - startTime < timeoutMs) {
             if (!this.isDaemonRunning()) {
+                log.info(`[waitForDaemonStop] Daemon stopped after ${Date.now() - startTime}ms (${checkCount} checks)`);
                 return;
             }
+            checkCount++;
             await this.delay(100);
         }
+        
+        log.warn(`[waitForDaemonStop] Daemon did not stop gracefully within ${timeoutMs}ms, forcing kill...`);
         
         // Force kill if still running
         const pidPath = this.getPidPath();
         if (fs.existsSync(pidPath)) {
             try {
                 const pid = parseInt(fs.readFileSync(pidPath, 'utf-8').trim(), 10);
-                process.kill(pid, 'SIGKILL');
-            } catch {
-                // Ignore kill errors
+                
+                log.info(`[waitForDaemonStop] Force killing PID ${pid}...`);
+                
+                if (isWindows) {
+                    // Windows: Use taskkill with /F for force kill
+                    execSync(`taskkill /PID ${pid} /T /F`, { 
+                        stdio: 'ignore',
+                        windowsHide: true 
+                    });
+                    log.info('[waitForDaemonStop] Force kill command sent (Windows)');
+                } else {
+                    // Unix: Send SIGKILL
+                    process.kill(pid, 'SIGKILL');
+                    log.info('[waitForDaemonStop] SIGKILL sent (Unix)');
+                }
+            } catch (err) {
+                log.warn('[waitForDaemonStop] Force kill error:', err);
             }
+        } else {
+            log.info('[waitForDaemonStop] PID file already removed');
         }
     }
     
@@ -429,11 +499,8 @@ export class DaemonManager {
         
         this.healthCheckInterval = setInterval(() => {
             if (!this.isDaemonRunning()) {
-                console.warn('[DaemonManager] Daemon died unexpectedly');
+                log.warn('Daemon died unexpectedly');
                 this.stopHealthCheck();
-                
-                // Could auto-restart here if desired
-                // this.startDaemon().catch(console.error);
             }
         }, 30000); // Check every 30 seconds
     }

@@ -486,7 +486,7 @@ export class PlanningService extends EventEmitter {
             throw new Error(`Plan is not ready for approval (status: ${session.status})`);
         }
 
-        // Run format review before approval
+        // Run format review before approval (includes basic cycle check)
         const reviewResult = await this.reviewPlanFormat(sessionId);
         if (!reviewResult.valid) {
             const errorMsg = `Plan format validation failed:\n${reviewResult.issues.join('\n')}`;
@@ -496,6 +496,33 @@ export class PlanningService extends EventEmitter {
             );
             throw new Error(errorMsg);
         }
+        
+        // CRITICAL: Run comprehensive cycle detection BEFORE approval
+        const { DependencyGraphUtils } = await import('./DependencyGraphUtils');
+        const taskNodes = reviewResult.tasksFound.map(t => ({
+            id: t.id,
+            dependencies: t.deps
+        }));
+        
+        const validation = DependencyGraphUtils.validateGraph(taskNodes);
+        if (!validation.valid) {
+            const errorMsg = `Dependency graph validation failed:\n${validation.errors.join('\n')}`;
+            this.notifyWarning(
+                `Plan has dependency issues. Fix circular dependencies before approval:\n${validation.errors.slice(0, 3).join('\n')}${validation.errors.length > 3 ? '...' : ''}`,
+                sessionId
+            );
+            throw new Error(errorMsg);
+        }
+        
+        // Log warnings (non-blocking)
+        if (validation.warnings.length > 0) {
+            this.writeProgress(sessionId, 'VALIDATE', `⚠️ Dependency graph warnings:`);
+            for (const warning of validation.warnings) {
+                this.writeProgress(sessionId, 'VALIDATE', `  • ${warning}`);
+            }
+        }
+        
+        this.writeProgress(sessionId, 'VALIDATE', `✅ Dependency graph validated: No cycles detected`);
 
         session.status = 'approved';
         session.updatedAt = new Date().toISOString();

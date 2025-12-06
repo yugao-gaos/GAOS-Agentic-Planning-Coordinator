@@ -4,6 +4,9 @@
 import * as vscode from 'vscode';
 import { VsCodeClient } from '../vscode/VsCodeClient';
 import { WorkflowInfo } from './webview/types';
+import { Logger } from '../utils/Logger';
+
+const log = Logger.create('Client', 'HistoryView');
 
 export class HistoryViewPanel {
     public static currentPanel: HistoryViewPanel | undefined;
@@ -129,7 +132,7 @@ export class HistoryViewPanel {
                 history: workflowHistory
             };
         } catch (error) {
-            console.error('Error fetching history data:', error);
+            log.error('Error fetching history data:', error);
             return null;
         }
     }

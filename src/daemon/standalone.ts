@@ -33,38 +33,67 @@ import { ProcessManager } from '../services/ProcessManager';
 import { UnityControlManager } from '../services/UnityControlManager';
 import { bootstrapDaemonServices, ServiceLocator } from '../services/DaemonBootstrap';
 import { EventBroadcaster } from './EventBroadcaster';
+import { DependencyService } from '../services/DependencyService';
+import { ScriptableWorkflowRegistry } from '../services/workflows/ScriptableWorkflowRegistry';
+import { Logger } from '../utils/Logger';
+import * as path from 'path';
+
+const log = Logger.create('Daemon', 'Standalone');
 
 /**
  * Initialize all services for standalone daemon mode
  * @param daemon The daemon instance (so we can signal when services are ready)
  */
 async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promise<ApiServices> {
-    console.log('[Standalone] Initializing services...');
-    console.log(`[Standalone] Workspace: ${config.workspaceRoot}`);
-    console.log(`[Standalone] Working directory: ${config.workingDirectory}`);
-    console.log(`[Standalone] Agent pool size: ${config.agentPoolSize}`);
+    log.info('Initializing services...');
+    log.info(`Workspace: ${config.workspaceRoot}`);
+    log.info(`Working directory: _AiDevLog (standard)`);
+    log.info(`Agent pool size: ${config.agentPoolSize}`);
+    
+    // Get broadcaster early so we can send progress updates
+    // Note: EventBroadcaster is registered by bootstrapDaemonServices()
+    const broadcastProgress = (step: string, phase: 'checking_dependencies' | 'initializing_services' | 'ready' = 'initializing_services') => {
+        try {
+            if (ServiceLocator.isRegistered(EventBroadcaster)) {
+                const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+                broadcaster.broadcast('daemon.progress' as any, {
+                    step,
+                    phase,
+                    timestamp: new Date().toISOString()
+                });
+            }
+        } catch (e) {
+            // Silently ignore errors in progress broadcasting
+        }
+    };
     
     // Bootstrap all services with ServiceLocator
+    // This registers AgentRunner and other services needed for dependency checks
+    broadcastProgress('Bootstrapping services');
     bootstrapDaemonServices();
+    
+    // Kill orphan agent processes using backend abstraction
+    // Check if AgentRunner is registered (it should be after bootstrapDaemonServices)
+    if (ServiceLocator.isRegistered(AgentRunner)) {
+        log.info('Cleaning up orphan agent processes...');
+        broadcastProgress('Cleaning up orphan processes');
+        const agentRunner = ServiceLocator.resolve(AgentRunner);
+        const killedCount = await agentRunner.killOrphanAgents();
+        if (killedCount > 0) {
+            log.info(`Killed ${killedCount} orphan processes`);
+        } else {
+            log.info('No orphan processes found');
+        }
+    }
     
     // Initialize output channel manager (file-only mode for standalone)
     const outputManager = ServiceLocator.resolve(OutputChannelManager);
     outputManager.setOutputTarget('file');
     
-    // Kill orphan cursor-agent processes from previous sessions
-    console.log('[Standalone] Cleaning up orphan cursor-agent processes...');
-    const processManager = ServiceLocator.resolve(ProcessManager);
-    const killedCount = await processManager.killOrphanCursorAgents();
-    if (killedCount > 0) {
-        console.log(`[Standalone] Killed ${killedCount} orphan cursor-agent processes`);
-    } else {
-        console.log('[Standalone] No orphan cursor-agent processes found');
-    }
-    
     // Initialize StateManager
+    broadcastProgress('Initializing StateManager');
     const stateManagerConfig: StateManagerConfig = {
         workspaceRoot: config.workspaceRoot,
-        workingDirectory: config.workingDirectory,
         agentPoolSize: config.agentPoolSize,
         defaultBackend: config.defaultBackend
     };
@@ -72,42 +101,48 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
     const stateManager = new StateManager(stateManagerConfig);
     await stateManager.initialize();
     ServiceLocator.register(StateManager, () => stateManager);
-    console.log(`[Standalone] StateManager initialized with ${stateManager.getAllPlanningSessions().length} sessions`);
+    log.info(`StateManager initialized with ${stateManager.getAllPlanningSessions().length} sessions`);
     
     // Reload persisted tasks now that StateManager is available
+    broadcastProgress('Reloading persisted tasks');
     const taskManager = ServiceLocator.resolve(TaskManager);
     taskManager.reloadPersistedTasks();
-    console.log(`[Standalone] TaskManager reloaded ${taskManager.getAllTasks().length} persisted tasks`);
+    log.info(`TaskManager reloaded ${taskManager.getAllTasks().length} persisted tasks`);
     
     // Initialize AgentRoleRegistry
+    broadcastProgress('Initializing AgentRoleRegistry');
     const roleRegistry = new AgentRoleRegistry(stateManager);
     // Unity features enabled by default (can be disabled via config or APC_ENABLE_UNITY=false)
     const enableUnity = config.enableUnityFeatures;
     roleRegistry.setUnityEnabled(enableUnity);
-    console.log(`[Standalone] AgentRoleRegistry initialized, Unity: ${enableUnity ? 'enabled' : 'disabled'}`);
+    log.info(`AgentRoleRegistry initialized, Unity: ${enableUnity ? 'enabled' : 'disabled'}`);
     
     // Initialize AgentPoolService
+    broadcastProgress('Initializing AgentPoolService');
     const agentPoolService = new AgentPoolService(stateManager, roleRegistry);
-    console.log(`[Standalone] AgentPoolService initialized with ${agentPoolService.getPoolStatus().total} agents`);
+    log.info(`AgentPoolService initialized with ${agentPoolService.getPoolStatus().total} agents`);
     
     // Initialize HeadlessTerminalManager (no-op for standalone)
     const terminalManager = new HeadlessTerminalManager();
     
     // Initialize AgentRunner with default backend
+    broadcastProgress('Initializing AgentRunner');
     const agentRunner = ServiceLocator.resolve(AgentRunner);
     agentRunner.setBackend(config.defaultBackend);
-    console.log(`[Standalone] AgentRunner initialized with backend: ${config.defaultBackend}`);
+    log.info(`AgentRunner initialized with backend: ${config.defaultBackend}`);
     
     // Initialize UnityControlManager if Unity is enabled
     let unityManager: UnityControlManager | undefined;
     if (enableUnity) {
+        broadcastProgress('Initializing UnityControlManager');
         unityManager = ServiceLocator.resolve(UnityControlManager);
         unityManager.setAgentRoleRegistry(roleRegistry);
         await unityManager.initialize(config.workspaceRoot);
-        console.log('[Standalone] UnityControlManager initialized');
+        log.info('UnityControlManager initialized');
     }
     
     // Register and initialize UnifiedCoordinatorService
+    broadcastProgress('Initializing UnifiedCoordinatorService');
     ServiceLocator.register(UnifiedCoordinatorService, () => 
         new UnifiedCoordinatorService(stateManager, agentPoolService, roleRegistry)
     );
@@ -123,7 +158,7 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
     // Subscribe to agent allocation events and broadcast to clients
     const broadcaster = ServiceLocator.resolve(EventBroadcaster);
     coordinator.onAgentAllocated(({ agentName, sessionId, roleId, workflowId }) => {
-        console.log(`[Standalone] onAgentAllocated: agent=${agentName}, session=${sessionId}, role=${roleId}, workflow=${workflowId}`);
+        log.debug(`onAgentAllocated: agent=${agentName}, session=${sessionId}, role=${roleId}, workflow=${workflowId}`);
         
         try {
             // Get log file path - include workflow ID and agent name for unique temp files
@@ -142,14 +177,14 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             // Also broadcast pool change so UI shows agent as busy
             const poolStatus = agentPoolService.getPoolStatus();
             const busyAgents = agentPoolService.getBusyAgents();
-            console.log(`[Standalone] Broadcasting pool.changed after allocation: available=${poolStatus.available.length}, busy=${busyAgents.length}`);
+            log.debug(`Broadcasting pool.changed after allocation: available=${poolStatus.available.length}, busy=${busyAgents.length}`);
             broadcaster.poolChanged(
                 poolStatus.total,
                 poolStatus.available,
                 busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId }))
             );
         } catch (e) {
-            console.error(`[Standalone] Error in onAgentAllocated handler:`, e);
+            log.error(`Error in onAgentAllocated handler:`, e);
             
             // Still try to broadcast pool.changed even if other parts failed
             try {
@@ -161,7 +196,7 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
                     busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId }))
                 );
             } catch (e2) {
-                console.error(`[Standalone] Failed to broadcast pool.changed:`, e2);
+                log.error(`Failed to broadcast pool.changed:`, e2);
             }
         }
     });
@@ -201,31 +236,97 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
         );
     });
     
-    console.log('[Standalone] UnifiedCoordinatorService initialized');
+    log.info('UnifiedCoordinatorService initialized');
+    
+    // Initialize ScriptableWorkflowRegistry for custom YAML workflows
+    broadcastProgress('Initializing ScriptableWorkflowRegistry');
+    const workflowsPath = path.join(config.workspaceRoot, '_AiDevLog', 'Workflows');
+    const scriptableRegistry = new ScriptableWorkflowRegistry(
+        coordinator.getWorkflowRegistry(),
+        workflowsPath
+    );
+    await scriptableRegistry.initialize();
+    scriptableRegistry.startWatching(); // Enable hot-reload on file changes
+    ServiceLocator.register(ScriptableWorkflowRegistry, () => scriptableRegistry);
+    log.info(`ScriptableWorkflowRegistry initialized with ${scriptableRegistry.getCustomWorkflowTypes().length} custom workflows`);
     
     // Recover any paused sessions
+    broadcastProgress('Recovering paused sessions');
     const recoveredCount = await coordinator.recoverAllSessions();
     if (recoveredCount > 0) {
-        console.log(`[Standalone] Recovered ${recoveredCount} paused workflow(s)`);
+        log.info(`Recovered ${recoveredCount} paused workflow(s)`);
     }
     
     // Initialize PlanningService
     const planningService = new PlanningService(stateManager, coordinator, {});
-    console.log('[Standalone] PlanningService initialized');
+    log.info('PlanningService initialized');
     
     // Initialize and start IdlePlanMonitor
     const { IdlePlanMonitor } = await import('./IdlePlanMonitor');
     const idlePlanMonitor = new IdlePlanMonitor(stateManager, agentPoolService, coordinator);
     idlePlanMonitor.setOutputManager(outputManager);
     idlePlanMonitor.start();
-    console.log('[Standalone] IdlePlanMonitor started');
+    log.info('IdlePlanMonitor started');
     
-    // Signal system ready - all services initialized successfully
-    // This allows IdlePlanMonitor to trigger startup evaluation immediately
-    idlePlanMonitor.setSystemReady();
-    console.log('[Standalone] System initialization complete - marked as ready');
+    // ========================================================================
+    // DEPENDENCY CHECK - After all services are initialized
+    // ========================================================================
+    // Now that AgentRunner is registered and available, we can run full dependency checks
+    // including MCP connectivity tests that require spawning agents
+    log.info('Checking system dependencies...');
+    const dependencyService = ServiceLocator.resolve(DependencyService);
+    dependencyService.setWorkspaceRoot(config.workspaceRoot);
+    dependencyService.setUnityEnabled(config.enableUnityFeatures);
     
-    // Signal daemon that services are ready (if daemon instance provided)
+    // No more auto-sync on every daemon start!
+    // User installs Unity MCP once (via UI button or manually), then it works forever
+    // URL is always localhost:8080 (mirrored mode is REQUIRED)
+    
+    // Set up progress broadcasting callback (reuse broadcaster from earlier)
+    dependencyService.setProgressCallback((name, status) => {
+        // Broadcast each dependency check result to connected clients in real-time
+        broadcaster.broadcast('deps.progress' as any, { name, status });
+    });
+    
+    // Broadcast the full list of dependencies upfront so UI can show all items
+    const dependencyList = dependencyService.getDependencyList();
+    broadcaster.broadcast('deps.list' as any, { dependencies: dependencyList });
+    log.debug(`Broadcasting dependency list: ${dependencyList.join(', ')}`);
+    
+    broadcastProgress('Checking system dependencies', 'checking_dependencies');
+    const depStatuses = await dependencyService.checkAllDependencies();
+    
+    // Analyze dependency status
+    const platform = process.platform;
+    const relevantDeps = depStatuses.filter(d => d.platform === platform || d.platform === 'all');
+    const missingDeps = relevantDeps.filter(d => d.required && !d.installed);
+    const criticalMissing = missingDeps.filter(d => 
+        d.name.includes('Python') || d.name.includes('APC CLI')
+    );
+    
+    if (missingDeps.length > 0) {
+        log.warn(`⚠️  Missing dependencies (${missingDeps.length}):`);
+        for (const dep of missingDeps) {
+            log.warn(`  ❌ ${dep.name}: ${dep.description}`);
+        }
+        if (criticalMissing.length > 0) {
+            log.warn(`⚠️  ${criticalMissing.length} critical dependencies missing - some operations BLOCKED!`);
+        }
+        
+        // System is "ready" but with missing dependencies
+        // This means the daemon works, but some features won't work
+        idlePlanMonitor.setSystemReady();
+        log.warn(`⚠️  System ready with ${missingDeps.length} missing dependencies - some features unavailable`);
+        log.info('💡 Use the GUI to install missing dependencies');
+    } else {
+        log.info('✅ All dependencies satisfied');
+        
+        // Signal system ready - all services initialized and dependencies OK
+        idlePlanMonitor.setSystemReady();
+        log.info('✅ System fully ready - all dependencies satisfied');
+    }
+    
+    // Signal daemon that services are ready (daemon itself is always ready, dependencies may not be)
     if (daemon) {
         daemon.setServicesReady();
     }
@@ -236,7 +337,9 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             getAllPlanningSessions: () => stateManager.getAllPlanningSessions(),
             getPlanningSession: (id: string) => stateManager.getPlanningSession(id),
             deletePlanningSession: (id: string) => stateManager.deletePlanningSession(id),
-            getSessionTasksFilePath: (sessionId: string) => stateManager.getSessionTasksFilePath(sessionId)
+            getSessionTasksFilePath: (sessionId: string) => stateManager.getSessionTasksFilePath(sessionId),
+            getWorkspaceRoot: () => stateManager.getWorkspaceRoot(),
+            getWorkingDir: () => stateManager.getWorkingDir()
         },
         agentPoolService: {
             getPoolStatus: () => agentPoolService.getPoolStatus(),
@@ -337,6 +440,7 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
         },
         roleRegistry: {
             getRole: (roleId: string) => roleRegistry.getRole(roleId),
+            getAllRoles: () => roleRegistry.getAllRoles(),
             updateRole: (roleId: string, updates: Record<string, any>) => {
                 // Get existing role, merge updates, and save
                 const existing = roleRegistry.getRole(roleId);
@@ -351,7 +455,15 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
                     roleRegistry.updateRole(updated);
                 }
             },
-            resetRoleToDefault: (roleId: string) => roleRegistry.resetToDefault(roleId) !== undefined
+            resetRoleToDefault: (roleId: string) => roleRegistry.resetToDefault(roleId) !== undefined,
+            getCoordinatorPrompt: () => roleRegistry.getCoordinatorPrompt() as unknown as Record<string, unknown>,
+            updateCoordinatorPrompt: (config: Record<string, any>) => roleRegistry.updateCoordinatorPrompt(config),
+            resetCoordinatorPromptToDefault: () => roleRegistry.resetCoordinatorPromptToDefault(),
+            getAllSystemPrompts: () => roleRegistry.getAllSystemPrompts(),
+            // Polling prompt methods
+            getPollingPrompt: () => roleRegistry.getPollingPrompt(),
+            updatePollingPrompt: (prompt: string) => roleRegistry.updatePollingPrompt(prompt),
+            resetPollingPromptToDefault: () => roleRegistry.resetPollingPromptToDefault()
         },
         // Unity manager - included when Unity features are enabled
         unityManager: unityManager ? {
@@ -399,7 +511,7 @@ async function main(): Promise<void> {
         
         // Start daemon WebSocket server
         await daemon.start();
-        console.log(`[Standalone] Daemon WebSocket server started on port ${config.port}`);
+        log.info(`Daemon WebSocket server started on port ${config.port}`);
         
         // Now initialize all services (passing daemon so it can be marked ready)
         const services = await initializeServices(config, daemon);
@@ -409,7 +521,7 @@ async function main(): Promise<void> {
         
         // Handle shutdown signals
         const shutdown = async (signal: string) => {
-            console.log(`\n[Standalone] Received ${signal}, shutting down...`);
+            log.info(`Received ${signal}, shutting down...`);
             await daemon.stop(signal);
             process.exit(0);
         };
@@ -418,14 +530,14 @@ async function main(): Promise<void> {
         process.on('SIGTERM', () => shutdown('SIGTERM'));
         
         console.log('');
-        console.log('[Standalone] Daemon is ready!');
-        console.log(`[Standalone] WebSocket: ws://127.0.0.1:${config.port}`);
-        console.log(`[Standalone] Health: http://127.0.0.1:${config.port}/health`);
+        log.info('Daemon is ready!');
+        log.info(`WebSocket: ws://127.0.0.1:${config.port}`);
+        log.info(`Health: http://127.0.0.1:${config.port}/health`);
         console.log('');
-        console.log('[Standalone] Press Ctrl+C to stop');
+        log.info('Press Ctrl+C to stop');
         
     } catch (err) {
-        console.error('[Standalone] Failed to start daemon:', err);
+        log.error('Failed to start daemon:', err);
         process.exit(1);
     }
 }
@@ -433,7 +545,7 @@ async function main(): Promise<void> {
 // Run if executed directly
 if (require.main === module) {
     main().catch(err => {
-        console.error('[Standalone] Fatal error:', err);
+        log.error('Fatal error:', err);
         process.exit(1);
     });
 }

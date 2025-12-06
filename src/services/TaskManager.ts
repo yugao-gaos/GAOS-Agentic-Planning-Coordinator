@@ -1027,6 +1027,34 @@ export class TaskManager {
             }
         }
         
+        // CRITICAL: Check for cycles after adding task (runtime check)
+        // This catches cycles created by adding new tasks to existing plans
+        const sessionTasks = this.getTasksForSession(sessionId);
+        const { DependencyGraphUtils } = require('./DependencyGraphUtils');
+        const taskNodes = sessionTasks.map(t => ({
+            id: t.id,
+            dependencies: t.dependencies
+        }));
+        
+        const cycleCheck = DependencyGraphUtils.detectCycles(taskNodes);
+        if (cycleCheck.hasCycle) {
+            // Remove the task we just added
+            this.tasks.delete(globalTaskId);
+            
+            // Also remove from dependents
+            for (const depId of globalDependencies) {
+                const depTask = this.tasks.get(depId);
+                if (depTask) {
+                    depTask.dependents = depTask.dependents.filter(d => d !== globalTaskId);
+                }
+            }
+            
+            return {
+                success: false,
+                error: `Cannot create task ${taskId}: Would create circular dependency.\n${cycleCheck.description}`
+            };
+        }
+        
         this.log(`Created task ${globalTaskId}: ${description.substring(0, 50)}...`);
         
         // Persist tasks after creation
