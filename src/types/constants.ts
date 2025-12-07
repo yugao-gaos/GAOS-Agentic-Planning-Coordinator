@@ -59,7 +59,10 @@ export const ROLE_WORKFLOW_MAP: Record<string, string[]> = {
     
     // Execution phase roles
     'engineer': ['task_implementation', 'error_resolution'],
-    'code_reviewer': ['task_implementation']
+    'code_reviewer': ['task_implementation'],
+    
+    // Utility roles
+    'text_clerk': ['planning_new', 'planning_revision']
     // Note: error_analyst removed - ErrorResolutionWorkflow uses engineer role
 };
 

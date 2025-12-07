@@ -531,25 +531,6 @@ export class DaemonStateProxy {
     }
 
     /**
-     * Get agents on bench (allocated but not busy)
-     * @deprecated Use getBenchAgents() instead (returns workflowId)
-     */
-    async getAgentsOnBench(sessionId?: string): Promise<Array<{ name: string; roleId: string; sessionId: string }>> {
-        if (!this.vsCodeClient.isConnected()) {
-            return [];
-        }
-
-        try {
-            const response: { agents?: Array<{ name: string; roleId: string; sessionId: string }> } = 
-                await this.vsCodeClient.send('pool.bench', { sessionId });
-            return response.agents || [];
-        } catch (err) {
-            log.warn('Failed to get bench agents from daemon:', err);
-            return [];
-        }
-    }
-
-    /**
      * Get all benched agents (allocated but not busy) - includes workflowId
      */
     async getBenchAgents(): Promise<Array<{ name: string; roleId: string; sessionId: string; workflowId: string }>> {
@@ -563,6 +544,23 @@ export class DaemonStateProxy {
             return response.allocated || [];
         } catch (err) {
             log.warn('Failed to get bench agents from daemon:', err);
+            return [];
+        }
+    }
+
+    /**
+     * Get agents in resting state (cooldown after release)
+     */
+    async getRestingAgents(): Promise<string[]> {
+        if (!this.vsCodeClient.isConnected()) {
+            return [];
+        }
+
+        try {
+            const response = await this.vsCodeClient.getPoolStatus();
+            return response.resting || [];
+        } catch (err) {
+            log.warn('Failed to get resting agents from daemon:', err);
             return [];
         }
     }

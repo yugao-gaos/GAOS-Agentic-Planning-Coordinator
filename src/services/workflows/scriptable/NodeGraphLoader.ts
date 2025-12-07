@@ -94,6 +94,7 @@ interface RawYamlGraph {
         id?: string;
         from: string;
         to: string;
+        reroutes?: Array<{ x: number; y: number }>;
     }>;
     editor?: {
         zoom?: number;
@@ -160,6 +161,30 @@ export class NodeGraphLoader {
         }
         
         return graph;
+    }
+    
+    /**
+     * Load a node graph from a YAML file without validation
+     * Used for displaying invalid workflows in the editor
+     * 
+     * @param filePath Path to the YAML file (relative to basePath or absolute)
+     * @returns Parsed node graph (may be invalid)
+     */
+    async loadRaw(filePath: string): Promise<INodeGraph> {
+        const fullPath = path.isAbsolute(filePath) 
+            ? filePath 
+            : path.join(this.basePath, filePath);
+        
+        log.debug(`Loading raw node graph from: ${fullPath}`);
+        
+        // Read file
+        const content = await fs.promises.readFile(fullPath, 'utf-8');
+        
+        // Parse YAML
+        const rawGraph: RawYamlGraph = yaml.parse(content);
+        
+        // Convert to internal format without validation
+        return this.parseRawGraph(rawGraph);
     }
     
     /**
@@ -476,7 +501,8 @@ export class NodeGraphLoader {
                     fromNodeId,
                     fromPortId,
                     toNodeId,
-                    toPortId
+                    toPortId,
+                    reroutes: conn.reroutes
                 });
             }
         }
@@ -502,9 +528,86 @@ export class NodeGraphLoader {
         const definition = nodeRegistry.getDefinition(raw.type);
         
         // Build input ports
-        const inputs: INodePort[] = definition 
+        let inputs: INodePort[] = definition 
             ? definition.defaultInputs.map(p => ({ ...p, direction: 'input' as const }))
             : [];
+        
+        // Build output ports
+        let outputs: INodePort[] = definition 
+            ? definition.defaultOutputs.map(p => ({ ...p, direction: 'output' as const }))
+            : [];
+        
+        // Handle dynamic port nodes based on config
+        const config = raw.config || {};
+        
+        // Agent Bench - dynamic seat ports
+        if (raw.type === 'agent_bench' && config.seatCount !== undefined) {
+            const seatCount = config.seatCount;
+            inputs = [];
+            outputs = [];
+            for (let i = 0; i < seatCount; i++) {
+                inputs.push({
+                    id: `agent_in_${i}`,
+                    name: `Seat ${i + 1} In`,
+                    direction: 'input',
+                    dataType: 'agent',
+                    description: `Agent input for seat ${i + 1}`
+                });
+                outputs.push({
+                    id: `agent_out_${i}`,
+                    name: `Seat ${i + 1} Out`,
+                    direction: 'output',
+                    dataType: 'agent',
+                    description: `Agent output for seat ${i + 1}`
+                });
+            }
+        }
+        
+        // Branch - dynamic branch output ports
+        if (raw.type === 'branch' && config.branchCount !== undefined) {
+            const branchCount = config.branchCount;
+            inputs = [
+                { id: 'trigger', name: 'Trigger', direction: 'input', dataType: 'trigger', description: 'Execution flow trigger' },
+                { id: 'input', name: 'Input', direction: 'input', dataType: 'any', description: 'Data to pass to all branches' }
+            ];
+            outputs = [];
+            for (let i = 0; i < branchCount; i++) {
+                outputs.push({
+                    id: `out_${i}`,
+                    name: `Branch ${i}`,
+                    direction: 'output',
+                    dataType: 'trigger',
+                    description: `Parallel branch ${i}`
+                });
+            }
+            outputs.push({
+                id: 'data',
+                name: 'Data',
+                direction: 'output',
+                dataType: 'any',
+                description: 'Input data passed through',
+                allowMultiple: true
+            });
+        }
+        
+        // Sync - dynamic branch input ports
+        if (raw.type === 'sync' && config.inputCount !== undefined) {
+            const inputCount = config.inputCount;
+            inputs = [];
+            for (let i = 0; i < inputCount; i++) {
+                inputs.push({
+                    id: `in_${i}`,
+                    name: `Branch ${i}`,
+                    direction: 'input',
+                    dataType: 'trigger',
+                    description: `Execution input from branch ${i}`
+                });
+            }
+            outputs = [
+                { id: 'results', name: 'Results', direction: 'output', dataType: 'array', description: 'Array of results from all branches' },
+                { id: 'trigger', name: 'Trigger', direction: 'output', dataType: 'trigger', description: 'Triggered when all branches complete' }
+            ];
+        }
         
         // Add any custom input ports from YAML
         if (raw.inputs) {
@@ -520,11 +623,6 @@ export class NodeGraphLoader {
                 }
             }
         }
-        
-        // Build output ports
-        const outputs: INodePort[] = definition 
-            ? definition.defaultOutputs.map(p => ({ ...p, direction: 'output' as const }))
-            : [];
         
         // Add any custom output ports from YAML
         if (raw.outputs) {
@@ -607,7 +705,8 @@ export class NodeGraphLoader {
             })),
             connections: graph.connections.map(c => ({
                 from: `${c.fromNodeId}.${c.fromPortId}`,
-                to: `${c.toNodeId}.${c.toPortId}`
+                to: `${c.toNodeId}.${c.toPortId}`,
+                reroutes: c.reroutes && c.reroutes.length > 0 ? c.reroutes : undefined
             })),
             editor: graph.editor,
             coordinator_prompt: graph.coordinatorPrompt

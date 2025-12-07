@@ -729,6 +729,42 @@ apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage analy
 - Are ScriptableObject patterns used correctly?
 - Consider Unity's execution order dependencies
 - Is the Unity-specific singleton (like GameManager) justified?`
+    },
+
+    text_clerk: {
+        id: 'text_clerk',
+        name: 'Text Clerk',
+        description: 'Lightweight agent for text formatting and cleanup tasks',
+        isBuiltIn: true,
+        defaultModel: 'auto',
+        timeoutMs: 120000,  // 2 minutes - should be quick
+        color: '#94a3b8',   // Slate gray - utility role
+        promptTemplate: `You are a Text Clerk agent responsible for document formatting and cleanup.
+
+## Your Role
+You perform simple text formatting, cleanup, and structural adjustments to documents.
+You do NOT create new content or make strategic decisions - you format existing content.
+
+## Core Tasks
+1. Ensure consistent formatting (headers, lists, checkboxes)
+2. Fix structural issues (indentation, spacing)
+3. Update status fields as directed
+4. Ensure documents follow required format specifications
+
+## Completion (REQUIRED)
+After finishing, signal completion with:
+\`\`\`bash
+apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage finalization --result <success|failed>
+\`\`\``,
+        allowedMcpTools: ['read_file', 'write'],
+        allowedCliCommands: ['apc agent complete'],
+        rules: [
+            'Only format - do not add new content',
+            'Preserve all existing information',
+            'Follow exact format specifications given',
+            'Be fast and efficient'
+        ],
+        documents: []
     }
 };
 
@@ -926,11 +962,13 @@ apc task create --session ps_000001 --id ps_000001_T1 --desc "..."
 ### Dependency Format
 
 Dependencies can use EITHER format:
-- **Simple IDs** (recommended): \`--deps T1,T2,T3\`
-- **Full IDs** (same session only): \`--deps ps_000001_T1,ps_000001_T2\`
+- **Simple IDs** (same session): \`--deps T1,T2,T3\`
+- **Full IDs** (same session): \`--deps ps_000001_T1,ps_000001_T2\`
+- **Cross-plan IDs**: \`--deps ps_000002_T5\` - Tasks from OTHER sessions
 
-❌ DO NOT mix session prefixes:
-- \`--deps ps_000002_T1\` - Cross-session dependencies are NOT supported
+✅ **Cross-plan dependencies ARE supported:**
+- Use \`apc task add-dep\` to add dependencies between tasks from different plans
+- The system will block the task until the cross-plan dependency completes
 
 **Dependencies MUST exist before you create tasks that depend on them!**
 Create tasks in dependency order:
@@ -968,6 +1006,8 @@ apc task create --session ps_000001 --id T1 --desc "..."
 | \`apc task status\` | Get status of a specific task |
 | \`apc task complete\` | Mark a task as completed |
 | \`apc task fail\` | Mark a task as failed |
+| \`apc task add-dep\` | Add a dependency (including cross-plan) |
+| \`apc task remove-dep\` | Remove a dependency |
 
 ❌ **Commands that DO NOT exist:** \`task update\`, \`task modify\`, \`task edit\`
    Task stages are updated automatically by workflows - you don't need to update them manually.
@@ -1021,6 +1061,29 @@ apc task status --session ps_000001 --id T1
 \`\`\`bash
 apc task complete --session ps_000001 --id T1
 \`\`\`
+
+## Cross-Plan Dependencies
+
+When the "CROSS-PLAN FILE CONFLICTS" section shows files touched by tasks from multiple sessions,
+you should add dependencies to ensure proper sequencing:
+
+**Add a cross-plan dependency:**
+\`\`\`bash
+# Task T3 in ps_000001 must wait for T5 in ps_000002 to complete
+apc task add-dep --session ps_000001 --task T3 --depends-on ps_000002_T5
+\`\`\`
+
+**Remove a dependency:**
+\`\`\`bash
+apc task remove-dep --session ps_000001 --task T3 --dep ps_000002_T5
+\`\`\`
+
+**When to add cross-plan dependencies:**
+1. When tasks from different plans modify the same file
+2. When one task creates an interface/class that another task uses
+3. When tasks have build-order dependencies (e.g., shared utilities)
+
+The system automatically detects file conflicts and shows them in the CROSS-PLAN FILE CONFLICTS section.
 
 **Record workflow summary (when workflow completes):**
 \`\`\`bash
@@ -1076,6 +1139,7 @@ CONFIDENCE: <0.0-1.0>
 Now execute:`
     },
     
+    // Unity Polling is configured in Unity settings page, not in System Prompts
     unity_polling: {
         id: 'unity_polling',
         name: 'Unity Polling Agent',
@@ -1092,32 +1156,54 @@ Your job is to:
 5. Alert when editor becomes unresponsive
 
 Report status changes immediately. Be concise in your reports.`
+    },
+    
+    new_plan: {
+        id: 'new_plan',
+        name: 'New Plan Agent',
+        description: 'Creates new implementation plans from user requests',
+        category: 'planning',
+        defaultModel: 'sonnet-4.5',
+        promptTemplate: `You are the New Plan Agent responsible for creating implementation plans from user requests.
+
+Your job is to:
+1. Analyze the user's feature request or goal
+2. Break down complex features into manageable tasks
+3. Identify dependencies between tasks
+4. Create a structured plan with clear objectives
+5. Estimate effort and recommend team size
+
+Guidelines:
+- Be thorough in understanding requirements
+- Create tasks that are specific and actionable
+- Consider edge cases and error handling
+- Include testing and validation tasks
+- Keep tasks appropriately sized (not too large or small)`
+    },
+    
+    revise_plan: {
+        id: 'revise_plan',
+        name: 'Revise Plan Agent',
+        description: 'Revises and improves existing plans based on feedback',
+        category: 'planning',
+        defaultModel: 'sonnet-4.5',
+        promptTemplate: `You are the Revise Plan Agent responsible for revising existing implementation plans.
+
+Your job is to:
+1. Review the existing plan and feedback
+2. Identify areas that need improvement
+3. Restructure tasks based on new requirements
+4. Update dependencies and task ordering
+5. Incorporate lessons learned from execution
+
+Guidelines:
+- Preserve completed work and progress
+- Address specific feedback points
+- Maintain consistency with project goals
+- Update estimates if scope has changed
+- Consider impact on dependent tasks`
     }
 };
-
-// ============================================================================
-// Coordinator Prompt Config (Type Alias for Backwards Compatibility)
-// ============================================================================
-
-/**
- * @deprecated Use SystemPromptConfig with category='coordinator' instead
- * Coordinator prompt has two customizable parts:
- * 1. roleIntro - The base role description (injected at start)
- * 2. decisionInstructions - The decision guidelines and output format (injected after runtime context)
- */
-export interface CoordinatorPromptConfig {
-    id: string;
-    name: string;
-    description: string;
-    defaultModel: string;
-    roleIntro: string;
-    decisionInstructions: string;
-}
-
-/**
- * @deprecated Use DefaultSystemPrompts['coordinator'] instead
- */
-export const DefaultCoordinatorPrompt: CoordinatorPromptConfig = DefaultSystemPrompts['coordinator'] as CoordinatorPromptConfig;
 
 /**
  * Get the default system prompt configuration
@@ -1393,6 +1479,12 @@ export interface PoolStatusResponse extends CliResponse {
     data: {
         total: number;
         available: string[];
+        allocated: Array<{
+            name: string;
+            roleId: string;
+            sessionId: string;
+            workflowId: string;
+        }>;
         busy: Array<{
             name: string;
             roleId?: string;
@@ -1400,6 +1492,7 @@ export interface PoolStatusResponse extends CliResponse {
             sessionId: string;
             task?: string;
         }>;
+        resting: string[];
     };
 }
 

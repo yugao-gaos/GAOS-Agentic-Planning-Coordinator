@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import { AgentTerminal } from '../types';
 import { ITerminalManager, IAgentTerminalInfo } from './ITerminalManager';
 import { getLogStreamService, disposeLogStreamService, LogStreamService } from './LogStreamService';
+import { LogPseudoterminal } from './LogPseudoterminal';
 import { Logger } from '../utils/Logger';
 
 const log = Logger.create('Client', 'TerminalManager');
@@ -35,6 +36,9 @@ export class TerminalManager implements ITerminalManager {
     private disposables: vscode.Disposable[] = [];
     private logStreamService: LogStreamService;
     private configProvider: ConfigProvider | null = null;
+    
+    // Pseudoterminal instances for direct output (no echo commands)
+    private pseudoterminals: Map<string, LogPseudoterminal> = new Map();
     
     // Cached config values (updated when provider is set or refreshConfig is called)
     private cachedConfig: { autoOpenTerminals: boolean } = { autoOpenTerminals: true };
@@ -121,7 +125,7 @@ export class TerminalManager implements ITerminalManager {
     }
 
     /**
-     * Start streaming a log file to a terminal using Node.js (cross-platform)
+     * Start streaming a log file to a pseudoterminal (cross-platform, no echo commands)
      */
     private startLogStreaming(terminal: vscode.Terminal, logFile: string, agentName: string): void {
         // Stop any existing stream for this file
@@ -130,29 +134,49 @@ export class TerminalManager implements ITerminalManager {
         // Ensure the log file and directory exist
         this.ensureFileExists(logFile);
         
-        // Show header in terminal
-        terminal.sendText(`echo ""`);
-        terminal.sendText(`echo "🔴 Streaming: ${logFile}"`);
-        terminal.sendText(`echo ""`);
+        // Get the pseudoterminal for this agent
+        const pty = this.pseudoterminals.get(agentName);
         
-        // Start streaming with the LogStreamService
-        this.logStreamService.startStreaming(logFile, (content) => {
-            // Send each chunk to the terminal
-            // Split by lines and send each line to avoid issues with large chunks
-            const lines = content.split('\n');
-            for (const line of lines) {
-                if (line) {
-                    // Use echo to display the content in the terminal
-                    // Escape special characters for shell safety
-                    const escaped = this.escapeForTerminal(line);
+        if (pty) {
+            // Show header using pseudoterminal (direct write, no shell commands)
+            pty.writeLine('');
+            pty.writeLine(`🔴 Streaming: ${logFile}`);
+            pty.writeLine('');
+            
+            // Start streaming with the LogStreamService - write directly to pseudoterminal
+            this.logStreamService.startStreaming(logFile, (content) => {
+                // Write content directly to pseudoterminal (handles newline conversion)
+                pty.writeContent(content);
+            }, false); // Don't show existing content on start
+        } else {
+            // Fallback for terminals without pseudoterminal (e.g., coordinator terminals)
+            // Use echo-based approach but batch lines to reduce command count
+            terminal.sendText(`echo ""`);
+            terminal.sendText(`echo "🔴 Streaming: ${logFile}"`);
+            terminal.sendText(`echo ""`);
+            
+            this.logStreamService.startStreaming(logFile, (content) => {
+                // Batch content and send as single echo when possible
+                const escaped = this.escapeForTerminal(content.replace(/\n+$/, ''));
+                if (escaped.length < 4000) { // PowerShell command length limit
                     terminal.sendText(`echo "${escaped}"`, true);
+                } else {
+                    // For very long content, split into chunks
+                    const lines = content.split('\n');
+                    for (const line of lines) {
+                        if (line) {
+                            const escapedLine = this.escapeForTerminal(line);
+                            terminal.sendText(`echo "${escapedLine}"`, true);
+                        }
+                    }
                 }
-            }
-        }, false); // Don't show existing content on start
+            }, false);
+        }
     }
 
     /**
      * Escape a string for safe echo in terminal (cross-platform)
+     * Only used as fallback when pseudoterminal is not available
      */
     private escapeForTerminal(text: string): string {
         // Escape backslashes, double quotes, and dollar signs
@@ -165,6 +189,7 @@ export class TerminalManager implements ITerminalManager {
 
     /**
      * Create a new terminal for an agent session
+     * Uses a pseudoterminal for efficient direct output (no shell echo commands)
      */
     createAgentTerminal(
         agentName: string,
@@ -218,16 +243,29 @@ export class TerminalManager implements ITerminalManager {
             if (existing.logFile) {
                 this.logStreamService.stopStreaming(existing.logFile);
             }
+            // Dispose old pseudoterminal
+            const oldPty = this.pseudoterminals.get(agentName);
+            if (oldPty) {
+                oldPty.dispose();
+                this.pseudoterminals.delete(agentName);
+            }
             this.agentTerminals.delete(agentName);
         }
 
-        log.debug(`  CREATING new terminal for ${agentName}`);
-        // Create new terminal with proper agent name
+        log.debug(`  CREATING new terminal with pseudoterminal for ${agentName}`);
+        
+        // Create pseudoterminal for efficient direct output
+        const pty = new LogPseudoterminal(
+            agentName,
+            `Agent ${agentName} | Session: ${sessionId}`
+        );
+        this.pseudoterminals.set(agentName, pty);
+        
+        // Create terminal with the pseudoterminal
         const terminal = vscode.window.createTerminal({
             name: terminalName,
-            cwd: workspaceRoot,
             iconPath: new vscode.ThemeIcon('person'),
-            message: `Agent ${agentName} | Session: ${sessionId}`
+            pty
         });
 
         // Store terminal reference
@@ -271,26 +309,24 @@ export class TerminalManager implements ITerminalManager {
         if (agentTerminal.logFile) {
             this.logStreamService.stopStreaming(agentTerminal.logFile);
             
+            const pty = this.pseudoterminals.get(agentName);
+            
             // Show existing content first
             if (fs.existsSync(agentTerminal.logFile)) {
                 try {
                     const content = fs.readFileSync(agentTerminal.logFile, 'utf-8');
-                    if (content) {
-                        agentTerminal.terminal.sendText(`echo "--- Existing log content ---"`);
-                        const lines = content.split('\n');
-                        for (const line of lines) {
-                            if (line) {
-                                const escaped = this.escapeForTerminal(line);
-                                agentTerminal.terminal.sendText(`echo "${escaped}"`, true);
-                            }
-                        }
+                    if (content && pty) {
+                        pty.writeLine('--- Existing log content ---');
+                        pty.writeContent(content);
                     }
                 } catch (e) {
                     // Ignore read errors
                 }
             }
             
-            agentTerminal.terminal.sendText(`echo "--- Live stream started ---"`);
+            if (pty) {
+                pty.writeLine('--- Live stream started ---');
+            }
             this.startLogStreaming(agentTerminal.terminal, agentTerminal.logFile, agentName);
         }
     }
@@ -368,19 +404,33 @@ export class TerminalManager implements ITerminalManager {
             return true;
         }
 
-        // Terminal was closed but we have the info - recreate it
+        // Terminal was closed but we have the info - recreate it with pseudoterminal
         if (agentTerminal) {
             const terminalName = `🔧 ${agentName}`;
-            const terminal = vscode.window.createTerminal({
-                name: terminalName,
-                iconPath: new vscode.ThemeIcon('person'),
-                message: `Agent ${agentName} - Reconnected | Session: ${agentTerminal.sessionId}`
-            });
-
+            
             // Stop any existing stream for old log file
             if (agentTerminal.logFile) {
                 this.logStreamService.stopStreaming(agentTerminal.logFile);
             }
+            
+            // Dispose old pseudoterminal if exists
+            const oldPty = this.pseudoterminals.get(agentName);
+            if (oldPty) {
+                oldPty.dispose();
+            }
+            
+            // Create new pseudoterminal
+            const pty = new LogPseudoterminal(
+                agentName,
+                `Agent ${agentName} - Reconnected | Session: ${agentTerminal.sessionId}`
+            );
+            this.pseudoterminals.set(agentName, pty);
+            
+            const terminal = vscode.window.createTerminal({
+                name: terminalName,
+                iconPath: new vscode.ThemeIcon('person'),
+                pty
+            });
 
             this.agentTerminals.set(agentName, {
                 ...agentTerminal,
@@ -391,8 +441,8 @@ export class TerminalManager implements ITerminalManager {
             
             // Start streaming if log file path exists (cross-platform)
             if (agentTerminal.logFile) {
-                terminal.sendText(`echo "📄 Reconnecting to: ${agentTerminal.logFile}"`);
-                terminal.sendText(`echo ""`);
+                pty.writeLine(`📄 Reconnecting to: ${agentTerminal.logFile}`);
+                pty.writeLine('');
                 this.startLogStreaming(terminal, agentTerminal.logFile, agentName);
             }
             return true;
@@ -415,6 +465,12 @@ export class TerminalManager implements ITerminalManager {
                 agentTerminal.terminal.dispose();
             }
         }
+        // Dispose pseudoterminal
+        const pty = this.pseudoterminals.get(agentName);
+        if (pty) {
+            pty.dispose();
+            this.pseudoterminals.delete(agentName);
+        }
         this.agentTerminals.delete(agentName);
     }
 
@@ -432,6 +488,12 @@ export class TerminalManager implements ITerminalManager {
             }
         }
         this.agentTerminals.clear();
+        
+        // Dispose all pseudoterminals
+        for (const pty of this.pseudoterminals.values()) {
+            pty.dispose();
+        }
+        this.pseudoterminals.clear();
     }
 
     /**
@@ -632,10 +694,16 @@ export class TerminalManager implements ITerminalManager {
      * Remove stale (dead) terminal references without closing active ones
      */
     cleanupStaleTerminals(): void {
-        // Clean up stale agent terminals
+        // Clean up stale agent terminals and their pseudoterminals
         for (const [name, agentTerminal] of this.agentTerminals) {
             if (!this.isTerminalAlive(agentTerminal.terminal)) {
                 log.debug(`Cleaning up stale terminal reference for agent: ${name}`);
+                // Dispose pseudoterminal
+                const pty = this.pseudoterminals.get(name);
+                if (pty) {
+                    pty.dispose();
+                    this.pseudoterminals.delete(name);
+                }
                 this.agentTerminals.delete(name);
             }
         }
@@ -666,6 +734,12 @@ export class TerminalManager implements ITerminalManager {
             }
         }
         this.coordinatorTerminals.clear();
+        
+        // Dispose all remaining pseudoterminals (should already be done by closeAllTerminals)
+        for (const pty of this.pseudoterminals.values()) {
+            pty.dispose();
+        }
+        this.pseudoterminals.clear();
         
         // Dispose the log stream service
         disposeLogStreamService();

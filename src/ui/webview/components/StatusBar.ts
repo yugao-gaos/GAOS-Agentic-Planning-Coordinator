@@ -235,10 +235,12 @@ function renderSystemReadyBox(
     if (unityEnabled) {
         const unityBadge = getUnityBadgeStyle(unity);
         unityHtml = `
-            <div class="status-box">
-                <span class="status-box-label">Unity</span>
-                <span class="unity-badge" style="background: ${unityBadge.background};">${unityBadge.text}</span>
-                ${unity.queueLength > 0 ? `<span class="unity-queue">(${unity.queueLength})</span>` : ''}
+            <div class="status-boxes-row" style="margin-top: 6px;">
+                <div class="status-box">
+                    <span class="status-box-label">Unity</span>
+                    <span class="unity-badge" style="background: ${unityBadge.background};">${unityBadge.text}</span>
+                    ${unity.queueLength > 0 ? `<span class="unity-queue">(${unity.queueLength})</span>` : ''}
+                </div>
             </div>
         `;
     }
@@ -246,13 +248,17 @@ function renderSystemReadyBox(
     return `
         <div class="context-box context-box-ready">
             <div class="status-boxes-row">
-                <div class="status-box clickable" id="coordinatorInfo" title="Click to open latest coordinator log">
+                <div class="status-box" id="coordinatorInfo">
                     <span class="status-box-label">Coordinator</span>
                     <div class="coordinator-dot ${coordClass}" id="coordinatorDot"></div>
                     <span class="coordinator-text" id="coordinatorText">${coordText}</span>
+                    <div class="coordinator-actions">
+                        <button class="coord-icon-btn" id="globalDepsBtn" title="Global Task Dependencies">🌐</button>
+                        <button class="coord-icon-btn" id="coordLogBtn" title="View Coordinator Log">📋</button>
+                    </div>
                 </div>
-                ${unityHtml}
             </div>
+            ${unityHtml}
         </div>
     `;
 }

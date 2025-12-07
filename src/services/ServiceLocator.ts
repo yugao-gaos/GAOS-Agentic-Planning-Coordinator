@@ -92,7 +92,7 @@ export class ServiceLocator {
     static resolve<T>(token: Constructor<T>): T {
         const reg = this.registrations.get(token);
         if (!reg) {
-            throw new Error(`Service not registered: ${token.name}. Did you call bootstrapServices()?`);
+            throw new Error(`Service not registered: ${token.name}. Did you call bootstrapDaemonServices()?`);
         }
         
         if (reg.lifecycle === 'singleton') {
@@ -185,7 +185,7 @@ export class ServiceLocator {
 
     /**
      * Mark the locator as initialized
-     * Used to track if bootstrapServices() has been called
+     * Used to track if bootstrapDaemonServices() has been called
      */
     static markInitialized(): void {
         this.initialized = true;

@@ -131,16 +131,23 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             // Allocate engineer and reviewer upfront - they stay on bench when idle
             // Only allocate if not already allocated (handles review iteration loops)
             if (!this.engineerName && !this.reviewerName) {
-                this.log(`🎭 Allocating engineer and reviewer for workflow...`);
+                this.log(`🎭 Allocating engineer and reviewer for workflow ${this.id.substring(0, 8)}...`);
+                
+                this.log(`  → Requesting 'engineer' role...`);
                 this.engineerName = await this.requestAgent('engineer');
+                this.log(`  ← Got engineer: ${this.engineerName}`);
+                
+                this.log(`  → Requesting 'code_reviewer' role...`);
                 this.reviewerName = await this.requestAgent('code_reviewer');
-                this.log(`✓ Agents allocated: ${this.engineerName} (engineer), ${this.reviewerName} (reviewer)`);
+                this.log(`  ← Got code_reviewer: ${this.reviewerName}`);
+                
+                this.log(`✓ Agents allocated: ${this.engineerName} (engineer), ${this.reviewerName} (code_reviewer)`);
                 
                 // Demote reviewer to bench immediately - it won't work until review phase
                 this.demoteAgentToBench(this.reviewerName);
-                this.log(`Reviewer ${this.reviewerName} moved to bench (waiting for review phase)`);
+                this.log(`⬇️ Demoted ${this.reviewerName} to bench (waiting for review phase)`);
             } else {
-                this.log(`✓ Using already allocated agents: ${this.engineerName} (engineer), ${this.reviewerName} (reviewer)`);
+                this.log(`✓ Using already allocated agents: ${this.engineerName} (engineer), ${this.reviewerName} (code_reviewer)`);
             }
         }
         
@@ -249,41 +256,6 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     // PHASE IMPLEMENTATIONS
     // =========================================================================
     
-    /**
-     * @deprecated Context phase removed from workflow - coordinator provides context via task metadata.
-     * Use ContextGatheringWorkflow for explicit context gathering.
-     */
-    private async executeContextPhase(): Promise<void> {
-        this.log(`📂 PHASE: CONTEXT for task ${this.taskId}`);
-        
-        const role = this.getRole('context_gatherer');
-        const prompt = this.buildContextPrompt(role);
-        
-        this.log(`Running context gatherer (${role?.defaultModel || 'gemini-3-pro'})...`);
-        
-        // Agent is automatically allocated and released by runAgentTask
-        const result = await this.runAgentTask('context', prompt, role, undefined);
-        
-        if (result.success && result.output) {
-            // Save context brief
-            const briefDir = path.join(
-                this.stateManager.getPlanFolder(this.sessionId),
-                'context'
-            );
-            if (!fs.existsSync(briefDir)) {
-                fs.mkdirSync(briefDir, { recursive: true });
-            }
-            
-            this.contextBriefPath = path.join(briefDir, `${this.taskId}_brief.md`);
-            fs.writeFileSync(this.contextBriefPath, result.output);
-            this.log(`✓ Context brief saved: ${this.taskId}_brief.md`);
-        } else {
-            this.log(`⚠️ Context gathering failed, continuing without brief`);
-        }
-        
-        // Note: Agent is automatically released by runAgentTask/runAgentTaskWithCallback
-    }
-    
     private async executeImplementPhase(): Promise<void> {
         const iteration = this.reviewIterations > 0 
             ? ` (revision ${this.reviewIterations})` 
@@ -301,7 +273,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         
         this.log(`Running engineer ${this.engineerName} (${role?.defaultModel || 'sonnet-4.5'})...`);
         
-        // Use pre-allocated engineer (don't request/release in runAgentTaskWithCallback)
+        // Use pre-allocated engineer - pass agentName to avoid requesting a new one
         const result = await this.runAgentTaskWithCallback(
             `implement_${this.taskId}`,
             prompt,
@@ -310,7 +282,8 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
                 expectedStage: 'implementation',
                 timeout: role?.timeoutMs || 600000,
                 model: role?.defaultModel,
-                cwd: this.stateManager.getWorkspaceRoot()
+                cwd: this.stateManager.getWorkspaceRoot(),
+                agentName: this.engineerName  // Use the pre-allocated engineer
             }
         );
         
@@ -354,7 +327,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         
         this.log(`Running code reviewer ${this.reviewerName} (${role?.defaultModel || 'sonnet-4.5'})...`);
         
-        // Use pre-allocated reviewer (don't request/release in runAgentTaskWithCallback)
+        // Use pre-allocated reviewer - pass agentName to avoid requesting a new one
         const result = await this.runAgentTaskWithCallback(
             `review_${this.taskId}`,
             prompt,
@@ -363,7 +336,8 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
                 expectedStage: 'review',
                 timeout: role?.timeoutMs || 600000,
                 model: role?.defaultModel,
-                cwd: this.stateManager.getWorkspaceRoot()
+                cwd: this.stateManager.getWorkspaceRoot(),
+                agentName: this.reviewerName  // Use the pre-allocated reviewer
             }
         );
         
@@ -443,12 +417,12 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         
         this.log(`Running context gatherer ${this.contextGathererName} in delta mode (${role?.defaultModel || 'gemini-3-pro'})...`);
         
-        // Use allocated context gatherer
+        // Use pre-allocated context gatherer
         const result = await this.runAgentTask(
             'delta_context', 
             prompt, 
             role, 
-            undefined
+            this.contextGathererName  // Pass pre-allocated agent
         );
         
         if (result.success) {
@@ -531,37 +505,6 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     // =========================================================================
     // PROMPT BUILDERS
     // =========================================================================
-    
-    /**
-     * @deprecated Context phase removed - coordinator provides context via task metadata.
-     * Use ContextGatheringWorkflow for explicit context gathering.
-     */
-    private buildContextPrompt(role: AgentRole | undefined): string {
-        if (!role?.promptTemplate) {
-            throw new Error('Missing prompt template for context_gatherer role');
-        }
-        const basePrompt = role.promptTemplate;
-        
-        return `${basePrompt}
-
-## Task
-${this.taskId}: ${this.taskDescription}
-
-## Dependencies
-${this.dependencies.length > 0 ? this.dependencies.join(', ') : 'None'}
-
-## Plan File
-Read the plan if you need more context: ${this.planPath}
-
-## Your Task
-Gather context relevant to implementing this task:
-1. Find existing code patterns to follow
-2. Identify integration points
-3. Note any risks or constraints
-
-## Output
-Provide a focused context brief in markdown format.`;
-    }
     
     private buildImplementPrompt(role: AgentRole | undefined): string {
         if (!role?.promptTemplate) {
@@ -696,7 +639,7 @@ Keep updates concise and focused on what changed.`;
         taskId: string,
         prompt: string,
         role: AgentRole | undefined,
-        _agentName?: string // Kept for API compatibility but unused
+        preAllocatedAgentName?: string // Use pre-allocated agent if provided
     ): Promise<{ success: boolean; output: string }> {
         const workspaceRoot = this.stateManager.getWorkspaceRoot();
         const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
@@ -705,8 +648,11 @@ Keep updates concise and focused on what changed.`;
             fs.mkdirSync(logDir, { recursive: true });
         }
         
-        // Request agent through normal allocation flow
-        const agentName = await this.requestAgent(role?.id || 'engineer');
+        // Use pre-allocated agent if provided, otherwise request a new one
+        const agentName = preAllocatedAgentName || await this.requestAgent(role?.id || 'engineer');
+        if (preAllocatedAgentName) {
+            this.log(`  Using pre-allocated agent: ${agentName} (role: ${role?.id || 'unknown'})`);
+        }
         
         // Use workflow ID + agent name for unique temp log file
         const logFile = path.join(logDir, `${this.id}_${agentName}.log`);

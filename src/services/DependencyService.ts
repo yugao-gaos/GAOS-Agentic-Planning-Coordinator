@@ -288,7 +288,7 @@ export class DependencyService {
             // On Windows, cursor-agent runs in WSL, so check WSL home directory
             try {
                 const { execSync } = require('child_process');
-                const wslUsername = execSync('wsl -d Ubuntu bash -c "whoami"', { encoding: 'utf8' }).trim();
+                const wslUsername = execSync('wsl -d Ubuntu bash -c "whoami"', { encoding: 'utf8', windowsHide: true }).trim();
                 mcpConfigPaths = [
                     // WSL home directory (where cursor-agent actually runs)
                     `\\\\wsl$\\Ubuntu\\home\\${wslUsername}\\.cursor\\mcp.json`,
@@ -679,9 +679,9 @@ export class DependencyService {
      * 4. If authenticated: Run normal connectivity test
      * 
      * @param interactive If true, opens terminal for login when needed
-     * @param timeoutMs Timeout for connectivity test (default: 15000)
+     * @param timeoutMs Timeout for connectivity test (default: 30000)
      */
-    async testUnityMcpConnectionSmart(interactive: boolean = false, tryCreateTempScene: boolean = false, timeoutMs: number = 15000): Promise<UnityMcpConnectivityResult> {
+    async testUnityMcpConnectionSmart(interactive: boolean = false, tryCreateTempScene: boolean = false, timeoutMs: number = 30000): Promise<UnityMcpConnectivityResult> {
         try {
             const agentRunner = ServiceLocator.resolve(AgentRunner);
             const backend = agentRunner['backend'] as CursorAgentRunner; // Access private backend (CursorAgentRunner)
@@ -745,9 +745,9 @@ export class DependencyService {
      * NOTE: This should only be called in daemon context (caller should check ServiceLocator.isRegistered(AgentRunner))
      * 
      * @param tryCreateTempScene If true, also creates _TempCompileCheck.unity scene via MCP if missing
-     * @param timeoutMs Timeout in milliseconds (default: 15000)
+     * @param timeoutMs Timeout in milliseconds (default: 30000)
      */
-    private async testUnityMcpConnectionViaAgent(tryCreateTempScene: boolean = false, timeoutMs: number = 15000): Promise<UnityMcpConnectivityResult> {
+    private async testUnityMcpConnectionViaAgent(tryCreateTempScene: boolean = false, timeoutMs: number = 30000): Promise<UnityMcpConnectivityResult> {
         try {
             const agentRunner = ServiceLocator.resolve(AgentRunner);
             
@@ -761,7 +761,7 @@ export class DependencyService {
                 };
             }
             
-            log.debug('Spawning connectivity test agent (timeout: 15s)...');
+            log.debug(`Spawning connectivity test agent (timeout: ${timeoutMs / 1000}s)...`);
             
             // Use unique ID to avoid conflicts with previous runs
             // ProcessManager kills previous process if same ID is reused
@@ -828,7 +828,7 @@ Reply now with ONLY "CONNECTED" or "ERROR: reason":`,
             if (!fs.existsSync(logsDir)) {
                 fs.mkdirSync(logsDir, { recursive: true });
             }
-            const debugLogPath = path.join(logsDir, `unity_mcp_test_${Date.now()}.log`);
+            const debugLogPath = path.join(logsDir, 'unity_mcp_test.log');
             
             const debugContent = `=== Unity MCP Connectivity Test Debug Log ===
 Timestamp: ${new Date().toISOString()}
@@ -1534,7 +1534,8 @@ Exit code is 0: ${result.exitCode === 0}
                         const { execSync } = require('child_process');
                         const getUserPath = `[Environment]::GetEnvironmentVariable("Path", "User")`;
                         const currentUserPath = execSync(`powershell -Command "${getUserPath}"`, {
-                            encoding: 'utf-8'
+                            encoding: 'utf-8',
+                            windowsHide: true
                         }).trim();
                         
                         // Check again in the actual User PATH (not just current session)
@@ -1543,7 +1544,7 @@ Exit code is 0: ${result.exitCode === 0}
                             const escapedCurrentPath = currentUserPath.replace(/\\/g, '\\\\');
                             const escapedTargetDir = targetDir.replace(/\\/g, '\\\\');
                             const setPathCmd = `[Environment]::SetEnvironmentVariable("Path", "${escapedCurrentPath};${escapedTargetDir}", "User")`;
-                            execSync(`powershell -Command "${setPathCmd}"`);
+                            execSync(`powershell -Command "${setPathCmd}"`, { windowsHide: true });
                             
                             return {
                                 success: true,

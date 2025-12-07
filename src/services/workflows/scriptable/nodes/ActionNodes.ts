@@ -429,7 +429,7 @@ export const LogNodeDefinition: INodeDefinition = {
     type: 'log',
     name: 'Log',
     description: 'Log a message for debugging or monitoring',
-    category: 'actions',
+    category: 'annotation',
     icon: 'output',
     color: '#9E9E9E',
     defaultInputs: [

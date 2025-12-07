@@ -448,6 +448,36 @@ export const statusBarStyles = `
     flex-shrink: 0;
 }
 
+/* Coordinator actions container */
+.coordinator-actions {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+    padding-left: 8px;
+}
+
+/* Coordinator icon buttons */
+.coord-icon-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    font-size: 12px;
+    background: transparent;
+    border: 1px solid var(--vscode-widget-border);
+    border-radius: 3px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    opacity: 0.7;
+}
+
+.coord-icon-btn:hover {
+    background: var(--vscode-list-hoverBackground);
+    border-color: var(--vscode-focusBorder);
+    opacity: 1;
+}
+
 /* Legacy ready-info styles for compatibility */
 .ready-info {
     display: flex;

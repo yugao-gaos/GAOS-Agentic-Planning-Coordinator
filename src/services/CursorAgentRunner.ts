@@ -1124,7 +1124,7 @@ export class CursorAgentRunner implements IAgentBackend {
                 const { execSync } = require('child_process');
                 const result = execSync(
                     'wsl -d Ubuntu bash -c "if [ -f ~/.local/bin/cursor-agent ]; then ~/.local/bin/cursor-agent --version 2>&1; else echo NOT_FOUND; fi"',
-                    { encoding: 'utf8', stdio: 'pipe', timeout: 5000 }
+                    { encoding: 'utf8', stdio: 'pipe', timeout: 5000, windowsHide: true }
                 );
                 
                 // Check if it returned a version (not NOT_FOUND)
@@ -1134,7 +1134,7 @@ export class CursorAgentRunner implements IAgentBackend {
                 return false;
             } else {
                 // On macOS/Linux, check if cursor-agent is in PATH
-                execSync('which cursor-agent', { stdio: 'ignore' });
+                execSync('which cursor-agent', { stdio: 'ignore', windowsHide: true });
                 return true;
             }
         } catch {
@@ -1317,7 +1317,7 @@ export class CursorAgentRunner implements IAgentBackend {
             // Get the actual WSL username dynamically
             try {
                 const { execSync } = require('child_process');
-                const wslUsername = execSync('wsl -d Ubuntu bash -c "whoami"', { encoding: 'utf8' }).trim();
+                const wslUsername = execSync('wsl -d Ubuntu bash -c "whoami"', { encoding: 'utf8', windowsHide: true }).trim();
                 return `\\\\wsl$\\Ubuntu\\home\\${wslUsername}\\.cursor\\mcp.json`;
             } catch (error) {
                 const errorMsg = error instanceof Error ? error.message : String(error);

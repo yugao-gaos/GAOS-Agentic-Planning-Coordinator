@@ -46,24 +46,49 @@ const WORKFLOW_TYPE_INFO: Record<string, { icon: string; class: string; label: s
 
 /**
  * Get plan action buttons based on session status.
+ * Note: Revise/Approve buttons are now in the Plan Viewer panel.
+ * Sidebar only shows Open button + status-specific actions (Stop, Restart).
  */
-function getPlanButtons(status: string): string {
-    // Only show Revise/Approve when plan is ready for review
-    if (status === 'reviewing') {
-        return `
-            <button class="sub-item-btn" data-action="revisePlan">Revise</button>
-            <button class="sub-item-btn primary" data-action="approvePlan">Approve</button>
-        `;
-    }
+function getPlanButtons(status: string, hasPartialPlan?: boolean): string {
     // Planning in progress - show stop button
     if (status === 'planning') {
-        return `<button class="sub-item-btn danger" data-action="stopExecution">Stop</button>`;
+        return `
+            <button class="sub-item-btn" data-action="openPlan" title="Open Plan Viewer">Open</button>
+            <button class="sub-item-btn danger" data-action="stopExecution">Stop</button>
+        `;
     }
+    // Revising in progress - show stop button
     if (status === 'revising') {
-        return `<button class="sub-item-btn danger" data-action="stopRevision">Stop</button>`;
+        return `
+            <button class="sub-item-btn" data-action="openPlan" title="Open Plan Viewer">Open</button>
+            <button class="sub-item-btn danger" data-action="stopRevision">Stop</button>
+        `;
     }
+    // Plan ready for review - show Open button (Revise/Approve are in Plan Viewer)
+    if (status === 'reviewing') {
+        if (hasPartialPlan) {
+            return `
+                <button class="sub-item-btn" data-action="openPlan" title="Open Plan Viewer">Open</button>
+                <button class="sub-item-btn" data-action="restartPlanning" title="Restart planning from beginning">Restart</button>
+            `;
+        }
+        return `<button class="sub-item-btn primary" data-action="openPlan" title="Open Plan Viewer">Open</button>`;
+    }
+    // Approved - show Open button (Revise is in Plan Viewer)
     if (status === 'approved') {
-        return `<button class="sub-item-btn" data-action="revisePlan">Revise</button>`;
+        return `<button class="sub-item-btn" data-action="openPlan" title="Open Plan Viewer">Open</button>`;
+    }
+    // Completed
+    if (status === 'completed') {
+        return `<button class="sub-item-btn" data-action="openPlan" title="Open Plan Viewer">Open</button>`;
+    }
+    // Executing
+    if (status === 'executing') {
+        return `<button class="sub-item-btn" data-action="openPlan" title="Open Plan Viewer">Open</button>`;
+    }
+    // No plan - show restart button
+    if (status === 'no_plan') {
+        return `<button class="sub-item-btn primary" data-action="restartPlanning">Restart Planning</button>`;
     }
     return '';
 }
@@ -313,7 +338,7 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
         ? session.requirement.substring(0, 40) + '...' 
         : session.requirement;
     
-    const planButtons = getPlanButtons(session.status);
+    const planButtons = getPlanButtons(session.status, session.hasPartialPlan);
     const hasExecution = !!(session.executionStatus || (session.activeWorkflows && session.activeWorkflows.length > 0));
     const execInfo = getExecutionInfo(session.status, hasExecution);
     const planBadgeClass = getPlanBadgeClass(session.planStatus);
@@ -345,7 +370,7 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
             <div class="session-body ${isExpanded ? 'expanded' : ''}">
                 
                 <!-- Plan sub-item -->
-                <div class="sub-item" data-action="openPlan">
+                <div class="sub-item" data-action="openPlan"${session.hasPartialPlan && session.interruptReason ? ` title="Plan interrupted: ${escapeHtml(session.interruptReason)}"` : ''}>
                     <div class="sub-item-icon">${ICONS.document}</div>
                     <span class="sub-item-label">
                         Plan V${session.planVersion} 

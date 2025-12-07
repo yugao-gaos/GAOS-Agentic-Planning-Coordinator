@@ -26,11 +26,17 @@ interface CustomWorkflowInfo {
     /** Workflow type ID (e.g., 'custom:my_workflow') */
     workflowType: string;
     
-    /** Parsed graph (cached) */
+    /** Parsed graph (cached) - may be partial if validation failed */
     graph: INodeGraph;
     
     /** Last modified time */
     lastModified: number;
+    
+    /** Whether the workflow passed validation */
+    isValid: boolean;
+    
+    /** Validation error message if invalid */
+    validationError?: string;
 }
 
 /**
@@ -139,60 +145,95 @@ export class ScriptableWorkflowRegistry {
         
         log.debug(`Loading workflow from: ${filePath}`);
         
-        // Load and parse the graph
-        const graph = await this.graphLoader.load(filePath);
-        
-        // Generate workflow type ID
-        const workflowType = this.getWorkflowTypeId(graph.name);
-        
         // Get file stats
         const stats = fs.statSync(filePath);
         
-        // Store info
-        const info: CustomWorkflowInfo = {
-            filePath,
-            workflowType,
-            graph,
-            lastModified: stats.mtimeMs
-        };
+        let graph: INodeGraph;
+        let isValid = true;
+        let validationError: string | undefined;
+        
+        try {
+            // Load and parse the graph (includes validation)
+            graph = await this.graphLoader.load(filePath);
+        } catch (error) {
+            // Validation failed - try to load without validation for display purposes
+            validationError = error instanceof Error ? error.message : String(error);
+            isValid = false;
+            log.warn(`Workflow validation failed for ${filePath}: ${validationError}`);
+            
+            // Try to load raw YAML for display
+            try {
+                graph = await this.graphLoader.loadRaw(filePath);
+            } catch {
+                // Can't even parse YAML - create minimal placeholder
+                const fileName = path.basename(filePath, path.extname(filePath));
+                graph = {
+                    name: fileName,
+                    version: '1.0',
+                    description: 'Failed to parse workflow file',
+                    parameters: [],
+                    variables: [],
+                    nodes: [],
+                    connections: []
+                };
+            }
+        }
+        
+        // Generate workflow type ID
+        const workflowType = this.getWorkflowTypeId(graph.name);
         
         // Unregister if already exists
         if (this.customWorkflows.has(workflowType)) {
             this.workflowRegistry.unregister(workflowType as WorkflowType);
         }
         
+        // Store info (even if invalid, so it shows in the list)
+        const info: CustomWorkflowInfo = {
+            filePath,
+            workflowType,
+            graph,
+            lastModified: stats.mtimeMs,
+            isValid,
+            validationError
+        };
+        
         this.customWorkflows.set(workflowType, info);
         
-        // Create factory function
-        const factory = (config: WorkflowConfig, services: WorkflowServices) => {
-            return new ScriptableNodeWorkflow(
-                {
-                    ...config,
-                    input: {
-                        ...config.input,
-                        graphPath: filePath
-                    }
-                },
-                services
+        // Only register with workflow registry if valid (so it can be executed)
+        if (isValid) {
+            // Create factory function
+            const factory = (config: WorkflowConfig, services: WorkflowServices) => {
+                return new ScriptableNodeWorkflow(
+                    {
+                        ...config,
+                        input: {
+                            ...config.input,
+                            graphPath: filePath
+                        }
+                    },
+                    services
+                );
+            };
+            
+            // Build metadata
+            const metadata: Partial<WorkflowMetadata> = {
+                name: graph.name,
+                requiresUnity: this.checkRequiresUnity(graph),
+                requiresCompleteDependencies: true,
+                coordinatorPrompt: this.generateCoordinatorPrompt(graph)
+            };
+            
+            // Register with workflow registry
+            this.workflowRegistry.register(
+                workflowType as WorkflowType,
+                factory,
+                metadata
             );
-        };
-        
-        // Build metadata
-        const metadata: Partial<WorkflowMetadata> = {
-            name: graph.name,
-            requiresUnity: this.checkRequiresUnity(graph),
-            requiresCompleteDependencies: true,
-            coordinatorPrompt: this.generateCoordinatorPrompt(graph)
-        };
-        
-        // Register with workflow registry
-        this.workflowRegistry.register(
-            workflowType as WorkflowType,
-            factory,
-            metadata
-        );
-        
-        log.info(`Registered custom workflow: ${workflowType} (${graph.nodes.length} nodes)`);
+            
+            log.info(`Registered custom workflow: ${workflowType} (${graph.nodes.length} nodes)`);
+        } else {
+            log.info(`Stored invalid workflow for editing: ${workflowType}`);
+        }
     }
     
     /**
@@ -324,6 +365,19 @@ export class ScriptableWorkflowRegistry {
     }
     
     /**
+     * Check if a workflow file already exists for the given name
+     */
+    workflowFileExists(name: string): string | null {
+        const safeName = name
+            .toLowerCase()
+            .replace(/[^a-z0-9]+/g, '_')
+            .replace(/^_+|_+$/g, '');
+        
+        const filePath = path.join(this.basePath, `${safeName}.yaml`);
+        return fs.existsSync(filePath) ? filePath : null;
+    }
+    
+    /**
      * Create a new workflow YAML file from template
      */
     async createWorkflowTemplate(name: string): Promise<string> {
@@ -354,16 +408,7 @@ nodes:
     type: start
     position:
       x: 100
-      y: 100
-
-  - id: log_start
-    type: log
-    config:
-      message: "Workflow started: ${name}"
-      level: info
-    position:
-      x: 300
-      y: 100
+      y: 200
 
   - id: end
     type: end
@@ -371,19 +416,26 @@ nodes:
       outputKey: result
       success: true
     position:
-      x: 500
-      y: 100
+      x: 400
+      y: 200
 
 connections:
   - from: start.trigger
-    to: log_start.trigger
-  - from: log_start.trigger
     to: end.trigger
 `;
         
         await fs.promises.writeFile(filePath, template, 'utf-8');
         
         log.info(`Created workflow template: ${filePath}`);
+        
+        // Explicitly register the workflow instead of waiting for file watcher
+        // This ensures the workflow is immediately available
+        try {
+            await this.registerWorkflowFile(filePath);
+            log.info(`Workflow registered: ${filePath}`);
+        } catch (regError) {
+            log.warn(`Failed to register new workflow (will retry via watcher): ${regError}`);
+        }
         
         return filePath;
     }

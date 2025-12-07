@@ -312,24 +312,37 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
         this.log('');
         this.log('📋 PHASE: FINALIZATION');
         
-        const role = this.getRole('planner');
+        const role = this.getRole('text_clerk');
         const prompt = this.buildFinalizationPrompt(role);
         
-        this.log('Running planner finalization...');
+        this.log(`Running text_clerk finalization (${role?.defaultModel || 'auto'})...`);
         
-        // Stream finalized plan directly to plan file
-        const result = await this.runAgentTask('planner_finalize', prompt, role, true);
-        
-        if (result.success) {
-            // Plan was streamed to file; verify it exists
-            if (!fs.existsSync(this.planPath)) {
-                throw new Error(
-                    `Plan finalization streaming failed: expected plan file at '${this.planPath}' not created. ` +
-                    `This indicates the agent did not properly stream the plan to the file. ` +
-                    `Check agent logs for streaming errors.`
-                );
+        // Use runAgentTaskWithCallback for proper completion signaling
+        const result = await this.runAgentTaskWithCallback(
+            'plan_finalize',
+            prompt,
+            'text_clerk',
+            {
+                expectedStage: 'finalization',
+                timeout: role?.timeoutMs || 120000,  // 2 minutes
+                model: role?.defaultModel,
+                cwd: this.stateManager.getWorkspaceRoot()
             }
-            this.log('✓ Revision finalized');
+        );
+        
+        if (result.fromCallback) {
+            this.log(`✓ Finalization completed via CLI callback: ${result.result}`);
+        } else {
+            // Fallback: process exited without callback
+            this.log(`✓ Finalization completed (process exit)`);
+        }
+        
+        // Verify plan file exists
+        if (!fs.existsSync(this.planPath)) {
+            throw new Error(
+                `Plan finalization failed: expected plan file at '${this.planPath}' not found. ` +
+                `Check agent logs for errors.`
+            );
         }
         
         // Update plan status
@@ -434,20 +447,33 @@ Review the revised plan and verify it addresses the user's feedback.
     }
     
     private buildFinalizationPrompt(role: AgentRole | undefined): string {
-        return `You are finalizing the revised execution plan.
+        const basePrompt = role?.promptTemplate || 'You are a Text Clerk agent for document formatting.';
+        
+        return `${basePrompt}
 
 ## Plan File
 Read and modify: ${this.planPath}
 
-## Codex Review
-${this.analystOutput || 'No review available'}
+## Codex Review Feedback
+${this.analystOutput || 'No review feedback - just ensure formatting is correct.'}
 
 ## Instructions
 1. Read the plan file using read_file
 2. Ensure all tasks use checkbox format: - [ ] **T{N}**: Description | Deps: X | Engineer: TBD
-3. Address any minor suggestions from the review
-4. Update status to "READY FOR REVIEW (Revised)"
-5. Write the finalized plan back using write tool`;
+3. Address any MINOR suggestions from the review (ignore CRITICAL - those need human review)
+4. Update status to "📋 READY FOR REVIEW (Revised)"
+5. Write the finalized plan back using write tool
+
+## Important
+- Do NOT change the plan content or strategy
+- Only fix formatting and apply minor suggestions
+- Be quick - this is a cleanup task
+
+## Completion (REQUIRED)
+After finishing, signal completion:
+\`\`\`bash
+apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage finalization --result success
+\`\`\``;
     }
     
     // =========================================================================

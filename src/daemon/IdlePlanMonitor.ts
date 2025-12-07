@@ -129,9 +129,26 @@ export class IdlePlanMonitor {
             const sessionState = this.coordinator.getSessionState(session.id);
             const hasActiveWorkflows = sessionState?.activeWorkflows && sessionState.activeWorkflows.size > 0;
             
-            if (hasActiveWorkflows) {
-                this.log(`Startup: Skipping ${session.id} - has active workflows`);
+            // Check if any workflows are actually running (not just paused)
+            // If all workflows are paused, we should still trigger evaluation so coordinator can resume them
+            let hasRunningWorkflows = false;
+            if (sessionState?.activeWorkflows) {
+                for (const progress of sessionState.activeWorkflows.values()) {
+                    if (progress.status === 'running' || progress.status === 'pending') {
+                        hasRunningWorkflows = true;
+                        break;
+                    }
+                }
+            }
+            
+            if (hasActiveWorkflows && hasRunningWorkflows) {
+                this.log(`Startup: Skipping ${session.id} - has running workflows`);
                 continue;
+            }
+            
+            // Log if we're triggering for paused workflows
+            if (hasActiveWorkflows && !hasRunningWorkflows) {
+                this.log(`Startup: Session ${session.id} has paused workflows - triggering coordinator to decide on resume`);
             }
             
             // Trigger coordinator
@@ -210,6 +227,20 @@ export class IdlePlanMonitor {
                 const activeWorkflowCount = sessionState?.activeWorkflows?.size || 0;
                 const hasActiveWorkflows = activeWorkflowCount > 0;
                 
+                // Check if any workflows are actually running vs all paused
+                let runningWorkflowCount = 0;
+                let pausedWorkflowCount = 0;
+                if (sessionState?.activeWorkflows) {
+                    for (const progress of sessionState.activeWorkflows.values()) {
+                        if (progress.status === 'running' || progress.status === 'pending') {
+                            runningWorkflowCount++;
+                        } else if (progress.status === 'paused') {
+                            pausedWorkflowCount++;
+                        }
+                    }
+                }
+                const hasOnlyPausedWorkflows = hasActiveWorkflows && runningWorkflowCount === 0 && pausedWorkflowCount > 0;
+                
                 // Check if there are ready tasks (tasks with all dependencies met)
                 let readyTasks: any[] = [];
                 let hasReadyTasks = false;
@@ -224,19 +255,20 @@ export class IdlePlanMonitor {
                 }
                 
                 // Determine if we should track this plan for coordination
-                // Track if: (1) No workflows (idle), OR (2) Has ready tasks that could use available agents
-                const shouldTrack = !hasActiveWorkflows || hasReadyTasks;
+                // Track if: (1) No workflows (idle), OR (2) Has ready tasks, OR (3) Has only paused workflows (coordinator decides to resume)
+                const shouldTrack = !hasActiveWorkflows || hasReadyTasks || hasOnlyPausedWorkflows;
                 
                 if (!shouldTrack) {
-                    // Has workflows but no ready tasks - nothing for coordinator to do
+                    // Has running workflows but no ready tasks - nothing for coordinator to do
                     this.idlePlans.delete(session.id);
                     continue;
                 }
                 
                 // Determine appropriate threshold based on situation
                 // - Fully idle (no workflows): 60s threshold (less urgent, avoid spam)
-                // - Has workflows + ready tasks: 0s threshold (immediate - maximize parallelization)
-                const threshold = hasActiveWorkflows ? 0 : IdlePlanMonitor.IDLE_THRESHOLD_MS;
+                // - Has workflows + ready tasks OR has paused workflows: 0s threshold (immediate)
+                const needsImmediateTrigger = (hasActiveWorkflows && hasReadyTasks) || hasOnlyPausedWorkflows;
+                const threshold = needsImmediateTrigger ? 0 : IdlePlanMonitor.IDLE_THRESHOLD_MS;
                 
                 // Get or create tracking state for this plan
                 let planState = this.idlePlans.get(session.id);
@@ -250,9 +282,14 @@ export class IdlePlanMonitor {
                     };
                     this.idlePlans.set(session.id, planState);
                     
-                    const reason = hasActiveWorkflows 
-                        ? `has ${activeWorkflowCount} workflows + ${readyTasks.length} ready tasks`
-                        : 'idle (no workflows)';
+                    let reason: string;
+                    if (hasOnlyPausedWorkflows) {
+                        reason = `has ${pausedWorkflowCount} paused workflow(s) - coordinator will decide on resume`;
+                    } else if (hasActiveWorkflows) {
+                        reason = `has ${activeWorkflowCount} workflows + ${readyTasks.length} ready tasks`;
+                    } else {
+                        reason = 'idle (no workflows)';
+                    }
                     this.log(`Tracking plan: ${session.id} (${reason})`);
                     continue;  // Don't trigger on first detection
                 }
@@ -275,9 +312,14 @@ export class IdlePlanMonitor {
                 }
                 
                 // Trigger coordinator evaluation
-                const reason = hasActiveWorkflows
-                    ? `${readyTasks.length} ready tasks with ${availableAgents.length} available agents (${activeWorkflowCount} workflows running)`
-                    : `idle for ${Math.round(timeSinceTracking / 1000)}s with ${availableAgents.length} available agents`;
+                let reason: string;
+                if (hasOnlyPausedWorkflows) {
+                    reason = `${pausedWorkflowCount} paused workflow(s) awaiting coordinator decision with ${availableAgents.length} available agents`;
+                } else if (hasActiveWorkflows) {
+                    reason = `${readyTasks.length} ready tasks with ${availableAgents.length} available agents (${runningWorkflowCount} workflows running)`;
+                } else {
+                    reason = `idle for ${Math.round(timeSinceTracking / 1000)}s with ${availableAgents.length} available agents`;
+                }
                 
                 this.log(`Triggering coordinator for ${session.id}: ${reason}`);
                 

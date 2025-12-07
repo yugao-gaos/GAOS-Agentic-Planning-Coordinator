@@ -197,6 +197,167 @@ export const ContextNodeExecutor: NodeExecutor = async (
 };
 
 // ============================================================================
+// Formatter Node
+// ============================================================================
+
+export const FormatterNodeDefinition: INodeDefinition = {
+    type: 'formatter',
+    name: 'Formatter',
+    description: 'Format and transform data using templates or expressions',
+    category: 'data',
+    icon: 'text-format',
+    color: '#9C27B0',
+    defaultInputs: [
+        {
+            id: 'trigger',
+            name: 'Trigger',
+            dataType: 'trigger',
+            description: 'Execution flow trigger'
+        },
+        {
+            id: 'data',
+            name: 'Data',
+            dataType: 'any',
+            description: 'Input data to format'
+        }
+    ],
+    defaultOutputs: [
+        {
+            id: 'result',
+            name: 'Result',
+            dataType: 'string',
+            description: 'Formatted output'
+        },
+        {
+            id: 'done',
+            name: 'Done',
+            dataType: 'trigger',
+            description: 'Execution flow continues after formatting'
+        }
+    ],
+    configSchema: {
+        fields: [
+            {
+                name: 'mode',
+                type: 'select',
+                label: 'Format Mode',
+                description: 'How to format the data',
+                options: [
+                    { value: 'template', label: 'Template String' },
+                    { value: 'json', label: 'JSON Stringify' },
+                    { value: 'join', label: 'Join Array' },
+                    { value: 'extract', label: 'Extract Property' },
+                    { value: 'regex', label: 'Regex Replace' }
+                ],
+                defaultValue: 'template'
+            },
+            {
+                name: 'template',
+                type: 'template',
+                label: 'Template',
+                description: 'Template string with {{variable}} placeholders (template mode)'
+            },
+            {
+                name: 'separator',
+                type: 'string',
+                label: 'Separator',
+                description: 'Separator for join mode',
+                defaultValue: ', '
+            },
+            {
+                name: 'propertyPath',
+                type: 'string',
+                label: 'Property Path',
+                description: 'Dot-notation path to extract (e.g., user.name)'
+            },
+            {
+                name: 'regexPattern',
+                type: 'string',
+                label: 'Regex Pattern',
+                description: 'Regular expression pattern'
+            },
+            {
+                name: 'regexReplace',
+                type: 'string',
+                label: 'Replacement',
+                description: 'Replacement string for regex'
+            },
+            {
+                name: 'prettyPrint',
+                type: 'boolean',
+                label: 'Pretty Print',
+                description: 'Format JSON with indentation',
+                defaultValue: true
+            }
+        ]
+    }
+};
+
+export const FormatterNodeExecutor: NodeExecutor = async (
+    node: INodeInstance,
+    inputs: Record<string, any>,
+    context: IExecutionContextAPI
+): Promise<Record<string, any>> => {
+    const mode = node.config.mode || 'template';
+    const data = inputs.data;
+    
+    let result: string;
+    
+    switch (mode) {
+        case 'template': {
+            const template = node.config.template || '';
+            result = context.renderTemplate(template);
+            break;
+        }
+        case 'json': {
+            const prettyPrint = node.config.prettyPrint !== false;
+            result = JSON.stringify(data, null, prettyPrint ? 2 : 0);
+            break;
+        }
+        case 'join': {
+            const separator = node.config.separator ?? ', ';
+            if (!Array.isArray(data)) {
+                throw new Error('Join mode requires an array input');
+            }
+            result = data.join(separator);
+            break;
+        }
+        case 'extract': {
+            const path = node.config.propertyPath || '';
+            const parts = path.split('.');
+            let value: any = data;
+            for (const part of parts) {
+                if (value === null || value === undefined) {
+                    throw new Error(`Cannot read property '${part}' of ${value}`);
+                }
+                value = value[part];
+            }
+            result = typeof value === 'string' ? value : JSON.stringify(value);
+            break;
+        }
+        case 'regex': {
+            const pattern = node.config.regexPattern;
+            const replacement = node.config.regexReplace || '';
+            if (!pattern) {
+                throw new Error('Regex pattern is required');
+            }
+            const regex = new RegExp(pattern, 'g');
+            result = String(data).replace(regex, replacement);
+            break;
+        }
+        default:
+            throw new Error(`Unknown format mode: ${mode}`);
+    }
+    
+    context.log(`Formatted data using ${mode} mode`, 'debug');
+    
+    return {
+        result,
+        done: true
+    };
+};
+
+// ============================================================================
 // Variable Node
 // ============================================================================
 
@@ -204,7 +365,7 @@ export const VariableNodeDefinition: INodeDefinition = {
     type: 'variable',
     name: 'Variable',
     description: 'Get or set a workflow variable',
-    category: 'data',
+    category: 'actions',
     icon: 'symbol-variable',
     color: '#8BC34A',
     defaultInputs: [
@@ -314,8 +475,8 @@ export const SubgraphNodeDefinition: INodeDefinition = {
     type: 'subgraph',
     name: 'Subgraph',
     description: 'Execute another workflow as a sub-workflow',
-    category: 'data',
-    icon: 'git-merge',
+    category: 'actions',
+    icon: 'workflow',
     color: '#673AB7',
     defaultInputs: [
         {
@@ -405,6 +566,7 @@ export const SubgraphNodeExecutor: NodeExecutor = async (
 export function registerDataNodes(): void {
     nodeRegistry.register(KnowledgeNodeDefinition, KnowledgeNodeExecutor);
     nodeRegistry.register(ContextNodeDefinition, ContextNodeExecutor);
+    nodeRegistry.register(FormatterNodeDefinition, FormatterNodeExecutor);
     nodeRegistry.register(VariableNodeDefinition, VariableNodeExecutor);
     nodeRegistry.register(SubgraphNodeDefinition, SubgraphNodeExecutor);
 }

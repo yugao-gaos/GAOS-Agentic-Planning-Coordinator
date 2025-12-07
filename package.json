@@ -127,6 +127,16 @@
         "title": "Agentic: Install CLI (apc command)"
       },
       {
+        "command": "agenticPlanning.openDependencyMap",
+        "title": "Agentic: Open Task Dependency Map",
+        "icon": "$(type-hierarchy)"
+      },
+      {
+        "command": "agenticPlanning.openGlobalDependencyMap",
+        "title": "Agentic: Open Global Task Dependencies",
+        "icon": "$(globe)"
+      },
+      {
         "command": "agenticPlanning.uninstallCli",
         "title": "Agentic: Uninstall CLI"
       },

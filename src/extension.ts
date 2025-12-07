@@ -891,6 +891,15 @@ Let's get started!`;
             DependencyMapPanel.show(sessionId, context.extensionUri, vsCodeClient);
         }),
         
+        // Global dependency map command - shows all tasks from all sessions
+        vscode.commands.registerCommand('agenticPlanning.openGlobalDependencyMap', async () => {
+            // Get any session as fallback (global view fetches all tasks anyway)
+            const sessions = await daemonStateProxy.getPlanningSessions();
+            const sessionId = sessions.length > 0 ? sessions[0].id : 'global';
+            
+            DependencyMapPanel.show(sessionId, context.extensionUri, vsCodeClient, 'global');
+        }),
+        
         // History view command - shows all workflow history for a session
         vscode.commands.registerCommand('agenticPlanning.openHistoryView', async (args?: { sessionId?: string }) => {
             let sessionId = args?.sessionId;

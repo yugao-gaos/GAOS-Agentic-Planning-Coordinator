@@ -18,8 +18,8 @@ export const BranchNodeDefinition: INodeDefinition = {
     type: 'branch',
     name: 'Branch',
     description: 'Split execution into multiple parallel branches (1 → N)',
-    category: 'parallel',
-    icon: 'git-branch',
+    category: 'flow',
+    icon: 'split',
     color: '#00BCD4',
     defaultInputs: [
         {
@@ -127,27 +127,27 @@ export const SyncNodeDefinition: INodeDefinition = {
     type: 'sync',
     name: 'Sync',
     description: 'Wait for multiple parallel branches to complete (N → 1)',
-    category: 'parallel',
-    icon: 'git-merge',
+    category: 'flow',
+    icon: 'merge',
     color: '#00BCD4',
     defaultInputs: [
         {
             id: 'in_0',
             name: 'Branch 0',
-            dataType: 'any',
-            description: 'Input from first branch'
+            dataType: 'trigger',
+            description: 'Execution input from first branch'
         },
         {
             id: 'in_1',
             name: 'Branch 1',
-            dataType: 'any',
-            description: 'Input from second branch'
+            dataType: 'trigger',
+            description: 'Execution input from second branch'
         },
         {
             id: 'in_2',
             name: 'Branch 2',
-            dataType: 'any',
-            description: 'Input from third branch'
+            dataType: 'trigger',
+            description: 'Execution input from third branch'
         }
     ],
     defaultOutputs: [

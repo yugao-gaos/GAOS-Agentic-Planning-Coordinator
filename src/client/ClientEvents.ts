@@ -192,15 +192,27 @@ export interface AgentErrorEventData {
 
 /**
  * Pool changed event data
+ * 
+ * Agent lifecycle states:
+ * - available: Ready to be allocated
+ * - allocated: On bench, assigned to workflow but waiting for work
+ * - busy: Actively working on a task
+ * - resting: In cooldown after release (5 seconds) before becoming available
  */
 export interface PoolChangedEventData {
     totalAgents: number;
     available: string[];
+    allocated: Array<{
+        name: string;
+        workflowId: string;
+        roleId?: string;
+    }>;
     busy: Array<{
         name: string;
         coordinatorId: string;
         roleId?: string;
     }>;
+    resting: string[];
     changedAt: string;
 }
 
@@ -351,11 +363,20 @@ export interface DaemonShutdownEventData {
 }
 
 /**
+ * Daemon error event data (fatal errors that may cause shutdown)
+ */
+export interface DaemonErrorEventData {
+    fatal: boolean;
+    message: string;
+    timestamp: string;
+}
+
+/**
  * Client connected event data
  */
 export interface ClientConnectedEventData {
     clientId: string;
-    clientType: 'vscode' | 'tui' | 'headless' | 'unknown';
+    clientType: 'vscode' | 'tui' | 'headless' | 'cli' | 'unknown';
     connectedAt: string;
     totalClients: number;
 }
@@ -483,6 +504,7 @@ export interface ApcEventMap {
     'daemon.progress': DaemonProgressEventData;
     'daemon.ready': DaemonReadyEventData;
     'daemon.shutdown': DaemonShutdownEventData;
+    'daemon.error': DaemonErrorEventData;
     'client.connected': ClientConnectedEventData;
     'client.disconnected': ClientDisconnectedEventData;
     'error': ErrorEventData;

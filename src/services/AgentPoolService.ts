@@ -119,6 +119,30 @@ export class AgentPoolService {
     }
 
     /**
+     * Get agents in resting state (cooldown after release)
+     */
+    getRestingAgents(): string[] {
+        const state = this.stateManager.getAgentPoolState();
+        return state.resting ? Object.keys(state.resting) : [];
+    }
+
+    /**
+     * Get allocated agents (on bench, waiting for work)
+     */
+    getAllocatedAgents(): Array<{ name: string; roleId: string; sessionId: string; workflowId: string }> {
+        const state = this.stateManager.getAgentPoolState();
+        if (!state.allocated) {
+            return [];
+        }
+        return Object.entries(state.allocated).map(([name, info]) => ({
+            name,
+            roleId: info.roleId,
+            sessionId: info.sessionId,
+            workflowId: info.workflowId
+        }));
+    }
+
+    /**
      * Get agents by their assigned role
      */
     getAgentsByRole(roleId: string): Array<{ name: string; sessionId: string; task?: string }> {
@@ -238,7 +262,8 @@ export class AgentPoolService {
                         roleId,
                         allocatedAt: new Date().toISOString()
                     };
-                    log.debug(`${agent} allocated to workflow ${workflowId}'s BENCH for role ${roleId}`);
+                    // Enhanced logging for debugging agent allocation
+                    log.info(`🎯 ALLOCATED: ${agent} -> workflow=${workflowId.substring(0, 8)}... role=${roleId} session=${sessionId}`);
                 }
             }
 
@@ -281,7 +306,8 @@ export class AgentPoolService {
             startTime: new Date().toISOString()
         };
         
-        log.debug(`${agentName} promoted to BUSY for workflow ${workflowId}`);
+        // Enhanced logging for debugging
+        log.info(`⬆️ PROMOTED: ${agentName} -> BUSY | workflow=${workflowId.substring(0, 8)}... role=${allocatedInfo.roleId}`);
         this.stateManager.updateAgentPool(state);
         return true;
     }
@@ -307,6 +333,8 @@ export class AgentPoolService {
             workflowId: busyInfo.workflowId  // Keep workflow association
         };
         
+        // Enhanced logging for debugging
+        log.info(`⬇️ DEMOTED: ${agentName} -> BENCH | workflow=${busyInfo.workflowId?.substring(0, 8) || 'none'}... role=${busyInfo.roleId}`);
         this.stateManager.updateAgentPool(state);
         return true;
     }
@@ -404,6 +432,70 @@ export class AgentPoolService {
         }
 
         return toRelease;
+    }
+
+    // ========================================================================
+    // Orphan Agent Cleanup (for daemon restart recovery)
+    // ========================================================================
+    
+    /**
+     * Validate agent allocations against active workflows and release orphans
+     * 
+     * Called during daemon startup after workflows are restored.
+     * Agents allocated to workflows that couldn't be restored are released.
+     * 
+     * @param validWorkflowIds Set of workflow IDs that are currently active/restored
+     * @returns List of released agent names
+     */
+    releaseOrphanAllocatedAgents(validWorkflowIds: Set<string>): string[] {
+        const state = this.stateManager.getAgentPoolState();
+        const orphans: string[] = [];
+        
+        // Check allocated (bench) agents
+        if (state.allocated) {
+            for (const [name, info] of Object.entries(state.allocated)) {
+                if (!validWorkflowIds.has(info.workflowId)) {
+                    orphans.push(name);
+                    log.info(`Found orphan allocated agent: ${name} (workflow ${info.workflowId} not found)`);
+                }
+            }
+        }
+        
+        // Check busy agents
+        for (const [name, info] of Object.entries(state.busy)) {
+            if (!validWorkflowIds.has(info.workflowId)) {
+                orphans.push(name);
+                log.info(`Found orphan busy agent: ${name} (workflow ${info.workflowId} not found)`);
+            }
+        }
+        
+        // Release all orphans
+        if (orphans.length > 0) {
+            this.releaseAgents(orphans);
+            log.info(`Released ${orphans.length} orphan agent(s): ${orphans.join(', ')}`);
+        }
+        
+        return orphans;
+    }
+    
+    /**
+     * Get all workflow IDs that have allocated or busy agents
+     */
+    getActiveWorkflowIds(): Set<string> {
+        const state = this.stateManager.getAgentPoolState();
+        const workflowIds = new Set<string>();
+        
+        if (state.allocated) {
+            for (const info of Object.values(state.allocated)) {
+                workflowIds.add(info.workflowId);
+            }
+        }
+        
+        for (const info of Object.values(state.busy)) {
+            workflowIds.add(info.workflowId);
+        }
+        
+        return workflowIds;
     }
 
     // ========================================================================

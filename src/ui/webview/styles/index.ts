@@ -7,6 +7,7 @@ import { sessionStyles } from './sessions';
 import { workflowStyles } from './workflows';
 import { agentStyles } from './agents';
 import { unityStyles } from './unity';
+import { getPlanViewerStyles } from './planViewer';
 
 /**
  * Get all combined styles for the sidebar webview.
@@ -30,5 +31,6 @@ export {
     workflowStyles,
     agentStyles,
     unityStyles,
+    getPlanViewerStyles,
 };
 

@@ -87,11 +87,13 @@ export class DaemonManager {
         const pidPath = this.getPidPath();
         
         if (!fs.existsSync(pidPath)) {
+            log.debug(`isDaemonRunning: PID file does not exist at ${pidPath}`);
             return false;
         }
         
         try {
             const pid = parseInt(fs.readFileSync(pidPath, 'utf-8').trim(), 10);
+            log.debug(`isDaemonRunning: Found PID file with PID=${pid}`);
             
             if (isWindows) {
                 // Windows: Use tasklist to check if process exists
@@ -103,16 +105,21 @@ export class DaemonManager {
                     });
                     // If process exists, tasklist returns info about it
                     // If not, it returns "INFO: No tasks are running..."
-                    return result.includes(pid.toString()) && !result.includes('No tasks');
-                } catch {
+                    const isRunning = result.includes(pid.toString()) && !result.includes('No tasks');
+                    log.debug(`isDaemonRunning: tasklist result for PID ${pid}: ${isRunning ? 'running' : 'not running'}`);
+                    return isRunning;
+                } catch (err) {
+                    log.debug(`isDaemonRunning: tasklist failed:`, err);
                     return false;
                 }
             } else {
                 // Unix: Check if process exists (signal 0 just checks existence)
                 process.kill(pid, 0);
+                log.debug(`isDaemonRunning: Process ${pid} exists (Unix check)`);
                 return true;
             }
-        } catch {
+        } catch (err) {
+            log.debug(`isDaemonRunning: Check failed, cleaning up stale PID file:`, err);
             // Process doesn't exist or we don't have permission
             // Clean up stale PID file
             try {
@@ -180,8 +187,11 @@ export class DaemonManager {
      *   - isExternal: true if daemon was started by CLI/external process
      */
     async ensureDaemonRunning(): Promise<EnsureDaemonResult> {
+        log.debug('ensureDaemonRunning: Checking if daemon is already running...');
+        
         if (this.isDaemonRunning()) {
             const port = this.getDaemonPort();
+            log.debug(`ensureDaemonRunning: isDaemonRunning=true, port=${port}`);
             if (port) {
                 // Daemon already running - check if we started it
                 const isOurs = this.daemonProcess !== null;
@@ -192,6 +202,9 @@ export class DaemonManager {
                     isExternal: !isOurs
                 };
             }
+            log.debug('ensureDaemonRunning: PID file exists but port file missing, will start new daemon');
+        } else {
+            log.debug('ensureDaemonRunning: isDaemonRunning=false, will start new daemon');
         }
         
         // Need to start daemon
@@ -241,7 +254,9 @@ export class DaemonManager {
         };
         
         if (isWindows) {
-            // Windows: Don't use detached, hide console window
+            // Windows: Use detached + windowsHide to create independent process without console
+            // This allows daemon to survive extension host reloads
+            spawnOptions.detached = true;
             spawnOptions.windowsHide = true;
         } else {
             // Unix: Use detached for process group management

@@ -15,6 +15,7 @@ import {
 import { AgentRunner, AgentRunOptions } from '../AgentBackend';
 import { AgentRole, getDefaultRole, AnalystVerdict } from '../../types';
 import { ServiceLocator } from '../ServiceLocator';
+import { TaskManager } from '../TaskManager';
 
 /**
  * Planning workflow for creating new plans
@@ -147,6 +148,30 @@ export class PlanningNewWorkflow extends BaseWorkflow {
                 this.stateManager.getPlanFolder(this.sessionId), 
                 'context.md'
             );
+            
+            // Create initial plan file with header so users can see progressive output
+            const initialContent = `# Execution Plan
+
+**Status:** 🔄 Planning in progress...
+
+**Requirement:** ${this.requirement.substring(0, 200)}${this.requirement.length > 200 ? '...' : ''}
+
+---
+
+*Plan content will appear below as the planner works...*
+
+`;
+            fs.writeFileSync(this.planPath, initialContent);
+            
+            // Update session's currentPlanPath immediately so GUI can show the file
+            const session = this.stateManager.getPlanningSession(this.sessionId);
+            if (session) {
+                session.currentPlanPath = this.planPath;
+                session.updatedAt = new Date().toISOString();
+                this.stateManager.savePlanningSession(session);
+            }
+            
+            this.log(`📄 Plan file created: ${this.planPath}`);
         }
         
         this.iteration++;
@@ -224,24 +249,37 @@ export class PlanningNewWorkflow extends BaseWorkflow {
         this.log('');
         this.log(`📋 PHASE: FINALIZATION${this.forcedFinalize ? ' (FORCED)' : ''}`);
         
-        const role = this.getRole('planner');
+        const role = this.getRole('text_clerk');
         const prompt = this.buildFinalizationPrompt(this.forcedFinalize, role);
         
-        this.log('Running planner finalization...');
+        this.log(`Running text_clerk finalization (${role?.defaultModel || 'auto'})...`);
         
-        // Stream finalized plan directly to plan file
-        const result = await this.runAgentTask('planner_finalize', prompt, role, true);
-        
-        if (result.success) {
-            // Plan was streamed to file; verify it exists
-            if (!fs.existsSync(this.planPath)) {
-                throw new Error(
-                    `Plan finalization streaming failed: expected plan file at '${this.planPath}' not created. ` +
-                    `This indicates the agent did not properly stream the plan to the file. ` +
-                    `Check agent logs for streaming errors.`
-                );
+        // Use runAgentTaskWithCallback for proper completion signaling
+        const result = await this.runAgentTaskWithCallback(
+            'plan_finalize',
+            prompt,
+            'text_clerk',
+            {
+                expectedStage: 'finalization',
+                timeout: role?.timeoutMs || 120000,  // 2 minutes
+                model: role?.defaultModel,
+                cwd: this.stateManager.getWorkspaceRoot()
             }
-            this.log('✓ Plan finalized');
+        );
+        
+        if (result.fromCallback) {
+            this.log(`✓ Finalization completed via CLI callback: ${result.result}`);
+        } else {
+            // Fallback: process exited without callback
+            this.log(`✓ Finalization completed (process exit)`);
+        }
+        
+        // Verify plan file exists
+        if (!fs.existsSync(this.planPath)) {
+            throw new Error(
+                `Plan finalization failed: expected plan file at '${this.planPath}' not found. ` +
+                `Check agent logs for errors.`
+            );
         }
         
         // Update plan status
@@ -261,37 +299,6 @@ export class PlanningNewWorkflow extends BaseWorkflow {
     // PROMPT BUILDERS
     // =========================================================================
     
-    /**
-     * @deprecated Context phase removed - coordinator provides context via task metadata.
-     * Use ContextGatheringWorkflow for explicit context gathering.
-     */
-    private buildContextPrompt(role: AgentRole | undefined): string {
-        if (!role?.promptTemplate) {
-            throw new Error('Missing prompt template for context_gatherer role');
-        }
-        const basePrompt = role.promptTemplate;
-        
-        return `${basePrompt}
-
-## Task
-Gather context for the following planning requirement:
-
-### Requirement
-${this.requirement}
-
-${this.docs.length > 0 ? `### Provided Documents
-${this.docs.join('\n')}` : ''}
-
-## Output
-Provide a structured context summary including:
-1. Relevant existing code and patterns
-2. Unity project structure (if applicable)
-3. Dependencies and integration points
-4. Potential risks or constraints
-
-Write your findings in markdown format.`;
-    }
-    
     private buildPlannerPrompt(mode: string, role: AgentRole | undefined): string {
         if (!role?.promptTemplate) {
             throw new Error('Missing prompt template for planner role');
@@ -301,6 +308,9 @@ Write your findings in markdown format.`;
         // Load the plan template path
         const templatePath = path.join(this.stateManager.getWorkspaceRoot(), 'resources/templates/skeleton_plan.md');
         const hasTemplate = fs.existsSync(templatePath);
+        
+        // Get existing plans context for cross-plan awareness
+        const existingPlansContext = this.getExistingPlansContext();
 
         let modeInstructions = '';
         
@@ -315,10 +325,13 @@ ${this.requirement}
 - Context (if exists): ${this.contextPath}
 ${hasTemplate ? `- Plan Template: ${templatePath}` : ''}
 
+${existingPlansContext}
+
 ### Instructions
 1. Read the context file if it exists
 ${hasTemplate ? '2. Read and follow the plan template structure' : '2. Create a detailed task breakdown'}
-3. Write the plan to: ${this.planPath}`;
+3. **CROSS-PLAN AWARENESS**: Check the existing plans above. If your tasks will modify files that existing tasks are also modifying, add cross-plan dependencies using the format: \`Deps: ps_XXXXXX_TN\`
+4. Write the plan to: ${this.planPath}`;
         } else {
             modeInstructions = `## Mode: UPDATE
 You are updating the plan based on analyst feedback.
@@ -347,13 +360,15 @@ Include sections: Overview, Task Breakdown, Dependencies, Risk Assessment`;
     }
     
     private buildFinalizationPrompt(forced: boolean, role: AgentRole | undefined): string {
+        const basePrompt = role?.promptTemplate || 'You are a Text Clerk agent for document formatting.';
+        
         const warnings = forced 
             ? `\n\n## WARNINGS (Max iterations reached)
 The following critical issues were not fully resolved:
 ${this.criticalIssues.map(i => `- ${i}`).join('\n') || '- None recorded'}` 
             : '';
         
-        return `You are finalizing the execution plan.
+        return `${basePrompt}
 
 ## Plan File
 Read and modify: ${this.planPath}
@@ -363,12 +378,23 @@ ${this.formatAnalystFeedback()}
 ${warnings}
 
 ## Instructions
-1. Read the plan file
+1. Read the plan file using read_file
 2. Ensure all tasks use checkbox format: - [ ] **T{N}**: Description | Deps: X | Engineer: TBD
-3. Incorporate any minor suggestions
-4. Update status to "READY FOR REVIEW"
+3. Address any MINOR suggestions (ignore CRITICAL - those need human review)
+4. Update status to "📋 READY FOR REVIEW"
 ${forced ? '5. Add a WARNINGS section noting unresolved critical issues' : ''}
-5. Write the finalized plan back to the same file`;
+5. Write the finalized plan back using write tool
+
+## Important
+- Do NOT change the plan content or strategy
+- Only fix formatting and apply minor suggestions
+- Be fast and efficient
+
+## Completion (REQUIRED)
+After finishing, signal completion:
+\`\`\`bash
+apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage finalization --result success
+\`\`\``;
     }
     
     private buildAnalystPrompt(roleId: string, role: AgentRole | undefined): string {
@@ -405,6 +431,63 @@ You MUST output your review in this EXACT format:
 - **PASS**: Plan is solid, no significant issues
 - **CRITICAL**: Blocking issues that must be fixed before proceeding
 - **MINOR**: Suggestions only, plan can proceed without changes`;
+    }
+    
+    /**
+     * Get context about existing plans and their tasks for cross-plan awareness
+     * This helps the planner understand what other work is in progress and avoid conflicts
+     */
+    private getExistingPlansContext(): string {
+        try {
+            // Get all approved sessions
+            const sessions = this.stateManager.getAllPlanningSessions()
+                .filter(s => s.status === 'approved' && s.id !== this.sessionId);
+            
+            if (sessions.length === 0) {
+                return '### Existing Plans\nNo other approved plans currently active.';
+            }
+            
+            // Get TaskManager for task details
+            const taskManager = ServiceLocator.resolve(TaskManager);
+            
+            let context = '### Existing Plans (CROSS-PLAN AWARENESS)\n\n';
+            context += '**IMPORTANT**: If your tasks will modify files that existing tasks are also modifying,\n';
+            context += 'you SHOULD add cross-plan dependencies using format: `Deps: ps_XXXXXX_TN`\n\n';
+            
+            for (const session of sessions) {
+                context += `#### ${session.id}: ${session.requirement.substring(0, 100)}...\n`;
+                
+                // Get tasks for this session
+                const tasks = taskManager.getTasksForSession(session.id);
+                
+                if (tasks.length === 0) {
+                    context += '- No tasks created yet\n';
+                } else {
+                    // Show task summary with target files
+                    const incompleteTasks = tasks.filter(t => 
+                        t.status !== 'completed' && t.status !== 'failed'
+                    );
+                    
+                    for (const task of incompleteTasks.slice(0, 10)) {  // Limit to first 10
+                        const files = task.targetFiles?.length 
+                            ? `Files: ${task.targetFiles.join(', ')}`
+                            : '';
+                        context += `- **${task.id}** [${task.status}]: ${task.description.substring(0, 60)}... ${files}\n`;
+                    }
+                    
+                    if (incompleteTasks.length > 10) {
+                        context += `  ... and ${incompleteTasks.length - 10} more tasks\n`;
+                    }
+                }
+                context += '\n';
+            }
+            
+            return context;
+        } catch (e) {
+            // Don't fail planning if we can't get existing plans
+            this.log(`Warning: Could not get existing plans context: ${e}`);
+            return '### Existing Plans\nCould not retrieve existing plans context.';
+        }
     }
     
     // =========================================================================

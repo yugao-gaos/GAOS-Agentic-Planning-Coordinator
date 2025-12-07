@@ -271,6 +271,12 @@ export interface WorkflowSummaryData {
 export interface PoolStatusResponse {
     total: number;
     available: string[];
+    allocated: Array<{
+        name: string;
+        roleId: string;
+        sessionId: string;
+        workflowId: string;
+    }>;
     busy: Array<{
         name: string;
         roleId?: string;
@@ -278,12 +284,7 @@ export interface PoolStatusResponse {
         sessionId: string;
         task?: string;
     }>;
-    allocated?: Array<{
-        name: string;
-        roleId: string;
-        sessionId: string;
-        workflowId: string;
-    }>;
+    resting: string[];
 }
 
 export interface PoolResizeParams {
@@ -303,6 +304,12 @@ export interface PoolResizeResponse {
 export interface AgentPoolResponse {
     availableCount: number;
     available: string[];
+    allocatedCount: number;
+    allocated: Array<{
+        name: string;
+        roleId: string;
+        workflowId: string;
+    }>;
     busyCount: number;
     busy: Array<{
         name: string;
@@ -310,6 +317,8 @@ export interface AgentPoolResponse {
         coordinatorId: string;
         task?: string;
     }>;
+    restingCount: number;
+    resting: string[];
 }
 
 export interface AgentRolesResponse {

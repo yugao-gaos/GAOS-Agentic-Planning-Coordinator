@@ -206,8 +206,29 @@ async function startVsCodeMode(config: CoreConfig, verbose: boolean): Promise<Ap
         log.info('Services initialization complete');
         // Set services on daemon once ready
         daemon.setServices(services);
-    }).catch(err => {
+    }).catch(async (err) => {
         log.error('Services initialization failed:', err);
+        // Daemon cannot function without services - broadcast error and shutdown
+        try {
+            const { ServiceLocator } = await import('../services/ServiceLocator');
+            const { EventBroadcaster } = await import('./EventBroadcaster');
+            if (ServiceLocator.isRegistered(EventBroadcaster)) {
+                const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+                broadcaster.broadcast('daemon.error', {
+                    fatal: true,
+                    message: `Services initialization failed: ${err instanceof Error ? err.message : String(err)}`,
+                    timestamp: new Date().toISOString()
+                });
+            }
+        } catch {
+            // Ignore broadcast errors during shutdown
+        }
+        // Give clients a moment to receive the error message
+        setTimeout(async () => {
+            log.info('Shutting down daemon due to service initialization failure');
+            await daemon.stop('service_init_failed');
+            process.exit(1);
+        }, 1000);
     });
     
     // Don't setup shutdown handlers - VS Code manages lifecycle

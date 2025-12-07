@@ -17,6 +17,10 @@ export {
     AgentRequestNodeExecutor,
     AgenticWorkNodeDefinition, 
     AgenticWorkNodeExecutor,
+    AgentReleaseNodeDefinition,
+    AgentReleaseNodeExecutor,
+    AgentBenchNodeDefinition,
+    AgentBenchNodeExecutor,
     registerAgentNodes 
 } from './AgentNodes';
 
@@ -41,6 +45,8 @@ export {
     KnowledgeNodeExecutor,
     ContextNodeDefinition, 
     ContextNodeExecutor,
+    FormatterNodeDefinition, 
+    FormatterNodeExecutor,
     VariableNodeDefinition, 
     VariableNodeExecutor,
     SubgraphNodeDefinition, 
@@ -77,6 +83,15 @@ export {
     registerScriptNode 
 } from './ScriptNode';
 
+// Annotation nodes (comment, group)
+export { 
+    CommentNodeDefinition, 
+    CommentNodeExecutor,
+    GroupNodeDefinition, 
+    GroupNodeExecutor,
+    registerAnnotationNodes 
+} from './AnnotationNodes';
+
 // ============================================================================
 // Register all built-in nodes
 // ============================================================================
@@ -88,6 +103,7 @@ import { registerDataNodes } from './DataNodes';
 import { registerControlFlowNodes } from './ControlFlowNodes';
 import { registerParallelNodes } from './ParallelNodes';
 import { registerScriptNode } from './ScriptNode';
+import { registerAnnotationNodes } from './AnnotationNodes';
 
 let isRegistered = false;
 
@@ -107,6 +123,7 @@ export function registerBuiltinNodes(): void {
     registerControlFlowNodes();
     registerParallelNodes();
     registerScriptNode();
+    registerAnnotationNodes();
     
     isRegistered = true;
 }

@@ -384,6 +384,16 @@ export class StateManager {
     getSessionTasksFilePath(sessionId: string): string {
         return path.join(this.getPlanFolder(sessionId), 'tasks.json');
     }
+    
+    /**
+     * Get the plans directory path
+     * Structure: {workingDir}/{plans}/
+     * Used to scan all session folders including completed ones
+     */
+    getPlansDirectory(): string {
+        // Use same pattern as getPlanFolder for consistency
+        return path.join(this.workingDir, this.folderStructure.getFolder('plans'));
+    }
 
     /**
      * Ensure all directories for a plan session exist
@@ -1409,49 +1419,6 @@ export class StateManager {
         const dir = this.getCoordinatorConfigDir();
         if (!fs.existsSync(dir)) {
             fs.mkdirSync(dir, { recursive: true });
-        }
-    }
-
-    private getCoordinatorPromptConfigPath(): string {
-        return path.join(this.getCoordinatorConfigDir(), 'prompt_config.json');
-    }
-
-    /**
-     * Get saved coordinator prompt configuration
-     */
-    getCoordinatorPromptConfig(): object | null {
-        const configPath = this.getCoordinatorPromptConfigPath();
-        if (fs.existsSync(configPath)) {
-            try {
-                const content = fs.readFileSync(configPath, 'utf-8');
-                return JSON.parse(content);
-            } catch (e) {
-                log.error('Failed to load coordinator prompt config', e);
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Save coordinator prompt configuration
-     */
-    saveCoordinatorPromptConfig(config: object): void {
-        this.ensureCoordinatorConfigDir();
-        const configPath = this.getCoordinatorPromptConfigPath();
-        atomicWriteFileSync(configPath, JSON.stringify(config, null, 2));
-    }
-
-    /**
-     * Clear saved coordinator prompt configuration (reset to defaults)
-     */
-    clearCoordinatorPromptConfig(): void {
-        const configPath = this.getCoordinatorPromptConfigPath();
-        if (fs.existsSync(configPath)) {
-            try {
-                fs.unlinkSync(configPath);
-            } catch (e) {
-                log.error('Failed to delete coordinator prompt config', e);
-            }
         }
     }
 

@@ -6,6 +6,7 @@ import { FailedTask, TaskOccupancyEntry } from '../types';
 import { ErrorClassifier } from './workflows/ErrorClassifier';
 import { EventBroadcaster } from '../daemon/EventBroadcaster';
 import { ServiceLocator } from './ServiceLocator';
+import { AgentPoolService } from './AgentPoolService';
 import { atomicWriteFileSync } from './StateManager';
 import { getMemoryMonitor } from './MemoryMonitor';
 import { getFolderStructureManager } from './FolderStructureManager';
@@ -295,9 +296,9 @@ export class TaskManager {
      * Get AgentPoolService for status queries
      * AgentPoolService is the authoritative source for agent allocation/status
      */
-    private getAgentPoolService(): import('./AgentPoolService').AgentPoolService | null {
+    private getAgentPoolService(): AgentPoolService | null {
         try {
-            return ServiceLocator.resolve<import('./AgentPoolService').AgentPoolService>('AgentPoolService' as any);
+            return ServiceLocator.resolve(AgentPoolService);
         } catch {
             return null;
         }
@@ -909,7 +910,7 @@ export class TaskManager {
 
         // Validate dependency ID formats
         for (const dep of dependencies) {
-            // Check for double-prefix error
+            // Check for double-prefix error (e.g., ps_000001_ps_000001_T1)
             if (dep.startsWith(`${sessionId}_${sessionId}_`)) {
                 return { 
                     success: false, 
@@ -917,21 +918,24 @@ export class TaskManager {
                 };
             }
             
-            // If dependency has underscore, validate it's from the same session
+            // Cross-session dependencies ARE supported (e.g., ps_000002_T5)
+            // Just validate the format if it contains underscores
             if (dep.includes('_')) {
-                if (!dep.startsWith(`${sessionId}_`)) {
+                // Check for valid session prefix format (ps_XXXXXX_TaskId)
+                const sessionMatch = dep.match(/^(ps_\d{6})_(.+)$/);
+                if (!sessionMatch) {
                     return { 
                         success: false, 
-                        error: `Invalid dependency "${dep}": Cross-session dependencies not supported. All dependencies must be from session ${sessionId}` 
+                        error: `Invalid dependency "${dep}": Must be simple ID (T1) or valid global ID (ps_XXXXXX_T1)` 
                     };
                 }
                 
-                // Extract the task part and validate format
-                const taskPart = dep.slice(sessionId.length + 1);
+                // Extract the task part and validate it doesn't have more underscores
+                const taskPart = sessionMatch[2];
                 if (taskPart.includes('_')) {
                     return { 
                         success: false, 
-                        error: `Invalid dependency "${dep}": Task ID portion "${taskPart}" contains underscores. Use format "${sessionId}_T1" not "${dep}"` 
+                        error: `Invalid dependency "${dep}": Task ID portion "${taskPart}" contains underscores. Use format "ps_XXXXXX_T1"` 
                     };
                 }
             }
@@ -1028,10 +1032,10 @@ export class TaskManager {
         }
         
         // CRITICAL: Check for cycles after adding task (runtime check)
-        // This catches cycles created by adding new tasks to existing plans
-        const sessionTasks = this.getTasksForSession(sessionId);
+        // Check globally since we support cross-session dependencies
+        const allTasks = this.getAllTasks();
         const { DependencyGraphUtils } = require('./DependencyGraphUtils');
-        const taskNodes = sessionTasks.map(t => ({
+        const taskNodes = allTasks.map(t => ({
             id: t.id,
             dependencies: t.dependencies
         }));
@@ -1058,6 +1062,120 @@ export class TaskManager {
         this.log(`Created task ${globalTaskId}: ${description.substring(0, 50)}...`);
         
         // Persist tasks after creation
+        this.persistTasks();
+        
+        return { success: true };
+    }
+    
+    // ========================================================================
+    // Dependency Management (including cross-plan dependencies)
+    // ========================================================================
+    
+    /**
+     * Add a dependency to a task (supports cross-plan dependencies)
+     * Updates both task.dependencies and depTask.dependents bidirectionally
+     * 
+     * @param taskId - Global task ID (e.g., ps_000001_T3)
+     * @param dependsOnId - Global task ID to depend on (e.g., ps_000002_T5)
+     * @returns Success/failure with error message
+     */
+    addDependency(taskId: string, dependsOnId: string): { success: boolean; error?: string } {
+        // Get both tasks
+        const task = this.tasks.get(taskId);
+        if (!task) {
+            return { success: false, error: `Task ${taskId} not found` };
+        }
+        
+        const depTask = this.tasks.get(dependsOnId);
+        if (!depTask) {
+            return { success: false, error: `Dependency task ${dependsOnId} not found` };
+        }
+        
+        // Check if dependency already exists
+        if (task.dependencies.includes(dependsOnId)) {
+            return { success: false, error: `Task ${taskId} already depends on ${dependsOnId}` };
+        }
+        
+        // Add dependency (update both sides)
+        task.dependencies.push(dependsOnId);
+        if (!depTask.dependents.includes(taskId)) {
+            depTask.dependents.push(taskId);
+        }
+        
+        // Check for cycles after adding dependency
+        const allTasks = this.getAllTasks();
+        const { DependencyGraphUtils } = require('./DependencyGraphUtils');
+        const taskNodes = allTasks.map(t => ({
+            id: t.id,
+            dependencies: t.dependencies
+        }));
+        
+        const cycleCheck = DependencyGraphUtils.detectCycles(taskNodes);
+        if (cycleCheck.hasCycle) {
+            // Rollback the dependency addition
+            task.dependencies = task.dependencies.filter(d => d !== dependsOnId);
+            depTask.dependents = depTask.dependents.filter(d => d !== taskId);
+            
+            return {
+                success: false,
+                error: `Cannot add dependency: Would create circular dependency.\n${cycleCheck.description}`
+            };
+        }
+        
+        // Update task status if dependency is not complete
+        if (depTask.status !== 'completed') {
+            task.status = 'blocked';
+            this.log(`Task ${taskId} blocked by new dependency ${dependsOnId}`);
+        }
+        
+        this.log(`Added dependency: ${taskId} → ${dependsOnId}`);
+        this.persistTasks();
+        
+        return { success: true };
+    }
+    
+    /**
+     * Remove a dependency from a task
+     * Updates both task.dependencies and depTask.dependents bidirectionally
+     * 
+     * @param taskId - Global task ID (e.g., ps_000001_T3)
+     * @param depId - Global task ID of dependency to remove (e.g., ps_000002_T5)
+     * @returns Success/failure with error message
+     */
+    removeDependency(taskId: string, depId: string): { success: boolean; error?: string } {
+        const task = this.tasks.get(taskId);
+        if (!task) {
+            return { success: false, error: `Task ${taskId} not found` };
+        }
+        
+        // Check if dependency exists
+        if (!task.dependencies.includes(depId)) {
+            return { success: false, error: `Task ${taskId} does not depend on ${depId}` };
+        }
+        
+        // Remove from task.dependencies
+        task.dependencies = task.dependencies.filter(d => d !== depId);
+        
+        // Remove from depTask.dependents (if depTask exists)
+        const depTask = this.tasks.get(depId);
+        if (depTask) {
+            depTask.dependents = depTask.dependents.filter(d => d !== taskId);
+        }
+        
+        // Check if task should be unblocked
+        if (task.status === 'blocked') {
+            const allDepsComplete = task.dependencies.every(d => {
+                const dep = this.tasks.get(d);
+                return dep && dep.status === 'completed';
+            });
+            
+            if (allDepsComplete || task.dependencies.length === 0) {
+                task.status = 'created';
+                this.log(`Task ${taskId} unblocked after dependency removal`);
+            }
+        }
+        
+        this.log(`Removed dependency: ${taskId} → ${depId}`);
         this.persistTasks();
         
         return { success: true };

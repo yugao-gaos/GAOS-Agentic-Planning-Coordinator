@@ -18,8 +18,8 @@ export const IfConditionNodeDefinition: INodeDefinition = {
     type: 'if_condition',
     name: 'If Condition',
     description: 'Branch execution based on a condition',
-    category: 'control',
-    icon: 'git-compare',
+    category: 'flow',
+    icon: 'split-branch',
     color: '#FF5722',
     defaultInputs: [
         {
@@ -104,8 +104,8 @@ export const SwitchCaseNodeDefinition: INodeDefinition = {
     type: 'switch_case',
     name: 'Switch Case',
     description: 'Multi-way branch based on value matching',
-    category: 'control',
-    icon: 'list-tree',
+    category: 'flow',
+    icon: 'switch',
     color: '#FF5722',
     defaultInputs: [
         {
@@ -212,15 +212,21 @@ export const ForLoopNodeDefinition: INodeDefinition = {
     type: 'for_loop',
     name: 'For Loop',
     description: 'Iterate over an array or range',
-    category: 'control',
-    icon: 'sync',
+    category: 'flow',
+    icon: 'loop',
     color: '#009688',
     defaultInputs: [
         {
             id: 'trigger',
             name: 'Trigger',
             dataType: 'trigger',
-            description: 'Execution flow trigger'
+            description: 'Starts the loop'
+        },
+        {
+            id: 'loop_back',
+            name: 'Loop Back',
+            dataType: 'trigger',
+            description: 'Connect from loop body to continue to next iteration'
         },
         {
             id: 'items',
@@ -350,15 +356,21 @@ export const WhileLoopNodeDefinition: INodeDefinition = {
     type: 'while_loop',
     name: 'While Loop',
     description: 'Loop while a condition is true',
-    category: 'control',
-    icon: 'refresh',
+    category: 'flow',
+    icon: 'repeat',
     color: '#009688',
     defaultInputs: [
         {
             id: 'trigger',
             name: 'Trigger',
             dataType: 'trigger',
-            description: 'Execution flow trigger'
+            description: 'Starts the loop'
+        },
+        {
+            id: 'loop_back',
+            name: 'Loop Back',
+            dataType: 'trigger',
+            description: 'Connect from loop body to continue to next iteration'
         }
     ],
     defaultOutputs: [

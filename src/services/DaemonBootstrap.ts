@@ -35,6 +35,8 @@ import { TaskManager } from './TaskManager';
 
 // Level 2 - Depends on Level 1
 import { CursorAgentRunner } from './CursorAgentRunner';
+
+// WorkflowPauseManager - no dependencies (StateManager injected later)
 import { WorkflowPauseManager } from './workflows/WorkflowPauseManager';
 
 // Level 3 - Depends on Level 2
@@ -85,6 +87,8 @@ export function bootstrapDaemonServices(): void {
     // ========================================================================
     
     ServiceLocator.register(CursorAgentRunner, () => new CursorAgentRunner());
+    
+    // WorkflowPauseManager has no constructor dependencies (StateManager injected later)
     ServiceLocator.register(WorkflowPauseManager, () => new WorkflowPauseManager());
 
     // ========================================================================
@@ -107,12 +111,6 @@ export function bootstrapDaemonServices(): void {
     ServiceLocator.markInitialized();
     console.log('[DaemonBootstrap] Daemon services registered:', ServiceLocator.getRegisteredServices().join(', '));
 }
-
-/**
- * Legacy export for backward compatibility
- * @deprecated Use bootstrapDaemonServices instead
- */
-export const bootstrapServices = bootstrapDaemonServices;
 
 /**
  * Re-export ServiceLocator for convenience

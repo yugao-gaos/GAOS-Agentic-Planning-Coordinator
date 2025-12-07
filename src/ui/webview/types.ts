@@ -93,6 +93,10 @@ export interface SessionInfo {
     isRevising: boolean;
     failedTasks: FailedTaskInfo[];
     sessionAgents: AgentInfo[];  // All agents associated with this session (for workflow display)
+    /** True if the plan is partial/incomplete (workflow was interrupted) */
+    hasPartialPlan?: boolean;
+    /** Reason the plan was interrupted, if applicable */
+    interruptReason?: string;
 }
 
 export interface FailedTaskInfo {
@@ -105,7 +109,7 @@ export interface FailedTaskInfo {
 
 export interface AgentInfo {
     name: string;
-    status: 'available' | 'allocated' | 'busy';  // Added 'allocated'
+    status: 'available' | 'allocated' | 'busy' | 'resting';  // All 4 agent states
     roleId?: string;
     workflowId?: string;  // The specific workflow this agent is working on
     roleColor?: string;

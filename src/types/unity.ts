@@ -16,11 +16,6 @@ export type UnityTaskType =
  */
 export interface TaskRequester {
     coordinatorId: string;
-    /** 
-     * The agent name requesting this task.
-     * @deprecated Use agentName instead of engineerName
-     */
-    engineerName?: string;
     agentName: string;
 }
 

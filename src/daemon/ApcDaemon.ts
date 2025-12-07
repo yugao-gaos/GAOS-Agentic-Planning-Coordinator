@@ -37,7 +37,7 @@ const log = Logger.create('Daemon', 'ApcDaemon');
 interface ConnectedClient {
     id: string;
     ws: WebSocket;
-    type: 'vscode' | 'tui' | 'headless' | 'unknown';
+    type: 'vscode' | 'tui' | 'headless' | 'cli' | 'unknown';
     connectedAt: string;
     lastActivity: string;
     subscribedSessions: Set<string>;
@@ -486,7 +486,8 @@ export class ApcDaemon {
         // Send cached initialization history to new client
         // This includes both in-progress initialization events AND the final daemon.ready event
         // Late-joining clients (connecting after daemon is ready) need the daemon.ready event
-        if (this.initializationHistory.length > 0) {
+        // Skip for CLI clients - they're transient command executors that don't need history
+        if (this.initializationHistory.length > 0 && client.type !== 'cli') {
             const statusMsg = this.readyState === 'ready' 
                 ? `📋 Sending cached initialization state (daemon ready) to new client ${clientId}`
                 : `📋 Replaying ${this.initializationHistory.length} initialization steps to new client ${clientId}`;
@@ -852,7 +853,7 @@ export class ApcDaemon {
         const clientType = req.headers['x-apc-client-type'] as string;
         
         if (clientType) {
-            if (['vscode', 'tui', 'headless'].includes(clientType)) {
+            if (['vscode', 'tui', 'headless', 'cli'].includes(clientType)) {
                 return clientType as ConnectedClient['type'];
             }
         }

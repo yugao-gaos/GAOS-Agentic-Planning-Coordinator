@@ -68,12 +68,71 @@ function renderBusyAgent(agent: AgentInfo): string {
 }
 
 /**
+ * Render an allocated (bench) agent card.
+ * These agents are assigned to a workflow but waiting for work.
+ */
+function renderAllocatedAgent(agent: AgentInfo): string {
+    const initial = agent.name.charAt(0).toUpperCase();
+    const roleColor = agent.roleColor || '#6366f1';  // Indigo for benched
+    const roleColorRgb = hexToRgb(roleColor);
+    
+    // Build status line - role name with "Bench" suffix
+    const statusLine = agent.roleId ? `${agent.roleId} (Bench)` : 'On Bench';
+    
+    // Session line with icon
+    const sessionLine = agent.sessionId 
+        ? `<span class="session-icon">${ICONS.document}</span>${agent.sessionId}` 
+        : '';
+    
+    return `
+        <div class="agent-card allocated" data-agent="${agent.name}" 
+             title="Agent on bench - waiting for work"
+             style="--role-color: ${roleColor}; --role-color-bg: rgba(${roleColorRgb}, 0.15); --role-color-glow: rgba(${roleColorRgb}, 0.2);">
+            <div class="agent-header">
+                <div class="agent-icon">${initial}</div>
+                <span class="agent-name">${agent.name}</span>
+            </div>
+            <div class="agent-status-line" style="color: ${roleColor};">${statusLine}</div>
+            ${sessionLine ? `<div class="agent-task-line agent-session-line">${sessionLine}</div>` : ''}
+        </div>
+    `;
+}
+
+/**
+ * Render a resting agent card.
+ * These agents are in cooldown after release (5 seconds).
+ */
+function renderRestingAgent(agent: AgentInfo): string {
+    const initial = agent.name.charAt(0).toUpperCase();
+    
+    return `
+        <div class="agent-card resting" data-agent="${agent.name}" 
+             title="Agent resting - cooldown after release">
+            <div class="agent-header">
+                <div class="agent-icon">${initial}</div>
+                <span class="agent-name">${agent.name}</span>
+            </div>
+            <div class="agent-status-line resting">Resting...</div>
+        </div>
+    `;
+}
+
+/**
  * Render a single agent card.
  */
 export function renderAgentCard(agent: AgentInfo): string {
-    return agent.status === 'available' 
-        ? renderAvailableAgent(agent) 
-        : renderBusyAgent(agent);
+    switch (agent.status) {
+        case 'available':
+            return renderAvailableAgent(agent);
+        case 'allocated':
+            return renderAllocatedAgent(agent);
+        case 'busy':
+            return renderBusyAgent(agent);
+        case 'resting':
+            return renderRestingAgent(agent);
+        default:
+            return renderAvailableAgent(agent);
+    }
 }
 
 /**

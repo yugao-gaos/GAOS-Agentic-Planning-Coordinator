@@ -234,3 +234,6 @@ export function formatDiagnosticsReport(report: NetworkDiagnosticsReport): strin
 }
 
 
+
+
+

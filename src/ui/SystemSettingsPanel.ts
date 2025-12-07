@@ -17,7 +17,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { VsCodeClient } from '../vscode/VsCodeClient';
 import { Logger } from '../utils/Logger';
-import { DefaultCoordinatorPrompt, CoordinatorPromptConfig } from '../types';
+import { DefaultSystemPrompts, SystemPromptConfig } from '../types';
 import { getSettingsCommonStyles } from './webview/styles/settingsCommon';
 
 const log = Logger.create('Client', 'SystemSettings');
@@ -41,6 +41,21 @@ interface FolderStructure {
     [key: string]: string;
 }
 
+/**
+ * System prompt data for UI display
+ */
+interface SystemPromptData {
+    id: string;
+    name: string;
+    description: string;
+    category: 'execution' | 'planning' | 'utility' | 'coordinator';
+    defaultModel: string;
+    promptTemplate: string;
+    roleIntro?: string;
+    decisionInstructions?: string;
+    isCustomized: boolean;
+}
+
 // ============================================================================
 // SystemSettingsPanel
 // ============================================================================
@@ -60,7 +75,7 @@ export class SystemSettingsPanel {
     // Cached data
     private config: ConfigData | null = null;
     private folders: FolderStructure | null = null;
-    private coordinatorPrompt: CoordinatorPromptConfig | null = null;
+    private systemPrompts: SystemPromptData[] = [];
     private daemonConnected: boolean = false;
 
     private constructor(
@@ -152,18 +167,88 @@ export class SystemSettingsPanel {
             this.folders = await this.vsCodeClient.getFolders() as FolderStructure;
             this.daemonConnected = true;
             
-            // Load coordinator prompt from daemon
-            const response = await this.vsCodeClient.send<{ coordinatorPrompt: CoordinatorPromptConfig }>('prompts.getCoordinator', {});
-            if (!response.coordinatorPrompt) {
-                throw new Error('Coordinator prompt not available from daemon');
-            }
-            this.coordinatorPrompt = response.coordinatorPrompt;
+            // Load all system prompts (includes coordinator)
+            await this.loadSystemPrompts();
         } catch (err) {
             log.error('Failed to load system settings from daemon:', err);
             throw new Error(`Cannot load system settings: ${err instanceof Error ? err.message : 'Daemon unavailable'}. Please ensure daemon is running.`);
         }
         
         this.panel.webview.html = this.getWebviewContent();
+    }
+    
+    /**
+     * Load all system prompts from daemon or defaults
+     * Note: unity_polling is excluded - it's configured in Unity settings page
+     */
+    private async loadSystemPrompts(): Promise<void> {
+        this.systemPrompts = [];
+        
+        // Prompts to exclude from System Prompts section (they have their own UI elsewhere)
+        const excludedPrompts = ['unity_polling'];
+        
+        // Build list from DefaultSystemPrompts
+        for (const [id, defaults] of Object.entries(DefaultSystemPrompts)) {
+            // Skip excluded prompts
+            if (excludedPrompts.includes(id)) continue;
+            
+            try {
+                // Try to get customized version from daemon
+                const response = await this.vsCodeClient.send<{ prompt: SystemPromptConfig }>('prompts.getSystemPrompt', { id });
+                const prompt = response?.prompt;
+                
+                if (prompt) {
+                    this.systemPrompts.push({
+                        id: prompt.id,
+                        name: prompt.name,
+                        description: prompt.description || defaults.description || '',
+                        category: prompt.category || defaults.category || 'utility',
+                        defaultModel: prompt.defaultModel || defaults.defaultModel || 'sonnet-4.5',
+                        promptTemplate: prompt.promptTemplate || defaults.promptTemplate || '',
+                        roleIntro: prompt.roleIntro || defaults.roleIntro,
+                        decisionInstructions: prompt.decisionInstructions || defaults.decisionInstructions,
+                        isCustomized: true
+                    });
+                } else {
+                    // Use defaults
+                    this.systemPrompts.push({
+                        id: defaults.id,
+                        name: defaults.name,
+                        description: defaults.description || '',
+                        category: defaults.category || 'utility',
+                        defaultModel: defaults.defaultModel || 'sonnet-4.5',
+                        promptTemplate: defaults.promptTemplate || '',
+                        roleIntro: defaults.roleIntro,
+                        decisionInstructions: defaults.decisionInstructions,
+                        isCustomized: false
+                    });
+                }
+            } catch {
+                // Use defaults if daemon call fails
+                this.systemPrompts.push({
+                    id: defaults.id,
+                    name: defaults.name,
+                    description: defaults.description || '',
+                    category: defaults.category || 'utility',
+                    defaultModel: defaults.defaultModel || 'sonnet-4.5',
+                    promptTemplate: defaults.promptTemplate || '',
+                    roleIntro: defaults.roleIntro,
+                    decisionInstructions: defaults.decisionInstructions,
+                    isCustomized: false
+                });
+            }
+        }
+        
+        // Sort: coordinator first, then by category, then by name
+        this.systemPrompts.sort((a, b) => {
+            if (a.id === 'coordinator') return -1;
+            if (b.id === 'coordinator') return 1;
+            if (a.category !== b.category) {
+                const categoryOrder = { coordinator: 0, planning: 1, execution: 2, utility: 3 };
+                return (categoryOrder[a.category] || 99) - (categoryOrder[b.category] || 99);
+            }
+            return a.name.localeCompare(b.name);
+        });
     }
 
     /**
@@ -195,21 +280,6 @@ export class SystemSettingsPanel {
             }
         }
         return this.getDefaultFolders();
-    }
-
-    /**
-     * Load coordinator prompt from local file
-     */
-    private loadCoordinatorPromptFromFile(): CoordinatorPromptConfig {
-        const promptPath = path.join(this.workspaceRoot, '_AiDevLog', '.config', 'coordinator_prompt.json');
-        if (fs.existsSync(promptPath)) {
-            try {
-                return JSON.parse(fs.readFileSync(promptPath, 'utf8'));
-            } catch (err) {
-                log.error('Failed to read coordinator prompt file:', err);
-            }
-        }
-        return { ...DefaultCoordinatorPrompt };
     }
 
     /**
@@ -291,24 +361,6 @@ export class SystemSettingsPanel {
     }
 
     /**
-     * Save coordinator prompt to local file
-     */
-    private saveCoordinatorPromptToFile(config: CoordinatorPromptConfig): void {
-        const promptPath = path.join(this.workspaceRoot, '_AiDevLog', '.config', 'coordinator_prompt.json');
-        try {
-            const dir = path.dirname(promptPath);
-            if (!fs.existsSync(dir)) {
-                fs.mkdirSync(dir, { recursive: true });
-            }
-            
-            fs.writeFileSync(promptPath, JSON.stringify(config, null, 2));
-        } catch (err) {
-            log.error('Failed to write coordinator prompt file:', err);
-            throw err;
-        }
-    }
-
-    /**
      * Handle messages from the webview
      */
     private async handleMessage(message: any): Promise<void> {
@@ -377,10 +429,12 @@ export class SystemSettingsPanel {
                 vscode.window.showInformationMessage(message.message);
                 break;
             case 'saveCoordinatorPrompt':
-                await this.saveCoordinatorPrompt(message.config);
+                // Redirect to system prompt handler (coordinator is now a system prompt)
+                await this.saveSystemPrompt('coordinator', message.config);
                 break;
             case 'resetCoordinatorPrompt':
-                await this.resetCoordinatorPrompt();
+                // Redirect to system prompt handler
+                await this.resetSystemPrompt('coordinator');
                 break;
             case 'installCursorCli':
                 await this.installCursorCli();
@@ -397,51 +451,70 @@ export class SystemSettingsPanel {
             case 'resetPollingPrompt':
                 await this.resetPollingPrompt();
                 break;
+            case 'saveSystemPrompt':
+                await this.saveSystemPrompt(message.promptId, message.config);
+                break;
+            case 'resetSystemPrompt':
+                await this.resetSystemPrompt(message.promptId);
+                break;
         }
     }
     
     /**
-     * Save coordinator prompt changes
+     * Save a system prompt
      */
-    private async saveCoordinatorPrompt(configData: CoordinatorPromptConfig): Promise<void> {
+    private async saveSystemPrompt(promptId: string, configData: Partial<SystemPromptConfig>): Promise<void> {
         try {
             if (this.daemonConnected) {
-                // Use daemon API
-                await this.vsCodeClient.send('prompts.updateCoordinator', { config: configData });
-                vscode.window.showInformationMessage('Coordinator prompt saved successfully');
+                await this.vsCodeClient.send('prompts.updateSystemPrompt', { id: promptId, config: configData });
+                vscode.window.showInformationMessage(`${configData.name || promptId} prompt saved successfully`);
             } else {
-                // Write to local file
-                this.saveCoordinatorPromptToFile(configData);
-                this.coordinatorPrompt = configData;
-                vscode.window.showInformationMessage('Coordinator prompt saved to local config');
+                // For non-daemon mode, save to local file
+                const promptPath = path.join(this.workspaceRoot, '_AiDevLog', '.config', 'prompts', `${promptId}.json`);
+                const dir = path.dirname(promptPath);
+                if (!fs.existsSync(dir)) {
+                    fs.mkdirSync(dir, { recursive: true });
+                }
+                fs.writeFileSync(promptPath, JSON.stringify(configData, null, 2));
+                vscode.window.showInformationMessage(`${configData.name || promptId} prompt saved to local config`);
             }
             await this.loadDataAndRender();
-        } catch (e: any) {
-            vscode.window.showErrorMessage(`Failed to save coordinator prompt: ${e.message}`);
+        } catch (e: unknown) {
+            const message = e instanceof Error ? e.message : String(e);
+            vscode.window.showErrorMessage(`Failed to save prompt: ${message}`);
         }
     }
     
     /**
-     * Reset coordinator prompt to defaults
+     * Reset a system prompt to defaults
      */
-    private async resetCoordinatorPrompt(): Promise<void> {
+    private async resetSystemPrompt(promptId: string): Promise<void> {
         const confirm = await vscode.window.showWarningMessage(
-            'Reset Coordinator prompt to defaults? Your customizations will be lost.',
+            `Reset ${promptId} prompt to defaults? Your customizations will be lost.`,
             { modal: true },
             'Reset'
         );
 
         if (confirm === 'Reset') {
             try {
-                await this.vsCodeClient.send('prompts.resetCoordinator', {});
-                vscode.window.showInformationMessage('Coordinator prompt reset to defaults');
+                if (this.daemonConnected) {
+                    await this.vsCodeClient.send('prompts.resetSystemPrompt', { id: promptId });
+                } else {
+                    // For non-daemon mode, delete the local config file
+                    const promptPath = path.join(this.workspaceRoot, '_AiDevLog', '.config', 'prompts', `${promptId}.json`);
+                    if (fs.existsSync(promptPath)) {
+                        fs.unlinkSync(promptPath);
+                    }
+                }
+                vscode.window.showInformationMessage(`${promptId} prompt reset to defaults`);
                 await this.loadDataAndRender();
-            } catch (e: any) {
-                vscode.window.showErrorMessage(`Failed to reset coordinator prompt: ${e.message}`);
+            } catch (e: unknown) {
+                const message = e instanceof Error ? e.message : String(e);
+                vscode.window.showErrorMessage(`Failed to reset prompt: ${message}`);
             }
         }
     }
-
+    
     /**
      * Set a config value
      */
@@ -1554,8 +1627,19 @@ export class SystemSettingsPanel {
         const foldersJson = JSON.stringify(this.folders || folderDefaults);
         const defaultsJson = JSON.stringify(defaults);
         const folderDefaultsJson = JSON.stringify(folderDefaults);
-        const coordinatorPromptJson = JSON.stringify(this.coordinatorPrompt || DefaultCoordinatorPrompt);
-        const defaultCoordinatorPromptJson = JSON.stringify(DefaultCoordinatorPrompt);
+        const systemPromptsJson = JSON.stringify(this.systemPrompts);
+        const defaultSystemPromptsJson = JSON.stringify(
+            Object.values(DefaultSystemPrompts).map(p => ({
+                id: p.id,
+                name: p.name,
+                description: p.description || '',
+                category: p.category || 'utility',
+                defaultModel: p.defaultModel || 'sonnet-4.5',
+                promptTemplate: p.promptTemplate || '',
+                roleIntro: p.roleIntro,
+                decisionInstructions: p.decisionInstructions
+            }))
+        );
         const daemonStatusJson = JSON.stringify({ connected: this.daemonConnected });
 
         return `<!DOCTYPE html>
@@ -1772,6 +1856,36 @@ ${getSettingsCommonStyles()}
             overflow-x: auto;
             white-space: pre;
         }
+        
+        /* Sidebar section label */
+        .sidebar-section-label {
+            font-size: 0.7em;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            opacity: 0.5;
+            padding: 16px 12px 6px 12px;
+            margin-top: 4px;
+        }
+        
+        .sidebar-section-label:first-child {
+            padding-top: 0;
+            margin-top: 0;
+        }
+        
+        /* Prompt form header */
+        .prompt-form-header {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 8px;
+        }
+        
+        .prompt-form-header h2 {
+            margin: 0;
+            font-size: 1.3em;
+            font-weight: 600;
+        }
     </style>
 </head>
 <body>
@@ -1796,9 +1910,12 @@ ${getSettingsCommonStyles()}
                 <button class="sidebar-tab" data-tab="folders">
                     <span class="tab-icon">📁</span>Folders
                 </button>
-                <button class="sidebar-tab" data-tab="prompts">
-                    <span class="tab-icon">💬</span>System Prompts
-                </button>
+                
+                <!-- System Prompts Section -->
+                <div class="sidebar-section-label">System Prompts</div>
+                <div id="prompt-tabs">
+                    <!-- Populated by JavaScript -->
+                </div>
             </div>
         </div>
         
@@ -2129,80 +2246,9 @@ ${getSettingsCommonStyles()}
                 </div>
             </div>
             
-            <!-- System Prompts Tab -->
-            <div id="prompts" class="tab-content">
-                <div class="section">
-                    <div class="section-header">
-                        <div class="section-title">
-                            Coordinator Agent
-                            <span class="badge" style="background: rgba(59, 130, 246, 0.2); color: #60a5fa;">System</span>
-                        </div>
-                    </div>
-                    <p style="opacity: 0.8; margin: 0 0 8px 0;" id="coordinator-description"></p>
-                    <p class="hint" style="margin: 0 0 16px 0;">
-                        <strong>Note:</strong> The Coordinator Agent makes high-level decisions about task dispatch, 
-                        workflow selection, and user interaction. Its prompt has two configurable parts (roleIntro and 
-                        decisionInstructions), while runtime context (current tasks, events, history) is injected dynamically.
-                    </p>
-                </div>
-                
-                <form id="coordinatorForm">
-                    <div class="section">
-                        <div class="section-header">
-                            <div class="section-title">Settings</div>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="coordinatorName">Display Name</label>
-                            <input type="text" id="coordinatorName" name="name" />
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="coordinatorDescription">Description</label>
-                            <input type="text" id="coordinatorDescription" name="description" />
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="coordinatorModel">Default Model</label>
-                            <select id="coordinatorModel" name="defaultModel">
-                                <option value="sonnet-4.5">Claude Sonnet 4.5</option>
-                                <option value="opus-4.5">Claude Opus 4.5</option>
-                                <option value="gemini-3-pro">Gemini 3 Pro</option>
-                                <option value="haiku-3.5">Claude Haiku 3.5</option>
-                                <option value="gpt-5.1-codex-high">GPT-5.1 Codex High</option>
-                            </select>
-                        </div>
-                    </div>
-                    
-                    <div class="section">
-                        <div class="section-header">
-                            <div class="section-title">Role Introduction</div>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="roleIntro">Introduction Prompt</label>
-                            <textarea id="roleIntro" name="roleIntro" style="min-height: 150px;"></textarea>
-                            <div class="hint">This sets the context and identity for the Coordinator Agent. It appears at the start of the prompt.</div>
-                        </div>
-                    </div>
-                    
-                    <div class="section">
-                        <div class="section-header">
-                            <div class="section-title">Decision Instructions</div>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="decisionInstructions">Decision Making Instructions</label>
-                            <textarea id="decisionInstructions" name="decisionInstructions" style="min-height: 300px;"></textarea>
-                            <div class="hint">These instructions guide how the Coordinator makes decisions. Runtime context (tasks, events, agents) is injected between the introduction and these instructions.</div>
-                        </div>
-                        
-                        <div class="button-row">
-                            <button type="submit">Save Changes</button>
-                            <button type="button" class="secondary" onclick="resetCoordinatorPrompt()">Reset to Default</button>
-                        </div>
-                    </div>
-                </form>
+            <!-- System Prompt Tabs (dynamically generated) -->
+            <div id="prompt-contents">
+                <!-- Populated by JavaScript - one tab-content per prompt -->
             </div>
             
         </div>
@@ -2217,8 +2263,11 @@ ${getSettingsCommonStyles()}
         const folders = ${foldersJson};
         const defaults = ${defaultsJson};
         const folderDefaults = ${folderDefaultsJson};
-        const coordinatorPrompt = ${coordinatorPromptJson};
-        const defaultCoordinatorPrompt = ${defaultCoordinatorPromptJson};
+        const systemPrompts = ${systemPromptsJson};
+        const defaultSystemPrompts = ${defaultSystemPromptsJson};
+        
+        // Active prompt tracking
+        let activePromptId = 'coordinator';
         
         // Update daemon-dependent features based on connection state
         function updateDaemonFeatures() {
@@ -2282,8 +2331,8 @@ ${getSettingsCommonStyles()}
             // Render folders
             renderFolders();
             
-            // Initialize coordinator prompt form
-            initCoordinatorForm();
+            // Initialize system prompts UI (tabs in sidebar)
+            renderPromptTabs();
             
             // Show config JSON
             document.getElementById('config-display').textContent = JSON.stringify(config, null, 2);
@@ -2298,46 +2347,221 @@ ${getSettingsCommonStyles()}
                 };
             });
             
-            // Set up coordinator form submit handler
-            const coordinatorForm = document.getElementById('coordinatorForm');
-            if (coordinatorForm) {
-                coordinatorForm.addEventListener('submit', (e) => {
-                    e.preventDefault();
-                    saveCoordinatorPrompt();
-                });
-            }
+            // Note: Form submit handlers are now set up dynamically in renderPromptContent()
             
             // Initialize daemon-dependent features
             updateDaemonFeatures();
         }
         
-        function initCoordinatorForm() {
-            document.getElementById('coordinator-description').textContent = coordinatorPrompt.description || '';
-            document.getElementById('coordinatorName').value = coordinatorPrompt.name || '';
-            document.getElementById('coordinatorDescription').value = coordinatorPrompt.description || '';
-            document.getElementById('coordinatorModel').value = coordinatorPrompt.defaultModel || 'sonnet-4.5';
-            document.getElementById('roleIntro').value = coordinatorPrompt.roleIntro || '';
-            document.getElementById('decisionInstructions').value = coordinatorPrompt.decisionInstructions || '';
-        }
+        // ========== System Prompts Functions ==========
         
-        function getCoordinatorFormData() {
-            return {
-                id: 'coordinator',
-                name: document.getElementById('coordinatorName').value,
-                description: document.getElementById('coordinatorDescription').value,
-                defaultModel: document.getElementById('coordinatorModel').value,
-                roleIntro: document.getElementById('roleIntro').value,
-                decisionInstructions: document.getElementById('decisionInstructions').value
+        function getPromptIcon(prompt) {
+            const icons = {
+                coordinator: '🎯',
+                new_plan: '📝',
+                revise_plan: '✏️'
             };
+            return icons[prompt.id] || '💬';
         }
         
+        function renderPromptTabs() {
+            const tabsContainer = document.getElementById('prompt-tabs');
+            const contentsContainer = document.getElementById('prompt-contents');
+            if (!tabsContainer || !contentsContainer) return;
+            
+            // Generate sidebar tabs for each prompt
+            let tabsHtml = '';
+            systemPrompts.forEach(prompt => {
+                tabsHtml += \`
+                    <button class="sidebar-tab" data-tab="prompt-\${prompt.id}">
+                        <span class="tab-icon">\${getPromptIcon(prompt)}</span>\${prompt.name}
+                    </button>
+                \`;
+            });
+            tabsContainer.innerHTML = tabsHtml;
+            
+            // Generate tab content for each prompt
+            let contentsHtml = '';
+            systemPrompts.forEach(prompt => {
+                contentsHtml += \`<div id="prompt-\${prompt.id}" class="tab-content">\${renderPromptForm(prompt)}</div>\`;
+            });
+            contentsContainer.innerHTML = contentsHtml;
+            
+            // Attach click handlers to new tabs
+            tabsContainer.querySelectorAll('.sidebar-tab').forEach(tab => {
+                tab.onclick = () => {
+                    document.querySelectorAll('.sidebar-tab').forEach(t => t.classList.remove('active'));
+                    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                    tab.classList.add('active');
+                    const tabId = tab.dataset.tab;
+                    document.getElementById(tabId).classList.add('active');
+                    activePromptId = tabId.replace('prompt-', '');
+                };
+            });
+        }
+        
+        function renderPromptForm(prompt) {
+            // Check if this is a coordinator-style prompt (two-part) or standard prompt
+            const isCoordinatorStyle = prompt.id === 'coordinator' || (prompt.roleIntro !== undefined && prompt.decisionInstructions !== undefined);
+            
+            let html = \`
+                <div class="section">
+                    <div class="prompt-form-header">
+                        <span style="font-size: 1.5em;">\${getPromptIcon(prompt)}</span>
+                        <h2>\${prompt.name}</h2>
+                        <span class="badge" style="background: rgba(59, 130, 246, 0.2); color: #60a5fa;">System</span>
+                    </div>
+                    <p style="opacity: 0.8; margin: 0 0 8px 0;">\${prompt.description}</p>
+                    \${isCoordinatorStyle ? \`
+                        <p class="hint" style="margin: 0 0 16px 0;">
+                            <strong>Note:</strong> This prompt has two configurable parts (roleIntro and decisionInstructions), 
+                            while runtime context is injected dynamically between them.
+                        </p>
+                    \` : \`
+                        <p class="hint" style="margin: 0 0 16px 0;">
+                            <strong>Note:</strong> This prompt template is used directly by the agent.
+                        </p>
+                    \`}
+                </div>
+                
+                <form id="promptForm-\${prompt.id}" onsubmit="savePromptById(event, '\${prompt.id}')">
+                    <div class="section">
+                        <div class="section-header">
+                            <div class="section-title">Settings</div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="promptName-\${prompt.id}">Display Name</label>
+                            <input type="text" id="promptName-\${prompt.id}" name="name" value="\${escapeHtml(prompt.name)}" />
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="promptDescription-\${prompt.id}">Description</label>
+                            <input type="text" id="promptDescription-\${prompt.id}" name="description" value="\${escapeHtml(prompt.description)}" />
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="promptModel-\${prompt.id}">Default Model</label>
+                            <select id="promptModel-\${prompt.id}" name="defaultModel">
+                                <option value="sonnet-4.5" \${prompt.defaultModel === 'sonnet-4.5' ? 'selected' : ''}>Claude Sonnet 4.5</option>
+                                <option value="opus-4.5" \${prompt.defaultModel === 'opus-4.5' ? 'selected' : ''}>Claude Opus 4.5</option>
+                                <option value="gemini-3-pro" \${prompt.defaultModel === 'gemini-3-pro' ? 'selected' : ''}>Gemini 3 Pro</option>
+                                <option value="haiku-3.5" \${prompt.defaultModel === 'haiku-3.5' ? 'selected' : ''}>Claude Haiku 3.5</option>
+                                <option value="gpt-5.1-codex-high" \${prompt.defaultModel === 'gpt-5.1-codex-high' ? 'selected' : ''}>GPT-5.1 Codex High</option>
+                            </select>
+                        </div>
+                    </div>
+            \`;
+            
+            if (isCoordinatorStyle) {
+                // Two-part prompt form (roleIntro + decisionInstructions)
+                html += \`
+                    <div class="section">
+                        <div class="section-header">
+                            <div class="section-title">Role Introduction</div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="roleIntro-\${prompt.id}">Introduction Prompt</label>
+                            <textarea id="roleIntro-\${prompt.id}" name="roleIntro" style="min-height: 150px;">\${escapeHtml(prompt.roleIntro || '')}</textarea>
+                            <div class="hint">This sets the context and identity. It appears at the start of the prompt.</div>
+                        </div>
+                    </div>
+                    
+                    <div class="section">
+                        <div class="section-header">
+                            <div class="section-title">Decision Instructions</div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="decisionInstructions-\${prompt.id}">Decision Making Instructions</label>
+                            <textarea id="decisionInstructions-\${prompt.id}" name="decisionInstructions" style="min-height: 300px;">\${escapeHtml(prompt.decisionInstructions || '')}</textarea>
+                            <div class="hint">These instructions guide decision-making. Runtime context is injected between the introduction and these instructions.</div>
+                        </div>
+                    </div>
+                \`;
+            } else {
+                // Standard single prompt form
+                html += \`
+                    <div class="section">
+                        <div class="section-header">
+                            <div class="section-title">Prompt Template</div>
+                        </div>
+                        
+                        <div class="form-group">
+                            <label for="promptTemplate-\${prompt.id}">System Prompt</label>
+                            <textarea id="promptTemplate-\${prompt.id}" name="promptTemplate" style="min-height: 300px;">\${escapeHtml(prompt.promptTemplate || '')}</textarea>
+                            <div class="hint">The complete prompt template for this agent.</div>
+                        </div>
+                    </div>
+                \`;
+            }
+            
+            html += \`
+                    <div class="section">
+                        <div class="button-row">
+                            <button type="submit">Save Changes</button>
+                            <button type="button" class="secondary" onclick="resetPrompt('\${prompt.id}')">Reset to Default</button>
+                        </div>
+                    </div>
+                </form>
+            \`;
+            
+            return html;
+        }
+        
+        function escapeHtml(text) {
+            if (!text) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        function savePromptById(event, promptId) {
+            event.preventDefault();
+            
+            const prompt = systemPrompts.find(p => p.id === promptId);
+            if (!prompt) return;
+            
+            const isCoordinatorStyle = prompt.id === 'coordinator' || (prompt.roleIntro !== undefined && prompt.decisionInstructions !== undefined);
+            
+            const data = {
+                id: promptId,
+                name: document.getElementById('promptName-' + promptId).value,
+                description: document.getElementById('promptDescription-' + promptId).value,
+                defaultModel: document.getElementById('promptModel-' + promptId).value
+            };
+            
+            if (isCoordinatorStyle) {
+                data.roleIntro = document.getElementById('roleIntro-' + promptId).value;
+                data.decisionInstructions = document.getElementById('decisionInstructions-' + promptId).value;
+            } else {
+                data.promptTemplate = document.getElementById('promptTemplate-' + promptId).value;
+            }
+            
+            // For coordinator, use the existing command for backwards compatibility
+            if (promptId === 'coordinator') {
+                vscode.postMessage({ command: 'saveCoordinatorPrompt', config: data });
+            } else {
+                vscode.postMessage({ command: 'saveSystemPrompt', promptId: promptId, config: data });
+            }
+        }
+        
+        function resetPrompt(promptId) {
+            if (promptId === 'coordinator') {
+                vscode.postMessage({ command: 'resetCoordinatorPrompt' });
+            } else {
+                vscode.postMessage({ command: 'resetSystemPrompt', promptId: promptId });
+            }
+        }
+        
+        // Legacy functions for backwards compatibility
         function saveCoordinatorPrompt() {
-            const data = getCoordinatorFormData();
-            vscode.postMessage({ command: 'saveCoordinatorPrompt', config: data });
+            savePromptById({ preventDefault: () => {} }, 'coordinator');
         }
         
         function resetCoordinatorPrompt() {
-            vscode.postMessage({ command: 'resetCoordinatorPrompt' });
+            resetPrompt('coordinator');
         }
         
         function updateBadge(key, value, defaultValue) {

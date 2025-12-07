@@ -27,6 +27,7 @@ import { OutputChannelManager } from '../OutputChannelManager';
 import { ProcessManager, ProcessState } from '../ProcessManager';
 import { ServiceLocator } from '../ServiceLocator';
 import { Logger } from '../../utils/Logger';
+import { SavedWorkflowState } from './WorkflowPauseManager';
 
 const log = Logger.create('Daemon', 'BaseWorkflow');
 
@@ -77,9 +78,11 @@ export abstract class BaseWorkflow implements IWorkflow {
     // ========================================================================
     
     protected status: WorkflowStatus = 'pending';
+    protected lastError: string | undefined;  // Error message if workflow failed
     protected phaseIndex: number = 0;
     protected startTime: number = 0;
     protected allocatedAgents: string[] = [];
+    protected benchedAgents: string[] = [];  // Agents demoted to bench (still allocated, but idle)
     protected input: Record<string, any>;
     protected priority: number;
     
@@ -397,6 +400,10 @@ export abstract class BaseWorkflow implements IWorkflow {
         return this.status;
     }
     
+    getError(): string | undefined {
+        return this.lastError;
+    }
+    
     getProgress(): WorkflowProgress {
         const phases = this.getPhases();
         
@@ -458,12 +465,17 @@ export abstract class BaseWorkflow implements IWorkflow {
             };
             
             this.log(`Workflow completed successfully`);
+            
+            // Clear persisted state on successful completion
+            this.clearPersistedState();
+            
             this.onComplete.fire(result);
             return result;
             
         } catch (error) {
             this.status = 'failed';
             const errorMessage = error instanceof Error ? error.message : String(error);
+            this.lastError = errorMessage;  // Store error for coordinator visibility
             const result: WorkflowResult = {
                 success: false,
                 error: errorMessage,
@@ -471,6 +483,10 @@ export abstract class BaseWorkflow implements IWorkflow {
             };
             
             this.log(`Workflow failed: ${errorMessage}`);
+            
+            // Clear persisted state on failure (no point resuming a failed workflow)
+            this.clearPersistedState();
+            
             this.onError.fire(error instanceof Error ? error : new Error(errorMessage));
             this.onComplete.fire(result);
             return result;
@@ -486,15 +502,20 @@ export abstract class BaseWorkflow implements IWorkflow {
      * 
      * @param options.force If true, immediately kill any running agent and save state.
      *                      If false (default), pause happens at next phase boundary.
+     * @param options.reason Why the workflow is being paused (for persistence)
      */
-    async pause(options?: { force?: boolean }): Promise<void> {
+    async pause(options?: { 
+        force?: boolean; 
+        reason?: 'user_request' | 'conflict' | 'error' | 'timeout' | 'daemon_shutdown';
+    }): Promise<void> {
         // Allow pausing workflows in pending, running, or blocked states
         if (this.status !== 'pending' && this.status !== 'running' && this.status !== 'blocked') {
             return;
         }
         
         const force = options?.force ?? false;
-        this.log(`Pause requested (force: ${force})`);
+        const reason = options?.reason ?? 'user_request';
+        this.log(`Pause requested (force: ${force}, reason: ${reason})`);
         this.pauseRequested = true;
         this.forcePauseRequested = force;
         
@@ -516,6 +537,10 @@ export abstract class BaseWorkflow implements IWorkflow {
         });
         
         this.status = 'paused';
+        
+        // Persist state to disk for cross-restart recovery
+        await this.persistState(reason);
+        
         this.emitProgress();
     }
     
@@ -828,6 +853,126 @@ ${ctx.partialOutput.slice(-3000)}
         return this.input;
     }
     
+    /**
+     * Get the priority of this workflow
+     */
+    getPriority(): number {
+        return this.priority;
+    }
+    
+    /**
+     * Get all agents allocated to this workflow (busy + benched)
+     */
+    getAllocatedAgentNames(): string[] {
+        return [...this.allocatedAgents, ...this.benchedAgents];
+    }
+    
+    /**
+     * Persist workflow state to disk for cross-restart recovery
+     * 
+     * Called:
+     * - When workflow is paused (user_request, conflict, daemon_shutdown)
+     * - After each phase completion (checkpoint)
+     * 
+     * The saved state includes everything needed to:
+     * - Recreate the workflow object on daemon restart
+     * - Resume from the correct phase
+     * - Restore agent allocations
+     * 
+     * @param reason Why the state is being saved
+     */
+    async persistState(reason: 'user_request' | 'conflict' | 'error' | 'timeout' | 'daemon_shutdown' | 'checkpoint'): Promise<void> {
+        const phases = this.getPhases();
+        const phaseName = phases[this.phaseIndex] || 'unknown';
+        
+        // Determine phase progress
+        let phaseProgress: 'not_started' | 'in_progress' | 'completed' = 'not_started';
+        if (this.status === 'completed') {
+            phaseProgress = 'completed';
+        } else if (this.currentAgentRunId || this.continuationContext) {
+            phaseProgress = 'in_progress';
+        }
+        
+        // Build what was done and what remains
+        const whatWasDone = this.continuationContext?.whatWasDone || 
+            (this.phaseIndex > 0 ? `Completed phases: ${phases.slice(0, this.phaseIndex).join(', ')}` : 'Just started');
+        const whatRemains = phases.slice(this.phaseIndex).join(', ') || 'Complete current phase';
+        
+        // Build continuation prompt if we have context
+        let continuationPrompt: string | undefined;
+        if (this.continuationContext) {
+            continuationPrompt = this.buildContinuationPromptFromContext();
+        }
+        
+        const savedState: SavedWorkflowState = {
+            workflowId: this.id,
+            workflowType: this.type,
+            sessionId: this.sessionId,
+            // Workflow recreation fields
+            workflowInput: this.input,
+            priority: this.priority,
+            allocatedAgents: this.getAllocatedAgentNames(),
+            // Phase progress
+            phaseIndex: this.phaseIndex,
+            phaseName,
+            phaseProgress,
+            // Task context
+            taskId: (this.input as any).taskId,
+            filesModified: this.continuationContext?.filesModified || [],
+            // Agent state
+            agentRunId: this.currentAgentRunId,
+            agentPartialOutput: this.continuationContext?.partialOutput,
+            // Continuation context
+            continuationPrompt,
+            whatWasDone,
+            whatRemains,
+            // Metadata
+            pausedAt: new Date().toISOString(),
+            pauseReason: reason === 'checkpoint' ? 'user_request' : reason
+        };
+        
+        // Save to disk
+        this.stateManager.savePausedWorkflow(this.sessionId, this.id, savedState);
+        this.log(`Persisted state (reason: ${reason}, phase: ${this.phaseIndex}/${phases.length})`);
+    }
+    
+    /**
+     * Build continuation prompt from saved context
+     */
+    private buildContinuationPromptFromContext(): string {
+        if (!this.continuationContext) return '';
+        
+        const lines: string[] = [
+            '## ⚠️ SESSION CONTINUATION',
+            '',
+            'This task was paused mid-execution. You are continuing from where the previous agent left off.',
+            '',
+            `### Phase: ${this.continuationContext.phaseName}`,
+            '',
+            '### What Was Done',
+            this.continuationContext.whatWasDone || 'Unknown - check files modified',
+            '',
+            '### Files Modified So Far',
+            this.continuationContext.filesModified.length > 0 
+                ? this.continuationContext.filesModified.map(f => `- ${f}`).join('\n')
+                : '- None yet',
+            '',
+            '### Instructions',
+            'Continue the work from where the previous agent left off. Do not repeat completed work.',
+            ''
+        ];
+        
+        return lines.join('\n');
+    }
+    
+    /**
+     * Clear persisted state (called after successful completion or cancellation)
+     */
+    clearPersistedState(): void {
+        this.stateManager.deletePausedWorkflow(this.sessionId, this.id);
+        this.log('Cleared persisted state');
+    }
+    
     // ========================================================================
     // IWorkflow Implementation - Cleanup
     // ========================================================================
@@ -870,6 +1015,7 @@ ${ctx.partialOutput.slice(-3000)}
         
         // Clear allocated agents array
         this.allocatedAgents = [];
+        this.benchedAgents = [];
         
         // Clear task tracking
         this.occupiedTaskIds = [];
@@ -925,6 +1071,12 @@ ${ctx.partialOutput.slice(-3000)}
             // Execute phase with retry support
             await this.executePhaseWithRetry(this.phaseIndex);
             this.phaseIndex++;
+            
+            // Checkpoint after each phase completion (for cross-restart recovery)
+            // Don't persist if we're about to complete (no more phases)
+            if (this.phaseIndex < phases.length) {
+                await this.persistState('checkpoint');
+            }
         }
     }
     
@@ -1071,6 +1223,13 @@ ${ctx.partialOutput.slice(-3000)}
                         this.log(`Workflow status changed to running (first agent allocated)`);
                     }
                     
+                    // Remove from benched if this agent was previously on bench
+                    const benchIndex = this.benchedAgents.indexOf(agentName);
+                    if (benchIndex >= 0) {
+                        this.benchedAgents.splice(benchIndex, 1);
+                        this.log(`Agent ${agentName} promoted from bench to busy`);
+                    }
+                    
                     this.allocatedAgents.push(agentName);
                     this.log(`Agent allocated and promoted to busy: ${agentName} (role: ${roleId})`);
                     
@@ -1109,6 +1268,10 @@ ${ctx.partialOutput.slice(-3000)}
         const index = this.allocatedAgents.indexOf(agentName);
         if (index >= 0) {
             this.allocatedAgents.splice(index, 1);
+            // Track benched agent so we can release it if workflow is cancelled
+            if (!this.benchedAgents.includes(agentName)) {
+                this.benchedAgents.push(agentName);
+            }
             this.log(`Agent demoted to bench: ${agentName}`);
             log.debug(`Firing onAgentDemotedToBench for ${agentName}`);
             this.onAgentDemotedToBench.fire(agentName);
@@ -1119,12 +1282,21 @@ ${ctx.partialOutput.slice(-3000)}
     }
     
     /**
-     * Release all allocated agents
+     * Release all allocated agents (including those on bench)
      */
     protected async releaseAllAgents(): Promise<void> {
+        // Release active agents
         const agents = [...this.allocatedAgents];
         for (const agent of agents) {
             this.releaseAgent(agent);
+        }
+        
+        // Also release benched agents (they were demoted but still allocated)
+        const benched = [...this.benchedAgents];
+        for (const agent of benched) {
+            log.debug(`Releasing benched agent ${agent}`);
+            this.benchedAgents = this.benchedAgents.filter(a => a !== agent);
+            this.onAgentReleased.fire(agent);
         }
     }
     
@@ -1220,6 +1392,8 @@ ${ctx.partialOutput.slice(-3000)}
             model?: string;
             /** Working directory for the agent */
             cwd?: string;
+            /** Pre-allocated agent name - if provided, uses this agent instead of requesting a new one */
+            agentName?: string;
         }
     ): Promise<AgentTaskResult> {
         const { AgentRunner } = await import('../AgentBackend');
@@ -1231,11 +1405,39 @@ ${ctx.partialOutput.slice(-3000)}
         const timeout = options.timeout ?? role?.timeoutMs ?? 600000;
         
         this.log(`Starting agent task [${taskId}] with CLI callback (stage: ${options.expectedStage})`);
-        this.log(`  Requesting agent for role: ${roleId}...`);
         
-        // Request an agent from the pool (this triggers agent.allocated event)
-        const agentName = await this.requestAgent(roleId);
-        this.log(`  Agent ${agentName} allocated for ${roleId}`);
+        // Use pre-allocated agent if provided, otherwise request a new one
+        let agentName: string;
+        if (options.agentName) {
+            agentName = options.agentName;
+            this.log(`  Using pre-allocated agent: ${agentName} (role: ${roleId})`);
+            
+            // Check if agent needs to be promoted from bench to busy
+            // Agent may already be busy (e.g., engineer allocated and not demoted)
+            // or on bench (e.g., reviewer that was demoted after allocation)
+            const { AgentPoolService } = await import('../AgentPoolService');
+            const agentPoolService = ServiceLocator.resolve(AgentPoolService);
+            const agentStatus = agentPoolService.getAgentStatus(agentName);
+            
+            if (agentStatus?.status === 'allocated') {
+                // Agent is on bench - promote to busy
+                const promoted = agentPoolService.promoteAgentToBusy(agentName, this.id, roleId);
+                if (promoted) {
+                    this.log(`  ⬆️ Promoted ${agentName} from bench to busy`);
+                } else {
+                    this.log(`  ⚠️ Failed to promote ${agentName} to busy`);
+                }
+            } else if (agentStatus?.status === 'busy') {
+                // Agent is already busy - no promotion needed
+                this.log(`  ✓ Agent ${agentName} is already busy`);
+            } else {
+                this.log(`  ⚠️ Agent ${agentName} has unexpected status: ${agentStatus?.status || 'unknown'}`);
+            }
+        } else {
+            this.log(`  Requesting new agent for role: ${roleId}...`);
+            agentName = await this.requestAgent(roleId);
+            this.log(`  Agent ${agentName} allocated for ${roleId}`);
+        }
         
         // Inject CLI callback instructions into prompt (include taskId for parallel task support)
         const enhancedPrompt = this.injectCliCallbackInstructions(
@@ -1255,6 +1457,10 @@ ${ctx.partialOutput.slice(-3000)}
             fs.mkdirSync(logDir, { recursive: true });
         }
         const logFile = path.join(logDir, `${this.id}_${agentName}.log`);
+        
+        // Log the agent's log file as clickable file URI
+        const fileUri = `file:///${logFile.replace(/\\/g, '/')}`;
+        this.log(`  📋 Agent log: ${fileUri}`);
         
         const agentPromise = agentRunner.run({
             id: runId,
@@ -1346,17 +1552,18 @@ ${ctx.partialOutput.slice(-3000)}
                 payload: { error: errorMessage },
                 fromCallback: false
             };
-        } finally {
-            // Always release the agent back to the pool
-            this.releaseAgent(agentName);
         }
+        // NOTE: Agent lifecycle is managed by the caller, not here.
+        // - TaskImplementationWorkflow demotes to bench (for implement→review→revise loop)
+        // - ErrorResolutionWorkflow releases immediately
+        // - Other workflows rely on releaseAllAgents() at workflow end
     }
     
     /**
      * Inject CLI callback instructions into the agent prompt
      * 
-     * This adds standardized instructions at the end of the prompt telling
-     * the agent how to signal completion via CLI.
+     * Uses "sandwich" technique: brief reminder at START + detailed instructions at END.
+     * This ensures the AI doesn't forget to call the callback even for long tasks.
      * 
      * @param prompt The original prompt
      * @param stage The agent stage
@@ -1374,11 +1581,27 @@ ${ctx.partialOutput.slice(-3000)}
         
         // Include --task parameter if taskId is provided (for parallel tasks)
         const taskParam = taskId ? `    --task ${taskId} \\\n` : '';
+        const taskParamInline = taskId ? ` --task ${taskId}` : '';
         
         // Get absolute path to apc CLI for reliable execution
         const apc = this.apcCommand;
         
+        // BRIEF REMINDER at START - critical for long tasks where AI might forget
+        const startReminder = `
+⚠️ **CRITICAL REQUIREMENT**: When you finish ALL your work, you MUST run this command:
+\`\`\`bash
+${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage ${stage}${taskParamInline} --result <success|failed> --data '<json>'
+\`\`\`
+DO NOT EXIT without running this command. See end of prompt for full details.
+
+---
+
+`;
+        
+        // DETAILED INSTRUCTIONS at END
         const callbackInstructions = `
+
+---
 
 ## 📡 COMPLETION SIGNALING (REQUIRED)
 
@@ -1412,13 +1635,13 @@ If the command fails (e.g., network error, daemon not running):
 2. Retry the command up to 3 times
 3. If still failing, output the error and exit
 
-### Important Notes
-- Call this command ONCE when your work is complete
-- The command will terminate your session gracefully
-- Include ALL relevant data in the payload
+### ⚠️ CRITICAL - DO NOT FORGET
+- You MUST call this command ONCE when your work is complete
+- The workflow WILL FAIL if you exit without calling this command
+- Include ALL relevant data in the payload (especially files you modified)
 `;
 
-        return prompt + callbackInstructions;
+        return startReminder + prompt + callbackInstructions;
     }
     
     /**

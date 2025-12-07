@@ -120,6 +120,7 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
     // Initialize AgentPoolService
     broadcastProgress('Initializing AgentPoolService');
     const agentPoolService = new AgentPoolService(stateManager, roleRegistry);
+    ServiceLocator.register(AgentPoolService, () => agentPoolService);
     log.info(`AgentPoolService initialized with ${agentPoolService.getPoolStatus().total} agents`);
     
     // Initialize HeadlessTerminalManager (no-op for standalone)
@@ -155,6 +156,40 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
         coordinator.setUnityEnabled(false);
     }
     
+    // ==========================================================================
+    // WORKFLOW RECOVERY: Restore paused workflows from previous daemon session
+    // ==========================================================================
+    broadcastProgress('Recovering paused workflows');
+    
+    // Get all non-completed sessions and restore their paused workflows
+    const allSessions = stateManager.getAllPlanningSessions();
+    const activeSessions = allSessions.filter(s => s.status !== 'completed');
+    
+    // Initialize each active session (this triggers workflow restoration)
+    for (const session of activeSessions) {
+        coordinator.getSessionState(session.id); // Auto-initializes and restores workflows
+    }
+    
+    // Collect all valid workflow IDs from restored workflows
+    const validWorkflowIds = new Set<string>();
+    for (const session of activeSessions) {
+        const sessionState = coordinator.getSessionState(session.id);
+        if (sessionState?.activeWorkflows) {
+            for (const workflowId of sessionState.activeWorkflows.keys()) {
+                validWorkflowIds.add(workflowId);
+            }
+        }
+    }
+    
+    // Release any agents allocated to workflows that couldn't be restored
+    const releasedOrphans = agentPoolService.releaseOrphanAllocatedAgents(validWorkflowIds);
+    if (releasedOrphans.length > 0) {
+        log.info(`Released ${releasedOrphans.length} orphan agent(s) from dead workflows`);
+    }
+    
+    log.info(`Workflow recovery complete: ${validWorkflowIds.size} workflows active across ${activeSessions.length} sessions`);
+    // ==========================================================================
+    
     // Subscribe to agent allocation events and broadcast to clients
     const broadcaster = ServiceLocator.resolve(EventBroadcaster);
     coordinator.onAgentAllocated(({ agentName, sessionId, roleId, workflowId }) => {
@@ -176,12 +211,16 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             
             // Also broadcast pool change so UI shows agent as busy
             const poolStatus = agentPoolService.getPoolStatus();
+            const allocatedAgents = agentPoolService.getAllocatedAgents();
             const busyAgents = agentPoolService.getBusyAgents();
-            log.debug(`Broadcasting pool.changed after allocation: available=${poolStatus.available.length}, busy=${busyAgents.length}`);
+            const restingAgents = agentPoolService.getRestingAgents();
+            log.debug(`Broadcasting pool.changed after allocation: available=${poolStatus.available.length}, allocated=${allocatedAgents.length}, busy=${busyAgents.length}, resting=${restingAgents.length}`);
             broadcaster.poolChanged(
                 poolStatus.total,
                 poolStatus.available,
-                busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId }))
+                allocatedAgents.map(a => ({ name: a.name, workflowId: a.workflowId, roleId: a.roleId })),
+                busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId })),
+                restingAgents
             );
         } catch (e) {
             log.error(`Error in onAgentAllocated handler:`, e);
@@ -189,11 +228,15 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             // Still try to broadcast pool.changed even if other parts failed
             try {
                 const poolStatus = agentPoolService.getPoolStatus();
+                const allocatedAgents = agentPoolService.getAllocatedAgents();
                 const busyAgents = agentPoolService.getBusyAgents();
+                const restingAgents = agentPoolService.getRestingAgents();
                 broadcaster.poolChanged(
                     poolStatus.total,
                     poolStatus.available,
-                    busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId }))
+                    allocatedAgents.map(a => ({ name: a.name, workflowId: a.workflowId, roleId: a.roleId })),
+                    busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId })),
+                    restingAgents
                 );
             } catch (e2) {
                 log.error(`Failed to broadcast pool.changed:`, e2);
@@ -217,11 +260,15 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
         
         // Also broadcast pool state since agent allocations may have changed
         const poolStatus2 = agentPoolService.getPoolStatus();
+        const allocatedAgents2 = agentPoolService.getAllocatedAgents();
         const busyAgents2 = agentPoolService.getBusyAgents();
+        const restingAgents2 = agentPoolService.getRestingAgents();
         broadcaster.poolChanged(
             poolStatus2.total,
             poolStatus2.available,
-            busyAgents2.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId }))
+            allocatedAgents2.map(a => ({ name: a.name, workflowId: a.workflowId, roleId: a.roleId })),
+            busyAgents2.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId })),
+            restingAgents2
         );
     });
     
@@ -250,12 +297,8 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
     ServiceLocator.register(ScriptableWorkflowRegistry, () => scriptableRegistry);
     log.info(`ScriptableWorkflowRegistry initialized with ${scriptableRegistry.getCustomWorkflowTypes().length} custom workflows`);
     
-    // Recover any paused sessions
-    broadcastProgress('Recovering paused sessions');
-    const recoveredCount = await coordinator.recoverAllSessions();
-    if (recoveredCount > 0) {
-        log.info(`Recovered ${recoveredCount} paused workflow(s)`);
-    }
+    // Note: Session recovery is now handled automatically by initSession() 
+    // which calls restorePausedWorkflows() for each active session
     
     // Initialize PlanningService
     const planningService = new PlanningService(stateManager, coordinator, {});
@@ -339,11 +382,13 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             deletePlanningSession: (id: string) => stateManager.deletePlanningSession(id),
             getSessionTasksFilePath: (sessionId: string) => stateManager.getSessionTasksFilePath(sessionId),
             getWorkspaceRoot: () => stateManager.getWorkspaceRoot(),
-            getWorkingDir: () => stateManager.getWorkingDir()
+            getWorkingDir: () => stateManager.getWorkingDir(),
+            getPlansDirectory: () => stateManager.getPlansDirectory()
         },
         agentPoolService: {
             getPoolStatus: () => agentPoolService.getPoolStatus(),
             getAvailableAgents: () => agentPoolService.getAvailableAgents(),
+            getAllocatedAgents: () => agentPoolService.getAllocatedAgents(),
             getBusyAgents: () => agentPoolService.getBusyAgents().map(b => ({
                 name: b.name,
                 roleId: b.roleId,
@@ -351,6 +396,7 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
                 sessionId: b.sessionId,
                 task: b.task
             })),
+            getRestingAgents: () => agentPoolService.getRestingAgents(),
             getAgentsOnBench: (sessionId?: string) => agentPoolService.getAgentsOnBench(sessionId),
             getAllRoles: () => agentPoolService.getAllRoles(),
             getRole: (roleId: string) => agentPoolService.getRole(roleId),
@@ -377,9 +423,11 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
                 coordinator.updateWorkflowHistorySummary(sessionId, workflowId, summary),
             startTaskWorkflow: (sessionId: string, taskId: string, workflowType: string) =>
                 coordinator.startTaskWorkflow(sessionId, taskId, workflowType),
-            // Graceful shutdown and recovery
-            gracefulShutdown: () => coordinator.gracefulShutdown(),
-            recoverAllSessions: () => coordinator.recoverAllSessions()
+            // Stale workflow cleanup
+            forceCleanupStaleWorkflows: (sessionId: string) => coordinator.forceCleanupStaleWorkflows(sessionId),
+            forceCleanupAllStaleWorkflows: () => coordinator.forceCleanupAllStaleWorkflows(),
+            // Graceful shutdown
+            gracefulShutdown: () => coordinator.gracefulShutdown()
         },
         planningService: {
             listPlanningSessions: () => planningService.listPlanningSessions(),
@@ -436,7 +484,9 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             deleteTask: (globalTaskId: string, reason?: string) => ServiceLocator.resolve(TaskManager).deleteTask(globalTaskId, reason),
             validateTaskFormat: (task: any) => ServiceLocator.resolve(TaskManager).validateTaskFormat(task),
             reloadPersistedTasks: () => ServiceLocator.resolve(TaskManager).reloadPersistedTasks(),
-            getAgentAssignmentsForUI: () => ServiceLocator.resolve(TaskManager).getAgentAssignmentsForUI?.() || []
+            getAgentAssignmentsForUI: () => ServiceLocator.resolve(TaskManager).getAgentAssignmentsForUI?.() || [],
+            addDependency: (taskId: string, dependsOnId: string) => ServiceLocator.resolve(TaskManager).addDependency(taskId, dependsOnId),
+            removeDependency: (taskId: string, depId: string) => ServiceLocator.resolve(TaskManager).removeDependency(taskId, depId)
         },
         roleRegistry: {
             getRole: (roleId: string) => roleRegistry.getRole(roleId),
@@ -456,10 +506,10 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
                 }
             },
             resetRoleToDefault: (roleId: string) => roleRegistry.resetToDefault(roleId) !== undefined,
-            getCoordinatorPrompt: () => roleRegistry.getCoordinatorPrompt() as unknown as Record<string, unknown>,
-            updateCoordinatorPrompt: (config: Record<string, any>) => roleRegistry.updateCoordinatorPrompt(config),
-            resetCoordinatorPromptToDefault: () => roleRegistry.resetCoordinatorPromptToDefault(),
             getAllSystemPrompts: () => roleRegistry.getAllSystemPrompts(),
+            getSystemPrompt: (id: string) => roleRegistry.getSystemPrompt(id),
+            updateSystemPrompt: (config: any) => roleRegistry.updateSystemPrompt(config),
+            resetSystemPromptToDefault: (promptId: string) => roleRegistry.resetSystemPromptToDefault(promptId),
             // Polling prompt methods
             getPollingPrompt: () => roleRegistry.getPollingPrompt(),
             updatePollingPrompt: (prompt: string) => roleRegistry.updatePollingPrompt(prompt),

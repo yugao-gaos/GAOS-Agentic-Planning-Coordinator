@@ -67,6 +67,9 @@ export interface INodeConnection {
     
     /** Target port ID */
     toPortId: string;
+    
+    /** Reroute points for visual routing (optional) */
+    reroutes?: { x: number; y: number }[];
 }
 
 /**
@@ -143,10 +146,9 @@ export interface INodeInstance {
 export type NodeCategory = 
     | 'flow'
     | 'agent'
-    | 'actions'
     | 'data'
-    | 'control'
-    | 'parallel';
+    | 'actions'
+    | 'annotation';
 
 /**
  * Node definition - static metadata about a node type
@@ -214,6 +216,9 @@ export interface INodeConfigField {
     
     /** Options for 'select' type */
     options?: { value: any; label: string }[];
+    
+    /** Dynamic options key - options fetched at runtime (e.g., 'agentRoles') */
+    dynamicOptions?: string;
     
     /** Validation pattern (regex) for strings */
     pattern?: string;
@@ -429,7 +434,7 @@ export interface IExecutionContextAPI {
     log(message: string, level?: 'info' | 'warn' | 'error' | 'debug'): void;
     
     /** Request an agent from the pool */
-    requestAgent(roleId: string): Promise<string>;
+    requestAgent(roleId: string, options?: { timeoutMs?: number }): Promise<string>;
     
     /** Release an agent back to the pool */
     releaseAgent(agentName: string): void;

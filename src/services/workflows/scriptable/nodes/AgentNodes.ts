@@ -17,7 +17,7 @@ import { nodeRegistry } from '../NodeRegistry';
 export const AgentRequestNodeDefinition: INodeDefinition = {
     type: 'agent_request',
     name: 'Agent Request',
-    description: 'Request an agent from the pool and allocate it to the workflow bench.',
+    description: 'Request an agent from the pool. Waits until an agent is available or times out.',
     category: 'agent',
     icon: 'person-add',
     color: '#2196F3',
@@ -34,7 +34,8 @@ export const AgentRequestNodeDefinition: INodeDefinition = {
             id: 'agent',
             name: 'Agent',
             dataType: 'agent',
-            description: 'Allocated agent reference'
+            description: 'Allocated agent reference',
+            allowMultiple: false
         },
         {
             id: 'done',
@@ -47,17 +48,21 @@ export const AgentRequestNodeDefinition: INodeDefinition = {
         fields: [
             {
                 name: 'role',
-                type: 'string',
+                type: 'select',
                 label: 'Agent Role',
-                description: 'Role ID for the agent (e.g., engineer, analyst, code_reviewer)',
-                required: true
+                description: 'Role for the agent to fulfill',
+                required: true,
+                dynamicOptions: 'agentRoles', // Options fetched dynamically from AgentRoleRegistry
+                defaultValue: 'engineer'
             },
             {
-                name: 'waitForAvailable',
-                type: 'boolean',
-                label: 'Wait for Available',
-                description: 'If true, wait until an agent is available. If false, fail immediately if none available.',
-                defaultValue: true
+                name: 'timeoutSeconds',
+                type: 'number',
+                label: 'Timeout (seconds)',
+                description: 'Maximum time to wait for an agent. 0 = no timeout.',
+                defaultValue: 300,
+                min: 0,
+                max: 3600
             }
         ]
     }
@@ -69,14 +74,17 @@ export const AgentRequestNodeExecutor: NodeExecutor = async (
     context: IExecutionContextAPI
 ): Promise<Record<string, any>> => {
     const role = node.config.role;
+    const timeoutSeconds = node.config.timeoutSeconds ?? 300;
+    const timeoutMs = timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined;
     
     if (!role) {
         throw new Error('Agent role is required');
     }
     
-    context.log(`Requesting agent with role: ${role}`, 'info');
+    context.log(`Requesting agent with role: ${role} (timeout: ${timeoutSeconds}s)`, 'info');
     
-    const agentName = await context.requestAgent(role);
+    // Request agent with timeout - always waits for availability
+    const agentName = await context.requestAgent(role, { timeoutMs });
     
     context.log(`Agent allocated: ${agentName}`, 'info');
     
@@ -103,7 +111,8 @@ export const AgenticWorkNodeDefinition: INodeDefinition = {
             name: 'Agent',
             dataType: 'agent',
             description: 'Agent reference (from Agent Request node)',
-            required: true
+            required: true,
+            allowMultiple: false
         },
         {
             id: 'trigger',
@@ -119,6 +128,13 @@ export const AgenticWorkNodeDefinition: INodeDefinition = {
         }
     ],
     defaultOutputs: [
+        {
+            id: 'agent_out',
+            name: 'Agent',
+            dataType: 'agent',
+            description: 'Agent reference (pass to bench, release, or next work node)',
+            allowMultiple: false
+        },
         {
             id: 'result',
             name: 'Result',
@@ -231,6 +247,7 @@ export const AgenticWorkNodeExecutor: NodeExecutor = async (
         }
         
         return {
+            agent_out: releaseAfter ? undefined : agentName, // Pass agent through (unless released)
             result: output,
             success: result.success,
             done: true
@@ -244,11 +261,128 @@ export const AgenticWorkNodeExecutor: NodeExecutor = async (
         }
         
         return {
+            agent_out: releaseAfter ? undefined : agentName, // Pass agent through even on failure (unless released)
             result: errorMsg,
             success: false,
             done: true
         };
     }
+};
+
+// ============================================================================
+// Agent Release Node
+// ============================================================================
+
+export const AgentReleaseNodeDefinition: INodeDefinition = {
+    type: 'agent_release',
+    name: 'Agent Release',
+    description: 'Release an agent back to the pool after use.',
+    category: 'agent',
+    icon: 'person-remove',
+    color: '#F44336',
+    defaultInputs: [
+        {
+            id: 'trigger',
+            name: 'Trigger',
+            dataType: 'trigger',
+            description: 'Execution flow trigger'
+        },
+        {
+            id: 'agent',
+            name: 'Agent',
+            dataType: 'agent',
+            description: 'Agent reference to release',
+            allowMultiple: false
+        }
+    ],
+    defaultOutputs: [
+        {
+            id: 'done',
+            name: 'Done',
+            dataType: 'trigger',
+            description: 'Execution flow continues after agent released'
+        }
+    ],
+    configSchema: {
+        fields: []
+    }
+};
+
+export const AgentReleaseNodeExecutor: NodeExecutor = async (
+    node: INodeInstance,
+    inputs: Record<string, any>,
+    context: IExecutionContextAPI
+): Promise<Record<string, any>> => {
+    const agentName = inputs.agent;
+    
+    if (!agentName) {
+        throw new Error('Agent reference is required');
+    }
+    
+    context.log(`Releasing agent: ${agentName}`, 'info');
+    context.releaseAgent(agentName);
+    
+    return {
+        done: true
+    };
+};
+
+// ============================================================================
+// Agent Bench Node - Holds agents ready for use in the workflow
+// ============================================================================
+
+export const AgentBenchNodeDefinition: INodeDefinition = {
+    type: 'agent_bench',
+    name: 'Agent Bench',
+    description: 'Holds agents ready for use. Each seat provides an agent in/out port pair.',
+    category: 'agent',
+    icon: 'people',
+    color: '#00897B',
+    defaultInputs: [
+        { id: 'agent_in_0', name: 'Seat 1 In', dataType: 'agent', description: 'Agent input for seat 1', allowMultiple: true },
+        { id: 'agent_in_1', name: 'Seat 2 In', dataType: 'agent', description: 'Agent input for seat 2', allowMultiple: true },
+        { id: 'agent_in_2', name: 'Seat 3 In', dataType: 'agent', description: 'Agent input for seat 3', allowMultiple: true }
+    ],
+    defaultOutputs: [
+        { id: 'agent_out_0', name: 'Seat 1 Out', dataType: 'agent', description: 'Agent output for seat 1', allowMultiple: true },
+        { id: 'agent_out_1', name: 'Seat 2 Out', dataType: 'agent', description: 'Agent output for seat 2', allowMultiple: true },
+        { id: 'agent_out_2', name: 'Seat 3 Out', dataType: 'agent', description: 'Agent output for seat 3', allowMultiple: true }
+    ],
+    allowDynamicPorts: true,
+    configSchema: {
+        fields: [
+            {
+                name: 'seatCount',
+                type: 'number',
+                label: 'Number of Seats',
+                description: 'Number of agent seats (each seat has an in/out port pair)',
+                required: true,
+                defaultValue: 3,
+                min: 1,
+                max: 10
+            }
+        ]
+    }
+};
+
+export const AgentBenchNodeExecutor: NodeExecutor = async (
+    node: INodeInstance,
+    inputs: Record<string, any>,
+    context: IExecutionContextAPI
+): Promise<Record<string, any>> => {
+    // Agent Bench is a passthrough node - agents flow in and out
+    // It serves as a visual organizer for agent references
+    const outputs: Record<string, any> = {};
+    
+    // Pass through each agent from input to corresponding output
+    for (const [key, value] of Object.entries(inputs)) {
+        if (key.startsWith('agent_in_')) {
+            const seatIndex = key.replace('agent_in_', '');
+            outputs[`agent_out_${seatIndex}`] = value;
+        }
+    }
+    
+    return outputs;
 };
 
 // ============================================================================
@@ -258,5 +392,7 @@ export const AgenticWorkNodeExecutor: NodeExecutor = async (
 export function registerAgentNodes(): void {
     nodeRegistry.register(AgentRequestNodeDefinition, AgentRequestNodeExecutor);
     nodeRegistry.register(AgenticWorkNodeDefinition, AgenticWorkNodeExecutor);
+    nodeRegistry.register(AgentReleaseNodeDefinition, AgentReleaseNodeExecutor);
+    nodeRegistry.register(AgentBenchNodeDefinition, AgentBenchNodeExecutor);
 }
 

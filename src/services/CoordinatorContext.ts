@@ -21,8 +21,10 @@ import {
     CoordinatorHistoryEntry,
     TaskSummary,
     ActiveWorkflowSummary,
+    FailedWorkflowSummary,
     PlanSummary,
-    SessionCapacity
+    SessionCapacity,
+    GlobalFileConflict
 } from '../types/coordinator';
 import { IWorkflow } from './workflows';
 
@@ -88,10 +90,10 @@ export class CoordinatorContext {
         // Build task summaries from TaskManager (ALL tasks, not just this session)
         const tasks = this.buildAllTaskSummaries();
         
-        // Build workflow summaries from session state
-        const activeWorkflows = sessionState 
+        // Build workflow summaries from session state (active + failed)
+        const { active: activeWorkflows, failed: recentlyFailedWorkflows } = sessionState 
             ? this.buildWorkflowSummaries(sessionState)
-            : [];
+            : { active: [], failed: [] };
         
         // Get agent statuses from AgentPoolService
         const agentStatuses = this.buildAgentStatuses();
@@ -99,6 +101,9 @@ export class CoordinatorContext {
         
         // Calculate per-session capacity analysis
         const sessionCapacities = this.calculateSessionCapacities(approvedPlans, sessionState);
+        
+        // Analyze cross-plan file conflicts
+        const globalConflicts = this.buildGlobalConflictAnalysis(tasks);
         
         return {
             event,
@@ -112,9 +117,11 @@ export class CoordinatorContext {
             agentStatuses,
             tasks,
             activeWorkflows,
+            recentlyFailedWorkflows,
             sessionStatus: session?.status || 'unknown',
             pendingQuestions: sessionState?.pendingQuestions || [],
-            sessionCapacities
+            sessionCapacities,
+            globalConflicts
         };
     }
     
@@ -210,7 +217,8 @@ export class CoordinatorContext {
                 dependencies: task.dependencies || [],
                 dependencyStatus,
                 assignedAgent: undefined, // TaskManager doesn't track this directly
-                attempts: task.previousAttempts || 0
+                attempts: task.previousAttempts || 0,
+                targetFiles: task.targetFiles  // For cross-plan conflict detection
             };
         });
     }
@@ -280,32 +288,49 @@ export class CoordinatorContext {
 
     /**
      * Build workflow summaries for coordinator input
-     * Transforms active workflows into summaries for AI
+     * Transforms workflows into summaries for AI (both active and failed)
      */
-    buildWorkflowSummaries(sessionState: SessionStateSnapshot): ActiveWorkflowSummary[] {
-        const summaries: ActiveWorkflowSummary[] = [];
+    buildWorkflowSummaries(sessionState: SessionStateSnapshot): {
+        active: ActiveWorkflowSummary[];
+        failed: FailedWorkflowSummary[];
+    } {
+        const active: ActiveWorkflowSummary[] = [];
+        const failed: FailedWorkflowSummary[] = [];
         
         for (const [workflowId, workflow] of sessionState.workflows) {
             const status = workflow.getStatus();
-            if (status === 'completed' || status === 'cancelled' || status === 'failed') {
-                continue;
-            }
-            
             const progress = workflow.getProgress();
-            summaries.push({
-                id: workflowId,
-                type: progress.type,
-                status: progress.status,
-                taskId: sessionState.workflowToTaskMap.get(workflowId),
-                phase: progress.phase,
-                phaseProgress: progress.percentage,
-                agentName: undefined, // Would need to track from workflow
-                startedAt: progress.startedAt,
-                lastUpdate: progress.updatedAt
-            });
+            
+            if (status === 'failed') {
+                // Include failed workflows so coordinator knows about failures
+                failed.push({
+                    id: workflowId,
+                    type: progress.type,
+                    taskId: sessionState.workflowToTaskMap.get(workflowId),
+                    error: workflow.getError() || 'Unknown error',
+                    failedAt: progress.updatedAt,
+                    phase: progress.phase
+                });
+            } else if (status === 'completed' || status === 'cancelled') {
+                // Skip completed/cancelled - coordinator doesn't need these
+                continue;
+            } else {
+                // Active workflows (running, pending, blocked)
+                active.push({
+                    id: workflowId,
+                    type: progress.type,
+                    status: progress.status,
+                    taskId: sessionState.workflowToTaskMap.get(workflowId),
+                    phase: progress.phase,
+                    phaseProgress: progress.percentage,
+                    agentName: undefined, // Would need to track from workflow
+                    startedAt: progress.startedAt,
+                    lastUpdate: progress.updatedAt
+                });
+            }
         }
         
-        return summaries;
+        return { active, failed };
     }
 
     /**
@@ -399,6 +424,60 @@ export class CoordinatorContext {
         }
         
         return capacities;
+    }
+    
+    /**
+     * Build global conflict analysis - find files touched by tasks from multiple sessions
+     * This helps the coordinator detect cross-plan dependencies that need sequencing
+     */
+    buildGlobalConflictAnalysis(tasks: TaskSummary[]): GlobalFileConflict[] {
+        // Group tasks by their target files
+        const fileToTasks = new Map<string, Array<{
+            taskId: string;
+            sessionId: string;
+            status: string;
+            description: string;
+        }>>();
+        
+        for (const task of tasks) {
+            if (!task.targetFiles || task.targetFiles.length === 0) {
+                continue;
+            }
+            
+            for (const file of task.targetFiles) {
+                // Normalize file path (use basename for matching)
+                const normalizedFile = file.split(/[/\\]/).pop() || file;
+                
+                if (!fileToTasks.has(normalizedFile)) {
+                    fileToTasks.set(normalizedFile, []);
+                }
+                
+                fileToTasks.get(normalizedFile)!.push({
+                    taskId: task.id,
+                    sessionId: task.sessionId || '',
+                    status: task.status,
+                    description: task.description
+                });
+            }
+        }
+        
+        // Filter to only files with tasks from MULTIPLE sessions
+        const conflicts: GlobalFileConflict[] = [];
+        
+        for (const [file, taskList] of fileToTasks) {
+            // Get unique session IDs
+            const sessionIds = new Set(taskList.map(t => t.sessionId));
+            
+            // Only report as conflict if multiple sessions touch this file
+            if (sessionIds.size > 1) {
+                conflicts.push({
+                    file,
+                    tasks: taskList
+                });
+            }
+        }
+        
+        return conflicts;
     }
 }
 

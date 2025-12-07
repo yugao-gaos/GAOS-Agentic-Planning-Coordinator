@@ -125,7 +125,8 @@ function getWslWindowsUsername() {
             const result = execSync('cmd.exe /c echo %USERNAME%', { 
                 encoding: 'utf-8',
                 stdio: ['pipe', 'pipe', 'pipe'],
-                timeout: 5000
+                timeout: 5000,
+                windowsHide: true
             }).trim();
             if (result && !result.includes('%')) {
                 return result;
@@ -168,6 +169,7 @@ function isRunningInWsl() {
 /**
  * Normalize workspace path for cross-platform daemon discovery
  * Converts WSL paths (/mnt/d/...) to Windows paths (d:\...) for consistent hashing
+ * Also normalizes Windows drive letters to lowercase for consistent hashing
  */
 function normalizeWorkspacePath(workspaceRoot) {
     if (isRunningInWsl() && workspaceRoot.startsWith('/mnt/')) {
@@ -179,6 +181,13 @@ function normalizeWorkspacePath(workspaceRoot) {
             return `${drive}:\\${rest}`;
         }
     }
+    
+    // On Windows, normalize drive letter to lowercase for consistent hashing
+    // e.g., D:\Project -> d:\Project (daemon uses lowercase)
+    if (process.platform === 'win32' && /^[A-Z]:/.test(workspaceRoot)) {
+        return workspaceRoot[0].toLowerCase() + workspaceRoot.slice(1);
+    }
+    
     return workspaceRoot;
 }
 
@@ -1187,7 +1196,8 @@ async function handleDaemon(args) {
             // Execute
             const proc = spawn('node', cmdArgs, {
                 detached: true,
-                stdio: mode === 'headless' ? 'ignore' : 'inherit'
+                stdio: mode === 'headless' ? 'ignore' : 'inherit',
+                windowsHide: mode === 'headless'  // Hide window in headless mode
             });
             
             if (mode === 'headless') {
@@ -1220,7 +1230,7 @@ async function handleDaemon(args) {
             
             try {
                 if (process.platform === 'win32') {
-                    execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' });
+                    execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore', windowsHide: true });
                 } else {
                     process.kill(pid, 'SIGTERM');
                 }
@@ -1247,7 +1257,7 @@ async function handleDaemon(args) {
                 const pid = getDaemonPid(workspaceRoot);
                 try {
                     if (process.platform === 'win32') {
-                        execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' });
+                        execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore', windowsHide: true });
                     } else {
                         process.kill(pid, 'SIGTERM');
                     }

@@ -19,7 +19,7 @@ export const ScriptNodeDefinition: INodeDefinition = {
     type: 'script',
     name: 'Script',
     description: 'Execute custom JavaScript code with access to workflow context',
-    category: 'data',
+    category: 'actions',
     icon: 'code',
     color: '#9C27B0',
     defaultInputs: [

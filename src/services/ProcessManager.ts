@@ -264,7 +264,8 @@ export class ProcessManager {
             env: options.env || process.env,
             detached: process.platform !== 'win32',  // Use process groups on Unix
             stdio: ['ignore', 'pipe', 'pipe'],
-            shell: process.platform === 'win32'  // Use shell on Windows
+            shell: process.platform === 'win32',  // Use shell on Windows
+            windowsHide: true  // Hide cmd.exe windows on Windows
         };
 
         const proc = spawn(command, args, spawnOptions);

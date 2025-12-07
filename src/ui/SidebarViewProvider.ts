@@ -4,6 +4,7 @@ import { DaemonStateProxy } from '../services/DaemonStateProxy';
 import { ROLE_WORKFLOW_MAP } from '../types/constants';
 import { ServiceLocator } from '../services/ServiceLocator';
 import { Logger } from '../utils/Logger';
+import { PlanViewerPanel } from './PlanViewerPanel';
 
 const log = Logger.create('Client', 'SidebarView');
 
@@ -179,6 +180,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         const readyUnsubscribe = proxy.subscribe('daemon.ready', (data: any) => {
             log.info('Daemon services ready - refreshing UI and enabling health monitoring');
             this.isDaemonReady = true;  // Mark daemon as ready
+            this.isConnecting = false;  // Clear connecting flag - we're past that phase
             
             // NOW start health monitoring - daemon is fully initialized
             // This prevents health check refreshes from wiping out initialization progress
@@ -219,6 +221,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     if (isReady && !this.isDaemonReady) {
                         log.info('Connected to already-ready daemon - no daemon.ready event received, setting state manually');
                         this.isDaemonReady = true;
+                        this.isConnecting = false;  // Clear connecting flag
                         this.healthMonitoringStarted = true;
                         this.refresh();
                     }
@@ -238,9 +241,17 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     if (isReady && !this.isDaemonReady) {
                         log.warn('Daemon was already ready but daemon.ready event was not processed - manually triggering ready state');
                         this.isDaemonReady = true;
+                        this.isConnecting = false;  // Clear connecting flag
                         this.healthMonitoringStarted = true;
                         this.refresh();
                     } else if (isReady && this.isDaemonReady) {
+                        // Daemon ready event was processed, but isConnecting might still be true
+                        // if refresh() returned early (due to _view not being set)
+                        // Clear it now to prevent stuck "Checking..." state when GUI opens late
+                        if (this.isConnecting) {
+                            log.debug('Clearing isConnecting flag (daemon ready, event processed, but flag was stuck)');
+                            this.isConnecting = false;
+                        }
                         log.debug('Daemon ready state already set from event - all good');
                     } else {
                         log.debug('Daemon not ready yet, waiting for daemon.ready event');
@@ -406,13 +417,18 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 case 'openPlan':
                     {
                         let planPath = data.planPath;
+                        let sessionId = data.sessionId;
                         // If planPath not provided directly, try to look it up from session
-                        if (!planPath && data.sessionId && this.stateProxy) {
+                        if (!planPath && sessionId && this.stateProxy) {
                             const sessions = await this.stateProxy.getPlanningSessions();
-                            const session = sessions.find(s => s.id === data.sessionId);
+                            const session = sessions.find(s => s.id === sessionId);
                             planPath = session?.currentPlanPath;
                         }
-                        if (planPath) {
+                        if (planPath && sessionId) {
+                            // Open in Plan Viewer Panel
+                            PlanViewerPanel.show(planPath, sessionId, this._extensionUri);
+                        } else if (planPath) {
+                            // Fallback: open raw file if no sessionId
                             const uri = vscode.Uri.file(planPath);
                             vscode.window.showTextDocument(uri);
                         } else {
@@ -452,6 +468,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     break;
                 case 'openCoordinatorLog':
                     this.openLatestCoordinatorLog();
+                    break;
+                case 'openGlobalDependencyMap':
+                    vscode.commands.executeCommand('agenticPlanning.openGlobalDependencyMap');
                     break;
                 case 'installDep':
                     await this.handleInstallDependency(data.depName, data.installType, data.installUrl, data.installCommand);
@@ -673,7 +692,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         }
         
         // If we're in connecting phase (proxy set but connection not confirmed)
-        if (this.isConnecting) {
+        // Skip this check if daemon is already known to be ready (prevents stuck state when GUI opens late)
+        if (this.isConnecting && !this.isDaemonReady) {
             this.isConnecting = false;  // Clear flag after first check
             return {
                 systemStatus: 'connecting',
@@ -699,6 +719,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 },
                 connectionHealth
             };
+        }
+        
+        // If we skipped the connecting check because daemon is ready, still clear the flag
+        if (this.isConnecting) {
+            this.isConnecting = false;
         }
         
         // Check daemon connection - if not connected, show error
@@ -938,10 +963,12 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             
             // Determine plan status
             let planStatus = 'Draft';
+            const hasPartialPlan = !!(s as any).metadata?.partialPlan;
             if (s.status === 'approved' || s.status === 'completed') {
                 planStatus = 'Approved';
             } else if (s.status === 'reviewing') {
-                planStatus = 'Pending Review';
+                // If plan is partial/incomplete, show warning indicator
+                planStatus = hasPartialPlan ? '⚠️ Incomplete' : 'Pending Review';
             } else if (s.status === 'planning') {
                 planStatus = 'Planning...';
             } else if (s.status === 'revising') {
@@ -1031,6 +1058,52 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 }
             }
             
+            // Also add benched agents to sessionAgents so they show on workflows
+            // Benched agents are allocated to a workflow but waiting for work (e.g., reviewer waiting for review phase)
+            const benchAgentsRaw = this.stateProxy 
+                ? await this.stateProxy.getBenchAgents()
+                : [];
+            for (const benchAgent of benchAgentsRaw) {
+                // Only include agents from this session
+                if (benchAgent.sessionId === s.id) {
+                    let roleColor: string | undefined;
+                    if (benchAgent.roleId) {
+                        const role = this.stateProxy 
+                            ? await this.stateProxy.getRole(benchAgent.roleId) 
+                            : undefined;
+                        roleColor = role?.color;
+                    }
+                    
+                    // Find workflow context for this benched agent
+                    let workflowType: string | undefined;
+                    let currentPhase: string | undefined;
+                    let taskId: string | undefined;
+                    
+                    if (benchAgent.workflowId) {
+                        for (const wf of activeWorkflows) {
+                            if (wf.id === benchAgent.workflowId) {
+                                workflowType = wf.type;
+                                currentPhase = wf.phase;
+                                taskId = wf.taskId;
+                                break;
+                            }
+                        }
+                    }
+                    
+                    sessionAgents.push({
+                        name: benchAgent.name,
+                        status: 'allocated',  // Mark as benched (allocated but idle)
+                        roleId: benchAgent.roleId,
+                        workflowId: benchAgent.workflowId,
+                        roleColor: roleColor || '#6366f1',  // Indigo for benched agents
+                        workflowType,
+                        currentPhase,
+                        taskId,
+                        sessionId: s.id
+                    });
+                }
+            }
+            
             sessions.push({
                 id: s.id,
                 requirement: s.requirement,
@@ -1047,7 +1120,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 workflowHistory,
                 isRevising,
                 failedTasks,
-                sessionAgents
+                sessionAgents,
+                hasPartialPlan: !!(s as any).metadata?.partialPlan,
+                interruptReason: (s as any).metadata?.interruptReason
             });
         }
 
@@ -1180,6 +1255,20 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 sessionId
             });
         }
+        
+        // Collect resting agents (cooldown after release)
+        const allRestingAgents = this.stateProxy 
+            ? await this.stateProxy.getRestingAgents()
+            : [];
+        
+        for (const name of allRestingAgents) {
+            agents.push({ 
+                name, 
+                status: 'resting',
+                roleColor: '#a3a3a3'  // Gray for resting
+            });
+        }
+        
         // Sort by name
         agents.sort((a, b) => a.name.localeCompare(b.name));
 

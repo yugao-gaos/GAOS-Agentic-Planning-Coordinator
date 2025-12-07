@@ -72,6 +72,7 @@ export interface IStateManagerApi {
     getPlanningSession(id: string): PlanningSessionData | undefined;
     deletePlanningSession(id: string): void;
     getSessionTasksFilePath(sessionId: string): string;
+    getPlansDirectory(): string;
     getWorkspaceRoot(): string;
     getWorkingDir(): string;
 }
@@ -99,9 +100,11 @@ export interface IProcessManagerApi {
  * Minimal agent pool interface for API handler
  */
 export interface IAgentPoolApi {
-    getPoolStatus(): { total: number; available: string[]; busy: string[] };
+    getPoolStatus(): { total: number; available: string[]; allocated: string[]; busy: string[] };
     getAvailableAgents(): string[];
+    getAllocatedAgents(): Array<{ name: string; roleId: string; sessionId: string; workflowId: string }>;
     getBusyAgents(): Array<{ name: string; roleId?: string; coordinatorId: string; sessionId: string; task?: string }>;
+    getRestingAgents(): string[];
     getAgentsOnBench(sessionId?: string): Array<{ name: string; roleId: string; sessionId: string }>;
     getAllRoles(): RoleData[];
     getRole(roleId: string): RoleData | undefined;
@@ -117,10 +120,10 @@ export interface IRoleRegistryApi {
     getAllRoles(): RoleData[];
     updateRole(roleId: string, updates: Record<string, unknown>): void;
     resetRoleToDefault(roleId: string): boolean;
-    getCoordinatorPrompt(): Record<string, unknown>;
-    updateCoordinatorPrompt(config: Record<string, unknown>): void;
-    resetCoordinatorPromptToDefault(): void;
     getAllSystemPrompts(): Array<{ toJSON(): Record<string, unknown> }>;
+    getSystemPrompt(id: string): { toJSON(): Record<string, unknown> } | undefined;
+    updateSystemPrompt(config: { id: string; toJSON(): Record<string, unknown> }): void;
+    resetSystemPromptToDefault(promptId: string): { toJSON(): Record<string, unknown> } | undefined;
     // Polling prompt methods
     getPollingPrompt(): { currentPrompt: string; defaultPrompt: string };
     updatePollingPrompt(prompt: string): void;
@@ -195,14 +198,15 @@ export interface ICoordinatorApi {
     // Get coordinator status for UI
     getCoordinatorStatus?(): CoordinatorStatusData;
     
+    // Manual workflow cleanup
+    forceCleanupStaleWorkflows(sessionId: string): number;
+    forceCleanupAllStaleWorkflows(): number;
+    
     // Get the workflow registry (for accessing workflow metadata)
     getWorkflowRegistry?(): IWorkflowRegistryApi;
     
     // Graceful shutdown - pause all workflows and release agents
     gracefulShutdown?(): Promise<{ workflowsPaused: number; agentsReleased: number }>;
-    
-    // Recover paused workflows after restart
-    recoverAllSessions?(): Promise<number>;
 }
 
 /**
@@ -225,6 +229,10 @@ export interface ITaskManagerApi {
     validateTaskFormat?(task: any): { valid: true } | { valid: false; reason: string };
     /** Get agent assignments for UI display */
     getAgentAssignmentsForUI?(): Array<{ name: string; sessionId: string; roleId?: string; workflowId?: string; currentTaskId?: string; status: string; assignedAt: string; lastActivityAt?: string; logFile: string }>;
+    /** Add a dependency to a task (supports cross-plan dependencies) */
+    addDependency(taskId: string, dependsOnId: string): { success: boolean; error?: string };
+    /** Remove a dependency from a task */
+    removeDependency(taskId: string, depId: string): { success: boolean; error?: string };
 }
 
 /**
@@ -390,7 +398,9 @@ export class ApiHandler {
      * Route a command to the appropriate handler
      */
     private async routeCommand(cmd: string, params: Record<string, unknown>): Promise<{ data?: unknown; message?: string }> {
-        const [category, action] = cmd.split('.');
+        const parts = cmd.split('.');
+        const category = parts[0];
+        const action = parts.slice(1).join('.'); // Join remaining parts to support nested actions like "custom.create"
         
         switch (category) {
             case 'status':
@@ -824,6 +834,27 @@ export class ApiHandler {
                 return { data: workflows };
             }
             
+            case 'cleanup': {
+                // Force cleanup of stale workflows for a session (or all sessions)
+                // This is useful when workflows get stuck in paused/running state
+                // but their tasks are already completed
+                const sessionId = params.sessionId as string | undefined;
+                
+                let cleanedCount = 0;
+                if (sessionId) {
+                    // Cleanup specific session
+                    cleanedCount = this.services.coordinator.forceCleanupStaleWorkflows(sessionId);
+                } else {
+                    // Cleanup all sessions
+                    cleanedCount = this.services.coordinator.forceCleanupAllStaleWorkflows();
+                }
+                
+                return {
+                    data: { cleanedCount, sessionId: sessionId || 'all' },
+                    message: `Cleaned up ${cleanedCount} stale workflow(s)`
+                };
+            }
+            
             case 'summarize': {
                 this.services.coordinator.updateWorkflowHistorySummary(
                     params.sessionId as string,
@@ -849,7 +880,9 @@ export class ApiHandler {
                         filePath: info.filePath,
                         requiresUnity: info.graph.nodes?.some(n => 
                             n.type === 'event' && n.config?.event_type?.includes('unity')
-                        ) || false
+                        ) || false,
+                        isValid: info.isValid,
+                        validationError: info.validationError
                     }));
                     return { data: workflows };
                 } catch (e: any) {
@@ -869,13 +902,24 @@ export class ApiHandler {
                     if (!name) {
                         throw new Error('Workflow name is required');
                     }
+                    
+                    // Check if file already exists
+                    const existingPath = scriptableRegistry.workflowFileExists(name);
+                    if (existingPath && !params.overwrite) {
+                        // Return exists flag so UI can prompt for confirmation
+                        return {
+                            data: { exists: true, filePath: existingPath, name },
+                            message: `Workflow "${name}" already exists`
+                        };
+                    }
+                    
                     log.info(`Creating workflow template: ${name}`);
                     
                     const filePath = await scriptableRegistry.createWorkflowTemplate(name);
                     log.info(`Workflow template created: ${filePath}`);
                     
                     return { 
-                        data: { filePath, name },
+                        data: { filePath, name, created: true },
                         message: `Custom workflow "${name}" created` 
                     };
                 } catch (e: any) {
@@ -951,12 +995,16 @@ export class ApiHandler {
     
     private poolStatus(): PoolStatusResponse {
         const status = this.services.agentPoolService.getPoolStatus();
+        const allocated = this.services.agentPoolService.getAllocatedAgents();
         const busy = this.services.agentPoolService.getBusyAgents();
+        const resting = this.services.agentPoolService.getRestingAgents();
         
         return {
             total: status.total,
             available: status.available,
-            busy: busy
+            allocated: allocated,
+            busy: busy,
+            resting: resting
         };
     }
     
@@ -1041,19 +1089,28 @@ export class ApiHandler {
     
     private agentPool(): AgentPoolResponse {
         const available = this.services.agentPoolService.getAvailableAgents();
+        const allocated = this.services.agentPoolService.getAllocatedAgents();
         const busy = this.services.agentPoolService.getBusyAgents();
+        const resting = this.services.agentPoolService.getRestingAgents();
         
         return {
             availableCount: available.length,
             available,
+            allocatedCount: allocated.length,
+            allocated: allocated.map(a => ({
+                name: a.name,
+                roleId: a.roleId,
+                workflowId: a.workflowId
+            })),
             busyCount: busy.length,
             busy: busy.map(b => ({
                 name: b.name,
                 roleId: b.roleId,
                 coordinatorId: b.coordinatorId,
-                sessionId: b.sessionId,
                 task: b.task
-            }))
+            })),
+            restingCount: resting.length,
+            resting: resting
         };
     }
     
@@ -1175,6 +1232,47 @@ export class ApiHandler {
                 };
             }
             
+            case 'listAllFilePaths': {
+                // Get all tasks.json file paths from all sessions (including completed ones)
+                // This is used by the dependency map global view to read tasks directly from disk
+                // (daemon memory may not have all tasks, especially completed ones)
+                const fs = require('fs');
+                const path = require('path');
+                
+                const filePaths: Array<{ sessionId: string; filePath: string; exists: boolean }> = [];
+                
+                // Get plans directory path
+                const plansDir = this.services.stateManager.getPlansDirectory();
+                log.debug(`[task.listAllFilePaths] Plans directory: ${plansDir}`);
+                log.debug(`[task.listAllFilePaths] Plans directory exists: ${fs.existsSync(plansDir)}`);
+                
+                if (fs.existsSync(plansDir)) {
+                    // Scan all session folders
+                    const sessionFolders = fs.readdirSync(plansDir, { withFileTypes: true })
+                        .filter((d: any) => d.isDirectory())
+                        .map((d: any) => d.name);
+                    
+                    log.debug(`[task.listAllFilePaths] Found ${sessionFolders.length} session folders: ${sessionFolders.join(', ')}`);
+                    
+                    for (const sessionId of sessionFolders) {
+                        const filePath = this.services.stateManager.getSessionTasksFilePath(sessionId);
+                        const exists = fs.existsSync(filePath);
+                        log.debug(`[task.listAllFilePaths] Session ${sessionId}: ${filePath} exists=${exists}`);
+                        // Only include sessions that have tasks.json files
+                        if (exists) {
+                            filePaths.push({ sessionId, filePath, exists });
+                        }
+                    }
+                } else {
+                    log.warn(`[task.listAllFilePaths] Plans directory does not exist: ${plansDir}`);
+                }
+                
+                return {
+                    data: filePaths,
+                    message: `Found ${filePaths.length} session(s) with task files`
+                };
+            }
+            
             case 'create': {
                 if (!sessionId) {
                     throw new Error('Missing session parameter');
@@ -1247,9 +1345,24 @@ export class ApiHandler {
                 } else if (task.status === 'paused') {
                     throw new Error(`Task ${taskId} is paused. Resume the task first.`);
                 } else if (task.status === 'in_progress') {
-                    // Task is in_progress, check if it's actually running or orphaned
-                    // For now, allow restart of in_progress tasks
-                    log.debug(`Task ${taskId} is in_progress, allowing restart`);
+                    // Task is in_progress - check if there's an active workflow
+                    // Only allow restart if the workflow is orphaned (not running)
+                    if (task.currentWorkflow && this.services.coordinator) {
+                        const sessionState = this.services.coordinator.getSessionState(sessionId);
+                        const existingWorkflow = sessionState?.activeWorkflows?.get(task.currentWorkflow);
+                        if (existingWorkflow) {
+                            const status = existingWorkflow.status;
+                            if (status === 'running' || status === 'pending' || status === 'blocked' || status === 'paused') {
+                                throw new Error(
+                                    `Task ${taskId} already has an active workflow (${task.currentWorkflow.substring(0, 8)}..., status: ${status}). ` +
+                                    `Wait for it to complete before starting a new one. ` +
+                                    `Use 'apc task status --session ${sessionId} --task ${taskId}' to check status.`
+                                );
+                            }
+                        }
+                    }
+                    // No active workflow found - task is orphaned, allow restart
+                    log.debug(`Task ${taskId} is in_progress but workflow is orphaned, allowing restart`);
                 }
                 // If status is 'created' or was recovered from orphaned 'in_progress', proceed
                 
@@ -1339,6 +1452,58 @@ export class ApiHandler {
                     : allAssignments;
                 
                 return { data: assignments };
+            }
+            
+            case 'add-dep': {
+                // Add a dependency to a task (supports cross-plan dependencies)
+                // apc task add-dep --session ps_000001 --task T3 --depends-on ps_000002_T5
+                if (!sessionId) {
+                    throw new Error('Missing session parameter');
+                }
+                if (!taskId) {
+                    throw new Error('Missing task parameter');
+                }
+                
+                const dependsOn = params['depends-on'] || params.dependsOn;
+                if (!dependsOn) {
+                    throw new Error('Missing depends-on parameter');
+                }
+                
+                const globalTaskId = `${sessionId}_${taskId}`;
+                const dependsOnId = String(dependsOn);
+                
+                const result = this.services.taskManager.addDependency(globalTaskId, dependsOnId);
+                if (!result.success) {
+                    throw new Error(result.error || 'Failed to add dependency');
+                }
+                
+                return { message: `Added dependency: ${taskId} → ${dependsOnId}` };
+            }
+            
+            case 'remove-dep': {
+                // Remove a dependency from a task
+                // apc task remove-dep --session ps_000001 --task T3 --dep ps_000002_T5
+                if (!sessionId) {
+                    throw new Error('Missing session parameter');
+                }
+                if (!taskId) {
+                    throw new Error('Missing task parameter');
+                }
+                
+                const depToRemove = params.dep;
+                if (!depToRemove) {
+                    throw new Error('Missing dep parameter');
+                }
+                
+                const globalTaskId = `${sessionId}_${taskId}`;
+                const depId = String(depToRemove);
+                
+                const result = this.services.taskManager.removeDependency(globalTaskId, depId);
+                if (!result.success) {
+                    throw new Error(result.error || 'Failed to remove dependency');
+                }
+                
+                return { message: `Removed dependency: ${taskId} → ${depId}` };
             }
             
             default:
@@ -1646,9 +1811,9 @@ export class ApiHandler {
         
         switch (action) {
             case 'getCoordinator': {
-                const coordinatorPrompt = this.services.roleRegistry.getCoordinatorPrompt();
+                const systemPrompt = this.services.roleRegistry.getSystemPrompt('coordinator');
                 return { 
-                    data: { coordinatorPrompt }
+                    data: { coordinatorPrompt: systemPrompt?.toJSON() }
                 };
             }
             
@@ -1657,15 +1822,20 @@ export class ApiHandler {
                 if (!config) {
                     throw new Error('Missing config parameter');
                 }
-                this.services.roleRegistry.updateCoordinatorPrompt(config);
+                // Create a SystemPromptConfig-like object for update
+                const promptConfig = {
+                    id: 'coordinator',
+                    ...config,
+                    toJSON: () => ({ id: 'coordinator', ...config })
+                };
+                this.services.roleRegistry.updateSystemPrompt(promptConfig as any);
                 return { message: 'Coordinator prompt updated successfully' };
             }
             
             case 'resetCoordinator': {
-                this.services.roleRegistry.resetCoordinatorPromptToDefault();
-                const coordinatorPrompt = this.services.roleRegistry.getCoordinatorPrompt();
+                const resetPrompt = this.services.roleRegistry.resetSystemPromptToDefault('coordinator');
                 return { 
-                    data: { coordinatorPrompt },
+                    data: { coordinatorPrompt: resetPrompt?.toJSON() },
                     message: 'Coordinator prompt reset to defaults'
                 };
             }
@@ -1975,13 +2145,10 @@ export class ApiHandler {
             }
             
             case 'count': {
-                // Count cursor-agent processes
-                const { execSync } = require('child_process');
+                // Count cursor-agent processes (cross-platform)
                 try {
-                    const count = parseInt(
-                        execSync('ps aux | grep -E "cursor.*(agent|--model)" | grep -v grep | wc -l', 
-                            { encoding: 'utf-8' }).trim()
-                    );
+                    const { countCursorAgentProcesses } = await import('../utils/orphanCleanup');
+                    const count = countCursorAgentProcesses();
                     return { data: { processCount: count } };
                 } catch (err) {
                     return { data: { processCount: 0, error: String(err) } };

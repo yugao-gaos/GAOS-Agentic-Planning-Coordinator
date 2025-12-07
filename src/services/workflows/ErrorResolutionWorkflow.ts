@@ -118,7 +118,7 @@ export class ErrorResolutionWorkflow extends BaseWorkflow {
         
         this.log(`Running fixer (${role?.defaultModel || 'sonnet-4.5'})...`);
         
-        // Use CLI callback for structured completion
+        // Use CLI callback for structured completion - pass pre-allocated agent
         const result = await this.runAgentTaskWithCallback(
             'error_fix',
             prompt,
@@ -127,7 +127,8 @@ export class ErrorResolutionWorkflow extends BaseWorkflow {
                 expectedStage: 'implementation',
                 timeout: role?.timeoutMs || 600000,
                 model: role?.defaultModel,
-                cwd: this.stateManager.getWorkspaceRoot()
+                cwd: this.stateManager.getWorkspaceRoot(),
+                agentName: this.fixerAgentName  // Use the pre-allocated fixer agent
             }
         );
         

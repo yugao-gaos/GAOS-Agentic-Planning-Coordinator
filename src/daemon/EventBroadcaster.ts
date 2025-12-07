@@ -447,12 +447,26 @@ export class EventBroadcaster extends EventEmitter implements IEventBroadcaster 
     
     /**
      * Broadcast pool change
+     *
+     * All 4 agent states are included so UI shows complete pool status:
+     * - available: Ready to be allocated
+     * - allocated: On bench, assigned to workflow but waiting for work
+     * - busy: Actively working on a task
+     * - resting: In cooldown after release before becoming available
      */
-    poolChanged(totalAgents: number, available: string[], busy: Array<{ name: string; coordinatorId: string; roleId?: string }>): void {
+    poolChanged(
+        totalAgents: number,
+        available: string[],
+        allocated: Array<{ name: string; workflowId: string; roleId?: string }>,
+        busy: Array<{ name: string; coordinatorId: string; roleId?: string }>,
+        resting: string[]
+    ): void {
         this.broadcast('pool.changed', {
             totalAgents,
             available,
+            allocated,
             busy,
+            resting,
             changedAt: new Date().toISOString()
         });
     }

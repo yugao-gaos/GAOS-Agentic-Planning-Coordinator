@@ -140,6 +140,7 @@ export interface TaskSummary {
     retryCount?: number;
     attempts: number;
     priority: number;
+    targetFiles?: string[];  // Files this task will modify - for cross-plan conflict detection
 }
 
 /**
@@ -155,6 +156,19 @@ export interface ActiveWorkflowSummary {
     agentName?: string;
     startedAt: string;
     lastUpdate: string;
+}
+
+/**
+ * Failed workflow summary for coordinator context
+ * Provides details about recently failed workflows so coordinator can react appropriately
+ */
+export interface FailedWorkflowSummary {
+    id: string;
+    type: WorkflowType;
+    taskId?: string;
+    error: string;
+    failedAt: string;
+    phase: string;  // Phase where failure occurred
 }
 
 /**
@@ -181,6 +195,20 @@ export interface SessionCapacity {
     currentlyAllocated: number;   // Agents currently on this session (busy + bench)
     availableCapacity: number;    // Can still allocate this many agents
     activeWorkflows: number;      // Currently running workflows for this session
+}
+
+/**
+ * Global file conflict info for cross-plan dependency detection
+ * Shows which tasks from different sessions touch the same files
+ */
+export interface GlobalFileConflict {
+    file: string;                 // The conflicting file path
+    tasks: Array<{
+        taskId: string;           // Global task ID (e.g., ps_000001_T3)
+        sessionId: string;        // Session this task belongs to
+        status: string;           // Current task status
+        description: string;      // Task description for context
+    }>;
 }
 
 export interface CoordinatorInput {
@@ -219,6 +247,8 @@ export interface CoordinatorInput {
     tasks: TaskSummary[];
     /** Currently running workflows */
     activeWorkflows: ActiveWorkflowSummary[];
+    /** Recently failed workflows (within last evaluation cycle) */
+    recentlyFailedWorkflows: FailedWorkflowSummary[];
     /** Session status */
     sessionStatus: string;
     /** Any pending user questions */
@@ -232,6 +262,10 @@ export interface CoordinatorInput {
     // ---- Capacity Planning (NEW) ----
     /** Per-session capacity analysis for respecting recommended team sizes */
     sessionCapacities: SessionCapacity[];
+    
+    // ---- Cross-Plan Conflict Detection ----
+    /** Files that are touched by tasks from multiple sessions - requires sequencing */
+    globalConflicts?: GlobalFileConflict[];
 }
 
 // ============================================================================

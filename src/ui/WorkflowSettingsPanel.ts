@@ -493,7 +493,8 @@ export class WorkflowSettingsPanel {
             }
             
             const response = await this.vsCodeClient.send('workflow.custom.list', {});
-            const workflows = (response as any)?.data || [];
+            // VsCodeClient.send() already unwraps response.data, so response IS the workflows array
+            const workflows = Array.isArray(response) ? response : [];
             
             this.panel.webview.postMessage({ 
                 command: 'setCustomWorkflows', 
@@ -535,12 +536,34 @@ export class WorkflowSettingsPanel {
             }
             
             log.info(`Creating workflow: ${name}`);
-            const response = await this.vsCodeClient.send('workflow.custom.create', { name });
+            let response = await this.vsCodeClient.send('workflow.custom.create', { name }) as any;
             log.info(`Response received:`, response);
             
-            const filePath = (response as any)?.data?.filePath;
+            // Check if file already exists and needs confirmation
+            if (response?.exists) {
+                const confirm = await vscode.window.showWarningMessage(
+                    `Workflow "${name}" already exists at ${response.filePath}. Overwrite?`,
+                    { modal: true },
+                    'Overwrite',
+                    'Open Existing'
+                );
+                
+                if (confirm === 'Open Existing') {
+                    // Just open the existing file
+                    await vscode.commands.executeCommand('apc.openNodeGraphEditor', vscode.Uri.file(response.filePath));
+                    return;
+                } else if (confirm === 'Overwrite') {
+                    // Re-call with overwrite flag
+                    response = await this.vsCodeClient.send('workflow.custom.create', { name, overwrite: true }) as any;
+                } else {
+                    // User cancelled
+                    return;
+                }
+            }
             
-            if (filePath) {
+            const filePath = response?.filePath;
+            
+            if (filePath && response?.created) {
                 log.info(`Workflow created at: ${filePath}`);
                 vscode.window.showInformationMessage(`Custom workflow "${name}" created at ${filePath}`);
                 
@@ -549,7 +572,7 @@ export class WorkflowSettingsPanel {
                 
                 // Refresh the list
                 await this.sendCustomWorkflows();
-            } else {
+            } else if (!response?.exists) {
                 log.warn(`No filePath in response:`, response);
                 vscode.window.showWarningMessage(`Workflow may have been created but no file path returned`);
             }
@@ -946,7 +969,7 @@ ${getSettingsCommonStyles()}
                             <span class="badge custom">Custom</span>
                             \${w.requiresUnity ? '<span class="badge unity">Requires Unity</span>' : ''}
                         </div>
-                        <button onclick="openEditor('\${escapeHtml(w.filePath)}')">📝 Open Editor</button>
+                        <button onclick="openEditor('\${escapeJsPath(w.filePath)}')">📝 Open Editor</button>
                     </div>
                     <p style="opacity: 0.8; margin: 0 0 16px 0;">\${w.description || 'No description'}</p>
                     
@@ -1019,8 +1042,8 @@ ${getSettingsCommonStyles()}
                 <div class="section">
                     <div class="section-title">Actions</div>
                     <div class="button-row">
-                        <button onclick="openEditor('\${escapeHtml(w.filePath)}')">Open in Node Graph Editor</button>
-                        <button class="secondary" onclick="openYamlFile('\${escapeHtml(w.filePath)}')">Edit YAML Directly</button>
+                        <button onclick="openEditor('\${escapeJsPath(w.filePath)}')">Open in Node Graph Editor</button>
+                        <button class="secondary" onclick="openYamlFile('\${escapeJsPath(w.filePath)}')">Edit YAML Directly</button>
                         <button class="danger" onclick="deleteWorkflow('\${w.type}')">Delete Workflow</button>
                     </div>
                 </div>
@@ -1244,6 +1267,14 @@ ${getSettingsCommonStyles()}
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
+        }
+        
+        // Escape for JavaScript string in onclick (handles backslashes in Windows paths)
+        function escapeJsPath(str) {
+            if (!str) return '';
+            // Replace backslashes with double backslashes for JS string escaping
+            // Then escape single quotes
+            return str.split('\\\\').join('\\\\\\\\').split("'").join("\\\\'");
         }
         
         // Coordinator prompt actions

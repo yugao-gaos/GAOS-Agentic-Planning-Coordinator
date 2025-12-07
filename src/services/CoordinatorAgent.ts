@@ -31,12 +31,13 @@ import {
     DEFAULT_COORDINATOR_CONFIG,
     TaskSummary,
     ActiveWorkflowSummary,
+    FailedWorkflowSummary,
     ExecutionStartedPayload,
     WorkflowCompletedPayload,
     WorkflowFailedPayload,
     UnityErrorPayload
 } from '../types/coordinator';
-import { DefaultCoordinatorPrompt } from '../types';
+import { DefaultSystemPrompts, SystemPromptConfig } from '../types';
 import { getEffectiveCoordinatorPrompts } from './WorkflowSettingsManager';
 
 /**
@@ -300,12 +301,9 @@ export class CoordinatorAgent {
      */
     private async checkCapacityAndCleanup(input: CoordinatorInput): Promise<void> {
         try {
-            // Count cursor-agent processes
-            const { execSync } = require('child_process');
-            const processCount = parseInt(
-                execSync('ps aux | grep -E "cursor.*(agent|--model)" | grep -v grep | wc -l', 
-                    { encoding: 'utf-8', timeout: 5000 }).trim()
-            );
+            // Count cursor-agent processes (cross-platform)
+            const { countCursorAgentProcesses } = await import('../utils/orphanCleanup');
+            const processCount = countCursorAgentProcesses();
             
             // Calculate capacity
             const availableAgentCount = input.availableAgents?.length ?? 0;
@@ -331,11 +329,8 @@ export class CoordinatorAgent {
                 if (killedCount > 0) {
                     this.log(`[CAPACITY CHECK] ✅ Killed ${killedCount} orphan processes`);
                     
-                    // Re-count after cleanup
-                    const afterCount = parseInt(
-                        execSync('ps aux | grep -E "cursor.*(agent|--model)" | grep -v grep | wc -l', 
-                            { encoding: 'utf-8', timeout: 5000 }).trim()
-                    );
+                    // Re-count after cleanup (cross-platform)
+                    const afterCount = countCursorAgentProcesses();
                     const afterCapacity = (afterCount / totalAgentCount) * 100;
                     this.log(`[CAPACITY CHECK] After cleanup: ${afterCount} processes (${afterCapacity.toFixed(0)}% capacity)`);
                 } else {
@@ -398,13 +393,16 @@ export class CoordinatorAgent {
         const historySection = this.formatHistory(input.history);
         const tasksSection = this.formatTasks(input.tasks);
         const workflowsSection = this.formatWorkflows(input.activeWorkflows);
+        const failedWorkflowsSection = this.formatFailedWorkflows(input.recentlyFailedWorkflows || []);
         const agentsSection = this.formatAgents(input.agentStatuses, input.availableAgents);
         const eventSection = this.formatEventSection(input);
         const plansSection = this.formatApprovedPlans(input);
         const capacitiesSection = this.formatSessionCapacities(input.sessionCapacities || []);
+        const globalConflictsSection = this.formatGlobalConflicts(input.globalConflicts || []);
         
         // Get customizable prompt parts from registry (or use defaults)
-        const promptConfig = this.roleRegistry?.getCoordinatorPrompt() || DefaultCoordinatorPrompt;
+        const defaultConfig = DefaultSystemPrompts['coordinator'];
+        const promptConfig = this.roleRegistry?.getSystemPrompt('coordinator') || new SystemPromptConfig(defaultConfig);
         
         // Get user-configured workflow prompts (overrides + defaults)
         const userOverrides = getEffectiveCoordinatorPrompts(this.workspaceRoot);
@@ -419,7 +417,7 @@ export class CoordinatorAgent {
         const totalAgentCount = availableAgentCount + busyAgentCount;
         
         // Replace template variables in decision instructions
-        const decisionInstructions = promptConfig.decisionInstructions
+        const decisionInstructions = (promptConfig.decisionInstructions || '')
             .replace('{{sessionId}}', input.sessionId)
             .replace('{{timestamp}}', String(Date.now()))
             .replace('{{WORKFLOW_SELECTION}}', workflowPrompts || 'No workflows registered')
@@ -457,8 +455,14 @@ ${tasksSection}
 --- ACTIVE WORKFLOWS ---
 ${workflowsSection}
 
+--- RECENTLY FAILED WORKFLOWS ---
+${failedWorkflowsSection}
+
 --- AGENTS ---
 ${agentsSection}
+
+--- CROSS-PLAN FILE CONFLICTS ---
+${globalConflictsSection}
 
 ═══════════════════════════════════════════════════════════════════════════════
 YOUR DECISION
@@ -582,6 +586,18 @@ ${decisionInstructions}`;
     }
 
     /**
+     * Format recently failed workflows for the prompt
+     * This helps the coordinator know about failures and react appropriately
+     */
+    private formatFailedWorkflows(workflows: FailedWorkflowSummary[]): string {
+        if (workflows.length === 0) return 'No recent workflow failures.';
+
+        return workflows.map(w => 
+            `- ${w.id.substring(0, 8)}... | ${w.type} | Task: ${w.taskId || 'N/A'} | Phase: ${w.phase}\n  ERROR: ${w.error.substring(0, 200)}${w.error.length > 200 ? '...' : ''}`
+        ).join('\n');
+    }
+
+    /**
      * Format agent status for the prompt
      */
     private formatAgents(statuses: CoordinatorInput['agentStatuses'], available: string[]): string {
@@ -634,6 +650,25 @@ ${decisionInstructions}`;
             
             return `- ${c.sessionId}: Recommends ${c.recommendedAgents} agents, currently using ${c.currentlyAllocated} (${c.activeWorkflows} workflows)\n  ${status}`;
         }).join('\n');
+    }
+    
+    /**
+     * Format global file conflicts for cross-plan dependency awareness
+     * Shows files touched by tasks from multiple sessions that need sequencing
+     */
+    private formatGlobalConflicts(conflicts: import('../types/coordinator').GlobalFileConflict[]): string {
+        if (!conflicts || conflicts.length === 0) {
+            return 'No cross-plan file conflicts detected.';
+        }
+        
+        return `⚠️ ${conflicts.length} file(s) touched by multiple sessions - SEQUENCE CAREFULLY:\n\n` +
+            conflicts.map(c => {
+                const taskList = c.tasks.map(t => 
+                    `    - ${t.taskId} (${t.sessionId}) [${t.status}]: ${t.description.substring(0, 50)}...`
+                ).join('\n');
+                return `📁 ${c.file}:\n${taskList}`;
+            }).join('\n\n') +
+            '\n\n💡 Use `apc task add-dep` to add cross-plan dependencies if needed.';
     }
 
     /**

@@ -216,10 +216,9 @@ export class PlanningService extends EventEmitter {
             if (event.sessionId === sessionId) {
                 const updatedSession = this.stateManager.getPlanningSession(sessionId);
                 if (updatedSession) {
-                    // On success -> reviewing, on failure -> no_plan (planning failed)
-                    updatedSession.status = event.result.success ? 'reviewing' : 'no_plan';
-                    
                     if (event.result.success && event.result.output?.planPath) {
+                        // Success - full plan available
+                        updatedSession.status = 'reviewing';
                         updatedSession.currentPlanPath = event.result.output.planPath;
                         updatedSession.planHistory.push({
                             version: 1,
@@ -232,6 +231,45 @@ export class PlanningService extends EventEmitter {
                             count: engineerCount,
                             justification: `Workflow-based planning (${event.result.output.iterations || 1} iterations)`
                         };
+                        
+                        // Clear any partial plan metadata on success
+                        if (updatedSession.metadata?.partialPlan) {
+                            delete updatedSession.metadata.partialPlan;
+                            delete updatedSession.metadata.interruptedAt;
+                            delete updatedSession.metadata.interruptReason;
+                        }
+                    } else {
+                        // Workflow failed or was cancelled
+                        // Check if partial plan file exists and has meaningful content
+                        const planPath = this.stateManager.getPlanFilePath(sessionId);
+                        let hasContent = false;
+                        if (fs.existsSync(planPath)) {
+                            try {
+                                const content = fs.readFileSync(planPath, 'utf-8');
+                                // Check if plan has content beyond the placeholder header
+                                // (more than 500 chars and not ending with the placeholder message)
+                                hasContent = content.length > 500 && 
+                                    !content.includes('*Plan content will appear below as the planner works...*');
+                            } catch { /* ignore read errors */ }
+                        }
+                        
+                        if (hasContent) {
+                            // Partial plan exists with content - allow review/restart
+                            updatedSession.status = 'reviewing';
+                            updatedSession.currentPlanPath = planPath;
+                            // Mark as partial in metadata for UI to indicate incomplete
+                            updatedSession.metadata = updatedSession.metadata || {};
+                            updatedSession.metadata.partialPlan = true;
+                            updatedSession.metadata.interruptedAt = new Date().toISOString();
+                            updatedSession.metadata.interruptReason = event.result.error || 'Workflow interrupted';
+                        } else {
+                            // No meaningful plan content - go to no_plan status
+                            // But keep currentPlanPath if the file exists so user can see what's there
+                            updatedSession.status = 'no_plan';
+                            if (fs.existsSync(planPath)) {
+                                updatedSession.currentPlanPath = planPath;
+                            }
+                        }
                     }
                     
                     updatedSession.updatedAt = new Date().toISOString();
@@ -343,15 +381,29 @@ export class PlanningService extends EventEmitter {
                 if (event.sessionId === sessionId && event.workflowId === workflowId) {
                     const updatedSession = this.stateManager.getPlanningSession(sessionId);
                     if (updatedSession) {
-                        updatedSession.status = event.result.success ? 'reviewing' : previousStatus;
-                        
                         if (event.result.success && event.result.output?.planPath) {
+                            // Success - plan revision complete
+                            updatedSession.status = 'reviewing';
                             updatedSession.currentPlanPath = event.result.output.planPath;
                             updatedSession.planHistory.push({
                                 version: newVersion,
                                 path: event.result.output.planPath,
                                 timestamp: new Date().toISOString()
                             });
+                            // Clear partial plan metadata on success
+                            if (updatedSession.metadata?.partialPlan) {
+                                delete updatedSession.metadata.partialPlan;
+                                delete updatedSession.metadata.interruptedAt;
+                                delete updatedSession.metadata.interruptReason;
+                            }
+                        } else {
+                            // Workflow failed or was cancelled
+                            // For revision, we keep the existing plan and just mark interrupted
+                            updatedSession.status = previousStatus;
+                            updatedSession.metadata = updatedSession.metadata || {};
+                            updatedSession.metadata.revisionInterrupted = true;
+                            updatedSession.metadata.interruptedAt = new Date().toISOString();
+                            updatedSession.metadata.interruptReason = event.result.error || 'Revision interrupted';
                         }
                         
                         updatedSession.updatedAt = new Date().toISOString();
@@ -406,7 +458,8 @@ export class PlanningService extends EventEmitter {
         const tasksFound: Array<{ id: string; description: string; deps: string[] }> = [];
 
         // Check for checkbox format tasks
-        const checkboxPattern = /^-\s*\[[ xX]\]\s*\*\*T(\d+)\*\*:\s*(.+?)(?:\s*\|\s*Deps?:\s*([^|]+))?(?:\s*\|\s*Engineer:\s*\w+)?$/gm;
+        // Support both T1 and T8.4 style task IDs (hierarchical with dots)
+        const checkboxPattern = /^-\s*\[[ xX]\]\s*\*\*T([\d.]+)\*\*:\s*(.+?)(?:\s*\|\s*Deps?:\s*([^|]+))?(?:\s*\|\s*Engineer:\s*\w+)?$/gm;
         
         let match;
         while ((match = checkboxPattern.exec(planContent)) !== null) {
@@ -416,7 +469,8 @@ export class PlanningService extends EventEmitter {
             
             const deps: string[] = [];
             if (depsStr.toLowerCase() !== 'none' && depsStr !== '-') {
-                const depMatches = depsStr.match(/T\d+/gi) || [];
+                // Support both T1 and T8.4 style dependency references
+                const depMatches = depsStr.match(/T[\d.]+/gi) || [];
                 deps.push(...depMatches.map(d => d.toUpperCase()));
             }
             

@@ -70,14 +70,6 @@ export function getSidebarScript(): string {
         if (workflowSettingsBtn) {
             workflowSettingsBtn.onclick = () => vscode.postMessage({ type: 'openWorkflowSettings' });
         }
-        
-        // Coordinator info click handler - open latest log
-        const coordinatorInfo = document.getElementById('coordinatorInfo');
-        if (coordinatorInfo) {
-            coordinatorInfo.onclick = () => {
-                vscode.postMessage({ type: 'openCoordinatorLog' });
-            };
-        }
 
         /**
          * Escape HTML special characters.
@@ -395,25 +387,27 @@ export function getSidebarScript(): string {
             let unityHtml = '';
             if (unityEnabled && unity) {
                 const unityBadge = getUnityBadgeStyle(unity);
-                const queueText = unity.queueLength > 0 ? '(' + unity.queueLength + ' queued)' : '';
-                unityHtml = '<div class="ready-item">' +
-                    '<span class="ready-label">Unity</span>' +
-                    '<div class="ready-value">' +
+                const queueText = unity.queueLength > 0 ? '(' + unity.queueLength + ')' : '';
+                unityHtml = '<div class="status-boxes-row" style="margin-top: 6px;">' +
+                    '<div class="status-box">' +
+                    '<span class="status-box-label">Unity</span>' +
                     '<span class="unity-badge" style="background: ' + unityBadge.background + ';">' + unityBadge.text + '</span>' +
                     (queueText ? '<span class="unity-queue">' + queueText + '</span>' : '') +
                     '</div></div>';
             }
             
             return '<div class="context-box context-box-ready">' +
-                '<div class="ready-info">' +
-                '<div class="ready-item clickable" id="coordinatorInfo" title="Click to open latest coordinator log">' +
-                '<span class="ready-label">Coordinator</span>' +
-                '<div class="ready-value">' +
+                '<div class="status-boxes-row">' +
+                '<div class="status-box" id="coordinatorInfo">' +
+                '<span class="status-box-label">Coordinator</span>' +
                 '<div class="coordinator-dot ' + coordClass + '" id="coordinatorDot"></div>' +
                 '<span class="coordinator-text" id="coordinatorText">' + coordText + '</span>' +
-                '</div></div>' +
+                '<div class="coordinator-actions">' +
+                '<button class="coord-icon-btn" id="globalDepsBtn" title="Global Task Dependencies">🌐</button>' +
+                '<button class="coord-icon-btn" id="coordLogBtn" title="View Coordinator Log">📋</button>' +
+                '</div></div></div>' +
                 unityHtml +
-                '</div></div>';
+                '</div>';
         }
         
         function getUnityBadgeStyle(unity) {
@@ -455,10 +449,16 @@ export function getSidebarScript(): string {
                 startBtn.onclick = () => vscode.postMessage({ type: 'startDaemon' });
             }
             
-            // Coordinator info click (open log)
-            const coordInfo = document.getElementById('coordinatorInfo');
-            if (coordInfo) {
-                coordInfo.onclick = () => vscode.postMessage({ type: 'openCoordinatorLog' });
+            // Coordinator Log button
+            const coordLogBtn = document.getElementById('coordLogBtn');
+            if (coordLogBtn) {
+                coordLogBtn.onclick = () => vscode.postMessage({ type: 'openCoordinatorLog' });
+            }
+            
+            // Global Dependencies button
+            const globalDepsBtn = document.getElementById('globalDepsBtn');
+            if (globalDepsBtn) {
+                globalDepsBtn.onclick = () => vscode.postMessage({ type: 'openGlobalDependencyMap' });
             }
             
             // Install buttons

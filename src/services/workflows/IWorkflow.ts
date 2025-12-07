@@ -95,6 +95,9 @@ export interface IWorkflow {
     /** Get progress for UI display */
     getProgress(): WorkflowProgress;
     
+    /** Get error message if workflow failed */
+    getError(): string | undefined;
+    
     /** Get serializable state for persistence/resume */
     getState(): object;
     
@@ -109,11 +112,34 @@ export interface IWorkflow {
      * Pause the workflow 
      * @param options.force If true, immediately kill any running agent and save state.
      *                      If false (default), pause happens at next phase boundary.
+     * @param options.reason Why the workflow is being paused (for persistence)
      */
-    pause(options?: { force?: boolean }): Promise<void>;
+    pause(options?: { 
+        force?: boolean; 
+        reason?: 'user_request' | 'conflict' | 'error' | 'timeout' | 'daemon_shutdown';
+    }): Promise<void>;
     
     /** Resume a paused workflow */
     resume(): Promise<void>;
+    
+    /**
+     * Restore workflow state from saved state
+     * Used during session recovery to set workflow back to its paused position
+     * 
+     * @param savedState State saved by persistState()
+     */
+    restoreFromSavedState(savedState: {
+        phaseIndex: number;
+        phaseName?: string;
+        phaseProgress?: 'not_started' | 'in_progress' | 'completed';
+        filesModified?: string[];
+        continuationContext?: {
+            phaseName: string;
+            partialOutput: string;
+            filesModified: string[];
+            whatWasDone: string;
+        };
+    }): void;
     
     /** Cancel the workflow */
     cancel(): Promise<void>;

@@ -38,6 +38,16 @@ export const agentStyles = `
     border-top: 2px solid #73c991;
 }
 
+.agent-card.allocated {
+    border-top: 2px solid var(--role-color, #6366f1);
+    opacity: 0.85;
+}
+
+.agent-card.resting {
+    border-top: 2px solid #a3a3a3;
+    opacity: 0.7;
+}
+
 .agent-card.busy {
     border-top: 2px solid var(--role-color, #f97316);
 }
@@ -103,6 +113,16 @@ export const agentStyles = `
     color: #73c991;
 }
 
+.agent-card.allocated .agent-icon {
+    background: var(--role-color-bg, rgba(99, 102, 241, 0.15));
+    color: var(--role-color, #6366f1);
+}
+
+.agent-card.resting .agent-icon {
+    background: rgba(163, 163, 163, 0.15);
+    color: #a3a3a3;
+}
+
 .agent-card.busy .agent-icon {
     background: var(--role-color-bg, rgba(249, 115, 22, 0.2));
     color: var(--role-color, #f97316);
@@ -127,6 +147,10 @@ export const agentStyles = `
 
 .agent-status-line.available {
     color: #73c991;
+}
+
+.agent-status-line.resting {
+    color: #a3a3a3;
 }
 
 .agent-task-line {
