@@ -23,10 +23,12 @@ import {
 import { OutputChannelManager } from './OutputChannelManager';
 import { AgentRunner, AgentRunResult } from './AgentBackend';
 import { AgentRoleRegistry } from './AgentRoleRegistry';
+import { UnityLogMonitor, LogMonitorResult } from './UnityLogMonitor';
 import { TaskManager, ERROR_RESOLUTION_SESSION_ID } from './TaskManager';
 import { UnifiedCoordinatorService } from './UnifiedCoordinatorService';
 import { ServiceLocator } from './ServiceLocator';
 import { EventBroadcaster } from '../daemon/EventBroadcaster';
+import { getFolderStructureManager } from './FolderStructureManager';
 
 // ============================================================================
 // Unity Control Manager - Background Service
@@ -34,13 +36,14 @@ import { EventBroadcaster } from '../daemon/EventBroadcaster';
 
 /**
  * Unity Editor state tracked by polling agent
+ * 
+ * Note: Error tracking is now handled by UnityLogMonitor via direct log file reading.
+ * The polling agent only monitors editor state (isCompiling, isPlaying, isPaused).
  */
 interface UnityEditorStatus {
     isCompiling: boolean;
     isPlaying: boolean;
     isPaused: boolean;
-    hasErrors: boolean;
-    errorCount: number;
     timestamp: number;
 }
 
@@ -111,16 +114,32 @@ export class UnityControlManager {
 
     // Output channel for logging
     private outputManager: OutputChannelManager;
+    
+    // Log file path for Unity pipeline logs
+    private logFilePath: string | null = null;
 
     // Task ID counter
     private taskIdCounter: number = 0;
     
     // Agent Role Registry for customizable prompts
     private agentRoleRegistry: AgentRoleRegistry | null = null;
+    
+    // Unity log monitor for capturing console output with timestamps
+    private logMonitor: UnityLogMonitor;
 
     constructor() {
         this.outputManager = ServiceLocator.resolve(OutputChannelManager);
         this.agentRunner = ServiceLocator.resolve(AgentRunner);
+        this.logMonitor = new UnityLogMonitor();
+    }
+    
+    /**
+     * Set workspace root for log monitor persistence
+     */
+    private initializeLogMonitor(): void {
+        if (this.workspaceRoot) {
+            this.logMonitor.setWorkspaceRoot(this.workspaceRoot);
+        }
     }
     
     /**
@@ -136,6 +155,12 @@ export class UnityControlManager {
     async initialize(workspaceRoot: string): Promise<void> {
         this.workspaceRoot = workspaceRoot;
         this.errorRegistryPath = path.join(workspaceRoot, '_AiDevLog/Errors/error_registry.md');
+        
+        // Initialize log file in the configured Logs folder
+        this.initializeLogFile();
+        
+        // Initialize log monitor with workspace for log persistence
+        this.initializeLogMonitor();
 
         this.log('Initializing Unity Control Manager...');
         this.log(`Workspace: ${workspaceRoot}`);
@@ -430,18 +455,8 @@ export class UnityControlManager {
                 });
             }
 
-            // Step 5: Read console for errors
-            this.log('Reading Unity console...');
-            const consoleResult = await this.readUnityConsole();
-            errors.push(...consoleResult.errors);
-            warnings.push(...consoleResult.warnings);
-
-            // Step 6: Route errors to global error handling
-            if (errors.length > 0) {
-                this.log(`Found ${errors.length} errors, routing to global handler...`);
-                // Error routing is handled by handlePipelineErrors() 
-                // which uses global TaskManager for cross-plan detection
-            }
+            // Note: Console errors are now captured by UnityLogMonitor at the pipeline step level
+            // with accurate timestamps (100ms precision). See executePipelineStep().
 
             return {
                 success: errors.filter(e => e.type === 'compilation').length === 0,
@@ -471,20 +486,9 @@ export class UnityControlManager {
         task.phase = 'running_tests';
         this.emitStatusUpdate();
 
-        // Check for compilation errors first
-        const consoleCheck = await this.readUnityConsole();
-        const compilationErrors = consoleCheck.errors.filter(e => e.code?.startsWith('CS'));
-
-        if (compilationErrors.length > 0) {
-            this.log('Cannot run tests - compilation errors exist');
-            return {
-                success: false,
-                errors: compilationErrors,
-                warnings: consoleCheck.warnings,
-                testsPassed: 0,
-                testsFailed: 0
-            };
-        }
+        // Note: Compilation errors are now detected via UnityLogMonitor during the prep step.
+        // If tests are run after prep, any compilation errors will have been captured.
+        // If compilation errors exist, Unity's test runner will fail appropriately.
 
         // Run EditMode tests via MCP
         this.log('Running EditMode tests...');
@@ -880,14 +884,55 @@ export class UnityControlManager {
     }
 
     /**
-     * Log to unified output channel
+     * Initialize the log file in the configured Logs folder
+     */
+    private initializeLogFile(): void {
+        try {
+            const folderStructure = getFolderStructureManager();
+            const logsDir = folderStructure.getFolderPath('logs');
+            
+            // Ensure logs directory exists
+            if (!fs.existsSync(logsDir)) {
+                fs.mkdirSync(logsDir, { recursive: true });
+            }
+            
+            this.logFilePath = path.join(logsDir, 'unity_pipeline.log');
+            
+            // Write header to log file
+            const header = `\n${'='.repeat(60)}\n` +
+                `=== Unity Pipeline Log ===\n` +
+                `Started: ${new Date().toISOString()}\n` +
+                `${'='.repeat(60)}\n\n`;
+            fs.appendFileSync(this.logFilePath, header);
+        } catch (error) {
+            // Silently ignore if FolderStructureManager not initialized yet
+            // Log file will not be available, but output channel still works
+        }
+    }
+    
+    /**
+     * Log to unified output channel and log file
      */
     private log(message: string): void {
         this.outputManager.log('UNITY', message);
+        
+        // Also write to log file if available
+        if (this.logFilePath) {
+            try {
+                const timestamp = new Date().toISOString();
+                fs.appendFileSync(this.logFilePath, `[${timestamp}] ${message}\n`);
+            } catch {
+                // Silently ignore file write errors
+            }
+        }
     }
 
     /**
      * Emit status update
+     * 
+     * Note: Error status is now determined by pipeline results, not polling.
+     * The polling agent only monitors editor state (isCompiling, isPlaying, isPaused).
+     * Error detection happens via UnityLogMonitor during pipeline operations.
      */
     private emitStatusUpdate(): void {
         this._onStatusChanged.fire(this.getState());
@@ -895,11 +940,9 @@ export class UnityControlManager {
         // Broadcast Unity status to all clients
         const broadcaster = ServiceLocator.resolve(EventBroadcaster);
         
-        // Determine overall status
+        // Determine overall status based on editor state
         let overallStatus: 'idle' | 'compiling' | 'testing' | 'playing' | 'error' = 'idle';
-        if (this.lastUnityStatus?.hasErrors) {
-            overallStatus = 'error';
-        } else if (this.lastUnityStatus?.isCompiling) {
+        if (this.lastUnityStatus?.isCompiling) {
             overallStatus = 'compiling';
         } else if (this.lastUnityStatus?.isPlaying) {
             overallStatus = 'playing';
@@ -907,13 +950,15 @@ export class UnityControlManager {
             overallStatus = 'testing';
         }
         
+        // Note: hasErrors and errorCount are now always false/0 from polling.
+        // Errors are detected via UnityLogMonitor and reported through pipeline results.
         broadcaster.unityStatusChanged(
             overallStatus,
             this.lastUnityStatus?.isCompiling ?? false,
             this.lastUnityStatus?.isPlaying ?? false,
             this.lastUnityStatus?.isPaused ?? false,
-            this.lastUnityStatus?.hasErrors ?? false,
-            this.lastUnityStatus?.errorCount ?? 0
+            false,  // hasErrors - now determined by pipeline, not polling
+            0       // errorCount - now determined by pipeline, not polling
         );
     }
 
@@ -1134,6 +1179,8 @@ export class UnityControlManager {
 
     /**
      * Update Unity status from polling agent
+     * 
+     * Note: Error tracking is now handled by UnityLogMonitor, not the polling agent.
      */
     private updateUnityStatus(status: Partial<UnityEditorStatus>): void {
         const wasCompiling = this.lastUnityStatus?.isCompiling ?? false;
@@ -1142,8 +1189,6 @@ export class UnityControlManager {
             isCompiling: status.isCompiling ?? false,
             isPlaying: status.isPlaying ?? false,
             isPaused: status.isPaused ?? false,
-            hasErrors: status.hasErrors ?? false,
-            errorCount: status.errorCount ?? 0,
             timestamp: Date.now()
         };
 
@@ -1225,14 +1270,16 @@ export class UnityControlManager {
         return `${basePrompt}
 
 ========================================
-📋 POLLING SESSION
+📋 POLLING SESSION - Editor State Only
 ========================================
 
 IMPORTANT: You must keep running and polling continuously. Do NOT exit after one check.
 
-🔧 MCP TOOLS YOU USE:
+🔧 MCP TOOL YOU USE:
 - fetch_mcp_resource uri="unity://editor/state" → Get isPlaying, isPaused, isCompiling
-- mcp_unityMCP_read_console action="get" types=["error"] count="10" → Get recent errors
+
+NOTE: Console/error reading is now handled via direct log file monitoring (UnityLogMonitor).
+Your only job is to report editor state changes.
 
 📜 POLLING LOOP - Repeat every 5 seconds:
 
@@ -1242,22 +1289,16 @@ fetch_mcp_resource uri="unity://editor/state"
 \`\`\`
 Returns: { isPlaying, isPaused, isCompiling }
 
-**Step 2: Check for errors** (if compiling or recently compiled)
+**Step 2: Report status** - Output this JSON line:
 \`\`\`
-mcp_unityMCP_read_console action="get" types=["error"] count="10"
-\`\`\`
-Count the errors returned.
-
-**Step 3: Report status** - Output this JSON line:
-\`\`\`
-{"unity_status": {"isCompiling": false, "isPlaying": false, "isPaused": false, "hasErrors": false, "errorCount": 0}}
+{"unity_status": {"isCompiling": false, "isPlaying": false, "isPaused": false}}
 \`\`\`
 
-**Step 4: Track state changes**
+**Step 3: Track state changes**
 - If was compiling → now not compiling: output "COMPILE_COMPLETE"
 - If was not compiling → now compiling: output "COMPILE_STARTED"
 
-**Step 5: Wait ~5 seconds, then repeat from Step 1**
+**Step 4: Wait ~5 seconds, then repeat from Step 1**
 
 ⚠️ CRITICAL RULES:
 1. Keep polling until timeout (~15 minutes) - DO NOT stop early
@@ -1268,7 +1309,7 @@ Count the errors returned.
 
 🔄 ALTERNATIVE: You can also call CLI to report status:
 \`\`\`
-apc unity notify-status --compiling true --playing false --errors 2
+apc unity notify-status --compiling true --playing false
 \`\`\`
 
 Begin polling now. First poll:`;
@@ -1523,10 +1564,19 @@ Begin polling now. First poll:`;
 
     /**
      * Execute a single pipeline step
+     * 
+     * Uses UnityLogMonitor to capture console output with accurate timestamps
+     * during the operation execution.
      */
     private async executePipelineStep(operation: PipelineOperation): Promise<PipelineStepResult> {
         const startTime = Date.now();
         let result: PipelineStepResult;
+
+        // Start log monitoring for this step (captures console output with timestamps)
+        const logMonitorStarted = this.logMonitor.startMonitoring();
+        if (logMonitorStarted) {
+            this.log(`[LogMonitor] Started monitoring for ${operation}`);
+        }
 
         try {
             switch (operation) {
@@ -1637,6 +1687,38 @@ Begin polling now. First poll:`;
                     timestamp: new Date().toISOString()
                 }]
             };
+        }
+
+        // Stop log monitoring and capture results
+        let logResult: LogMonitorResult | null = null;
+        if (logMonitorStarted) {
+            const pipelineId = this.currentPipeline?.id || `step_${operation}_${Date.now()}`;
+            logResult = this.logMonitor.stopMonitoring(pipelineId);
+            
+            this.log(`[LogMonitor] Captured ${logResult.totalSegments} segments for ${operation}`);
+            this.log(`[LogMonitor] Errors: ${logResult.errorCount}, Exceptions: ${logResult.exceptionCount}, Warnings: ${logResult.warningCount}`);
+            
+            if (logResult.persistedPath) {
+                this.log(`[LogMonitor] Logs persisted to: ${logResult.persistedPath}`);
+            }
+            
+            // Update success based on detected errors/exceptions
+            // Coordinator will analyze the persisted log file for full context
+            if (logResult.errorCount > 0 || logResult.exceptionCount > 0) {
+                result.success = false;
+                
+                // Add a summary error entry pointing to the log file
+                // Full error details are in the persisted log for AI analysis
+                if (!result.errors) result.errors = [];
+                result.errors.push({
+                    id: `log_${Date.now()}`,
+                    type: 'compilation',
+                    message: `Detected ${logResult.errorCount} error(s) and ${logResult.exceptionCount} exception(s). See log file for details.`,
+                    timestamp: new Date().toISOString(),
+                    // Store the path in a way the coordinator can access
+                    file: logResult.persistedPath || undefined
+                });
+            }
         }
 
         return result;

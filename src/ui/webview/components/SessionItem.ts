@@ -1,7 +1,7 @@
 /**
  * Session item component - renders a single planning session with its sub-items.
  */
-import { SessionInfo, WorkflowInfo, AgentInfo, FailedTaskInfo } from '../types';
+import { SessionInfo, WorkflowInfo, AgentInfo } from '../types';
 import { ICONS } from '../icons';
 import { escapeHtml } from '../helpers';
 import { Logger } from '../../../utils/Logger';
@@ -276,41 +276,15 @@ function findAgentsForWorkflow(wf: WorkflowInfo, agents: AgentInfo[]): AgentInfo
     const matches = agents.filter(a => a.workflowId && a.workflowId === wf.id);
     
     // Log warning if workflow is running but no agents matched
-    // This helps debug cases where workflowId isn't being set properly
-    if (matches.length === 0 && wf.status === 'running') {
+    // Skip warning if workflow is waitingForAgent - that's an expected state where
+    // the workflow is legitimately running but waiting for an agent to be allocated
+    if (matches.length === 0 && wf.status === 'running' && !wf.waitingForAgent) {
         log.warn(`No agents matched for running workflow ${wf.id} (${wf.type}). Available agents:`, 
             agents.map(a => ({ name: a.name, workflowId: a.workflowId, roleId: a.roleId }))
         );
     }
     
     return matches;
-}
-
-/**
- * Render failed tasks section.
- */
-function renderFailedTasks(failedTasks: FailedTaskInfo[]): string {
-    if (!failedTasks || failedTasks.length === 0) {
-        return '';
-    }
-    
-    return `
-        <div class="nested-item failed-header">
-            <div class="nested-icon" style="color: #f14c4c;">
-                ${ICONS.error}
-            </div>
-            <span class="nested-label" style="color: #f14c4c;">Failed Tasks (${failedTasks.length})</span>
-        </div>
-        ${failedTasks.map(ft => `
-            <div class="nested-item level-3 nested-failed">
-                <span class="nested-label" title="${escapeHtml(ft.lastError)}">
-                    ${ft.taskId}: ${escapeHtml(ft.description.substring(0, 30))}...
-                </span>
-                <span class="nested-badge" style="color: #f14c4c;">${ft.attempts} attempts</span>
-                ${ft.canRetry ? `<button class="retry-btn" data-action="retryTask" data-task-id="${ft.taskId}">Retry</button>` : ''}
-            </div>
-        `).join('')}
-    `;
 }
 
 /**
@@ -351,7 +325,8 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
     return `
         <div class="session-item ${isExpanded ? 'expanded' : ''} ${activityClass}" 
              data-session-id="${session.id}" 
-             data-plan-path="${session.planPath || ''}">
+             data-plan-path="${session.planPath || ''}"
+             data-session-status="${session.status || ''}">
             <!-- Session Header -->
             <div class="session-header" data-toggle="${session.id}">
                 <div class="session-expand ${isExpanded ? 'expanded' : ''}">
@@ -432,9 +407,6 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
                             </div>
                         </div>
                     ` : ''}
-                    
-                    <!-- Failed Tasks -->
-                    ${renderFailedTasks(session.failedTasks)}
                 </div>
             </div>
         </div>

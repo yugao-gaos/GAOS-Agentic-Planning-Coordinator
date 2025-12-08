@@ -401,21 +401,6 @@ export interface ErrorEventData {
     timestamp: string;
 }
 
-/**
- * Task failed after all attempts event data
- * Triggers when a task has exhausted retries or needs user clarity
- */
-export interface TaskFailedFinalEventData {
-    sessionId: string;
-    taskId: string;
-    description: string;
-    attempts: number;
-    lastError: string;
-    errorType: 'transient' | 'permanent' | 'unknown' | 'needs_clarity';
-    canRetry: boolean;
-    clarityQuestion?: string;  // Only if errorType is 'needs_clarity'
-    failedAt: string;
-}
 
 /**
  * Task paused event data
@@ -510,7 +495,6 @@ export interface ApcEventMap {
     'error': ErrorEventData;
     
     // Task attention events (require user intervention)
-    'task.failedFinal': TaskFailedFinalEventData;
     'task.paused': TaskPausedEventData;
     
     // Coordinator events

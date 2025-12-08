@@ -208,18 +208,29 @@ export const statusBarStyles = `
     font-size: 11px;
 }
 
-/* Health warning banner */
+/* Health warning banner - base styles */
 .health-warning {
     padding: 4px 12px;
-    background: rgba(239, 68, 68, 0.15);
-    border: 1px solid var(--vscode-testing-iconFailed, #f14c4c);
     border-top: none;
     border-radius: 0 0 6px 6px;
-    color: var(--vscode-testing-iconFailed, #f14c4c);
     font-size: 11px;
     font-weight: 500;
     text-align: center;
     animation: fadeIn 0.3s ease-in;
+}
+
+/* Connection unstable - warning state (trying to reconnect) */
+.health-warning.connection-unstable {
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid var(--vscode-testing-iconFailed, #f14c4c);
+    color: var(--vscode-testing-iconFailed, #f14c4c);
+}
+
+/* Daemon stopped - informational state (not an error, just needs restart) */
+.health-warning.daemon-stopped {
+    background: rgba(100, 116, 139, 0.15);
+    border: 1px solid var(--vscode-descriptionForeground, #717780);
+    color: var(--vscode-descriptionForeground, #717780);
 }
 
 @keyframes fadeIn {

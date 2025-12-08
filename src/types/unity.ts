@@ -235,6 +235,18 @@ export type PipelineOperation =
     | 'test_player_playmode';     // Manual player testing
 
 /**
+ * Unity pipeline configuration - determines which operations to run per task
+ * Set by quality analyst during planning, read by workflow during execution
+ */
+export type UnityPipelineConfig = 
+    | 'none'              // Documentation, non-Unity changes - skip pipeline entirely
+    | 'prep'              // Code/asset changes - compile only
+    | 'prep_editmode'     // Code with EditMode tests - compile + editmode test runner
+    | 'prep_playmode'     // Code with PlayMode tests - compile + playmode test runner
+    | 'prep_playtest'     // Data/balance changes - compile + manual play test (human plays)
+    | 'full';             // Milestone - compile + all test runners + manual playtest
+
+/**
  * Task context - which task triggered this pipeline request
  */
 export interface PipelineTaskContext {

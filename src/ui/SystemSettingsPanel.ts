@@ -1258,7 +1258,9 @@ export class SystemSettingsPanel {
     private async checkCursorCliStatus(): Promise<void> {
         const { exec } = require('child_process');
         const { promisify } = require('util');
-        const execAsync = promisify(exec);
+        const execAsyncRaw = promisify(exec);
+        // Wrapper to hide terminal windows on Windows
+        const execAsync = (cmd: string, opts?: any) => execAsyncRaw(cmd, { ...opts, windowsHide: true });
         
         let status: {
             installed: boolean;

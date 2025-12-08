@@ -81,7 +81,7 @@ interface DebounceConfig {
 const DEFAULT_DEBOUNCE_CONFIG: DebounceConfig = {
     debounceMs: 2000,
     maxWaitMs: 10000,
-    cooldownMs: 10000
+    cooldownMs: 120000  // 2 minutes - coordinator evals take ~100s
 };
 
 export class CoordinatorAgent {
@@ -232,12 +232,27 @@ export class CoordinatorAgent {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const logFile = path.join(logDir, `${timestamp}_${evalId}_stream.log`);
         
+        // Write prompt to log file FIRST (before agent runs)
+        // This helps debug what context the coordinator received
+        const promptHeader = `${'═'.repeat(80)}
+COORDINATOR PROMPT (sent to AI)
+${'═'.repeat(80)}
+
+${prompt}
+
+${'═'.repeat(80)}
+END OF PROMPT - AI OUTPUT BELOW
+${'═'.repeat(80)}
+
+`;
+        fs.writeFileSync(logFile, promptHeader, 'utf-8');
+        
         // Run the AI agent - it will call run_terminal_cmd directly
         // Use simpleMode (no streaming JSON) for coordinator - cleaner output
         const result = await this.agentRunner.run({
             id: evalId,
             prompt,
-            cwd: process.cwd(),
+            cwd: this.workspaceRoot,
             model: this.config.model,
             timeoutMs: this.config.evaluationTimeout,
             logFile,  // Capture output
@@ -390,7 +405,7 @@ export class CoordinatorAgent {
      * 3. decisionInstructions (configurable) - Decision guidelines and output format
      */
     private buildPrompt(input: CoordinatorInput): string {
-        const historySection = this.formatHistory(input.history);
+        const historySection = this.formatHistory(input.history, input.sessionId);
         const tasksSection = this.formatTasks(input.tasks);
         const workflowsSection = this.formatWorkflows(input.activeWorkflows);
         const failedWorkflowsSection = this.formatFailedWorkflows(input.recentlyFailedWorkflows || []);
@@ -440,10 +455,10 @@ APPROVED PLANS
 ${plansSection}
 
 ═══════════════════════════════════════════════════════════════════════════════
-DECISION HISTORY (${input.history.length} previous evaluations)
+DECISION HISTORY
 ═══════════════════════════════════════════════════════════════════════════════
 
-${historySection || 'No previous decisions.'}
+${historySection}
 
 ═══════════════════════════════════════════════════════════════════════════════
 CURRENT STATE
@@ -472,48 +487,28 @@ ${decisionInstructions}`;
     }
 
     /**
-     * Get plan content, potentially truncated
+     * Format history section for the prompt
+     * 
+     * Instead of embedding history (which contains stale state info that confuses the AI),
+     * we just provide the file path. The AI can read it if needed.
      */
-    private getPlanContent(input: CoordinatorInput): string {
-        if (!this.config.includePlanContent || !input.planPath) {
-            return `Plan path: ${input.planPath || 'N/A'}`;
+    private formatHistory(history: CoordinatorHistoryEntry[], sessionId?: string): string {
+        if (history.length === 0) {
+            return 'No previous decisions.';
         }
-
-        let content = input.planContent;
         
-        if (content.length > this.config.maxPlanContentLength) {
-            // Truncate but keep structure - show start and task breakdown
-            const taskBreakdownIndex = content.indexOf('## Task Breakdown');
-            if (taskBreakdownIndex > 0) {
-                const start = content.substring(0, 2000);
-                const taskSection = content.substring(taskBreakdownIndex, taskBreakdownIndex + this.config.maxPlanContentLength - 2500);
-                content = `${start}\n\n... [content truncated] ...\n\n${taskSection}\n\n... [remaining content truncated] ...`;
-            } else {
-                content = content.substring(0, this.config.maxPlanContentLength) + '\n\n... [truncated] ...';
-            }
+        // Get history file path
+        let historyPath = 'History file path unavailable';
+        try {
+            const stateManager = ServiceLocator.resolve(StateManager);
+            historyPath = stateManager.getCoordinatorHistoryPath(sessionId || '');
+        } catch {
+            // StateManager might not be available
         }
-
-        return `Plan File: ${input.planPath}\n\n${content}`;
-    }
-
-    /**
-     * Format history entries for the prompt
-     */
-    private formatHistory(history: CoordinatorHistoryEntry[]): string {
-        if (history.length === 0) return '';
-
-        return history.slice(-this.config.maxHistoryEntries).map((entry, i) => {
-            const outcomeStr = entry.outcome 
-                ? `\n   Outcome: ${entry.outcome.success ? '✓' : '✗'} ${entry.outcome.notes || ''}`
-                : '';
-            
-            return `[${i + 1}] ${entry.timestamp}
-   Event: ${entry.event.type} - ${entry.event.summary}
-   Decision: Dispatched ${entry.decision.dispatchCount} tasks (${entry.decision.dispatchedTasks.join(', ') || 'none'})
-            ${entry.decision.askedUser ? '| Asked user' : ''}
-            ${entry.decision.pausedCount > 0 ? `| Paused ${entry.decision.pausedCount}` : ''}
-   Reasoning: ${entry.decision.reasoning}${outcomeStr}`;
-        }).join('\n\n');
+        
+        return `${history.length} previous evaluations recorded.
+History file: ${historyPath}
+⚠️ Read ONLY if you need to understand past decisions. Do NOT use old state info from history for current decisions.`;
     }
 
     /**
@@ -530,9 +525,29 @@ ${decisionInstructions}`;
 
         let result = '';
         
-        // Show ready tasks first (pending with all deps complete)
+        // Show awaiting_decision tasks FIRST - these need immediate attention
+        const awaitingDecision = byStatus['awaiting_decision'] || [];
+        if (awaitingDecision.length > 0) {
+            result += `⚡ AWAITING YOUR DECISION (${awaitingDecision.length}):\n`;
+            result += awaitingDecision.map(t => 
+                `  - ${t.id}: ${t.description} | Workflow finished - mark complete, fail, or start another workflow`
+            ).join('\n');
+            result += '\n\n';
+        }
+        
+        // Show paused tasks that can be resumed
+        const paused = byStatus['paused'] || [];
+        if (paused.length > 0) {
+            result += `⏸️ PAUSED - CAN RESUME (${paused.length}):\n`;
+            result += paused.map(t => 
+                `  - ${t.id}: ${t.description} | Use \`apc workflow resume\` to continue`
+            ).join('\n');
+            result += '\n\n';
+        }
+        
+        // Show ready tasks (created with all deps complete)
         const readyTasks = tasks.filter(t => 
-            t.status === 'pending' && t.dependencyStatus === 'all_complete'
+            (t.status === 'created' || t.status === 'pending') && t.dependencyStatus === 'all_complete'
         );
         if (readyTasks.length > 0) {
             result += `READY TO DISPATCH (${readyTasks.length}):\n`;
@@ -552,10 +567,10 @@ ${decisionInstructions}`;
             result += '\n\n';
         }
 
-        // Show blocked/paused tasks
-        const blocked = [...(byStatus['blocked'] || []), ...(byStatus['paused'] || [])];
+        // Show blocked tasks (waiting on dependencies)
+        const blocked = byStatus['blocked'] || [];
         if (blocked.length > 0) {
-            result += `BLOCKED/PAUSED (${blocked.length}):\n`;
+            result += `BLOCKED (${blocked.length}):\n`;
             result += blocked.map(t => 
                 `  - ${t.id}: ${t.description} | Status: ${t.status} | Deps: ${t.dependencies.join(', ') || 'none'}`
             ).join('\n');
@@ -566,7 +581,7 @@ ${decisionInstructions}`;
         const completed = byStatus['completed'] || [];
         const failed = byStatus['failed'] || [];
         const pendingBlocked = tasks.filter(t => 
-            t.status === 'pending' && t.dependencyStatus !== 'all_complete'
+            (t.status === 'created' || t.status === 'pending') && t.dependencyStatus !== 'all_complete'
         );
         
         result += `Summary: ${completed.length} completed, ${failed.length} failed, ${pendingBlocked.length} waiting on deps`;
@@ -821,6 +836,9 @@ ${JSON.stringify(input.event.payload, null, 2)}`;
     
     /**
      * Execute all pending evaluations
+     * 
+     * IMPORTANT: This method is guarded against concurrent execution.
+     * If an evaluation is already in progress, we reschedule to try again later.
      */
     private async executePendingEvaluations(
         buildInputFn: (sessionId: string, event: CoordinatorEvent) => Promise<CoordinatorInput>
@@ -829,6 +847,21 @@ ${JSON.stringify(input.event.payload, null, 2)}`;
         
         if (this.pendingEvents.length === 0) {
             this.setState('idle');
+            return;
+        }
+        
+        // GUARD: Prevent concurrent evaluations
+        // If already evaluating, reschedule to try again after a delay
+        if (this.currentState === 'evaluating') {
+            this.log(`⚠️ Evaluation already in progress - rescheduling ${this.pendingEvents.length} pending events`);
+            
+            // Reschedule after a short delay (5 seconds)
+            // Events remain in pendingEvents, so they'll be picked up
+            this.debounceTimer = setTimeout(() => {
+                this.executePendingEvaluations(buildInputFn).catch(e => {
+                    this.log(`Rescheduled evaluation failed: ${e}`);
+                });
+            }, 5000);
             return;
         }
         

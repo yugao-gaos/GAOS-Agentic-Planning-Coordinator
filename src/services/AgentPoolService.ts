@@ -227,8 +227,17 @@ export class AgentPoolService {
         count: number, 
         roleId: string = 'engineer'
     ): Promise<string[]> {
+        // ============ TIMING: Track mutex wait and allocation ============
+        const mutexWaitStart = Date.now();
+        
         // CRITICAL: Acquire mutex to prevent concurrent allocation
         const release = await this.allocationMutex.acquire();
+        const mutexWaitMs = Date.now() - mutexWaitStart;
+        if (mutexWaitMs > 10) {
+            log.debug(`[TIMING] Mutex wait: ${mutexWaitMs}ms for workflow ${workflowId.substring(0, 8)}...`);
+        }
+        
+        const allocationStart = Date.now();
         
         try {
             // Validate role exists in registry
@@ -270,7 +279,8 @@ export class AgentPoolService {
             // Update state before releasing mutex
             this.stateManager.updateAgentPool(updatedState);
             
-            log.info(`🔒 Allocated ${allocated.length}/${count} agents to workflow ${workflowId} (mutex protected)`);
+            const allocationMs = Date.now() - allocationStart;
+            log.info(`🔒 Allocated ${allocated.length}/${count} agents to workflow ${workflowId} [mutex: ${mutexWaitMs}ms, alloc: ${allocationMs}ms]`);
             return allocated;
         } finally {
             // CRITICAL: Always release mutex, even on error

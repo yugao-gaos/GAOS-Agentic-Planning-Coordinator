@@ -326,7 +326,7 @@ apc workflow dispatch ps_000001 context_gathering --input '{
   "targets": ["Assets/Scripts/Combat", "Assets/Prefabs/Enemies"],
   "depth": "shallow",
   "focusAreas": ["enemy AI patterns", "combat system"],
-  "taskId": "T5"
+  "taskId": "ps_000001_T5"
 }'
 ```
 

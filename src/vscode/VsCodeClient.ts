@@ -41,6 +41,10 @@ export class VsCodeClient extends BaseApcClient {
     private ws: WebSocket | null = null;
     private showNotifications: boolean;
     
+    // Track if daemon shutdown was intentional (received daemon.shutdown event)
+    // When true, don't attempt to reconnect
+    private daemonShutdownReceived: boolean = false;
+    
     // VS Code notification callbacks (set by extension)
     private notificationCallbacks: {
         showInfo?: (msg: string) => void;
@@ -68,6 +72,38 @@ export class VsCodeClient extends BaseApcClient {
         
         // Start periodic cache cleanup
         this.startCacheCleanup();
+        
+        // Listen for daemon shutdown event to disable auto-reconnect
+        this.setupShutdownHandler();
+    }
+    
+    /**
+     * Set up handler for daemon.shutdown event
+     * When received, disable auto-reconnect so we don't spam connection attempts
+     */
+    private setupShutdownHandler(): void {
+        this.on('daemon.shutdown', (data: any) => {
+            log.info(`Received daemon.shutdown event: ${data?.reason || 'unknown reason'}`);
+            this.daemonShutdownReceived = true;
+            
+            if (this.showNotifications && this.notificationCallbacks.showInfo) {
+                this.notificationCallbacks.showInfo('Daemon stopped gracefully');
+            }
+        });
+    }
+    
+    /**
+     * Reset shutdown state - called when user explicitly starts daemon again
+     */
+    resetShutdownState(): void {
+        this.daemonShutdownReceived = false;
+    }
+    
+    /**
+     * Check if daemon was intentionally shut down
+     */
+    wasDaemonShutdown(): boolean {
+        return this.daemonShutdownReceived;
     }
     
     /**
@@ -123,10 +159,16 @@ export class VsCodeClient extends BaseApcClient {
                     this.emit('disconnected', { code, reason: reason.toString() });
                     
                     if (wasConnected) {
+                        // Don't show warning or reconnect if daemon was intentionally shut down
+                        if (this.daemonShutdownReceived) {
+                            log.info('Connection closed after daemon shutdown - not attempting reconnect');
+                            return;
+                        }
+                        
                         if (this.showNotifications && this.notificationCallbacks.showWarning) {
                             this.notificationCallbacks.showWarning(`Disconnected from APC daemon: ${reason || 'unknown'}`);
                         }
-                        // Attempt reconnect
+                        // Attempt reconnect only if daemon didn't shut down gracefully
                         this.attemptReconnect();
                     }
                 });
@@ -227,6 +269,22 @@ export class VsCodeClient extends BaseApcClient {
      */
     async getUnityStatus(): Promise<UnityStatusResponse> {
         return this.send<UnityStatusResponse>('unity.status');
+    }
+    
+    /**
+     * Trigger Unity prep (compile) run manually
+     * Only triggers if Unity pipeline queue is empty
+     */
+    async triggerUnityPrep(): Promise<{ success: boolean; taskId?: string; error?: string }> {
+        try {
+            const response = await this.send<{ rawTaskId: string; type: string }>('unity.compile', {
+                coordinatorId: 'manual-gui',
+                agentName: 'gui-user'
+            });
+            return { success: true, taskId: response.rawTaskId };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
     }
     
     /**
@@ -550,21 +608,6 @@ export class VsCodeClient extends BaseApcClient {
     }
     
     // ========================================================================
-    // Workflow Management
-    // ========================================================================
-    
-    /**
-     * Retry a failed task
-     */
-    async retryTask(sessionId: string, taskId: string): Promise<{ success: boolean; workflowId?: string; error?: string }> {
-        try {
-            const response = await this.send<{ workflowId: string }>('workflow.retry', { sessionId, taskId });
-            return { success: true, workflowId: response.workflowId };
-        } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-        }
-    }
-    
     // ========================================================================
     // Roles Management
     // ========================================================================

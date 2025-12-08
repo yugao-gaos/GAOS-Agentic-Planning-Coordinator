@@ -24,6 +24,10 @@ import {
 } from './DaemonConfig';
 import { Logger } from '../utils/Logger';
 import { ScriptableWorkflowRegistry } from '../services/workflows/ScriptableWorkflowRegistry';
+import { ProcessManager } from '../services/ProcessManager';
+import { HeadlessTerminalManager } from '../services/HeadlessTerminalManager';
+import { WslKeepaliveMonitor } from './WslKeepaliveMonitor';
+import { countCursorAgentProcesses, killOrphanCursorAgents } from '../utils/orphanCleanup';
 
 const log = Logger.create('Daemon', 'ApcDaemon');
 
@@ -349,6 +353,18 @@ export class ApcDaemon {
             this.log('warn', `ScriptableWorkflowRegistry cleanup error: ${err}`);
         }
         
+        // Stop WSL keepalive monitor (if running)
+        try {
+            if (ServiceLocator.isRegistered(WslKeepaliveMonitor)) {
+                const wslKeepalive = ServiceLocator.resolve(WslKeepaliveMonitor);
+                wslKeepalive.stop();
+                this.log('info', 'WslKeepaliveMonitor stopped');
+            }
+        } catch (err) {
+            // WSL keepalive may not be registered (non-Windows or non-cursor backend)
+            this.log('debug', `WslKeepaliveMonitor cleanup skipped: ${err}`);
+        }
+        
         // Broadcast shutdown event
         this.broadcaster.broadcast('daemon.shutdown', {
             reason,
@@ -382,8 +398,30 @@ export class ApcDaemon {
             this.httpServer = null;
         }
         
-        // Kill any orphan cursor-agent processes
-        // This ensures clean shutdown with no lingering processes
+        // ========================================================================
+        // COMPREHENSIVE PROCESS CLEANUP
+        // Ensures no cursor-agent processes survive daemon shutdown
+        // ========================================================================
+        
+        // Step 1: Force-stop all tracked processes via ProcessManager
+        // This catches processes that gracefulShutdown might have missed
+        // (e.g., agents that were just starting up without a workflowId yet)
+        try {
+            if (ServiceLocator.isRegistered(ProcessManager)) {
+                const processManager = ServiceLocator.resolve(ProcessManager);
+                const runningBefore = processManager.getRunningProcessIds().length;
+                if (runningBefore > 0) {
+                    this.log('info', `Force-stopping ${runningBefore} tracked processes...`);
+                    await processManager.stopAll(true);  // force=true for immediate kill
+                    this.log('info', `Force-stopped all tracked processes`);
+                }
+            }
+        } catch (err) {
+            this.log('warn', `ProcessManager.stopAll() error: ${err}`);
+        }
+        
+        // Step 2: Kill orphan cursor-agent processes (not tracked by ProcessManager)
+        // Uses the standalone killOrphanCursorAgents utility
         if (this.services?.processManager) {
             try {
                 const killedCount = await this.services.processManager.killOrphanCursorAgents();
@@ -393,6 +431,44 @@ export class ApcDaemon {
             } catch (err) {
                 this.log('warn', `Failed to kill orphan processes: ${err}`);
             }
+        }
+        
+        // Step 3: Final verification - ensure NO cursor-agent processes remain
+        // If any survive, use the standalone utility as a last resort
+        try {
+            const remainingCount = countCursorAgentProcesses();
+            if (remainingCount > 0) {
+                this.log('warn', `⚠️ ${remainingCount} cursor-agent processes still running after cleanup, forcing final kill...`);
+                const finalKilled = await killOrphanCursorAgents(new Set(), '[ApcDaemon.stop]');
+                if (finalKilled > 0) {
+                    this.log('info', `Final cleanup killed ${finalKilled} lingering processes`);
+                }
+                
+                // Verify again
+                const afterFinal = countCursorAgentProcesses();
+                if (afterFinal > 0) {
+                    this.log('error', `❌ ${afterFinal} cursor-agent processes still running - manual cleanup may be needed`);
+                } else {
+                    this.log('info', `✅ All cursor-agent processes cleaned up successfully`);
+                }
+            } else {
+                this.log('info', `✅ No cursor-agent processes remaining`);
+            }
+        } catch (err) {
+            this.log('warn', `Final process verification error: ${err}`);
+        }
+        
+        // Step 4: Dispose terminal manager (close all terminals)
+        try {
+            if (ServiceLocator.isRegistered(HeadlessTerminalManager)) {
+                const terminalManager = ServiceLocator.resolve(HeadlessTerminalManager);
+                terminalManager.closeAllTerminals();
+                terminalManager.dispose();
+                this.log('info', 'Terminal manager disposed');
+            }
+        } catch (err) {
+            // Terminal manager may not be registered in all modes
+            this.log('debug', `Terminal manager cleanup skipped: ${err}`);
         }
         
         // Cleanup PID files

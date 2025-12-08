@@ -244,7 +244,6 @@ export async function activate(context: vscode.ExtensionContext) {
         'AgentRunner',
         'CursorAgentRunner',
         'UnityControlManager',
-        'WorkflowPauseManager',
         'EventBroadcaster',
         'OutputChannelManager',
         'PlanCache',
@@ -416,67 +415,6 @@ export async function activate(context: vscode.ExtensionContext) {
                 })
             );
         }
-        
-        // Listen for task.failedFinal events from daemon via WebSocket
-        eventSubscriptions.push(
-            vsCodeClient.subscribe('task.failedFinal', async (data: unknown) => {
-                const failedData = data as { 
-                    errorType?: string; 
-                    taskId?: string; 
-                    clarityQuestion?: string; 
-                    lastError?: string; 
-                    sessionId?: string; 
-                    attempts?: number; 
-                    canRetry?: boolean 
-                };
-                const isNeedsClarity = failedData.errorType === 'needs_clarity';
-                
-                const prompt = isNeedsClarity 
-                    ? `Engineer needs clarity on task "${failedData.taskId}":
-${failedData.clarityQuestion || failedData.lastError}
-
-Session: ${failedData.sessionId}
-Please help clarify, then use:
-  apc plan revise ${failedData.sessionId} "<your clarification>"
-
-IMPORTANT - Status Polling Timing:
-After running "apc plan revise", the revision process takes about 80 seconds to complete.
-- Wait 80 seconds before checking status the first time
-- Then poll every 30 seconds: sleep 30 && apc plan status ${failedData.sessionId}
-- Do NOT poll more frequently - the multi-agent debate takes time!`
-                    : `Task "${failedData.taskId}" failed after ${failedData.attempts} attempt(s).
-
-Error: ${failedData.lastError}
-Session: ${failedData.sessionId}
-${failedData.canRetry ? 'Can retry.' : 'Cannot retry (permanent error).'}
-
-Options:
-1. Revise plan: apc plan revise ${failedData.sessionId} "<feedback>"
-2. ${failedData.canRetry ? `Retry: apc task retry ${failedData.sessionId} ${failedData.taskId}` : 'Skip task via revision'}
-
-IMPORTANT - Status Polling Timing:
-If you revise the plan, the revision process takes about 80 seconds to complete.
-- Wait 80 seconds before checking status the first time
-- Then poll every 30 seconds: sleep 30 && apc plan status ${failedData.sessionId}
-- Do NOT poll more frequently - the multi-agent debate takes time!`;
-
-                // Copy prompt to clipboard and open agent chat
-                await vscode.env.clipboard.writeText(prompt);
-                await openAgentChat();
-                
-                // Also show a notification
-                const action = isNeedsClarity ? 'Needs Clarity' : 'Task Failed';
-                vscode.window.showWarningMessage(
-                    `${action}: ${failedData.taskId} - ${failedData.lastError?.substring(0, 50)}...`,
-                    'View in Chat'
-                ).then(selection => {
-                    if (selection === 'View in Chat') {
-                        // Chat was already opened, just show info
-                        vscode.window.showInformationMessage('Check the agent chat for details and next steps.');
-                    }
-                });
-            })
-        );
         
         // Listen for daemon.ready event - daemon broadcasts this after all services (including dependency checks) are initialized
         // Flow:
@@ -782,29 +720,6 @@ Let's get started!`;
             }
         }),
         
-        vscode.commands.registerCommand('agenticPlanning.retryFailedTask', async (args?: { sessionId?: string; taskId?: string }) => {
-            if (!vsCodeClient?.isConnected()) {
-                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
-                return;
-            }
-            
-            const sessionId = args?.sessionId;
-            const taskId = args?.taskId;
-            
-            if (!sessionId || !taskId) {
-                vscode.window.showWarningMessage('Missing session or task ID for retry');
-                return;
-            }
-            
-            const result = await vsCodeClient.retryTask(sessionId, taskId);
-            if (result.success) {
-                vscode.window.showInformationMessage(`Retry started: ${result.workflowId}`);
-                sidebarProvider.refresh();
-            } else {
-                vscode.window.showErrorMessage(result.error || 'Failed to retry task');
-            }
-        }),
-
         vscode.commands.registerCommand('agenticPlanning.showAgentTerminal', async (agentName?: string) => {
             if (!agentName) {
                 const busyAgents = await daemonStateProxy.getBusyAgents();

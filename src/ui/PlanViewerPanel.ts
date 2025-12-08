@@ -9,6 +9,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import { getPlanViewerStyles } from './webview/styles/planViewer';
 import { Logger } from '../utils/Logger';
+import { PlanParser } from '../services/PlanParser';
 
 const log = Logger.create('Client', 'PlanViewer');
 
@@ -59,17 +60,20 @@ export class PlanViewerPanel {
     private _disposables: vscode.Disposable[] = [];
     private _planPath: string;
     private _sessionId: string;
+    private _sessionStatus: string;
 
     private constructor(
         panel: vscode.WebviewPanel,
         extensionUri: vscode.Uri,
         planPath: string,
-        sessionId: string
+        sessionId: string,
+        sessionStatus: string
     ) {
         this._panel = panel;
         this._extensionUri = extensionUri;
         this._planPath = planPath;
         this._sessionId = sessionId;
+        this._sessionStatus = sessionStatus;
 
         // Update content
         this.updateWebviewContent();
@@ -90,7 +94,7 @@ export class PlanViewerPanel {
         this._disposables.push(watcher);
     }
 
-    public static show(planPath: string, sessionId: string, extensionUri: vscode.Uri): void {
+    public static show(planPath: string, sessionId: string, extensionUri: vscode.Uri, sessionStatus?: string): void {
         const column = vscode.window.activeTextEditor
             ? vscode.window.activeTextEditor.viewColumn
             : undefined;
@@ -100,6 +104,7 @@ export class PlanViewerPanel {
             PlanViewerPanel.currentPanel._panel.reveal(column);
             PlanViewerPanel.currentPanel._planPath = planPath;
             PlanViewerPanel.currentPanel._sessionId = sessionId;
+            PlanViewerPanel.currentPanel._sessionStatus = sessionStatus || '';
             PlanViewerPanel.currentPanel.updateWebviewContent();
             return;
         }
@@ -116,7 +121,7 @@ export class PlanViewerPanel {
             }
         );
 
-        PlanViewerPanel.currentPanel = new PlanViewerPanel(panel, extensionUri, planPath, sessionId);
+        PlanViewerPanel.currentPanel = new PlanViewerPanel(panel, extensionUri, planPath, sessionId, sessionStatus || '');
     }
 
     private async handleMessage(message: any): Promise<void> {
@@ -282,37 +287,8 @@ export class PlanViewerPanel {
     }
 
     private parseTasksFromContent(content: string): ParsedTask[] {
-        const tasks: ParsedTask[] = [];
-
-        // Match checkbox format: - [ ] **T{N}**: Description | Deps: X | Engineer: Y
-        // Also handle variants: - [x], - [X], and task IDs like T0.1, T1, etc.
-        const taskPattern = /^-\s*\[([xX ])\]\s*\*\*T([\d.]+)\*\*:\s*(.+?)(?:\s*\|\s*Deps?:\s*([^|]+))?(?:\s*\|\s*Engineer:\s*(\w+))?$/gm;
-
-        let match: RegExpExecArray | null;
-        while ((match = taskPattern.exec(content)) !== null) {
-            const completed = match[1].toLowerCase() === 'x';
-            const taskId = `T${match[2]}`;
-            const description = match[3].trim();
-            const depsStr = match[4]?.trim() || 'None';
-            const engineer = match[5]?.trim() || 'TBD';
-
-            // Parse dependencies
-            const deps: string[] = [];
-            if (depsStr.toLowerCase() !== 'none' && depsStr !== '-') {
-                const depMatches = depsStr.match(/T[\d.]+/gi) || [];
-                deps.push(...depMatches.map(d => d.toUpperCase()));
-            }
-
-            tasks.push({
-                id: taskId,
-                description,
-                completed,
-                dependencies: deps,
-                engineer
-            });
-        }
-
-        return tasks;
+        // Use PlanParser for consistency with daemon
+        return PlanParser.parseInlineCheckboxTasks(content);
     }
 
     private updateWebviewContent(): void {
@@ -332,11 +308,14 @@ export class PlanViewerPanel {
         const defaultTab = data.parseSuccess ? 'structured' : 'markdown';
         
         // Determine which action buttons to show based on status
-        const status = data.metadata?.status?.toLowerCase() || '';
+        // Use actual session status (not markdown status text) for approval/completion check
+        const sessionStatus = this._sessionStatus.toLowerCase();
+        const metadataStatus = data.metadata?.status?.toLowerCase() || '';
         // Show Revise/Approve buttons when plan exists (not during active planning)
-        const isActivelyPlanning = status.includes('planning') && !status.includes('updated');
-        const isActivelyRevising = status.includes('revising');
-        const isApprovedOrCompleted = status.includes('approved') || status.includes('completed');
+        const isActivelyPlanning = sessionStatus === 'planning' || (metadataStatus.includes('planning') && !metadataStatus.includes('updated'));
+        const isActivelyRevising = sessionStatus === 'revising' || metadataStatus.includes('revising');
+        // Use session status (which is authoritative) to determine if plan is already approved
+        const isApprovedOrCompleted = sessionStatus === 'approved' || sessionStatus === 'completed' || sessionStatus === 'executing';
         // Show buttons unless actively planning (buttons are disabled during revising)
         const showButtons = data.rawContent && !isActivelyPlanning;
         // Disable buttons during revision
@@ -359,7 +338,7 @@ export class PlanViewerPanel {
             <span class="plan-session">${this.escapeHtml(data.metadata?.session || this._sessionId)}</span>
         </div>
         <div class="title-bar-right">
-            <span class="status-badge ${this.getStatusClass(status)}">${this.escapeHtml(data.metadata?.status || 'Unknown')}</span>
+            <span class="status-badge ${this.getStatusClass(sessionStatus || metadataStatus)}">${this.escapeHtml(data.metadata?.status || 'Unknown')}</span>
             ${showButtons ? `
                 <button class="action-btn secondary" data-command="revisePlan" ${buttonsDisabled ? 'disabled title="Revision in progress..."' : ''}>Revise</button>
                 ${!isApprovedOrCompleted ? `<button class="action-btn primary" data-command="approvePlan" ${buttonsDisabled ? 'disabled title="Revision in progress..."' : ''}>Approve</button>` : ''}

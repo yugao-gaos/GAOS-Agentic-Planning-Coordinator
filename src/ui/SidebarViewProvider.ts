@@ -19,7 +19,6 @@ import {
     AgentInfo,
     UnityInfo,
     WorkflowInfo,
-    FailedTaskInfo,
     CoordinatorStatusInfo,
     ConnectionHealthInfo,
 } from './webview';
@@ -418,15 +417,17 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     {
                         let planPath = data.planPath;
                         let sessionId = data.sessionId;
+                        let sessionStatus = data.sessionStatus;
                         // If planPath not provided directly, try to look it up from session
-                        if (!planPath && sessionId && this.stateProxy) {
+                        if ((!planPath || !sessionStatus) && sessionId && this.stateProxy) {
                             const sessions = await this.stateProxy.getPlanningSessions();
                             const session = sessions.find(s => s.id === sessionId);
-                            planPath = session?.currentPlanPath;
+                            if (!planPath) planPath = session?.currentPlanPath;
+                            if (!sessionStatus) sessionStatus = session?.status;
                         }
                         if (planPath && sessionId) {
-                            // Open in Plan Viewer Panel
-                            PlanViewerPanel.show(planPath, sessionId, this._extensionUri);
+                            // Open in Plan Viewer Panel with session status for proper button visibility
+                            PlanViewerPanel.show(planPath, sessionId, this._extensionUri, sessionStatus);
                         } else if (planPath) {
                             // Fallback: open raw file if no sessionId
                             const uri = vscode.Uri.file(planPath);
@@ -443,12 +444,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                         const uri = vscode.Uri.file(data.logPath);
                         vscode.window.showTextDocument(uri);
                     }
-                    break;
-                case 'retryTask':
-                    vscode.commands.executeCommand('agenticPlanning.retryFailedTask', { 
-                        sessionId: data.sessionId, 
-                        taskId: data.taskId 
-                    });
                     break;
                 case 'openDependencyMap':
                     vscode.commands.executeCommand('agenticPlanning.openDependencyMap', { 
@@ -491,6 +486,18 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                         await this.stateProxy.refreshDependencies();
                     }
                     this.refresh();
+                    break;
+                case 'triggerUnityPrep':
+                    // Trigger Unity prep (compile) run manually
+                    if (this.stateProxy) {
+                        const result = await this.stateProxy.triggerUnityPrep();
+                        if (result.success) {
+                            vscode.window.showInformationMessage('Unity prep queued');
+                        } else {
+                            vscode.window.showErrorMessage(`Failed to trigger Unity prep: ${result.error}`);
+                        }
+                        this.refresh();
+                    }
                     break;
             }
         });
@@ -979,23 +986,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             
             // NOTE: progressLogPath removed - progress.log no longer generated
             // Workflow logs are available via activeWorkflows[].logPath
-            
-            // Get failed tasks from proxy
-            let failedTasks: FailedTaskInfo[] = [];
-            try {
-                const failed = this.stateProxy
-                    ? await this.stateProxy.getFailedTasks(s.id)
-                    : [];
-                failedTasks = failed.map(f => ({
-                    taskId: f.taskId,
-                    description: f.description,
-                    attempts: f.attempts,
-                    lastError: f.lastError,
-                    canRetry: f.canRetry
-                }));
-            } catch (e) {
-                log.warn(`Error getting failed tasks for ${s.id}:`, e);
-            }
                 
             // Get agents assigned to this session with workflow context
             const sessionAgents: AgentInfo[] = [];
@@ -1119,7 +1109,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 activeWorkflows,
                 workflowHistory,
                 isRevising,
-                failedTasks,
                 sessionAgents,
                 hasPartialPlan: !!(s as any).metadata?.partialPlan,
                 interruptReason: (s as any).metadata?.interruptReason

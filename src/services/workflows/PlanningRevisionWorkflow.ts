@@ -11,10 +11,8 @@ import {
     WorkflowResult, 
     PlanningWorkflowInput 
 } from '../../types/workflow';
-import { AgentRunner, AgentRunOptions } from '../AgentBackend';
 import { RevisionImpactAnalyzer, RevisionImpactResult } from '../RevisionImpactAnalyzer';
 import { AgentRole, getDefaultRole, AnalystVerdict } from '../../types';
-import { ServiceLocator } from '../ServiceLocator';
 
 /**
  * Planning revision workflow for updating existing plans
@@ -53,11 +51,8 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
     // Reserved planner agent - kept for the entire workflow (not released between phases)
     private plannerAgentName: string | undefined;
     
-    private agentRunner: AgentRunner;
-    
     constructor(config: WorkflowConfig, services: WorkflowServices) {
         super(config, services);
-        this.agentRunner = ServiceLocator.resolve(AgentRunner);
         
         // Extract input
         const input = config.input as PlanningWorkflowInput;
@@ -245,10 +240,28 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
         fs.copyFileSync(this.planPath, backupPath);
         this.log(`Created backup: backups/${backupFilename}`);
         
-        // Stream revised plan directly to plan file (commentary goes to log)
-        const result = await this.runAgentTask('planner_revise', prompt, role, true);
+        // Reuse planner agent across phases, or request new one
+        if (!this.plannerAgentName) {
+            this.plannerAgentName = await this.requestAgent('planner');
+        }
         
-        if (result.success) {
+        // Stream revised plan directly to plan file (commentary goes to log)
+        // Use CLI callback for structured completion
+        const result = await this.runAgentTaskWithCallback(
+            'planner_revise',
+            prompt,
+            'planner',
+            {
+                expectedStage: 'planning',
+                timeout: role?.timeoutMs || 900000,
+                model: role?.defaultModel,
+                cwd: this.stateManager.getWorkspaceRoot(),
+                agentName: this.plannerAgentName,
+                planFile: this.planPath
+            }
+        );
+        
+        if (result.fromCallback && this.isAgentSuccess(result)) {
             // Plan was streamed to file; verify it exists
             if (!fs.existsSync(this.planPath)) {
                 throw new Error(
@@ -257,10 +270,19 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
                     `Check agent logs for streaming errors.`
                 );
             }
-            this.log('✓ Plan revised');
+            this.log('✓ Plan revised via CLI callback');
+        } else if (!result.fromCallback) {
+            throw new Error(
+                `Planner did not use CLI callback (\`apc agent complete\`). ` +
+                'All agents must report results via CLI callback.'
+            );
         } else {
-            throw new Error('Planner revision task failed');
+            const error = result.payload?.error || result.payload?.message || 'Unknown error';
+            throw new Error(`Planner revision task failed: ${error}`);
         }
+        
+        // Demote planner to bench (may be needed for analyst feedback loop)
+        this.demoteAgentToBench(this.plannerAgentName);
     }
     
     private async executeReviewPhase(): Promise<void> {
@@ -272,39 +294,60 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
         
         this.log(`Running analyst_implementation (${role?.defaultModel || 'gpt-5.1-codex-high'})...`);
         
-        // Use CLI callback for structured completion
-        const result = await this.runAgentTaskWithCallback(
-            'analyst_implementation_review',
-            prompt,
-            'analyst_implementation',
-            {
-                expectedStage: 'analysis',
-                timeout: role?.timeoutMs || 300000,
-                model: role?.defaultModel,
-                cwd: this.stateManager.getWorkspaceRoot()
-            }
-        );
+        // Request agent BEFORE running task so we can release it after
+        const agentName = await this.requestAgent('analyst_implementation');
         
-        if (result.fromCallback) {
-            // CLI callback - use verdict directly
-            const verdictMap: Record<string, AnalystVerdict> = {
-                'pass': 'pass',
-                'critical': 'critical',
-                'minor': 'minor'
-            };
-            this.analystVerdict = verdictMap[result.result] || 'pass';
-            this.analystOutput = result.rawOutput || `Review Result: ${this.analystVerdict.toUpperCase()}`;
-            
-            const icon = this.analystVerdict === 'pass' ? '✅' 
-                : this.analystVerdict === 'critical' ? '❌' : '⚠️';
-            this.log(`${icon} Codex verdict via CLI callback: ${this.analystVerdict.toUpperCase()}`);
-        } else {
-            // No callback received - agent must use CLI callback
-            throw new Error(
-                'Analyst did not use CLI callback (`apc agent complete`). ' +
-                'All agents must report results via CLI callback for structured data. ' +
-                'Legacy output parsing is no longer supported.'
+        try {
+            // Use CLI callback for structured completion
+            const result = await this.runAgentTaskWithCallback(
+                'analyst_implementation_review',
+                prompt,
+                'analyst_implementation',
+                {
+                    expectedStage: 'analysis',
+                    timeout: role?.timeoutMs || 300000,
+                    model: role?.defaultModel,
+                    cwd: this.stateManager.getWorkspaceRoot(),
+                    agentName  // Pass pre-allocated agent
+                }
             );
+            
+            if (result.fromCallback) {
+                // CLI callback - use verdict directly
+                const verdictMap: Record<string, AnalystVerdict> = {
+                    'pass': 'pass',
+                    'critical': 'critical',
+                    'minor': 'minor'
+                };
+                this.analystVerdict = verdictMap[result.result] || 'pass';
+                
+                // Build output from payload
+                const issues = result.payload?.issues || [];
+                const suggestions = result.payload?.suggestions || [];
+                let output = `### Review Result: ${this.analystVerdict.toUpperCase()}\n\n`;
+                if (issues.length > 0) {
+                    output += '#### Issues\n' + issues.map((i: string) => `- ${i}`).join('\n') + '\n\n';
+                }
+                if (suggestions.length > 0) {
+                    output += '#### Suggestions\n' + suggestions.map((s: string) => `- ${s}`).join('\n') + '\n';
+                }
+                this.analystOutput = output;
+                
+                const icon = this.analystVerdict === 'pass' ? '✅' 
+                    : this.analystVerdict === 'critical' ? '❌' : '⚠️';
+                this.log(`${icon} Codex verdict via CLI callback: ${this.analystVerdict.toUpperCase()}`);
+            } else {
+                // No callback received - agent must use CLI callback
+                throw new Error(
+                    'Analyst did not use CLI callback (`apc agent complete`). ' +
+                    'All agents must report results via CLI callback for structured data. ' +
+                    'Legacy output parsing is no longer supported.'
+                );
+            }
+        } finally {
+            // Release analyst agent immediately - review is a one-shot task
+            this.releaseAgent(agentName);
+            this.log(`  Released analyst agent ${agentName}`);
         }
     }
     
@@ -330,12 +373,15 @@ export class PlanningRevisionWorkflow extends BaseWorkflow {
             }
         );
         
-        if (result.fromCallback) {
-            this.log(`✓ Finalization completed via CLI callback: ${result.result}`);
-        } else {
-            // Fallback: process exited without callback
-            this.log(`✓ Finalization completed (process exit)`);
+        if (!result.fromCallback) {
+            // Agent failed to use CLI callback - this is an error
+            throw new Error(
+                `Text clerk did not use CLI callback (\`apc agent complete\`). ` +
+                `Result: ${result.result}, Error: ${result.payload?.error || 'unknown'}`
+            );
         }
+        
+        this.log(`✓ Finalization completed via CLI callback: ${result.result}`);
         
         // Verify plan file exists
         if (!fs.existsSync(this.planPath)) {
@@ -426,24 +472,13 @@ ${this.userFeedback}
 ## Your Task
 Review the revised plan and verify it addresses the user's feedback.
 
-## REQUIRED Output Format
-\`\`\`
-### Review Result: [PASS|CRITICAL|MINOR]
+## How to Complete This Review
+After reviewing, signal your verdict via CLI callback (see end of prompt):
+- \`--result pass\` - Revision adequately addresses the feedback
+- \`--result critical\` - Revision missed key points or introduced problems  
+- \`--result minor\` - Has suggestions, but revision is acceptable
 
-#### Critical Issues
-- [List blocking issues, or "None"]
-
-#### Minor Suggestions
-- [List optional improvements, or "None"]
-
-#### Feedback Addressed
-[Verify the user's feedback was properly addressed]
-\`\`\`
-
-## Verdict Guidelines
-- **PASS**: Revision adequately addresses the feedback
-- **CRITICAL**: Revision missed key points or introduced problems
-- **MINOR**: Suggestions only, revision is acceptable`;
+Include any issues or suggestions in the callback payload.`;
     }
     
     private buildFinalizationPrompt(role: AgentRole | undefined): string {
@@ -459,7 +494,7 @@ ${this.analystOutput || 'No review feedback - just ensure formatting is correct.
 
 ## Instructions
 1. Read the plan file using read_file
-2. Ensure all tasks use checkbox format: - [ ] **T{N}**: Description | Deps: X | Engineer: TBD
+2. Ensure all tasks use checkbox format with GLOBAL IDs: - [ ] **${this.sessionId}_T{N}**: Description | Deps: ${this.sessionId}_TX | Engineer: TBD
 3. Address any MINOR suggestions from the review (ignore CRITICAL - those need human review)
 4. Update status to "📋 READY FOR REVIEW (Revised)"
 5. Write the finalized plan back using write tool
@@ -469,157 +504,12 @@ ${this.analystOutput || 'No review feedback - just ensure formatting is correct.
 - Only fix formatting and apply minor suggestions
 - Be quick - this is a cleanup task
 
-## Completion (REQUIRED)
-After finishing, signal completion:
-\`\`\`bash
-apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage finalization --result success
-\`\`\``;
+Note: CLI completion instructions with real session/workflow IDs are injected at runtime.`;
     }
     
     // =========================================================================
     // HELPER METHODS
     // =========================================================================
-    
-    private async runAgentTask(
-        taskId: string,
-        prompt: string,
-        role: AgentRole | undefined,
-        streamToPlanFile: boolean = false
-    ): Promise<{ success: boolean; output: string }> {
-        const roleId = role?.id || 'planner';
-        const isPlannerRole = roleId === 'planner';
-        
-        // For planner role, reuse the same agent across phases (don't release between phases)
-        let agentName: string;
-        if (isPlannerRole && this.plannerAgentName) {
-            // Reuse existing planner agent (already in allocatedAgents)
-            agentName = this.plannerAgentName;
-            this.log(`Reusing reserved planner agent: ${agentName}`);
-        } else {
-            // Request a new agent from the pool
-            agentName = await this.requestAgent(roleId);
-            
-            // Remember the planner agent for reuse across phases
-            if (isPlannerRole) {
-                this.plannerAgentName = agentName;
-            }
-        }
-        
-        const workspaceRoot = this.stateManager.getWorkspaceRoot();
-        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
-        
-        if (!fs.existsSync(logDir)) {
-            fs.mkdirSync(logDir, { recursive: true });
-        }
-        
-        // Use workflow ID + agent name for unique temp log file
-        const logFile = path.join(logDir, `${this.id}_${agentName}.log`);
-        
-        try {
-            // Prepend continuation context if we were paused mid-task
-            const continuationPrompt = this.getContinuationPrompt();
-            const fullPrompt = continuationPrompt 
-                ? `${continuationPrompt}\n\n---\n\n${prompt}`
-                : prompt;
-            
-            // Clear continuation context after using it
-            if (continuationPrompt) {
-                this.clearContinuationContext();
-            }
-            
-            const options: AgentRunOptions = {
-                id: `revision_${this.sessionId}_${taskId}`,
-                prompt: fullPrompt,
-                cwd: workspaceRoot,
-                model: role?.defaultModel || 'sonnet-4.5',
-                logFile,
-                planFile: streamToPlanFile ? this.planPath : undefined,
-                timeoutMs: role?.timeoutMs || 600000,
-                onProgress: (msg) => this.log(`  ${msg}`)
-            };
-            
-            // Track agent run ID for pause handling
-            this.currentAgentRunId = options.id;
-            
-            const agentRunId = options.id;
-            const result = await this.agentRunner.run(options);
-            
-            this.currentAgentRunId = undefined;
-            
-            return {
-                success: result.success,
-                output: result.output
-            };
-        } finally {
-            // Release analyst agents immediately - they're done
-            // Demote planner agent to bench - it will wait for analyst feedback and potential revision loop
-            if (!isPlannerRole) {
-                this.releaseAgent(agentName);
-            } else {
-                this.demoteAgentToBench(agentName);
-                this.log(`Planner agent ${agentName} moved to bench (waiting for analyst feedback)`);
-            }
-            
-            // Don't delete log file - terminal may still be tailing it
-            // Log files are cleaned up when session ends
-        }
-    }
-    
-    private parseAnalystResult(): void {
-        const verdictMatch = this.analystOutput.match(
-            /###?\s*Review\s*Result:\s*(PASS|CRITICAL|MINOR)/i
-        );
-        this.analystVerdict = verdictMatch 
-            ? verdictMatch[1].toLowerCase() as AnalystVerdict 
-            : 'pass';
-    }
-    
-    /**
-     * Extract the actual plan content from agent output.
-     * Agents often include reasoning/commentary before the plan - this extracts just the plan.
-     */
-    private extractPlanFromOutput(output: string): string {
-        // Look for the start of actual plan content using common patterns
-        const planStartPatterns = [
-            // Plan title headers
-            /^(#\s+[^\n]*(?:Plan|Migration|Implementation|Execution)[^\n]*)/mi,
-            // Metadata line at start of plan
-            /^(\*\*Project:\*\*)/mi,
-            // Horizontal rule followed by header (common wrapper)
-            /^(---\s*\n+#)/m,
-            // Overview section
-            /^(##\s+Overview)/mi,
-            // Document metadata block
-            /^(>\s*\*\*[A-Z])/m,
-        ];
-        
-        for (const pattern of planStartPatterns) {
-            const match = output.match(pattern);
-            if (match && match.index !== undefined) {
-                const extracted = output.substring(match.index);
-                // Verify we extracted something substantial (at least 100 chars)
-                if (extracted.length > 100) {
-                    return extracted;
-                }
-            }
-        }
-        
-        // Fallback: If output starts with commentary (lowercase sentence), 
-        // try to find where the plan actually starts
-        if (/^[a-z]/.test(output.trim())) {
-            // Look for first markdown header
-            const headerMatch = output.match(/^(#+ .+)/m);
-            if (headerMatch && headerMatch.index !== undefined && headerMatch.index > 0) {
-                const extracted = output.substring(headerMatch.index);
-                if (extracted.length > 100) {
-                    return extracted;
-                }
-            }
-        }
-        
-        // Last resort: return as-is
-        return output;
-    }
     
     private updatePlanStatus(): void {
         if (!fs.existsSync(this.planPath)) return;

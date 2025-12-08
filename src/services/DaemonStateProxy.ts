@@ -17,7 +17,7 @@ import {
     AgentStatus,
     AgentRole
 } from '../types';
-import { WorkflowProgress, FailedTask, CompletedWorkflowSummary } from '../types/workflow';
+import { WorkflowProgress, CompletedWorkflowSummary } from '../types/workflow';
 import { Logger } from '../utils/Logger';
 
 const log = Logger.create('Client', 'DaemonStateProxy');
@@ -89,13 +89,22 @@ export interface DaemonStateProxyOptions {
 // DaemonStateProxy
 // ============================================================================
 
-export type ConnectionHealthState = 'healthy' | 'unhealthy' | 'unknown';
+/**
+ * Connection health states:
+ * - 'healthy': Connected and responding
+ * - 'unhealthy': Connection issues (should try to reconnect)
+ * - 'daemon_stopped': Daemon was intentionally stopped (don't reconnect)
+ * - 'unknown': Initial state before first health check
+ */
+export type ConnectionHealthState = 'healthy' | 'unhealthy' | 'daemon_stopped' | 'unknown';
 
 export interface ConnectionHealthInfo {
     state: ConnectionHealthState;
     lastPingSuccess: boolean;
     lastPingTime?: number;
     consecutiveFailures: number;
+    /** True if daemon was intentionally stopped (vs connection lost) */
+    daemonStopped?: boolean;
 }
 
 export class DaemonStateProxy {
@@ -110,6 +119,9 @@ export class DaemonStateProxy {
     private lastPingTime?: number;
     private currentHealthState: ConnectionHealthState = 'unknown';
     private isReconnecting: boolean = false;
+    
+    // Track if daemon was intentionally shut down - don't reconnect in this case
+    private daemonShutdownReceived: boolean = false;
     
     // Cached status from events
     private lastCoordinatorStatus?: CoordinatorStatusInfo;
@@ -131,6 +143,15 @@ export class DaemonStateProxy {
      * Set up event listeners for status updates
      */
     private setupEventListeners(): void {
+        // Listen for daemon shutdown - stop trying to reconnect
+        this.vsCodeClient.on('daemon.shutdown', (data: any) => {
+            log.info(`Received daemon.shutdown event: ${data?.reason || 'unknown reason'}`);
+            this.daemonShutdownReceived = true;
+            this.currentHealthState = 'daemon_stopped';  // Distinct from 'unhealthy' - don't reconnect
+            this.stopConnectionMonitor();  // Stop health checks - daemon is gone
+            this._onConnectionHealthChanged.fire(this.getConnectionHealth());
+        });
+        
         // Listen for coordinator status changes
         this.vsCodeClient.on('coordinator.statusChanged', (data: any) => {
             this.lastCoordinatorStatus = {
@@ -165,6 +186,20 @@ export class DaemonStateProxy {
                 this.lastUnityStatus.queueLength--;
             }
         });
+    }
+    
+    /**
+     * Reset shutdown state - called when user explicitly starts daemon again
+     */
+    resetShutdownState(): void {
+        this.daemonShutdownReceived = false;
+    }
+    
+    /**
+     * Check if daemon was intentionally shut down
+     */
+    wasDaemonShutdown(): boolean {
+        return this.daemonShutdownReceived;
     }
 
     // ========================================================================
@@ -222,7 +257,8 @@ export class DaemonStateProxy {
             state: this.currentHealthState,
             lastPingSuccess: this.lastPingSuccess,
             lastPingTime: this.lastPingTime,
-            consecutiveFailures: this.consecutiveFailures
+            consecutiveFailures: this.consecutiveFailures,
+            daemonStopped: this.daemonShutdownReceived
         };
     }
     
@@ -291,6 +327,12 @@ export class DaemonStateProxy {
     private async attemptReconnect(): Promise<boolean> {
         if (this.isReconnecting) return false;
         
+        // Don't reconnect if daemon was intentionally shut down
+        if (this.daemonShutdownReceived) {
+            log.debug('Skipping reconnect - daemon was intentionally shut down');
+            return false;
+        }
+        
         const port = this.readDaemonPort();
         if (!port) {
             return false;
@@ -317,10 +359,22 @@ export class DaemonStateProxy {
     
     /**
      * Manually trigger a reconnection attempt.
-     * Called by UI "Retry Now" button.
+     * Called by UI "Retry Now" button or when starting daemon.
      * @returns true if reconnection succeeded
      */
     async manualReconnect(): Promise<{ success: boolean; error?: string }> {
+        // Reset shutdown state - user explicitly wants to reconnect
+        this.daemonShutdownReceived = false;
+        this.currentHealthState = 'unknown';  // Reset to unknown, not unhealthy
+        
+        // Also reset the VsCodeClient's shutdown state
+        if (typeof (this.vsCodeClient as any).resetShutdownState === 'function') {
+            (this.vsCodeClient as any).resetShutdownState();
+        }
+        
+        // Notify UI that we're attempting to reconnect
+        this._onConnectionHealthChanged.fire(this.getConnectionHealth());
+        
         if (this.vsCodeClient.isConnected()) {
             // Already connected, just verify with ping
             try {
@@ -359,6 +413,12 @@ export class DaemonStateProxy {
      * Perform a health check ping (with auto-reconnect on failure)
      */
     private async performHealthCheck(): Promise<void> {
+        // Don't perform health checks if daemon was intentionally shut down
+        if (this.daemonShutdownReceived) {
+            log.debug('Skipping health check - daemon was intentionally shut down');
+            return;
+        }
+        
         const previousState = this.currentHealthState;
         
         // If not connected, try to reconnect first
@@ -670,23 +730,6 @@ export class DaemonStateProxy {
         }
     }
 
-    /**
-     * Get failed tasks for a session
-     */
-    async getFailedTasks(sessionId: string): Promise<FailedTask[]> {
-        if (!this.vsCodeClient.isConnected()) {
-            return [];
-        }
-
-        try {
-            const response: { failedTasks?: FailedTask[] } = await this.vsCodeClient.send('session.failed_tasks', { id: sessionId });
-            return response.failedTasks || [];
-        } catch (err) {
-            log.warn('Failed to get failed tasks from daemon:', err);
-            return [];
-        }
-    }
-
     // ========================================================================
     // Unity Status
     // ========================================================================
@@ -723,6 +766,27 @@ export class DaemonStateProxy {
         } catch (err) {
             log.warn('Failed to get Unity status from daemon:', err);
             return undefined;
+        }
+    }
+    
+    /**
+     * Trigger Unity prep (compile) run manually
+     * Only call this when Unity pipeline queue is empty
+     */
+    async triggerUnityPrep(): Promise<{ success: boolean; taskId?: string; error?: string }> {
+        if (!this.unityEnabled) {
+            return { success: false, error: 'Unity features not enabled' };
+        }
+        
+        if (!this.vsCodeClient.isConnected()) {
+            return { success: false, error: 'Daemon not connected' };
+        }
+        
+        try {
+            return await this.vsCodeClient.triggerUnityPrep();
+        } catch (err) {
+            log.warn('Failed to trigger Unity prep:', err);
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
         }
     }
     

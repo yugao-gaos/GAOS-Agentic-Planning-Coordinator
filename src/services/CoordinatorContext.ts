@@ -24,7 +24,8 @@ import {
     FailedWorkflowSummary,
     PlanSummary,
     SessionCapacity,
-    GlobalFileConflict
+    GlobalFileConflict,
+    WorkflowHealth
 } from '../types/coordinator';
 import { IWorkflow } from './workflows';
 
@@ -84,8 +85,8 @@ export class CoordinatorContext {
         // Get ALL approved plans (not just the triggering session)
         const approvedPlans = this.getApprovedPlans();
         
-        // Get plan content for backward compatibility
-        const { planPath, planContent } = this.getPlanContent(session);
+        // Plan path only - coordinator will read_file when needed
+        const planPath = session?.currentPlanPath || '';
         
         // Build task summaries from TaskManager (ALL tasks, not just this session)
         const tasks = this.buildAllTaskSummaries();
@@ -105,12 +106,17 @@ export class CoordinatorContext {
         // Analyze cross-plan file conflicts
         const globalConflicts = this.buildGlobalConflictAnalysis(tasks);
         
+        // Build workflow health status for stuck detection
+        const workflowHealth = sessionState 
+            ? this.buildWorkflowHealth(sessionState)
+            : [];
+        
         return {
             event,
             sessionId,
             approvedPlans,
             planPath,
-            planContent,
+            planContent: '',  // Deprecated - coordinator reads plan files directly via read_file
             planRequirement: session?.requirement || '',
             history: sessionState?.coordinatorHistory || [],
             availableAgents,
@@ -121,7 +127,8 @@ export class CoordinatorContext {
             sessionStatus: session?.status || 'unknown',
             pendingQuestions: sessionState?.pendingQuestions || [],
             sessionCapacities,
-            globalConflicts
+            globalConflicts,
+            workflowHealth
         };
     }
     
@@ -196,8 +203,8 @@ export class CoordinatorContext {
             let dependencyStatus: 'all_complete' | 'some_pending' | 'some_failed' = 'all_complete';
             if (task.dependencies && task.dependencies.length > 0) {
                 const depTasks = task.dependencies.map(depId => {
-                    // Try both local and global ID formats
-                    return taskManager.getTask(depId) || taskManager.getTask(`${task.sessionId}_${depId}`);
+                    // Dependencies are in global format PS_XXXXXX_TN - just normalize to uppercase
+                    return taskManager.getTask(depId.toUpperCase());
                 });
                 
                 if (depTasks.some(t => t?.status === 'failed')) {
@@ -207,11 +214,12 @@ export class CoordinatorContext {
                 }
             }
             
+            // Preserve awaiting_decision status - coordinator needs to know about these tasks
             return {
                 id: task.id,
                 sessionId: task.sessionId,
                 description: task.description,
-                status: task.status,
+                status: task.status as TaskSummary['status'],
                 type: task.taskType as 'implementation' | 'error_fix' | 'context_gathering',
                 priority: task.priority,
                 dependencies: task.dependencies || [],
@@ -221,25 +229,6 @@ export class CoordinatorContext {
                 targetFiles: task.targetFiles  // For cross-plan conflict detection
             };
         });
-    }
-
-    /**
-     * Get plan content from disk
-     */
-    private getPlanContent(session: PlanningSession | undefined): { planPath: string; planContent: string } {
-        let planContent = '';
-        let planPath = '';
-        
-        if (session?.currentPlanPath) {
-            planPath = session.currentPlanPath;
-            try {
-                planContent = fs.readFileSync(planPath, 'utf-8');
-            } catch (e) {
-                planContent = `[Error reading plan: ${e}]`;
-            }
-        }
-        
-        return { planPath, planContent };
     }
 
     /**
@@ -255,7 +244,11 @@ export class CoordinatorContext {
             let dependencyStatus: 'all_complete' | 'some_pending' | 'some_failed' = 'all_complete';
             if (task.dependencies && task.dependencies.length > 0) {
                 const depTasks = task.dependencies.map(depId => {
-                    const globalDepId = `${sessionId}_${depId}`;
+                    // Dependencies might be short (T1) or full (PS_000001_T1) format
+                    // Normalize to UPPERCASE for consistent lookup
+                    const globalDepId = depId.includes('_') 
+                        ? depId.toUpperCase() 
+                        : `${sessionId.toUpperCase()}_${depId.toUpperCase()}`;
                     return taskManager.getTask(globalDepId);
                 });
                 
@@ -331,6 +324,100 @@ export class CoordinatorContext {
         }
         
         return { active, failed };
+    }
+    
+    /**
+     * Build workflow health status for stuck detection
+     * Identifies workflows that may be stuck due to various conditions
+     */
+    private buildWorkflowHealth(sessionState: SessionStateSnapshot): WorkflowHealth[] {
+        const health: WorkflowHealth[] = [];
+        const now = Date.now();
+        const STUCK_THRESHOLD_MINUTES = 10;
+        
+        for (const [workflowId, workflow] of sessionState.workflows) {
+            const status = workflow.getStatus();
+            
+            // Only check running/pending/blocked workflows
+            if (status === 'completed' || status === 'cancelled' || status === 'failed') {
+                continue;
+            }
+            
+            const progress = workflow.getProgress();
+            const taskId = sessionState.workflowToTaskMap.get(workflowId);
+            
+            // Calculate minutes since last activity
+            const lastActivityMs = progress.updatedAt 
+                ? new Date(progress.updatedAt).getTime() 
+                : new Date(progress.startedAt).getTime();
+            const minutesSinceActivity = Math.floor((now - lastActivityMs) / (1000 * 60));
+            
+            // Determine stuck reason
+            let stuckReason: WorkflowHealth['stuckReason'] = null;
+            let stuckDetail: string | undefined;
+            
+            // Check -1: Orphan workflow - task already completed
+            if (taskId) {
+                const taskManager = ServiceLocator.resolve(TaskManager);
+                // taskId should be in global format - just normalize to uppercase
+                const globalTaskId = taskId.toUpperCase();
+                const task = taskManager.getTask(globalTaskId);
+                if (task && task.status === 'completed') {
+                    stuckReason = 'task_completed';
+                    stuckDetail = `Task ${taskId} already completed - cancel this orphan workflow`;
+                }
+            }
+            
+            // Check 0: Workflow is paused - needs resume
+            if (!stuckReason && status === 'paused') {
+                stuckReason = 'paused';
+                stuckDetail = `Workflow paused for ${minutesSinceActivity} min - use 'apc workflow resume' to continue`;
+            }
+            
+            // Check 1: No activity for too long
+            if (!stuckReason && minutesSinceActivity >= STUCK_THRESHOLD_MINUTES) {
+                stuckReason = 'no_activity';
+                stuckDetail = `No progress for ${minutesSinceActivity} minutes`;
+            }
+            
+            // Check 2: Waiting for agent but pool is exhausted
+            // Get allocated agents for this workflow from the pool service
+            const allocatedAgents = this.agentPoolService.getAllocatedAgents()
+                .filter(a => a.workflowId === workflowId)
+                .map(a => a.name);
+            if (!stuckReason && allocatedAgents.length === 0 && status === 'pending') {
+                const availableCount = this.agentPoolService.getAvailableAgents().length;
+                if (availableCount === 0) {
+                    stuckReason = 'waiting_for_agent';
+                    stuckDetail = 'Workflow waiting for agent but pool has 0 available';
+                }
+            }
+            
+            // Check 3: Has agents allocated but all are idle (on bench)
+            if (!stuckReason && allocatedAgents.length > 0) {
+                const allIdle = allocatedAgents.every((agentName: string) => {
+                    const agentStatus = this.agentPoolService.getAgentStatus(agentName);
+                    // Agent is idle if not currently running a process
+                    return agentStatus?.status !== 'busy';
+                });
+                
+                if (allIdle && minutesSinceActivity >= 5) {  // 5 min grace period for idle agents
+                    stuckReason = 'agents_idle';
+                    stuckDetail = `${allocatedAgents.length} agent(s) allocated but all idle for ${minutesSinceActivity} min`;
+                }
+            }
+            
+            health.push({
+                workflowId,
+                taskId,
+                status,
+                minutesSinceActivity,
+                stuckReason,
+                stuckDetail
+            });
+        }
+        
+        return health;
     }
 
     /**

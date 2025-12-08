@@ -439,11 +439,13 @@ export interface IExecutionContextAPI {
     /** Release an agent back to the pool */
     releaseAgent(agentName: string): void;
     
-    /** Run an agent task */
+    /** Run an agent task with CLI callback requirement */
     runAgentTask(agentName: string, prompt: string, options?: {
         model?: string;
         timeoutMs?: number;
-    }): Promise<{ success: boolean; output: string }>;
+        /** Stage for CLI callback (required) */
+        stage?: 'implementation' | 'review' | 'analysis' | 'context' | 'planning' | 'finalization';
+    }): Promise<{ success: boolean; output: string; fromCallback?: boolean }>;
     
     /** Emit an event */
     emitEvent(eventType: string, payload?: any): void;

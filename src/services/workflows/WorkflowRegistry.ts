@@ -98,8 +98,8 @@ export class WorkflowRegistry {
     }
     
     /**
-     * Get combined coordinator prompts for all workflows
-     * Optionally filter by Unity availability
+     * Get combined coordinator prompts for dispatchable workflows
+     * Filters out planning workflows (triggered via UI, not coordinator)
      * 
      * @param unityEnabled Whether Unity features are enabled
      * @param userOverrides Optional user-configured prompt overrides
@@ -110,7 +110,15 @@ export class WorkflowRegistry {
     ): string {
         const prompts: string[] = [];
         
+        // Planning workflows are NOT dispatchable by coordinator (triggered via UI)
+        const nonDispatchableTypes = ['planning_new', 'planning_revision'];
+        
         for (const entry of this.entries.values()) {
+            // Skip planning workflows - coordinator doesn't dispatch these
+            if (nonDispatchableTypes.includes(entry.metadata.type)) {
+                continue;
+            }
+            
             // Skip Unity-only workflows if Unity is disabled
             if (entry.metadata.requiresUnity && !unityEnabled) {
                 continue;

@@ -8,6 +8,8 @@ import { OutputChannelManager } from './OutputChannelManager';
 import { EventBroadcaster } from '../daemon/EventBroadcaster';
 import { PlanningWorkflowInput } from '../types/workflow';
 import { ServiceLocator } from './ServiceLocator';
+import { TaskManager } from './TaskManager';
+import { PlanParser } from './PlanParser';
 
 /**
  * Configuration for PlanningService
@@ -455,35 +457,22 @@ export class PlanningService extends EventEmitter {
 
         const planContent = fs.readFileSync(session.currentPlanPath, 'utf-8');
         const issues: string[] = [];
-        const tasksFound: Array<{ id: string; description: string; deps: string[] }> = [];
-
-        // Check for checkbox format tasks
-        // Support both T1 and T8.4 style task IDs (hierarchical with dots)
-        const checkboxPattern = /^-\s*\[[ xX]\]\s*\*\*T([\d.]+)\*\*:\s*(.+?)(?:\s*\|\s*Deps?:\s*([^|]+))?(?:\s*\|\s*Engineer:\s*\w+)?$/gm;
         
-        let match;
-        while ((match = checkboxPattern.exec(planContent)) !== null) {
-            const taskId = `T${match[1]}`;
-            const description = match[2].trim();
-            const depsStr = match[3]?.trim() || 'None';
-            
-            const deps: string[] = [];
-            if (depsStr.toLowerCase() !== 'none' && depsStr !== '-') {
-                // Support both T1 and T8.4 style dependency references
-                const depMatches = depsStr.match(/T[\d.]+/gi) || [];
-                deps.push(...depMatches.map(d => d.toUpperCase()));
-            }
-            
-            tasksFound.push({ id: taskId, description, deps });
-        }
+        // Use PlanParser for consistency
+        const parsedTasks = PlanParser.parseInlineCheckboxTasks(planContent);
+        const tasksFound: Array<{ id: string; description: string; deps: string[] }> = parsedTasks.map((t: any) => ({
+            id: t.id,
+            description: t.description,
+            deps: t.dependencies
+        }));
 
         if (tasksFound.length === 0) {
-            issues.push('No tasks found in checkbox format. Expected format: - [ ] **T1**: Task description | Deps: None');
+            issues.push(`No tasks found in checkbox format. Expected format: - [ ] **${sessionId}_T1**: Task description | Deps: None`);
             
-            const tablePattern = /\|\s*T\d+\s*\|/g;
-            const tableMatches = planContent.match(tablePattern);
-            if (tableMatches && tableMatches.length > 0) {
-                issues.push(`Found ${tableMatches.length} tasks in TABLE format. Please convert to CHECKBOX format for tracking.`);
+            // Check for table format tasks
+            const tableCount = PlanParser.countTableFormatTasks(planContent);
+            if (tableCount > 0) {
+                issues.push(`Found ${tableCount} tasks in TABLE format. Please convert to CHECKBOX format for tracking.`);
             }
         }
 
@@ -583,6 +572,9 @@ export class PlanningService extends EventEmitter {
         this.stateManager.savePlanningSession(session);
         this.notifyChange();
         
+        // Try to auto-create tasks from parsed plan (saves coordinator work)
+        await this.tryCreateTasksFromPlan(sessionId, session.currentPlanPath!);
+        
         if (autoStart) {
             const result = await this.startExecution(sessionId);
             if (result.success) {
@@ -592,6 +584,86 @@ export class PlanningService extends EventEmitter {
             }
         } else {
             this.notifyInfo(`Plan ${sessionId} approved and ready for execution`, sessionId);
+        }
+    }
+    
+    /**
+     * Auto-create tasks from a parsed plan file.
+     * 
+     * @param sessionId Session ID for the plan
+     * @param planPath Path to the plan file
+     */
+    private async tryCreateTasksFromPlan(sessionId: string, planPath: string): Promise<void> {
+        const taskManager = ServiceLocator.resolve(TaskManager);
+        
+        // Parse the plan file
+        const parsedPlan = PlanParser.parsePlanFile(planPath);
+        
+        if (!parsedPlan.tasks || parsedPlan.tasks.length === 0) {
+            this.writeProgress(sessionId, 'TASKS', `⚠️ No tasks found in plan file`);
+            return;
+        }
+        
+        // Get existing tasks to avoid duplicates
+        const existingTasks = taskManager.getTasksForSession(sessionId);
+        const existingIds = new Set(existingTasks.map(t => t.id));
+        
+        let created = 0;
+        let skipped = 0;
+        const errors: string[] = [];
+        
+        // Create tasks in order (to respect dependency ordering)
+        // Normalize sessionId to UPPERCASE for consistent task ID format
+        const normalizedSessionId = sessionId.toUpperCase();
+        
+        for (const task of parsedPlan.tasks) {
+            // Normalize task ID to global format if it's simple (T1 -> PS_XXXXXX_T1)
+            // Always use UPPERCASE for consistency with TaskManager storage
+            const globalTaskId = task.id.includes('_') 
+                ? task.id.toUpperCase() 
+                : `${normalizedSessionId}_${task.id.toUpperCase()}`;
+            
+            // Skip if already exists
+            if (existingIds.has(globalTaskId)) {
+                skipped++;
+                continue;
+            }
+            
+            // Normalize dependencies to global format (UPPERCASE)
+            const globalDeps = task.dependencies.map(dep => 
+                dep.includes('_') ? dep.toUpperCase() : `${normalizedSessionId}_${dep.toUpperCase()}`
+            );
+            
+            // Pass global task ID - createTaskFromCli requires global format PS_XXXXXX_TN
+            const result = taskManager.createTaskFromCli({
+                sessionId,
+                taskId: globalTaskId,
+                description: task.description,
+                dependencies: globalDeps,
+                taskType: 'implementation',
+                priority: 10
+            });
+            
+            if (result.success) {
+                created++;
+                existingIds.add(globalTaskId);
+            } else {
+                errors.push(`${globalTaskId}: ${result.error}`);
+            }
+        }
+        
+        // Log results
+        if (created > 0) {
+            this.writeProgress(sessionId, 'TASKS', `✅ Auto-created ${created} tasks from plan`);
+        }
+        if (skipped > 0) {
+            this.writeProgress(sessionId, 'TASKS', `⏭️ Skipped ${skipped} existing tasks`);
+        }
+        if (errors.length > 0) {
+            this.writeProgress(sessionId, 'TASKS', `❌ ${errors.length} tasks failed to create:`);
+            for (const err of errors) {
+                this.writeProgress(sessionId, 'TASKS', `   • ${err}`);
+            }
         }
     }
     
@@ -1046,6 +1118,11 @@ export class PlanningService extends EventEmitter {
             
             // Clean up session-specific subscriptions
             this.cleanupSessionSubscriptions(sessionId);
+            
+            // Delete all tasks for this session from the global TaskManager
+            const taskManager = ServiceLocator.resolve(TaskManager);
+            const deletedCount = taskManager.deleteTasksForSession(sessionId);
+            console.log(`Deleted ${deletedCount} tasks for session ${sessionId}`);
 
             // Delete the plan folder
             const planFolder = this.stateManager.getPlanFolder(sessionId);

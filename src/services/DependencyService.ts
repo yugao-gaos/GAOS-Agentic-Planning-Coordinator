@@ -1,4 +1,4 @@
-import { exec, execSync, spawnSync } from 'child_process';
+import { exec, execSync, spawnSync, ExecOptions } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -9,8 +9,20 @@ import { AgentRunner } from './AgentBackend';
 import { CursorAgentRunner } from './CursorAgentRunner';
 import { Logger } from '../utils/Logger';
 
-const execAsync = promisify(exec);
+const execAsyncRaw = promisify(exec);
 const log = Logger.create('Daemon', 'DependencyService');
+
+/**
+ * Wrapper for exec that automatically hides terminal windows on Windows.
+ * This prevents empty CMD windows from flashing during dependency checks.
+ */
+const execAsync = (command: string, options?: ExecOptions): Promise<{ stdout: string; stderr: string }> => {
+    return execAsyncRaw(command, { 
+        encoding: 'utf8',  // Ensure string output
+        ...options, 
+        windowsHide: true 
+    }) as Promise<{ stdout: string; stderr: string }>;
+};
 
 // ============================================================================
 // Unity MCP Config Types
@@ -679,9 +691,9 @@ export class DependencyService {
      * 4. If authenticated: Run normal connectivity test
      * 
      * @param interactive If true, opens terminal for login when needed
-     * @param timeoutMs Timeout for connectivity test (default: 30000)
+     * @param timeoutMs Timeout for connectivity test (default: 180000 = 3 minutes)
      */
-    async testUnityMcpConnectionSmart(interactive: boolean = false, tryCreateTempScene: boolean = false, timeoutMs: number = 30000): Promise<UnityMcpConnectivityResult> {
+    async testUnityMcpConnectionSmart(interactive: boolean = false, tryCreateTempScene: boolean = false, timeoutMs: number = 180000): Promise<UnityMcpConnectivityResult> {
         try {
             const agentRunner = ServiceLocator.resolve(AgentRunner);
             const backend = agentRunner['backend'] as CursorAgentRunner; // Access private backend (CursorAgentRunner)
@@ -745,9 +757,9 @@ export class DependencyService {
      * NOTE: This should only be called in daemon context (caller should check ServiceLocator.isRegistered(AgentRunner))
      * 
      * @param tryCreateTempScene If true, also creates _TempCompileCheck.unity scene via MCP if missing
-     * @param timeoutMs Timeout in milliseconds (default: 30000)
+     * @param timeoutMs Timeout in milliseconds (default: 180000 = 3 minutes)
      */
-    private async testUnityMcpConnectionViaAgent(tryCreateTempScene: boolean = false, timeoutMs: number = 30000): Promise<UnityMcpConnectivityResult> {
+    private async testUnityMcpConnectionViaAgent(tryCreateTempScene: boolean = false, timeoutMs: number = 180000): Promise<UnityMcpConnectivityResult> {
         try {
             const agentRunner = ServiceLocator.resolve(AgentRunner);
             

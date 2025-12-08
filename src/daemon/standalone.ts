@@ -109,6 +109,14 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
     taskManager.reloadPersistedTasks();
     log.info(`TaskManager reloaded ${taskManager.getAllTasks().length} persisted tasks`);
     
+    // Sync plan checkboxes with TaskManager (source of truth)
+    broadcastProgress('Syncing plan checkboxes');
+    for (const session of stateManager.getAllPlanningSessions()) {
+        if (session.status === 'approved') {
+            taskManager.syncAllPlanCheckboxes(session.id);
+        }
+    }
+    
     // Initialize AgentRoleRegistry
     broadcastProgress('Initializing AgentRoleRegistry');
     const roleRegistry = new AgentRoleRegistry(stateManager);
@@ -124,7 +132,9 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
     log.info(`AgentPoolService initialized with ${agentPoolService.getPoolStatus().total} agents`);
     
     // Initialize HeadlessTerminalManager (no-op for standalone)
+    // Register with ServiceLocator so it can be cleaned up during shutdown
     const terminalManager = new HeadlessTerminalManager();
+    ServiceLocator.register(HeadlessTerminalManager, () => terminalManager);
     
     // Initialize AgentRunner with default backend
     broadcastProgress('Initializing AgentRunner');
@@ -374,6 +384,26 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
         daemon.setServicesReady();
     }
     
+    // Start WSL keepalive monitor AFTER system is ready (Windows only, cursor backend only)
+    // This prevents WSL from hibernating and causing delays when cursor-agent needs it
+    // Only start if WSL-related dependencies are installed (cursor-agent in WSL)
+    if (process.platform === 'win32' && config.defaultBackend === 'cursor') {
+        // Check if cursor-agent (in WSL) is available before starting keepalive
+        const cursorAgentDep = depStatuses.find(d => d.name === 'Cursor Agent CLI');
+        if (cursorAgentDep?.installed) {
+            const { WslKeepaliveMonitor } = await import('./WslKeepaliveMonitor');
+            const wslKeepalive = new WslKeepaliveMonitor();
+            wslKeepalive.setOutputManager(outputManager);
+            if (wslKeepalive.start()) {
+                log.info('WslKeepaliveMonitor started');
+                // Register for cleanup on daemon shutdown
+                ServiceLocator.register(WslKeepaliveMonitor, () => wslKeepalive);
+            }
+        } else {
+            log.debug('WSL keepalive not started - cursor-agent not installed in WSL');
+        }
+    }
+    
     // Return API services interface
     return {
         stateManager: {
@@ -415,7 +445,6 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             resumeSession: (sessionId: string) => coordinator.resumeSession(sessionId),
             cancelSession: (sessionId: string) => coordinator.cancelSession(sessionId),
             startExecution: (sessionId: string) => coordinator.startExecution(sessionId),
-            getFailedTasks: (sessionId: string) => coordinator.getFailedTasks(sessionId),
             signalAgentCompletion: (signal: any) => coordinator.signalAgentCompletion(signal),
             triggerCoordinatorEvaluation: (sessionId: string, eventType: string, payload: any) => 
                 coordinator.triggerCoordinatorEvaluation(sessionId, eventType as any, payload),
@@ -476,8 +505,11 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             getTasksForSession: (sessionId: string) => ServiceLocator.resolve(TaskManager).getTasksForSession(sessionId),
             getTask: (globalTaskId: string) => ServiceLocator.resolve(TaskManager).getTask(globalTaskId),
             getAllTasks: () => ServiceLocator.resolve(TaskManager).getAllTasks(),
-            createTaskFromCli: (params: { sessionId: string; taskId: string; description: string; dependencies?: string[]; taskType?: 'implementation' | 'error_fix'; priority?: number; errorText?: string }) => 
-                ServiceLocator.resolve(TaskManager).createTaskFromCli(params),
+            createTaskFromCli: (params: { sessionId: string; rawTaskId: string; description: string; dependencies?: string[]; taskType?: 'implementation' | 'error_fix'; priority?: number; errorText?: string }) => 
+                ServiceLocator.resolve(TaskManager).createTaskFromCli({
+                    ...params,
+                    taskId: params.rawTaskId
+                }),
             completeTask: (globalTaskId: string, summary?: string) => ServiceLocator.resolve(TaskManager).markTaskCompletedViaCli(globalTaskId, summary),
             updateTaskStage: (globalTaskId: string, stage: string) => ServiceLocator.resolve(TaskManager).updateTaskStage(globalTaskId, stage),
             markTaskFailed: (globalTaskId: string, reason?: string) => ServiceLocator.resolve(TaskManager).markTaskFailed(globalTaskId, reason),

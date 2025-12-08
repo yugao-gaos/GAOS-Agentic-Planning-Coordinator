@@ -47,7 +47,6 @@ export type CoordinatorEventPayload =
 export interface ExecutionStartedPayload {
     type: 'execution_started';
     planPath: string;
-    planContent?: string;    // Raw plan markdown for coordinator to read
     taskCount: number;
 }
 
@@ -130,7 +129,7 @@ export interface TaskSummary {
     id: string;
     sessionId?: string;  // Added for multi-plan support
     description: string;
-    status: 'created' | 'pending' | 'in_progress' | 'completed' | 'failed' | 'paused' | 'blocked';
+    status: 'created' | 'pending' | 'in_progress' | 'completed' | 'failed' | 'paused' | 'blocked' | 'awaiting_decision';
     type: 'implementation' | 'error_fix' | 'context_gathering';
     dependencies: string[];
     dependencyStatus: 'all_complete' | 'some_pending' | 'some_failed';
@@ -266,6 +265,24 @@ export interface CoordinatorInput {
     // ---- Cross-Plan Conflict Detection ----
     /** Files that are touched by tasks from multiple sessions - requires sequencing */
     globalConflicts?: GlobalFileConflict[];
+    
+    // ---- Workflow Health Detection ----
+    /** Health status of active workflows - identifies stuck workflows */
+    workflowHealth?: WorkflowHealth[];
+}
+
+/**
+ * Workflow health status for stuck detection
+ */
+export interface WorkflowHealth {
+    workflowId: string;
+    taskId?: string;
+    status: string;
+    minutesSinceActivity: number;
+    /** null = healthy, otherwise indicates why workflow may be stuck */
+    stuckReason: null | 'task_completed' | 'paused' | 'no_activity' | 'waiting_for_agent' | 'agents_idle';
+    /** Additional context about the stuck condition */
+    stuckDetail?: string;
 }
 
 // ============================================================================
@@ -338,12 +355,6 @@ export interface CoordinatorAgentConfig {
     /** Model to use for evaluation */
     model: string;
     
-    /** Whether to include full plan content or just summary */
-    includePlanContent: boolean;
-    
-    /** Maximum plan content length before truncation */
-    maxPlanContentLength: number;
-    
     /** Enable debug logging */
     debug: boolean;
 }
@@ -353,10 +364,8 @@ export interface CoordinatorAgentConfig {
  */
 export const DEFAULT_COORDINATOR_CONFIG: CoordinatorAgentConfig = {
     maxHistoryEntries: 20,
-    evaluationTimeout: 300000,  // 5 minutes - coordinator needs time to read plan (can be 500+ lines) and execute multiple commands
+    evaluationTimeout: 300000,  // 5 minutes - coordinator needs time to execute multiple commands
     model: 'sonnet-4.5',
-    includePlanContent: true,
-    maxPlanContentLength: 50000,
     debug: false,
 };
 

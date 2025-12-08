@@ -43,6 +43,9 @@ export { EventBroadcaster, IEventBroadcaster, getBroadcaster } from './EventBroa
 // Standalone service initialization
 export { initializeServices } from './standalone';
 
+// WSL keepalive monitor (Windows only)
+export { WslKeepaliveMonitor, WslKeepaliveOptions } from './WslKeepaliveMonitor';
+
 // Unified daemon starter
 export { 
     startDaemon, 

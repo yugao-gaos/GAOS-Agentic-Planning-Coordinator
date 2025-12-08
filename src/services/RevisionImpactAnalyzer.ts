@@ -3,7 +3,7 @@
 // ============================================================================
 
 import * as fs from 'fs';
-import { PlanTask } from './PlanParser';
+import { PlanTask, PlanParser } from './PlanParser';
 import { ServiceLocator } from './ServiceLocator';
 import { TaskManager } from './TaskManager';
 
@@ -100,8 +100,7 @@ export class RevisionImpactAnalyzer {
      * Analyze revision feedback to determine affected tasks
      * 
      * @param feedback - The revision feedback text
-     * @param sessionId - The session ID to get tasks for (extracted from planPath or provided directly)
-     * @param planPath - Optional plan path for backward compatibility (sessionId is extracted)
+     * @param sessionIdOrPlanPath - The session ID or full plan path (sessionId is extracted from path)
      * @param currentTaskStates - Optional current task states
      * @param options - Analysis options
      */
@@ -117,26 +116,68 @@ export class RevisionImpactAnalyzer {
             considerInProgress = true
         } = options;
         
-        // Extract sessionId from planPath if needed (e.g., "/path/Plans/ps_000001/plan.md" -> "ps_000001")
+        // Extract sessionId from planPath if needed
+        // Supports both Unix (/) and Windows (\) paths
+        // e.g., "/path/Plans/ps_000001/plan.md" or "D:\path\Plans\ps_000001\plan.md" -> "ps_000001"
         let sessionId = sessionIdOrPlanPath;
-        if (sessionIdOrPlanPath.includes('/')) {
-            const match = sessionIdOrPlanPath.match(/\/(ps_\d+)\//);
+        let planPath: string | undefined;
+        
+        if (sessionIdOrPlanPath.includes('/') || sessionIdOrPlanPath.includes('\\')) {
+            // This is a path, extract sessionId
+            planPath = sessionIdOrPlanPath;
+            const match = sessionIdOrPlanPath.match(/[/\\](ps_\d+)[/\\]/);
             if (match) {
                 sessionId = match[1];
             }
         }
         
-        // Get tasks from TaskManager instead of parsing the plan
+        // Get tasks from TaskManager first (authoritative source)
         const taskManager = ServiceLocator.resolve(TaskManager);
-        const managedTasks = taskManager.getTasksForSession(sessionId);
+        let managedTasks = taskManager.getTasksForSession(sessionId);
+        
+        // If no tasks in TaskManager, fall back to parsing the existing plan file
+        // This handles the revision case where tasks haven't been created yet
+        if (managedTasks.length === 0 && planPath && fs.existsSync(planPath)) {
+            console.warn(`[RevisionImpactAnalyzer] No tasks in TaskManager for session ${sessionId}, parsing plan file`);
+            const parsedPlan = PlanParser.parsePlanFile(planPath);
+            
+            if (parsedPlan.tasks && parsedPlan.tasks.length > 0) {
+                console.warn(`[RevisionImpactAnalyzer] Found ${parsedPlan.tasks.length} tasks from plan file`);
+                // Use parsed tasks directly (they're already in PlanTask format)
+                return this.analyzeWithTasks(feedback, parsedPlan.tasks, currentTaskStates, options);
+            }
+        }
         
         if (managedTasks.length === 0) {
-            console.warn(`[RevisionImpactAnalyzer] No tasks found for session ${sessionId} in TaskManager`);
+            console.warn(`[RevisionImpactAnalyzer] No tasks found for session ${sessionId}`);
             return this.createEmptyResult();
         }
         
         // Convert ManagedTask[] to PlanTask[] format for compatibility with existing analysis logic
         const allTasks: PlanTask[] = managedTasks.map(task => this.convertToPlanTask(task));
+        
+        // Delegate to core analysis logic
+        return this.analyzeWithTasks(feedback, allTasks, currentTaskStates, options);
+    }
+    
+    /**
+     * Core analysis logic - analyzes tasks against feedback
+     * 
+     * @param feedback - The revision feedback text
+     * @param allTasks - Tasks to analyze (in PlanTask format)
+     * @param currentTaskStates - Optional current task states
+     * @param options - Analysis options
+     */
+    private static analyzeWithTasks(
+        feedback: string,
+        allTasks: PlanTask[],
+        currentTaskStates?: Map<string, { status: string; filesModified: string[] }>,
+        options: AnalysisOptions = {}
+    ): RevisionImpactResult {
+        const {
+            minConfidence = 0.3,
+            includeTransitive = true,
+        } = options;
         
         // Extract keywords and entities from feedback
         const feedbackAnalysis = this.analyzeFeedback(feedback);

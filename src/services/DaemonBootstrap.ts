@@ -11,7 +11,7 @@
  * Dependency Levels:
  * - Level 0: No dependencies (OutputChannelManager, EventBroadcaster, etc.)
  * - Level 1: Depends on Level 0 (ProcessManager, TaskManager)
- * - Level 2: Depends on Level 1 (CursorAgentRunner, WorkflowPauseManager)
+ * - Level 2: Depends on Level 1 (CursorAgentRunner)
  * - Level 3: Depends on Level 2 (AgentRunner, UnityControlManager)
  * - Level 4: UnifiedCoordinatorService - requires external deps, registered in standalone.ts
  * 
@@ -35,9 +35,6 @@ import { TaskManager } from './TaskManager';
 
 // Level 2 - Depends on Level 1
 import { CursorAgentRunner } from './CursorAgentRunner';
-
-// WorkflowPauseManager - no dependencies (StateManager injected later)
-import { WorkflowPauseManager } from './workflows/WorkflowPauseManager';
 
 // Level 3 - Depends on Level 2
 import { AgentRunner } from './AgentBackend';
@@ -87,9 +84,6 @@ export function bootstrapDaemonServices(): void {
     // ========================================================================
     
     ServiceLocator.register(CursorAgentRunner, () => new CursorAgentRunner());
-    
-    // WorkflowPauseManager has no constructor dependencies (StateManager injected later)
-    ServiceLocator.register(WorkflowPauseManager, () => new WorkflowPauseManager());
 
     // ========================================================================
     // Level 3 - Depends on Level 2

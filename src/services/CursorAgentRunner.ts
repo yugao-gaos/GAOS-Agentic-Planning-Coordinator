@@ -80,6 +80,13 @@ export class CursorAgentRunner implements IAgentBackend {
         idleInterval?: NodeJS.Timeout;  // Interval for idle indicator
         idleSpinnerIndex: number;  // Current spinner frame index
         lastIdleLogTime: number;  // Last time we logged idle status to file
+        timing?: {  // Startup timing metrics
+            promptWriteStart: number;
+            promptWriteEnd: number;
+            spawnStart: number;
+            spawnEnd: number;
+            firstOutputAt: number;
+        };
     }> = new Map();
     
     // Track runs that were intentionally stopped (so we don't log them as failures)
@@ -266,6 +273,15 @@ export class CursorAgentRunner implements IAgentBackend {
         let collectedOutput = '';
         let exitCode: number | null = null;
         let error: string | undefined;
+        
+        // ============ TIMING: Track startup phases ============
+        const timing = {
+            promptWriteStart: Date.now(),
+            promptWriteEnd: 0,
+            spawnStart: 0,
+            spawnEnd: 0,
+            firstOutputAt: 0
+        };
 
         // Write prompt to OS temp file to avoid shell escaping issues
         const tempDir = path.join(os.tmpdir(), 'apc_prompts');
@@ -274,6 +290,7 @@ export class CursorAgentRunner implements IAgentBackend {
         }
         const promptFile = path.join(tempDir, `prompt_${id}_${Date.now()}.txt`);
         fs.writeFileSync(promptFile, prompt);
+        timing.promptWriteEnd = Date.now();
 
         // Build cursor-agent flags (common across platforms)
         // Always use stream-json format - text mode doesn't produce capturable stdout
@@ -293,11 +310,17 @@ export class CursorAgentRunner implements IAgentBackend {
             this.appendToLog(logFile, `${C.gray}Model: ${model}${C.reset}\n`);
             this.appendToLog(logFile, `${C.gray}Process ID: ${id}${C.reset}\n`);
             this.appendToLog(logFile, `${C.gray}Platform: ${process.platform}${C.reset}\n`);
+            this.appendToLog(logFile, `${C.gray}Prompt write: ${timing.promptWriteEnd - timing.promptWriteStart}ms${C.reset}\n`);
             this.appendToLog(logFile, `${C.gray}---${C.reset}\n\n`);
         }
+        
+        // Log timing for prompt write
+        log.debug(`[TIMING] ${id}: Prompt file written in ${timing.promptWriteEnd - timing.promptWriteStart}ms`);
 
         return new Promise((resolve) => {
             let proc: ChildProcess;
+            
+            timing.spawnStart = Date.now();
             
             if (process.platform === 'win32') {
                 // Windows: Use WSL to run cursor-agent (cursor-agent requires Unix environment)
@@ -338,9 +361,16 @@ export class CursorAgentRunner implements IAgentBackend {
                 });
             }
 
+            timing.spawnEnd = Date.now();
+            const spawnDuration = timing.spawnEnd - timing.spawnStart;
+            
             if (proc.pid) {
                 onStart?.(proc.pid);
-                onProgress?.(`📡 Process started (PID: ${proc.pid})`);
+                onProgress?.(`📡 Process started (PID: ${proc.pid}) - spawn took ${spawnDuration}ms`);
+                log.debug(`[TIMING] ${id}: Process spawned in ${spawnDuration}ms (PID: ${proc.pid})`);
+                if (logFile) {
+                    this.appendToLog(logFile, `${this.COLORS.gray}[TIMING] Spawn: ${spawnDuration}ms${this.COLORS.reset}\n`);
+                }
             }
 
             const runEntry = {
@@ -353,7 +383,8 @@ export class CursorAgentRunner implements IAgentBackend {
                 lastOutputTime: Date.now(),
                 idleInterval: undefined as NodeJS.Timeout | undefined,
                 idleSpinnerIndex: 0,
-                lastIdleLogTime: 0
+                lastIdleLogTime: 0,
+                timing  // Include timing for first output tracking
             };
             this.activeRuns.set(id, runEntry);
             
@@ -405,13 +436,30 @@ export class CursorAgentRunner implements IAgentBackend {
                 chunkCount++;
                 totalBytes += text.length;
 
+                // ============ TIMING: First output tracking ============
+                const run = this.activeRuns.get(id);
+                if (chunkCount === 1 && run?.timing) {
+                    run.timing.firstOutputAt = Date.now();
+                    const timeToFirstOutput = run.timing.firstOutputAt - run.timing.spawnEnd;
+                    const totalStartupTime = run.timing.firstOutputAt - startTime;
+                    log.info(`[TIMING] ${id}: First output after ${timeToFirstOutput}ms (total startup: ${totalStartupTime}ms)`);
+                    onProgress?.(`⚡ First output received - startup took ${totalStartupTime}ms`);
+                    if (logFile) {
+                        const C = this.COLORS;
+                        this.appendToLog(logFile, `${C.green}[TIMING] First output: ${timeToFirstOutput}ms after spawn${C.reset}\n`);
+                        this.appendToLog(logFile, `${C.green}[TIMING] Total startup: ${totalStartupTime}ms${C.reset}\n`);
+                        this.appendToLog(logFile, `${C.gray}  - Prompt write: ${run.timing.promptWriteEnd - run.timing.promptWriteStart}ms${C.reset}\n`);
+                        this.appendToLog(logFile, `${C.gray}  - Spawn process: ${run.timing.spawnEnd - run.timing.spawnStart}ms${C.reset}\n`);
+                        this.appendToLog(logFile, `${C.gray}  - Wait for output: ${timeToFirstOutput}ms${C.reset}\n`);
+                    }
+                }
+
                 // Debug: log first chunk to see what we're getting
                 if (chunkCount === 1 && logFile) {
                     this.appendToLog(logFile, `[DEBUG] First stdout chunk (${text.length} bytes): ${text.substring(0, 200)}\n`);
                 }
 
                 // Update activity tracking
-                const run = this.activeRuns.get(id);
                 if (run) {
                     run.collectedOutput += text;
                     run.lastOutputTime = Date.now();
@@ -1013,7 +1061,9 @@ export class CursorAgentRunner implements IAgentBackend {
         try {
             const { exec } = require('child_process');
             const { promisify } = require('util');
-            const execAsync = promisify(exec);
+            const execAsyncRaw = promisify(exec);
+            // Wrapper to hide terminal windows on Windows
+            const execAsync = (cmd: string, opts?: any) => execAsyncRaw(cmd, { ...opts, windowsHide: true });
             
             let result: { stdout: string; stderr: string };
             

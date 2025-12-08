@@ -965,107 +965,16 @@ export class StateManager {
     }
 
     // ========================================================================
-    // Paused Workflow Persistence Methods
+    // Paused Workflow Persistence Methods (DEPRECATED - migration only)
+    // Active workflow state is now stored in task.activeWorkflow (tasks.json)
     // ========================================================================
     
     /**
      * Get the paused workflows folder for a session
-     * Structure: _AiDevLog/Plans/{sessionId}/paused_workflows/
+     * @deprecated Used only for migration from old pause files to tasks.json
      */
     getPausedWorkflowsFolder(sessionId: string): string {
         return path.join(this.getPlanFolder(sessionId), 'paused_workflows');
-    }
-    
-    /**
-     * Ensure paused workflows folder exists
-     */
-    private ensurePausedWorkflowsFolder(sessionId: string): void {
-        const folder = this.getPausedWorkflowsFolder(sessionId);
-        if (!fs.existsSync(folder)) {
-            fs.mkdirSync(folder, { recursive: true });
-        }
-    }
-    
-    /**
-     * Save a paused workflow state to disk
-     */
-    savePausedWorkflow(sessionId: string, workflowId: string, state: object): void {
-        this.ensurePausedWorkflowsFolder(sessionId);
-        const filePath = path.join(this.getPausedWorkflowsFolder(sessionId), `${workflowId}.json`);
-        atomicWriteFileSync(filePath, JSON.stringify(state, null, 2));
-    }
-    
-    /**
-     * Load a paused workflow state from disk
-     */
-    loadPausedWorkflow(sessionId: string, workflowId: string): object | null {
-        const filePath = path.join(this.getPausedWorkflowsFolder(sessionId), `${workflowId}.json`);
-        if (fs.existsSync(filePath)) {
-            try {
-                return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-            } catch (e) {
-                log.error(`Failed to load paused workflow ${workflowId}:`, e);
-            }
-        }
-        return null;
-    }
-    
-    /**
-     * Load all paused workflow states for a session
-     */
-    loadAllPausedWorkflows(sessionId: string): Map<string, object> {
-        const result = new Map<string, object>();
-        const folder = this.getPausedWorkflowsFolder(sessionId);
-        
-        if (!fs.existsSync(folder)) {
-            return result;
-        }
-        
-        try {
-            const files = fs.readdirSync(folder).filter(f => f.endsWith('.json'));
-            for (const file of files) {
-                const workflowId = file.replace('.json', '');
-                const state = this.loadPausedWorkflow(sessionId, workflowId);
-                if (state) {
-                    result.set(workflowId, state);
-                }
-            }
-        } catch (e) {
-            log.error(`Failed to load paused workflows for session ${sessionId}:`, e);
-        }
-        
-        return result;
-    }
-    
-    /**
-     * Delete a paused workflow state from disk
-     */
-    deletePausedWorkflow(sessionId: string, workflowId: string): void {
-        const filePath = path.join(this.getPausedWorkflowsFolder(sessionId), `${workflowId}.json`);
-        if (fs.existsSync(filePath)) {
-            try {
-                fs.unlinkSync(filePath);
-            } catch (e) {
-                log.error(`Failed to delete paused workflow ${workflowId}:`, e);
-            }
-        }
-    }
-    
-    /**
-     * Delete all paused workflow states for a session
-     */
-    deleteAllPausedWorkflows(sessionId: string): void {
-        const folder = this.getPausedWorkflowsFolder(sessionId);
-        if (fs.existsSync(folder)) {
-            try {
-                const files = fs.readdirSync(folder);
-                for (const file of files) {
-                    fs.unlinkSync(path.join(folder, file));
-                }
-            } catch (e) {
-                log.error(`Failed to delete paused workflows for session ${sessionId}:`, e);
-            }
-        }
     }
 
     // ========================================================================
@@ -1494,7 +1403,8 @@ export class StateManager {
                 .map(d => d.name);
             
             for (const folder of planFolders) {
-                const match = folder.match(/^ps_(\d{6})$/);
+                // Case-insensitive match for ps_XXXXXX folders
+                const match = folder.match(/^ps_(\d{6})$/i);
                 if (match) {
                     const num = parseInt(match[1], 10);
                     if (num > count) {
@@ -1504,7 +1414,8 @@ export class StateManager {
             }
         }
         
-        return `ps_${(count + 1).toString().padStart(6, '0')}`;
+        // Return UPPERCASE session ID for consistency
+        return `PS_${(count + 1).toString().padStart(6, '0')}`;
     }
     
     /**

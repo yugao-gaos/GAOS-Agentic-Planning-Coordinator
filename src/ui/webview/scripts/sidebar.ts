@@ -200,17 +200,13 @@ export function getSidebarScript(): string {
                     
                     if (action === 'openPlan') {
                         const planPath = item.dataset.planPath;
+                        const sessionStatus = item.dataset.sessionStatus;
                         // Always send the message with sessionId so extension can look up plan path if needed
-                        vscode.postMessage({ type: 'openPlan', planPath, sessionId });
+                        vscode.postMessage({ type: 'openPlan', planPath, sessionId, sessionStatus });
                     } else if (action === 'openWorkflowLog') {
                         const workflowLog = el.dataset.workflowLog;
                         if (workflowLog) {
                             vscode.postMessage({ type: 'openWorkflowLog', logPath: workflowLog });
-                        }
-                    } else if (action === 'retryTask') {
-                        const taskId = el.dataset.taskId;
-                        if (taskId) {
-                            vscode.postMessage({ type: 'retryTask', sessionId, taskId });
                         }
                     } else if (action === 'openFullHistory') {
                         const historySessionId = el.dataset.sessionId;
@@ -388,11 +384,22 @@ export function getSidebarScript(): string {
             if (unityEnabled && unity) {
                 const unityBadge = getUnityBadgeStyle(unity);
                 const queueText = unity.queueLength > 0 ? '(' + unity.queueLength + ')' : '';
+                // Show prep button when Unity is idle and queue is empty
+                const canTriggerPrep = unity.connected && 
+                                       !unity.isCompiling && 
+                                       !unity.isPlaying && 
+                                       !unity.currentTask && 
+                                       unity.queueLength === 0;
+                const prepBtnHtml = canTriggerPrep 
+                    ? '<button class="coord-icon-btn" id="unityPrepBtn" title="Trigger Unity Prep (compile)">🔄</button>'
+                    : '';
+                
                 unityHtml = '<div class="status-boxes-row" style="margin-top: 6px;">' +
                     '<div class="status-box">' +
                     '<span class="status-box-label">Unity</span>' +
                     '<span class="unity-badge" style="background: ' + unityBadge.background + ';">' + unityBadge.text + '</span>' +
                     (queueText ? '<span class="unity-queue">' + queueText + '</span>' : '') +
+                    prepBtnHtml +
                     '</div></div>';
             }
             
@@ -459,6 +466,12 @@ export function getSidebarScript(): string {
             const globalDepsBtn = document.getElementById('globalDepsBtn');
             if (globalDepsBtn) {
                 globalDepsBtn.onclick = () => vscode.postMessage({ type: 'openGlobalDependencyMap' });
+            }
+            
+            // Unity Prep button
+            const unityPrepBtn = document.getElementById('unityPrepBtn');
+            if (unityPrepBtn) {
+                unityPrepBtn.onclick = () => vscode.postMessage({ type: 'triggerUnityPrep' });
             }
             
             // Install buttons
@@ -553,14 +566,22 @@ export function getSidebarScript(): string {
                 attachContextBoxHandlers();
             }
             
-            // Connection health warning
+            // Connection health warning - show different messages for different states
             const healthWarning = document.getElementById('healthWarning');
             if (healthWarning && state.connectionHealth) {
-                if (state.connectionHealth.state === 'unhealthy') {
+                if (state.connectionHealth.state === 'daemon_stopped') {
+                    // Daemon was intentionally stopped - user needs to restart
                     healthWarning.style.display = 'block';
-                    healthWarning.textContent = '⚠ Connection unstable (' + state.connectionHealth.consecutiveFailures + ' failures)';
+                    healthWarning.className = 'health-warning daemon-stopped';
+                    healthWarning.textContent = '⏹ Daemon stopped - Click "Start Daemon" to restart';
+                } else if (state.connectionHealth.state === 'unhealthy') {
+                    // Connection issues - client is trying to reconnect
+                    healthWarning.style.display = 'block';
+                    healthWarning.className = 'health-warning connection-unstable';
+                    healthWarning.textContent = '⚠ Connection unstable - Reconnecting... (' + state.connectionHealth.consecutiveFailures + ' failures)';
                 } else {
                     healthWarning.style.display = 'none';
+                    healthWarning.className = 'health-warning';
                 }
             }
 

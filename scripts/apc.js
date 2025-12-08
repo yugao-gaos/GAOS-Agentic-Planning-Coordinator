@@ -684,9 +684,9 @@ async function handleTask(args) {
             
             case 'create':
             case 'c': {
-                const params = parseNamedParams(args.slice(1), ['session', 'id', 'desc', 'deps', 'type', 'priority', 'error-text']);
+                const params = parseNamedParams(args.slice(1), ['session', 'id', 'desc', 'deps', 'type', 'priority', 'error-text', 'unity']);
                 if (!params.session || !params.id || !params.desc) {
-                    printError('Usage: apc task create --session <id> --id <taskId> --desc "description" [--deps T1,T2] [--type implementation|error_fix]');
+                    printError('Usage: apc task create --session <id> --id <taskId> --desc "description" [--deps T1,T2] [--type implementation|error_fix] [--unity none|prep|prep_editmode|prep_playmode|prep_playtest|full]');
                     process.exit(1);
                 }
                 const response = await sendCommand('task.create', {
@@ -696,7 +696,8 @@ async function handleTask(args) {
                     deps: params.deps,
                     type: params.type || 'implementation',
                     priority: params.priority ? parseInt(params.priority, 10) : undefined,
-                    errorText: params['error-text']
+                    errorText: params['error-text'],
+                    unity: params.unity
                 });
                 displayResponse(response);
                 break;

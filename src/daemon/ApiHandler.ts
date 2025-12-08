@@ -180,7 +180,6 @@ export interface ICoordinatorApi {
     resumeSession(sessionId: string): Promise<void>;
     cancelSession(sessionId: string): Promise<void>;
     startExecution(sessionId: string): Promise<string[]>;
-    getFailedTasks(sessionId: string): Array<{ taskId: string; description: string; attempts: number; lastError: string; canRetry: boolean }>;
     
     // Agent CLI callback support
     signalAgentCompletion(signal: AgentCompletionSignal): boolean;
@@ -193,7 +192,7 @@ export interface ICoordinatorApi {
     updateWorkflowHistorySummary(sessionId: string, workflowId: string, summary: string): void;
     
     // Start a workflow for a specific task
-    startTaskWorkflow(sessionId: string, taskId: string, workflowType: string): Promise<string>;
+    startTaskWorkflow(sessionId: string, rawTaskId: string, workflowType: string): Promise<string>;
     
     // Get coordinator status for UI
     getCoordinatorStatus?(): CoordinatorStatusData;
@@ -214,10 +213,10 @@ export interface ICoordinatorApi {
  */
 export interface ITaskManagerApi {
     getProgressForSession(sessionId: string): { completed: number; pending: number; inProgress: number; failed: number; ready: number; total: number };
-    getTasksForSession(sessionId: string): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string; currentWorkflow?: string }>;
-    getTask(globalTaskId: string): { id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string; currentWorkflow?: string } | undefined;
-    getAllTasks(): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string; currentWorkflow?: string }>;
-    createTaskFromCli(params: { sessionId: string; taskId: string; description: string; dependencies?: string[]; taskType?: 'implementation' | 'error_fix'; priority?: number; errorText?: string }): { success: boolean; error?: string };
+    getTasksForSession(sessionId: string): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string; activeWorkflow?: { id: string; type: string; status: string } }>;
+    getTask(globalTaskId: string): { id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string; activeWorkflow?: { id: string; type: string; status: string } } | undefined;
+    getAllTasks(): Array<{ id: string; sessionId: string; description: string; status: string; taskType: string; stage?: string; dependencies: string[]; dependents: string[]; priority: number; actualAgent?: string; filesModified?: string[]; startedAt?: string; completedAt?: string; errorText?: string; previousAttempts?: number; previousFixSummary?: string; activeWorkflow?: { id: string; type: string; status: string } }>;
+    createTaskFromCli(params: { sessionId: string; rawTaskId: string; description: string; dependencies?: string[]; taskType?: 'implementation' | 'error_fix'; priority?: number; errorText?: string; unityPipeline?: 'none' | 'prep' | 'prep_editmode' | 'prep_playmode' | 'prep_playtest' | 'full' }): { success: boolean; error?: string };
     completeTask(globalTaskId: string, summary?: string): void;
     updateTaskStage(globalTaskId: string, stage: string): void;
     markTaskFailed(globalTaskId: string, reason?: string): void;
@@ -230,9 +229,9 @@ export interface ITaskManagerApi {
     /** Get agent assignments for UI display */
     getAgentAssignmentsForUI?(): Array<{ name: string; sessionId: string; roleId?: string; workflowId?: string; currentTaskId?: string; status: string; assignedAt: string; lastActivityAt?: string; logFile: string }>;
     /** Add a dependency to a task (supports cross-plan dependencies) */
-    addDependency(taskId: string, dependsOnId: string): { success: boolean; error?: string };
+    addDependency(rawTaskId: string, dependsOnId: string): { success: boolean; error?: string };
     /** Remove a dependency from a task */
-    removeDependency(taskId: string, depId: string): { success: boolean; error?: string };
+    removeDependency(rawTaskId: string, depId: string): { success: boolean; error?: string };
 }
 
 /**
@@ -339,6 +338,32 @@ export class ApiHandler {
         this.services = services;
         this.broadcaster = ServiceLocator.resolve(EventBroadcaster);
         this.startTime = Date.now();
+    }
+    
+    /**
+     * Validate and normalize task ID to UPPERCASE global format.
+     * STRICT: Only accepts global format PS_XXXXXX_TN - rejects simple IDs.
+     * This is the SINGLE SOURCE OF TRUTH for task ID validation in the API layer.
+     * 
+     * @param rawTaskId - The raw task ID (must be global format)
+     * @param session - The session ID for context (used in error messages)
+     * @returns Normalized global task ID in UPPERCASE (e.g., "PS_000001_T1")
+     * @throws Error if taskId is not in global format
+     */
+    private toGlobalTaskId(rawTaskId: string, session: string): string {
+        if (!rawTaskId) return rawTaskId;
+        
+        // STRICT: Must be global format PS_XXXXXX_TN
+        const globalMatch = rawTaskId.match(/^(ps_\d{6})_([^_]+)$/i);
+        if (!globalMatch) {
+            throw new Error(
+                `Invalid taskId "${rawTaskId}": Must be global format PS_XXXXXX_TN ` +
+                `(e.g., "${session.toUpperCase()}_T1"). Simple IDs like "T1" are not accepted.`
+            );
+        }
+        
+        // Normalize to uppercase
+        return `${globalMatch[1].toUpperCase()}_${globalMatch[2].toUpperCase()}`;
     }
     
     /**
@@ -514,11 +539,6 @@ export class ApiHandler {
             
             case 'state': {
                 return { data: { state: this.sessionState(params.id as string) } };
-            }
-            
-            case 'failed_tasks': {
-                const failedTasks = this.services.coordinator.getFailedTasks(params.id as string);
-                return { data: { failedTasks } };
             }
             
             case 'stop': {
@@ -1066,7 +1086,7 @@ export class ApiHandler {
             }
         }
         
-        // Build signal (include taskId if provided for parallel task support)
+        // Build signal (include rawTaskId if provided for parallel task support)
         const signal: AgentCompletionSignal = {
             sessionId: session as string,
             workflowId: workflow as string,
@@ -1139,15 +1159,12 @@ export class ApiHandler {
         }
         
         const sessionId = (params.session || params.sessionId) as string;
-        let taskId = (params.task || params.taskId || params.id) as string;
+        const rawTaskId = (params.task || params.rawTaskId || params.id) as string;
         
-        // Normalize task ID: strip session prefix if coordinator mistakenly included it
-        // e.g., "ps_000001_T1" with session "ps_000001" → "T1"
-        if (taskId && sessionId && taskId.startsWith(`${sessionId}_`)) {
-            const normalizedId = taskId.slice(sessionId.length + 1);
-            log.debug(`Normalized task ID: "${taskId}" → "${normalizedId}" (stripped session prefix)`);
-            taskId = normalizedId;
-        }
+        // Helper to get global task ID - delegates to class method for consistent normalization
+        const toGlobalTaskId = (rawTaskId: string, session: string): string => {
+            return this.toGlobalTaskId(rawTaskId, session);
+        };
         
         // Helper to validate and normalize task type
         const normalizeTaskType = (type: unknown): 'implementation' | 'error_fix' => {
@@ -1189,14 +1206,14 @@ export class ApiHandler {
                 }
                 
                 const tasks = sessionId 
-                    ? allTasks.filter(t => t.sessionId === sessionId)
+                    ? allTasks.filter(t => t.sessionId.toUpperCase() === sessionId.toUpperCase())
                     : allTasks;
                 
                 return {
                     data: tasks.map(t => ({
-                        // Extract short ID by removing the sessionId_ prefix
-                        // e.g., "ps_000001_T1" with sessionId "ps_000001" → "T1"
-                        id: t.sessionId && t.id.startsWith(`${t.sessionId}_`) 
+                        // Extract short ID by removing the sessionId_ prefix (case-insensitive)
+                        // e.g., "PS_000001_T1" with sessionId "PS_000001" → "T1"
+                        id: t.sessionId && t.id.toUpperCase().startsWith(`${t.sessionId.toUpperCase()}_`) 
                             ? t.id.slice(t.sessionId.length + 1) 
                             : t.id,
                         globalId: t.id,
@@ -1277,35 +1294,43 @@ export class ApiHandler {
                 if (!sessionId) {
                     throw new Error('Missing session parameter');
                 }
-                if (!taskId) {
+                if (!rawTaskId) {
                     throw new Error('Missing id parameter');
                 }
                 if (!params.desc && !params.description) {
                     throw new Error('Missing desc parameter');
                 }
                 
+                // Validate unity pipeline config if provided
+                const validUnityConfigs = ['none', 'prep', 'prep_editmode', 'prep_playmode', 'prep_playtest', 'full'];
+                const unityPipeline = params.unity as string | undefined;
+                if (unityPipeline && !validUnityConfigs.includes(unityPipeline)) {
+                    throw new Error(`Invalid unity pipeline config "${unityPipeline}". Valid values: ${validUnityConfigs.join(', ')}`);
+                }
+                
                 const result = this.services.taskManager.createTaskFromCli({
                     sessionId,
-                    taskId,
+                    rawTaskId,
                     description: (params.desc || params.description) as string,
                     dependencies: params.deps ? String(params.deps).split(',').filter(d => d.trim()) : [],
                     taskType: normalizeTaskType(params.type),
                     priority: params.priority ? Number(params.priority) : 0,
-                    errorText: params.errorText as string | undefined
+                    errorText: params.errorText as string | undefined,
+                    unityPipeline: unityPipeline as 'none' | 'prep' | 'prep_editmode' | 'prep_playmode' | 'prep_playtest' | 'full' | undefined
                 });
                 
                 if (!result.success) {
                     throw new Error(result.error || 'Failed to create task');
                 }
                 
-                return { message: `Task ${taskId} created in session ${sessionId}` };
+                return { message: `Task ${rawTaskId} created in session ${sessionId}` };
             }
             
             case 'start': {
                 if (!sessionId) {
                     throw new Error('Missing session parameter');
                 }
-                if (!taskId) {
+                if (!rawTaskId) {
                     throw new Error('Missing id parameter');
                 }
                 
@@ -1318,10 +1343,10 @@ export class ApiHandler {
                 const workflowType = (params.workflow || 'task_implementation') as string;
                 
                 // Get the task to verify it exists
-                const globalTaskId = `${sessionId}_${taskId}`;
+                const globalTaskId = toGlobalTaskId(rawTaskId, sessionId);
                 const task = this.services.taskManager.getTask(globalTaskId);
                 if (!task) {
-                    throw new Error(`Task ${taskId} not found in session ${sessionId}`);
+                    throw new Error(`Task ${rawTaskId} not found in session ${sessionId}`);
                 }
                 
                 // Validate task format - if invalid, delete and fail
@@ -1331,40 +1356,59 @@ export class ApiHandler {
                     if (!validation.valid) {
                         const reason = `Invalid task format: ${validation.reason}`;
                         this.services.taskManager.deleteTask?.(globalTaskId, reason);
-                        throw new Error(`Task ${taskId} deleted due to invalid format (${validation.reason}). Coordinator will recreate.`);
+                        throw new Error(`Task ${rawTaskId} deleted due to invalid format (${validation.reason}). Coordinator will recreate.`);
                     }
                 }
                 
                 // Validate task can be started
                 if (task.status === 'blocked') {
-                    throw new Error(`Task ${taskId} is blocked by unmet dependencies`);
+                    // Don't trust cached blocked status - verify dependencies are actually unmet
+                    // The blocking status might be stale if dependencies completed recently
+                    const actuallyUnmetDeps = task.dependencies.filter(depId => {
+                        const depTask = this.services.taskManager!.getTask(depId);
+                        return !depTask || depTask.status !== 'completed';
+                    });
+                    
+                    if (actuallyUnmetDeps.length > 0) {
+                        // Dependencies are truly unmet
+                        throw new Error(`Task ${rawTaskId} is blocked by unmet dependencies: ${actuallyUnmetDeps.join(', ')}`);
+                    } else {
+                        // All dependencies are complete - update task status and continue
+                        // Status will be persisted when workflow starts (changes to in_progress)
+                        log.info(`Task ${rawTaskId} was marked blocked but all dependencies are complete - allowing start`);
+                        task.status = 'created';
+                    }
                 } else if (task.status === 'completed') {
-                    throw new Error(`Task ${taskId} is already completed`);
+                    throw new Error(`Task ${rawTaskId} is already completed`);
                 } else if (task.status === 'failed') {
-                    throw new Error(`Task ${taskId} has failed. Cannot restart failed tasks.`);
+                    throw new Error(`Task ${rawTaskId} has failed. Cannot restart failed tasks.`);
                 } else if (task.status === 'paused') {
-                    throw new Error(`Task ${taskId} is paused. Resume the task first.`);
-                } else if (task.status === 'in_progress') {
-                    // Task is in_progress - check if there's an active workflow
-                    // Only allow restart if the workflow is orphaned (not running)
-                    if (task.currentWorkflow && this.services.coordinator) {
-                        const sessionState = this.services.coordinator.getSessionState(sessionId);
-                        const existingWorkflow = sessionState?.activeWorkflows?.get(task.currentWorkflow);
-                        if (existingWorkflow) {
-                            const status = existingWorkflow.status;
-                            if (status === 'running' || status === 'pending' || status === 'blocked' || status === 'paused') {
-                                throw new Error(
-                                    `Task ${taskId} already has an active workflow (${task.currentWorkflow.substring(0, 8)}..., status: ${status}). ` +
-                                    `Wait for it to complete before starting a new one. ` +
-                                    `Use 'apc task status --session ${sessionId} --task ${taskId}' to check status.`
-                                );
-                            }
+                    throw new Error(`Task ${rawTaskId} is paused. Resume the task first.`);
+                }
+                
+                // CRITICAL: Check for active workflow regardless of task status
+                // This prevents duplicate workflows even when task is 'created' (race condition)
+                if (task.activeWorkflow && this.services.coordinator) {
+                    const sessionState = this.services.coordinator.getSessionState(sessionId);
+                    const existingWorkflow = sessionState?.activeWorkflows?.get(task.activeWorkflow.id);
+                    if (existingWorkflow) {
+                        const status = existingWorkflow.status;
+                        if (status === 'running' || status === 'pending' || status === 'blocked' || status === 'paused') {
+                            throw new Error(
+                                `Task ${rawTaskId} already has an active workflow (${task.activeWorkflow.id.substring(0, 8)}..., status: ${status}). ` +
+                                `Wait for it to complete before starting a new one. ` +
+                                `Use 'apc task status --session ${sessionId} --task ${rawTaskId}' to check status.`
+                            );
                         }
                     }
-                    // No active workflow found - task is orphaned, allow restart
-                    log.debug(`Task ${taskId} is in_progress but workflow is orphaned, allowing restart`);
+                    // Workflow exists in task but not in activeWorkflows - stale reference, allow restart
+                    log.debug(`Task ${rawTaskId} has stale workflow reference, allowing restart`);
                 }
-                // If status is 'created' or was recovered from orphaned 'in_progress', proceed
+                
+                // Additional check: task is in_progress but no activeWorkflow - orphaned
+                if (task.status === 'in_progress' && !task.activeWorkflow) {
+                    log.debug(`Task ${rawTaskId} is in_progress but workflow is orphaned, allowing restart`);
+                }
                 
                 // Check dependencies - but only if the workflow requires it
                 // Some workflows (like context_gathering) can start even with incomplete dependencies
@@ -1373,14 +1417,14 @@ export class ApiHandler {
                 
                 if (workflowMetadata?.requiresCompleteDependencies !== false) {
                     // This workflow requires all dependencies to be complete
+                    // Dependencies are stored as global IDs (e.g., "ps_000001_T1")
                     const unmetDeps = task.dependencies.filter(depId => {
-                        const depTask = this.services.taskManager!.getTask(depId) || 
-                                       this.services.taskManager!.getTask(`${sessionId}_${depId}`);
+                        const depTask = this.services.taskManager!.getTask(depId);
                         return !depTask || depTask.status !== 'completed';
                     });
                     
                     if (unmetDeps.length > 0) {
-                        throw new Error(`Task ${taskId} has unmet dependencies: ${unmetDeps.join(', ')}. The workflow '${workflowType}' requires all dependencies to be completed first.`);
+                        throw new Error(`Task ${globalTaskId} has unmet dependencies: ${unmetDeps.join(', ')}. The workflow '${workflowType}' requires all dependencies to be completed first.`);
                     }
                 } else {
                     // This workflow can proceed with incomplete dependencies
@@ -1389,8 +1433,8 @@ export class ApiHandler {
                 
                 // Start workflow for this task via coordinator
                 if (this.services.coordinator) {
-                    await this.services.coordinator.startTaskWorkflow(sessionId, taskId, workflowType);
-                    return { message: `Started ${workflowType} workflow for task ${taskId}` };
+                    await this.services.coordinator.startTaskWorkflow(sessionId, rawTaskId, workflowType);
+                    return { message: `Started ${workflowType} workflow for task ${rawTaskId}` };
                 } else {
                     throw new Error('Coordinator not available to start workflow');
                 }
@@ -1400,14 +1444,14 @@ export class ApiHandler {
                 if (!sessionId) {
                     throw new Error('Missing session parameter');
                 }
-                if (!taskId) {
+                if (!rawTaskId) {
                     throw new Error('Missing id parameter');
                 }
                 
-                const globalTaskId = `${sessionId}_${taskId}`;
+                const globalTaskId = toGlobalTaskId(rawTaskId, sessionId);
                 this.services.taskManager.completeTask(globalTaskId, params.summary as string);
                 
-                return { message: `Task ${taskId} marked complete` };
+                return { message: `Task ${rawTaskId} marked complete` };
             }
             
             case 'progress': {
@@ -1421,23 +1465,23 @@ export class ApiHandler {
                 if (!sessionId) {
                     throw new Error('Missing session parameter');
                 }
-                if (!taskId) {
+                if (!rawTaskId) {
                     throw new Error('Missing task parameter');
                 }
-                return { data: this.taskStatus(sessionId, taskId) };
+                return { data: this.taskStatus(sessionId, rawTaskId) };
             }
             
             case 'fail': {
                 if (!sessionId) {
                     throw new Error('Missing session parameter');
                 }
-                if (!taskId) {
+                if (!rawTaskId) {
                     throw new Error('Missing task parameter');
                 }
                 if (!params.reason) {
                     throw new Error('Missing reason parameter');
                 }
-                return this.taskFail(sessionId, taskId, params.reason as string);
+                return this.taskFail(sessionId, rawTaskId, params.reason as string);
             }
             
             case 'assignments': {
@@ -1460,7 +1504,7 @@ export class ApiHandler {
                 if (!sessionId) {
                     throw new Error('Missing session parameter');
                 }
-                if (!taskId) {
+                if (!rawTaskId) {
                     throw new Error('Missing task parameter');
                 }
                 
@@ -1469,7 +1513,7 @@ export class ApiHandler {
                     throw new Error('Missing depends-on parameter');
                 }
                 
-                const globalTaskId = `${sessionId}_${taskId}`;
+                const globalTaskId = toGlobalTaskId(rawTaskId, sessionId);
                 const dependsOnId = String(dependsOn);
                 
                 const result = this.services.taskManager.addDependency(globalTaskId, dependsOnId);
@@ -1477,7 +1521,7 @@ export class ApiHandler {
                     throw new Error(result.error || 'Failed to add dependency');
                 }
                 
-                return { message: `Added dependency: ${taskId} → ${dependsOnId}` };
+                return { message: `Added dependency: ${rawTaskId} → ${dependsOnId}` };
             }
             
             case 'remove-dep': {
@@ -1486,7 +1530,7 @@ export class ApiHandler {
                 if (!sessionId) {
                     throw new Error('Missing session parameter');
                 }
-                if (!taskId) {
+                if (!rawTaskId) {
                     throw new Error('Missing task parameter');
                 }
                 
@@ -1495,7 +1539,7 @@ export class ApiHandler {
                     throw new Error('Missing dep parameter');
                 }
                 
-                const globalTaskId = `${sessionId}_${taskId}`;
+                const globalTaskId = toGlobalTaskId(rawTaskId, sessionId);
                 const depId = String(depToRemove);
                 
                 const result = this.services.taskManager.removeDependency(globalTaskId, depId);
@@ -1503,7 +1547,7 @@ export class ApiHandler {
                     throw new Error(result.error || 'Failed to remove dependency');
                 }
                 
-                return { message: `Removed dependency: ${taskId} → ${depId}` };
+                return { message: `Removed dependency: ${rawTaskId} → ${depId}` };
             }
             
             default:
@@ -1523,7 +1567,8 @@ export class ApiHandler {
             sessionId,
             progress,
             tasks: tasks.map(t => ({
-                id: t.id.replace(`${sessionId}_`, ''),
+                // Use task's own sessionId for reliable prefix stripping (handles case differences)
+                id: t.id.replace(`${t.sessionId}_`, ''),
                 description: t.description,
                 status: t.status,
                 stage: t.stage,
@@ -1533,7 +1578,7 @@ export class ApiHandler {
         };
     }
     
-    private taskStatus(sessionId: string, taskId: string): {
+    private taskStatus(sessionId: string, rawTaskId: string): {
         id: string;
         globalId: string;
         description: string;
@@ -1543,34 +1588,38 @@ export class ApiHandler {
         filesModified?: string[];
         startedAt?: string;
         completedAt?: string;
-        currentWorkflow?: string;
+        activeWorkflowId?: string;
         workflowStatus?: string;
     } {
-        const globalTaskId = `${sessionId}_${taskId}`;
+        // Use class method for consistent task ID normalization (UPPERCASE)
+        const globalTaskId = this.toGlobalTaskId(rawTaskId, sessionId);
         const task = this.services.taskManager!.getTask(globalTaskId);
         
         if (!task) {
             // Get all tasks for this session to help with debugging
+            // Use case-insensitive session matching by normalizing both sides
+            const normalizedSessionId = sessionId.toUpperCase();
             const sessionTasks = this.services.taskManager!.getTasksForSession(sessionId);
             const taskList = sessionTasks.length > 0 
-                ? sessionTasks.map(t => t.id.replace(`${sessionId}_`, '')).join(', ')
+                // Use task's own sessionId for reliable prefix stripping
+                ? sessionTasks.map(t => t.id.replace(`${t.sessionId.toUpperCase()}_`, '')).join(', ')
                 : '(no tasks)';
             
             throw new Error(
-                `Task ${taskId} not found in session ${sessionId}. ` +
+                `Task ${rawTaskId} not found in session ${sessionId}. ` +
                 `Available tasks for this session: ${taskList}`
             );
         }
         
         // Get current workflow status if task has one
         let workflowStatus: string | undefined;
-        if (task.currentWorkflow) {
-            const progress = this.services.coordinator.getWorkflowStatus(sessionId, task.currentWorkflow);
+        if (task.activeWorkflow) {
+            const progress = this.services.coordinator.getWorkflowStatus(sessionId, task.activeWorkflow.id);
             workflowStatus = progress?.status;
         }
         
         return {
-            id: taskId,
+            id: rawTaskId,
             globalId: globalTaskId,
             description: task.description,
             status: task.status,
@@ -1579,18 +1628,19 @@ export class ApiHandler {
             filesModified: task.filesModified,
             startedAt: task.startedAt,
             completedAt: task.completedAt,
-            currentWorkflow: task.currentWorkflow,
+            activeWorkflowId: task.activeWorkflow?.id,
             workflowStatus
         };
     }
     
-    private taskFail(sessionId: string, taskId: string, reason: string): { data?: unknown; message?: string } {
-        const globalTaskId = `${sessionId}_${taskId}`;
+    private taskFail(sessionId: string, rawTaskId: string, reason: string): { data?: unknown; message?: string } {
+        // Use class method for consistent task ID normalization (UPPERCASE)
+        const globalTaskId = this.toGlobalTaskId(rawTaskId, sessionId);
         this.services.taskManager!.markTaskFailed(globalTaskId, reason);
         
         return {
-            data: { sessionId, taskId, reason },
-            message: `Task ${taskId} marked as failed`
+            data: { sessionId, rawTaskId, reason },
+            message: `Task ${rawTaskId} marked as failed`
         };
     }
     
@@ -1618,7 +1668,7 @@ export class ApiHandler {
                     agentName: params.agentName as string
                 });
                 return {
-                    data: { taskId: compileTaskId, type: 'prep_editor' },
+                    data: { rawTaskId: compileTaskId, type: 'prep_editor' },
                     message: 'Unity compilation queued'
                 };
             }
@@ -1633,7 +1683,7 @@ export class ApiHandler {
                     testScene: params.scene as string | undefined
                 });
                 return {
-                    data: { taskId: testTaskId, type: testType },
+                    data: { rawTaskId: testTaskId, type: testType },
                     message: `Unity ${params.mode} tests queued`
                 };
             }
@@ -1810,33 +1860,46 @@ export class ApiHandler {
         }
         
         switch (action) {
-            case 'getCoordinator': {
-                const systemPrompt = this.services.roleRegistry.getSystemPrompt('coordinator');
+            // Generic system prompt handlers (used by SystemSettingsPanel)
+            case 'getSystemPrompt': {
+                const id = params.id as string;
+                if (!id) {
+                    throw new Error('Missing id parameter');
+                }
+                const prompt = this.services.roleRegistry.getSystemPrompt(id);
                 return { 
-                    data: { coordinatorPrompt: systemPrompt?.toJSON() }
+                    data: { prompt: prompt?.toJSON() }
                 };
             }
             
-            case 'updateCoordinator': {
+            case 'updateSystemPrompt': {
+                const id = params.id as string;
                 const config = params.config as Record<string, unknown>;
+                if (!id) {
+                    throw new Error('Missing id parameter');
+                }
                 if (!config) {
                     throw new Error('Missing config parameter');
                 }
                 // Create a SystemPromptConfig-like object for update
                 const promptConfig = {
-                    id: 'coordinator',
+                    id,
                     ...config,
-                    toJSON: () => ({ id: 'coordinator', ...config })
+                    toJSON: () => ({ id, ...config })
                 };
                 this.services.roleRegistry.updateSystemPrompt(promptConfig as any);
-                return { message: 'Coordinator prompt updated successfully' };
+                return { message: `System prompt ${id} updated successfully` };
             }
             
-            case 'resetCoordinator': {
-                const resetPrompt = this.services.roleRegistry.resetSystemPromptToDefault('coordinator');
+            case 'resetSystemPrompt': {
+                const id = params.id as string;
+                if (!id) {
+                    throw new Error('Missing id parameter');
+                }
+                const resetPrompt = this.services.roleRegistry.resetSystemPromptToDefault(id);
                 return { 
-                    data: { coordinatorPrompt: resetPrompt?.toJSON() },
-                    message: 'Coordinator prompt reset to defaults'
+                    data: { prompt: resetPrompt?.toJSON() },
+                    message: `System prompt ${id} reset to defaults`
                 };
             }
             

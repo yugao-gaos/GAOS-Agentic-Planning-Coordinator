@@ -4,12 +4,18 @@
  * Helps diagnose network issues that may cause fetch failures in Cursor agents.
  */
 
-import { exec } from 'child_process';
+import { exec, ExecOptions } from 'child_process';
 import { promisify } from 'util';
 import * as https from 'https';
 import * as http from 'http';
 
-const execAsync = promisify(exec);
+const execAsyncRaw = promisify(exec);
+/**
+ * Wrapper for exec that hides terminal windows on Windows.
+ */
+const execAsync = (command: string, options?: ExecOptions): Promise<{ stdout: string; stderr: string }> => {
+    return execAsyncRaw(command, { encoding: 'utf8', ...options, windowsHide: true }) as Promise<{ stdout: string; stderr: string }>;
+};
 
 export interface NetworkDiagnosticResult {
     check: string;

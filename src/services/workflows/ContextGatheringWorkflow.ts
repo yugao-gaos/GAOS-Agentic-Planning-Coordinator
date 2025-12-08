@@ -12,9 +12,7 @@ import {
     ContextGatheringInput,
     ContextGatheringPresetConfig
 } from '../../types/workflow';
-import { AgentRunner, AgentRunOptions } from '../AgentBackend';
 import { AgentRole } from '../../types';
-import { ServiceLocator } from '../ServiceLocator';
 import { getFolderStructureManager } from '../FolderStructureManager';
 import {
     getAllPresets,
@@ -78,11 +76,8 @@ export class ContextGatheringWorkflow extends BaseWorkflow {
     private summarizedOutput: string = '';  // Final output after summarization
     private contextPath: string = '';
     
-    private agentRunner: AgentRunner;
-    
     constructor(config: WorkflowConfig, services: WorkflowServices) {
         super(config, services);
-        this.agentRunner = ServiceLocator.resolve(AgentRunner);
         
         // Extract input
         const input = config.input as ContextGatheringInput;
@@ -300,36 +295,45 @@ export class ContextGatheringWorkflow extends BaseWorkflow {
         const role = this.getRole('context_gatherer');
         const prompt = this.buildGatherPrompt(preset, files, role);
         
-        const workspaceRoot = this.stateManager.getWorkspaceRoot();
-        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
-        
-        if (!fs.existsSync(logDir)) {
-            fs.mkdirSync(logDir, { recursive: true });
-        }
-        
-        // Use workflow ID + agent name for unique temp log file
-        const logFile = path.join(logDir, `${this.id}_${agentName}.log`);
-        
         try {
-            const options: AgentRunOptions = {
-                id: `context_${this.sessionId}_${presetId}`,
+            // Use CLI callback for structured completion
+            const result = await this.runAgentTaskWithCallback(
+                `gather_${presetId}`,
                 prompt,
-                cwd: workspaceRoot,
-                model: role?.defaultModel || 'gemini-3-pro',
-                logFile,
-                timeoutMs: role?.timeoutMs || 300000,
-                onProgress: (msg) => this.log(`  [${presetId}] ${msg}`)
-            };
+                'context_gatherer',
+                {
+                    expectedStage: 'context',
+                    timeout: role?.timeoutMs || 300000,
+                    model: role?.defaultModel,
+                    cwd: this.stateManager.getWorkspaceRoot(),
+                    agentName
+                }
+            );
             
-            const result = await this.agentRunner.run(options);
-            
-            return {
-                presetId,
-                success: result.success,
-                output: result.output,
-                fileCount: files.length,
-                error: result.success ? undefined : 'Agent task failed'
-            };
+            if (result.fromCallback && this.isAgentSuccess(result)) {
+                return {
+                    presetId,
+                    success: true,
+                    output: result.payload?.message || '',
+                    fileCount: files.length
+                };
+            } else if (!result.fromCallback) {
+                return {
+                    presetId,
+                    success: false,
+                    output: '',
+                    fileCount: files.length,
+                    error: 'Agent did not use CLI callback'
+                };
+            } else {
+                return {
+                    presetId,
+                    success: false,
+                    output: '',
+                    fileCount: files.length,
+                    error: result.payload?.error || 'Agent task failed'
+                };
+            }
         } catch (error) {
             return {
                 presetId,
@@ -341,13 +345,6 @@ export class ContextGatheringWorkflow extends BaseWorkflow {
         } finally {
             // Always release the agent back to the pool
             this.releaseAgent(agentName);
-            
-            // Clean up temp log file (streaming was for real-time terminal viewing)
-            try {
-                if (fs.existsSync(logFile)) {
-                    fs.unlinkSync(logFile);
-                }
-            } catch { /* ignore cleanup errors */ }
         }
     }
     
@@ -433,51 +430,38 @@ ${result.output}
         const role = this.getRole('context_gatherer');
         const prompt = this.buildSummarizePrompt(role);
         
-        const workspaceRoot = this.stateManager.getWorkspaceRoot();
-        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
-        
-        if (!fs.existsSync(logDir)) {
-            fs.mkdirSync(logDir, { recursive: true });
-        }
-        
-        // Use workflow ID + agent name for unique temp log file
-        const logFile = path.join(logDir, `${this.id}_${agentName}.log`);
-        
         try {
-            const options: AgentRunOptions = {
-                id: `context_${this.sessionId}_summarize`,
+            // Use CLI callback for structured completion
+            const result = await this.runAgentTaskWithCallback(
+                'summarize',
                 prompt,
-                cwd: workspaceRoot,
-                model: role?.defaultModel || 'gemini-3-pro',
-                logFile,
-                timeoutMs: role?.timeoutMs || 300000,
-                onProgress: (msg) => this.log(`  [summarize] ${msg}`)
-            };
+                'context_gatherer',
+                {
+                    expectedStage: 'context',
+                    timeout: role?.timeoutMs || 300000,
+                    model: role?.defaultModel,
+                    cwd: this.stateManager.getWorkspaceRoot(),
+                    agentName
+                }
+            );
             
-            const agentRunId = options.id;
-            const result = await this.agentRunner.run(options);
-            
-            if (result.success && result.output) {
-                this.summarizedOutput = result.output;
-                this.log(`✓ Summarized to ${this.summarizedOutput.length} chars (${Math.round((1 - this.summarizedOutput.length / this.combinedOutput.length) * 100)}% reduction)`);
+            if (result.fromCallback && this.isAgentSuccess(result)) {
+                // Get summarized content from payload or use combined as fallback
+                this.summarizedOutput = result.payload?.message || this.combinedOutput;
+                this.log(`✓ Summarized via CLI callback (${this.summarizedOutput.length} chars)`);
+            } else if (!result.fromCallback) {
+                throw new Error(
+                    'Summarizer did not use CLI callback (`apc agent complete`). ' +
+                    'All agents must report results via CLI callback.'
+                );
             } else {
-                // Fall back to combined output on failure
-                this.summarizedOutput = this.combinedOutput;
-                this.log(`⚠️ Summarization failed, using combined output directly`);
+                throw new Error(result.payload?.error || 'Summarization failed');
             }
         } catch (error) {
-            // Fall back to combined output on error
-            this.summarizedOutput = this.combinedOutput;
-            this.log(`⚠️ Summarization error, using combined output directly`);
+            // No fallback - fail the workflow
+            throw new Error(`Summarization failed: ${error instanceof Error ? error.message : String(error)}`);
         } finally {
             this.releaseAgent(agentName);
-            
-            // Clean up temp log file (streaming was for real-time terminal viewing)
-            try {
-                if (fs.existsSync(logFile)) {
-                    fs.unlinkSync(logFile);
-                }
-            } catch { /* ignore cleanup errors */ }
         }
     }
     

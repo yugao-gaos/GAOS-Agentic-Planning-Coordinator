@@ -38,9 +38,18 @@ export interface SidebarState {
 }
 
 export interface ConnectionHealthInfo {
-    state: 'healthy' | 'unhealthy' | 'unknown';
+    /**
+     * Connection health states:
+     * - 'healthy': Connected and responding
+     * - 'unhealthy': Connection issues (attempting to reconnect)
+     * - 'daemon_stopped': Daemon was intentionally stopped (not reconnecting)
+     * - 'unknown': Initial state
+     */
+    state: 'healthy' | 'unhealthy' | 'daemon_stopped' | 'unknown';
     lastPingSuccess: boolean;
     consecutiveFailures: number;
+    /** True if daemon was intentionally stopped (vs connection lost) */
+    daemonStopped?: boolean;
 }
 
 export interface CoordinatorStatusInfo {
@@ -91,20 +100,11 @@ export interface SessionInfo {
     activeWorkflows: WorkflowInfo[];
     workflowHistory: WorkflowInfo[];  // Completed workflows (newest first)
     isRevising: boolean;
-    failedTasks: FailedTaskInfo[];
     sessionAgents: AgentInfo[];  // All agents associated with this session (for workflow display)
     /** True if the plan is partial/incomplete (workflow was interrupted) */
     hasPartialPlan?: boolean;
     /** Reason the plan was interrupted, if applicable */
     interruptReason?: string;
-}
-
-export interface FailedTaskInfo {
-    taskId: string;
-    description: string;
-    attempts: number;
-    lastError: string;
-    canRetry: boolean;
 }
 
 export interface AgentInfo {

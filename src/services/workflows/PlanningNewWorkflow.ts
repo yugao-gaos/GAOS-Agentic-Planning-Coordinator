@@ -12,7 +12,6 @@ import {
     WorkflowResult, 
     PlanningWorkflowInput 
 } from '../../types/workflow';
-import { AgentRunner, AgentRunOptions } from '../AgentBackend';
 import { AgentRole, getDefaultRole, AnalystVerdict } from '../../types';
 import { ServiceLocator } from '../ServiceLocator';
 import { TaskManager } from '../TaskManager';
@@ -47,7 +46,6 @@ export class PlanningNewWorkflow extends BaseWorkflow {
     private iteration: number = 0;
     private analystOutputs: Record<string, string> = {};
     private analystResults: Record<string, AnalystVerdict> = {};
-    private analystUsedCallback: Set<string> = new Set(); // Track which analysts used CLI callback
     private criticalIssues: string[] = [];
     private minorSuggestions: string[] = [];
     private forcedFinalize: boolean = false;
@@ -55,11 +53,8 @@ export class PlanningNewWorkflow extends BaseWorkflow {
     // Reserved planner agent - kept for the entire workflow (not released between phases)
     private plannerAgentName: string | undefined;
     
-    private agentRunner: AgentRunner;
-    
     constructor(config: WorkflowConfig, services: WorkflowServices) {
         super(config, services);
-        this.agentRunner = ServiceLocator.resolve(AgentRunner);
         
         // Extract input
         const input = config.input as PlanningWorkflowInput;
@@ -185,10 +180,28 @@ export class PlanningNewWorkflow extends BaseWorkflow {
         
         this.log(`Running planner - ${mode.toUpperCase()} mode (${role?.defaultModel || 'opus-4.5'})...`);
         
-        // Stream plan content directly to plan file (commentary goes to log)
-        const result = await this.runAgentTask('planner', prompt, role, true);
+        // Reuse planner agent across iterations, or request new one
+        if (!this.plannerAgentName) {
+            this.plannerAgentName = await this.requestAgent('planner');
+        }
         
-        if (result.success) {
+        // Stream plan content directly to plan file (commentary goes to log)
+        // Use CLI callback for structured completion
+        const result = await this.runAgentTaskWithCallback(
+            `planner_${mode}`,
+            prompt,
+            'planner',
+            {
+                expectedStage: 'planning',
+                timeout: role?.timeoutMs || 900000,
+                model: role?.defaultModel,
+                cwd: this.stateManager.getWorkspaceRoot(),
+                agentName: this.plannerAgentName,
+                planFile: this.planPath
+            }
+        );
+        
+        if (result.fromCallback && this.isAgentSuccess(result)) {
             // Plan was streamed to file; verify it exists
             if (!fs.existsSync(this.planPath)) {
                 throw new Error(
@@ -197,10 +210,19 @@ export class PlanningNewWorkflow extends BaseWorkflow {
                     `Check agent logs for streaming errors.`
                 );
             }
-            this.log(`✓ Plan ${mode === 'create' ? 'created' : 'updated'}`);
+            this.log(`✓ Plan ${mode === 'create' ? 'created' : 'updated'} via CLI callback`);
+        } else if (!result.fromCallback) {
+            throw new Error(
+                `Planner did not use CLI callback (\`apc agent complete\`). ` +
+                'All agents must report results via CLI callback.'
+            );
         } else {
-            throw new Error(`Planner ${mode} task failed`);
+            const error = result.payload?.error || result.payload?.message || 'Unknown error';
+            throw new Error(`Planner ${mode} task failed: ${error}`);
         }
+        
+        // Demote planner to bench (may be needed for next iteration)
+        this.demoteAgentToBench(this.plannerAgentName);
     }
     
     private async executeAnalystsPhase(): Promise<void> {
@@ -218,9 +240,6 @@ export class PlanningNewWorkflow extends BaseWorkflow {
             analystRoles.map(roleId => this.runAnalystTask(roleId))
         );
         this.log(`All analysts completed in ${Date.now() - startTime}ms`);
-        
-        // Parse results
-        this.parseAnalystResults();
         
         // Log summary
         this.log('Review Summary:');
@@ -267,12 +286,15 @@ export class PlanningNewWorkflow extends BaseWorkflow {
             }
         );
         
-        if (result.fromCallback) {
-            this.log(`✓ Finalization completed via CLI callback: ${result.result}`);
-        } else {
-            // Fallback: process exited without callback
-            this.log(`✓ Finalization completed (process exit)`);
+        if (!result.fromCallback) {
+            // Agent failed to use CLI callback - this is an error
+            throw new Error(
+                `Text clerk did not use CLI callback (\`apc agent complete\`). ` +
+                `Result: ${result.result}, Error: ${result.payload?.error || 'unknown'}`
+            );
         }
+        
+        this.log(`✓ Finalization completed via CLI callback: ${result.result}`);
         
         // Verify plan file exists
         if (!fs.existsSync(this.planPath)) {
@@ -354,7 +376,13 @@ ${this.formatAnalystFeedback()}
 ${modeInstructions}
 
 ## Plan Format
-Use checkbox format: - [ ] **T{N}**: Description | Deps: X | Engineer: TBD
+**Session ID:** ${this.sessionId}
+
+Use checkbox format with GLOBAL task IDs:
+- [ ] **${this.sessionId}_T1**: Description | Deps: None | Engineer: TBD
+- [ ] **${this.sessionId}_T2**: Description | Deps: ${this.sessionId}_T1 | Engineer: TBD
+
+Task ID format: ${this.sessionId}_T{N} (e.g., ${this.sessionId}_T1, ${this.sessionId}_T2, ${this.sessionId}_T3)
 
 Include sections: Overview, Task Breakdown, Dependencies, Risk Assessment`;
     }
@@ -379,7 +407,7 @@ ${warnings}
 
 ## Instructions
 1. Read the plan file using read_file
-2. Ensure all tasks use checkbox format: - [ ] **T{N}**: Description | Deps: X | Engineer: TBD
+2. Ensure all tasks use checkbox format with GLOBAL IDs: - [ ] **${this.sessionId}_T{N}**: Description | Deps: ${this.sessionId}_TX | Engineer: TBD
 3. Address any MINOR suggestions (ignore CRITICAL - those need human review)
 4. Update status to "📋 READY FOR REVIEW"
 ${forced ? '5. Add a WARNINGS section noting unresolved critical issues' : ''}
@@ -390,11 +418,7 @@ ${forced ? '5. Add a WARNINGS section noting unresolved critical issues' : ''}
 - Only fix formatting and apply minor suggestions
 - Be fast and efficient
 
-## Completion (REQUIRED)
-After finishing, signal completion:
-\`\`\`bash
-apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage finalization --result success
-\`\`\``;
+Note: CLI completion instructions with real session/workflow IDs are injected at runtime.`;
     }
     
     private buildAnalystPrompt(roleId: string, role: AgentRole | undefined): string {
@@ -411,26 +435,32 @@ apc agent complete --session <SESSION_ID> --workflow <WORKFLOW_ID> --stage final
 
 Read these files using read_file tool, then provide your review.
 
-## REQUIRED Output Format
-You MUST output your review in this EXACT format:
+## How to Complete This Review
+After analyzing, signal your verdict via CLI callback (see end of prompt):
+- \`--result pass\` - Plan is solid, no significant issues
+- \`--result critical\` - Blocking issues that must be fixed before proceeding
+- \`--result minor\` - Has suggestions, but plan can proceed
 
-\`\`\`
-### Review Result: [PASS|CRITICAL|MINOR]
-
-#### Critical Issues
-- [List blocking issues that MUST be fixed, or "None"]
-
-#### Minor Suggestions
-- [List optional improvements, or "None"]
-
-#### Analysis
-[Your detailed analysis]
-\`\`\`
-
-## Verdict Guidelines
-- **PASS**: Plan is solid, no significant issues
-- **CRITICAL**: Blocking issues that must be fixed before proceeding
-- **MINOR**: Suggestions only, plan can proceed without changes`;
+Include your analysis, issues, and suggestions in the callback payload.`;
+    }
+    
+    /**
+     * Format analyst output from callback payload for human-readable display
+     */
+    private formatAnalystOutput(roleId: string, verdict: string, issues: string[], suggestions: string[]): string {
+        let output = `### Review Result: ${verdict.toUpperCase()}\n\n`;
+        
+        if (issues.length > 0) {
+            output += '#### Issues\n';
+            output += issues.map(i => `- ${i}`).join('\n') + '\n\n';
+        }
+        
+        if (suggestions.length > 0) {
+            output += '#### Suggestions\n';
+            output += suggestions.map(s => `- ${s}`).join('\n') + '\n';
+        }
+        
+        return output;
     }
     
     /**
@@ -494,91 +524,6 @@ You MUST output your review in this EXACT format:
     // HELPER METHODS
     // =========================================================================
     
-    private async runAgentTask(
-        taskId: string,
-        prompt: string,
-        role: AgentRole | undefined,
-        streamToPlanFile: boolean = false
-    ): Promise<{ success: boolean; output: string }> {
-        const roleId = role?.id || 'planner';
-        const isPlannerRole = roleId === 'planner';
-        
-        // For planner role, reuse the same agent across iterations (don't release between phases)
-        let agentName: string;
-        if (isPlannerRole && this.plannerAgentName) {
-            // Reuse existing planner agent (already in allocatedAgents)
-            agentName = this.plannerAgentName;
-            this.log(`Reusing reserved planner agent: ${agentName}`);
-        } else {
-            // Request a new agent from the pool
-            agentName = await this.requestAgent(roleId);
-            
-            // Remember the planner agent for reuse across iterations
-            if (isPlannerRole) {
-                this.plannerAgentName = agentName;
-            }
-        }
-        
-        const workspaceRoot = this.stateManager.getWorkspaceRoot();
-        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
-        
-        if (!fs.existsSync(logDir)) {
-            fs.mkdirSync(logDir, { recursive: true });
-        }
-        
-        // Use workflow ID + agent name for unique temp log file
-        const logFile = path.join(logDir, `${this.id}_${agentName}.log`);
-        
-        try {
-            // Prepend continuation context if we were paused mid-task
-            const continuationPrompt = this.getContinuationPrompt();
-            const fullPrompt = continuationPrompt 
-                ? `${continuationPrompt}\n\n---\n\n${prompt}`
-                : prompt;
-            
-            // Clear continuation context after using it
-            if (continuationPrompt) {
-                this.clearContinuationContext();
-            }
-            
-            const options: AgentRunOptions = {
-                id: `planning_${this.sessionId}_${taskId}`,
-                prompt: fullPrompt,
-                cwd: workspaceRoot,
-                model: role?.defaultModel || 'sonnet-4.5',
-                logFile,
-                planFile: streamToPlanFile ? this.planPath : undefined,
-                timeoutMs: role?.timeoutMs || 600000,
-                onProgress: (msg) => this.log(`  ${msg}`)
-            };
-            
-            // Track agent run ID for pause handling
-            this.currentAgentRunId = options.id;
-            
-            const agentRunId = options.id;
-            const result = await this.agentRunner.run(options);
-            
-            this.currentAgentRunId = undefined;
-            
-            return {
-                success: result.success,
-                output: result.output
-            };
-        } finally {
-            // Release analyst agents immediately - they're done
-            // Demote planner agent to bench - it may be needed again in the next iteration
-            if (!isPlannerRole) {
-                this.releaseAgent(agentName);
-            } else {
-                this.demoteAgentToBench(agentName);
-                this.log(`Planner agent ${agentName} moved to bench (idle, waiting for potential next iteration)`);
-            }
-            
-            // Don't delete log file - terminal may still be tailing it
-            // Log files are cleaned up when session ends
-        }
-    }
-    
     private async runAnalystTask(roleId: string): Promise<void> {
         const role = this.getRole(roleId);
         
@@ -587,7 +532,6 @@ You MUST output your review in this EXACT format:
             this.analystResults[roleId] = 'critical';
             this.analystOutputs[roleId] = `### Review Result: CRITICAL\n\n#### Critical Issues\n- Role ${roleId} not found in registry\n`;
             this.criticalIssues.push(`[${roleId}] Role configuration missing from registry`);
-            this.analystUsedCallback.add(roleId);
             return;
         }
         
@@ -595,87 +539,58 @@ You MUST output your review in this EXACT format:
         
         this.log(`🚀 Starting ${roleId} (model: ${role?.defaultModel || 'sonnet-4.5'})...`);
         
-        // Use CLI callback for structured completion
-        const result = await this.runAgentTaskWithCallback(
-            `analyst_${roleId}`,
-            prompt,
-            roleId,
-            {
-                expectedStage: 'analysis',
-                timeout: role?.timeoutMs || 300000,
-                model: role?.defaultModel,
-                cwd: this.stateManager.getWorkspaceRoot()
-            }
-        );
+        // Request agent BEFORE running task so we can release it after
+        const agentName = await this.requestAgent(roleId);
         
-        if (result.fromCallback) {
-            // Got structured data from CLI callback - preferred path
-            // Directly populate results (no need to parse)
-            const verdict = (result.result as AnalystVerdict) || 'pass';
-            this.analystResults[roleId] = verdict;
-            this.analystUsedCallback.add(roleId);
-            
-            // Extract issues/suggestions from callback payload
-            const issues = result.payload?.issues || [];
-            const suggestions = result.payload?.suggestions || [];
-            
-            if (verdict === 'critical' && issues.length > 0) {
-                this.criticalIssues.push(...issues.map(i => `[${roleId}] ${i}`));
-            }
-            if (suggestions.length > 0) {
-                this.minorSuggestions.push(...suggestions.map(s => `[${roleId}] ${s}`));
-            }
-            
-            // Store raw output for feedback formatting (if available)
-            this.analystOutputs[roleId] = result.rawOutput || `### Review Result: ${verdict.toUpperCase()}\n`;
-            
-            this.log(`✓ ${roleId} complete via CLI callback: ${verdict.toUpperCase()}`);
-        } else {
-            // No callback received - agent must use CLI callback
-            throw new Error(
-                `Analyst ${roleId} did not use CLI callback (\`apc agent complete\`). ` +
-                'All agents must report results via CLI callback for structured data. ' +
-                'Legacy output parsing is no longer supported.'
+        try {
+            // Use CLI callback for structured completion
+            // Note: roleId is already unique (e.g., 'analyst_implementation'), no need to add prefix
+            const result = await this.runAgentTaskWithCallback(
+                roleId,
+                prompt,
+                roleId,
+                {
+                    expectedStage: 'analysis',
+                    timeout: role?.timeoutMs || 300000,
+                    model: role?.defaultModel,
+                    cwd: this.stateManager.getWorkspaceRoot(),
+                    agentName  // Pass pre-allocated agent
+                }
             );
-        }
-    }
-    
-    private parseAnalystResults(): void {
-        // Only parse results for analysts that didn't use CLI callback
-        for (const [roleId, output] of Object.entries(this.analystOutputs)) {
-            // Skip if already processed via CLI callback
-            if (this.analystUsedCallback.has(roleId)) {
-                continue;
-            }
             
-            const verdictMatch = output.match(/###?\s*Review\s*Result:\s*(PASS|CRITICAL|MINOR)/i);
-            const verdict: AnalystVerdict = verdictMatch 
-                ? verdictMatch[1].toLowerCase() as AnalystVerdict 
-                : 'pass';
-            
-            this.analystResults[roleId] = verdict;
-            
-            // Extract critical issues
-            const criticalSection = output.match(/####?\s*Critical\s*Issues[\s\S]*?(?=####|$)/i);
-            if (criticalSection && verdict === 'critical') {
-                const issues = criticalSection[0].match(/^-\s+(?!None).+$/gm);
-                if (issues) {
-                    this.criticalIssues.push(
-                        ...issues.map(i => `[${roleId}] ${i.replace(/^-\s+/, '')}`)
-                    );
+            if (result.fromCallback) {
+                // Got structured data from CLI callback - required path
+                const verdict = (result.result as AnalystVerdict) || 'pass';
+                this.analystResults[roleId] = verdict;
+                
+                // Extract issues/suggestions from callback payload
+                const issues = result.payload?.issues || [];
+                const suggestions = result.payload?.suggestions || [];
+                
+                if (verdict === 'critical' && issues.length > 0) {
+                    this.criticalIssues.push(...issues.map(i => `[${roleId}] ${i}`));
                 }
-            }
-            
-            // Extract minor suggestions
-            const minorSection = output.match(/####?\s*Minor\s*Suggestions[\s\S]*?(?=####|$)/i);
-            if (minorSection) {
-                const suggestions = minorSection[0].match(/^-\s+(?!None).+$/gm);
-                if (suggestions) {
-                    this.minorSuggestions.push(
-                        ...suggestions.map(s => `[${roleId}] ${s.replace(/^-\s+/, '')}`)
-                    );
+                if (suggestions.length > 0) {
+                    this.minorSuggestions.push(...suggestions.map(s => `[${roleId}] ${s}`));
                 }
+                
+                // Build formatted output from callback payload
+                const formattedOutput = this.formatAnalystOutput(roleId, verdict, issues, suggestions);
+                this.analystOutputs[roleId] = formattedOutput;
+                
+                this.log(`✓ ${roleId} complete via CLI callback: ${verdict.toUpperCase()}`);
+            } else {
+                // No callback received - agent must use CLI callback
+                throw new Error(
+                    `Analyst ${roleId} did not use CLI callback (\`apc agent complete\`). ` +
+                    'All agents must report results via CLI callback for structured data. ' +
+                    'Legacy output parsing is no longer supported.'
+                );
             }
+        } finally {
+            // Release analyst agent immediately - analysts are one-shot tasks
+            this.releaseAgent(agentName);
+            this.log(`  Released analyst agent ${agentName}`);
         }
     }
     
@@ -707,53 +622,6 @@ You MUST output your review in this EXACT format:
         );
         
         fs.writeFileSync(this.planPath, content);
-    }
-    
-    /**
-     * Extract the actual plan content from agent output.
-     * Agents often include reasoning/commentary before the plan - this extracts just the plan.
-     */
-    private extractPlanFromOutput(output: string): string {
-        // Look for the start of actual plan content using common patterns
-        const planStartPatterns = [
-            // Plan title headers
-            /^(#\s+[^\n]*(?:Plan|Migration|Implementation|Execution)[^\n]*)/mi,
-            // Metadata line at start of plan
-            /^(\*\*Project:\*\*)/mi,
-            // Horizontal rule followed by header (common wrapper)
-            /^(---\s*\n+#)/m,
-            // Overview section
-            /^(##\s+Overview)/mi,
-            // Document metadata block
-            /^(>\s*\*\*[A-Z])/m,
-        ];
-        
-        for (const pattern of planStartPatterns) {
-            const match = output.match(pattern);
-            if (match && match.index !== undefined) {
-                const extracted = output.substring(match.index);
-                // Verify we extracted something substantial (at least 100 chars)
-                if (extracted.length > 100) {
-                    return extracted;
-                }
-            }
-        }
-        
-        // Fallback: If output starts with commentary (lowercase sentence), 
-        // try to find where the plan actually starts
-        if (/^[a-z]/.test(output.trim())) {
-            // Look for first markdown header
-            const headerMatch = output.match(/^(#+ .+)/m);
-            if (headerMatch && headerMatch.index !== undefined && headerMatch.index > 0) {
-                const extracted = output.substring(headerMatch.index);
-                if (extracted.length > 100) {
-                    return extracted;
-                }
-            }
-        }
-        
-        // Last resort: return as-is
-        return output;
     }
 }
 

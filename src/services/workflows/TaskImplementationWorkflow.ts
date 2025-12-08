@@ -12,9 +12,9 @@ import {
     WorkflowResult, 
     TaskImplementationInput 
 } from '../../types/workflow';
-import { AgentRunner, AgentRunOptions } from '../AgentBackend';
 import { AgentRole, getDefaultRole } from '../../types';
-import { PipelineOperation, PipelineTaskContext } from '../../types/unity';
+import { PipelineOperation, PipelineTaskContext, UnityPipelineConfig } from '../../types/unity';
+import { TaskManager } from '../TaskManager';
 import { ServiceLocator } from '../ServiceLocator';
 
 /**
@@ -63,18 +63,14 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     private filesModified: string[] = [];
     private unityResult: { success: boolean; errors?: string[] } | null = null;
     private previousErrors: string[] = [];
-    private skipUnity: boolean = false; // Set true if max iterations reached with critical issues
     
     // Agent names for bench management
     private engineerName?: string;
     private reviewerName?: string;
     private contextGathererName?: string;
     
-    private agentRunner: AgentRunner;
-    
     constructor(config: WorkflowConfig, services: WorkflowServices) {
         super(config, services);
-        this.agentRunner = ServiceLocator.resolve(AgentRunner);
         
         // Extract input
         const input = config.input as TaskImplementationInput;
@@ -177,18 +173,10 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
                 break;
         }
         
-        // Release engineer and reviewer after finalize phase (or if skipping to delta_context)
-        if (phase === 'finalize' || (phase === 'delta_context' && this.skipUnity)) {
-            if (this.engineerName) {
-                this.log(`Releasing engineer: ${this.engineerName}`);
-                this.releaseAgent(this.engineerName);
-                this.engineerName = undefined;
-            }
-            if (this.reviewerName) {
-                this.log(`Releasing reviewer: ${this.reviewerName}`);
-                this.releaseAgent(this.reviewerName);
-                this.reviewerName = undefined;
-            }
+        // Release context gatherer after finalize phase
+        // Note: Engineer and reviewer are released at the START of delta_context phase
+        // to prevent deadlock when requesting context_gatherer
+        if (phase === 'finalize') {
             if (this.contextGathererName) {
                 this.log(`Releasing context gatherer: ${this.contextGathererName}`);
                 this.releaseAgent(this.contextGathererName);
@@ -380,24 +368,9 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
                 // Loop back to implement phase (index 0) - set to -1 since runPhases increments
                 this.phaseIndex = -1; // Will be incremented to 0 (implement)
             } else {
-                // Max iterations reached - check if there are critical issues in feedback
-                const hasCriticalIssues = this.reviewFeedback && (
-                    this.reviewFeedback.toLowerCase().includes('critical') ||
-                    this.reviewFeedback.toLowerCase().includes('blocking') ||
-                    this.reviewFeedback.toLowerCase().includes('must fix') ||
-                    this.reviewFeedback.toLowerCase().includes('error') ||
-                    this.reviewFeedback.toLowerCase().includes('crash') ||
-                    this.reviewFeedback.toLowerCase().includes('broken')
-                );
-                
-                if (hasCriticalIssues) {
-                    this.log(`⚠️ Max review iterations reached WITH CRITICAL ISSUES`);
-                    this.log(`⏩ Skipping Unity compilation - will go directly to context update`);
-                    this.skipUnity = true;
-                } else {
-                    this.log(`⚠️ Max review iterations reached, proceeding despite non-critical changes`);
-                }
-                
+                // Max iterations reached - proceed with Unity verification anyway
+                // Unity pipeline will catch any compilation errors
+                this.log(`⚠️ Max review iterations reached, proceeding to Unity verification`);
                 this.reviewResult = 'approved';
             }
         } else {
@@ -408,6 +381,20 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     private async executeDeltaContextPhase(): Promise<void> {
         this.log(`\n📝 PHASE: DELTA CONTEXT for task ${this.taskId}`);
         
+        // Release engineer and reviewer BEFORE requesting context gatherer
+        // They're no longer needed after approval - releasing them prevents deadlock
+        // when all agents are on bench and context_gatherer can't be allocated
+        if (this.engineerName) {
+            this.log(`Releasing engineer: ${this.engineerName} (no longer needed)`);
+            this.releaseAgent(this.engineerName);
+            this.engineerName = undefined;
+        }
+        if (this.reviewerName) {
+            this.log(`Releasing reviewer: ${this.reviewerName} (no longer needed)`);
+            this.releaseAgent(this.reviewerName);
+            this.reviewerName = undefined;
+        }
+        
         // Request context gatherer from pool
         this.contextGathererName = await this.requestAgent('context_gatherer');
         this.log(`✓ Context gatherer allocated: ${this.contextGathererName}`);
@@ -417,18 +404,29 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         
         this.log(`Running context gatherer ${this.contextGathererName} in delta mode (${role?.defaultModel || 'gemini-3-pro'})...`);
         
-        // Use pre-allocated context gatherer
-        const result = await this.runAgentTask(
-            'delta_context', 
-            prompt, 
-            role, 
-            this.contextGathererName  // Pass pre-allocated agent
+        // Use runAgentTaskWithCallback - agent must call CLI callback to complete
+        const result = await this.runAgentTaskWithCallback(
+            `delta_context_${this.taskId}`,
+            prompt,
+            'context_gatherer',
+            {
+                expectedStage: 'delta_context',
+                timeout: role?.timeoutMs || 600000,
+                model: role?.defaultModel,
+                cwd: this.stateManager.getWorkspaceRoot(),
+                agentName: this.contextGathererName  // Use pre-allocated agent
+            }
         );
         
-        if (result.success) {
-            this.log(`✓ Delta context updated`);
+        if (result.fromCallback) {
+            if (this.isAgentSuccess(result)) {
+                this.log(`✓ Delta context updated via CLI callback`);
+            } else {
+                this.log(`⚠️ Delta context update failed: ${result.payload?.error || 'unknown'}, continuing`);
+            }
         } else {
-            this.log(`⚠️ Delta context update failed, continuing`);
+            // Context gatherer didn't use callback - log warning but don't fail workflow
+            this.log(`⚠️ Context gatherer did not use CLI callback - delta context may be incomplete`);
         }
         
         // Context gatherer will be released in executePhase cleanup
@@ -437,13 +435,6 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     private async executeUnityPhase(): Promise<void> {
         this.log(`\n🎮 PHASE: UNITY PIPELINE for task ${this.taskId}`);
         
-        // Skip Unity if flagged (max iterations with critical issues)
-        if (this.skipUnity) {
-            this.log(`⏩ Skipping Unity pipeline due to critical review issues`);
-            this.unityResult = { success: true }; // Treat as success to not block workflow
-            return;
-        }
-        
         // Check if Unity is available
         if (!this.isUnityAvailable() || !this.unityManager) {
             this.log(`⚠️ Unity features disabled - skipping Unity pipeline`);
@@ -451,8 +442,20 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             return;
         }
         
-        // Define operations: 'prep' (reimport + compile) and 'test_editmode'
-        const operations: PipelineOperation[] = ['prep', 'test_editmode'];
+        // Get task's Unity pipeline configuration from TaskManager
+        const taskManager = ServiceLocator.resolve(TaskManager);
+        const task = taskManager.getTask(this.taskId);
+        const pipelineConfig = task?.unityPipeline || 'prep_editmode'; // Default for backward compat
+        
+        // Map pipeline config to operations
+        const operations = this.getOperationsForPipelineConfig(pipelineConfig);
+        
+        // Skip entirely if 'none'
+        if (operations.length === 0) {
+            this.log(`⏩ Skipping Unity pipeline (task config: none)`);
+            this.unityResult = { success: true };
+            return;
+        }
         
         // Create task context
         // Note: agentName no longer tracked at workflow level - use generic identifier
@@ -466,7 +469,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         // FIRE-AND-FORGET: Queue the Unity pipeline without waiting
         // The centralized Unity service will handle compilation/tests asynchronously
         // If compilation or test errors occur, the coordinator will detect them and create error tasks
-        this.log(`📤 Queueing Unity pipeline (fire-and-forget): ${operations.join(' → ')}`);
+        this.log(`📤 Queueing Unity pipeline (${pipelineConfig}): ${operations.join(' → ')}`);
         
         try {
             // Use queuePipeline (not queuePipelineAndWait) for fire-and-forget
@@ -487,6 +490,29 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             this.log(`⚠️ Unity pipeline queueing warning: ${errorMsg}`);
             // Even queueing issues don't fail the workflow - just log the warning
             this.unityResult = { success: true };
+        }
+    }
+    
+    /**
+     * Map Unity pipeline config to actual operations
+     */
+    private getOperationsForPipelineConfig(config: UnityPipelineConfig): PipelineOperation[] {
+        switch (config) {
+            case 'none':
+                return [];
+            case 'prep':
+                return ['prep'];
+            case 'prep_editmode':
+                return ['prep', 'test_editmode'];
+            case 'prep_playmode':
+                return ['prep', 'test_playmode'];
+            case 'prep_playtest':
+                return ['prep', 'test_player_playmode'];
+            case 'full':
+                return ['prep', 'test_editmode', 'test_playmode', 'test_player_playmode'];
+            default:
+                // Default to prep + editmode tests for backward compatibility
+                return ['prep', 'test_editmode'];
         }
     }
     
@@ -555,15 +581,11 @@ ${errorContext}
 1. Implement the task as described
 2. Follow existing code patterns
 3. Write tests if appropriate for the task type
-4. List all files you create or modify
+4. Track all files you create or modify (you'll need to report them)
 
-## Output
-Implement the task. At the end, list all files modified:
-\`\`\`
-FILES_MODIFIED:
-- path/to/file1.cs
-- path/to/file2.cs
-\`\`\``;
+## How to Complete This Task
+After implementing, you MUST signal completion via CLI callback (see end of prompt).
+Include the list of files you modified in the callback payload.`;
     }
     
     private buildReviewPrompt(role: AgentRole | undefined): string {
@@ -586,19 +608,10 @@ ${this.filesModified.map(f => `- ${f}`).join('\n')}
 3. Are there any bugs or issues?
 4. Is the code well-organized and readable?
 
-## REQUIRED Output Format
-\`\`\`
-### Review Result: [APPROVED|CHANGES_REQUESTED]
-
-#### Issues Found
-- [List issues, or "None"]
-
-#### Suggestions
-- [List suggestions, or "None"]
-
-#### Summary
-[Brief summary of the review]
-\`\`\``;
+## How to Complete This Review
+After reviewing, you MUST signal your decision via CLI callback (see end of prompt).
+- Use \`--result approved\` if the code is acceptable
+- Use \`--result changes_requested\` if changes are needed (include feedback in payload)`;
     }
     
     private buildDeltaContextPrompt(role: AgentRole | undefined): string {
@@ -630,162 +643,6 @@ Keep updates concise and focused on what changed.`;
     // =========================================================================
     // HELPER METHODS
     // =========================================================================
-    
-    /**
-     * Legacy runAgentTask method for deprecated phases
-     * @deprecated Use runAgentTaskWithCallback for better structured results
-     */
-    private async runAgentTask(
-        taskId: string,
-        prompt: string,
-        role: AgentRole | undefined,
-        preAllocatedAgentName?: string // Use pre-allocated agent if provided
-    ): Promise<{ success: boolean; output: string }> {
-        const workspaceRoot = this.stateManager.getWorkspaceRoot();
-        const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
-        
-        if (!fs.existsSync(logDir)) {
-            fs.mkdirSync(logDir, { recursive: true });
-        }
-        
-        // Use pre-allocated agent if provided, otherwise request a new one
-        const agentName = preAllocatedAgentName || await this.requestAgent(role?.id || 'engineer');
-        if (preAllocatedAgentName) {
-            this.log(`  Using pre-allocated agent: ${agentName} (role: ${role?.id || 'unknown'})`);
-        }
-        
-        // Use workflow ID + agent name for unique temp log file
-        const logFile = path.join(logDir, `${this.id}_${agentName}.log`);
-        
-        // Prepend continuation context if we were force-paused mid-agent
-        let finalPrompt = prompt;
-        const continuationPrompt = this.getContinuationPrompt();
-        if (continuationPrompt) {
-            finalPrompt = continuationPrompt + prompt;
-            this.log(`  📋 Using continuation context from paused session`);
-            this.clearContinuationContext();
-        }
-        
-        // Track the agent run ID for pause/resume
-        const agentRunId = `task_${this.sessionId}_${this.taskId}_${taskId}`;
-        this.currentAgentRunId = agentRunId;
-        
-        const options: AgentRunOptions = {
-            id: agentRunId,
-            prompt: finalPrompt,
-            cwd: workspaceRoot,
-            model: role?.defaultModel || 'sonnet-4.5',
-            logFile,
-            timeoutMs: role?.timeoutMs || 600000,
-            onProgress: (msg) => this.log(`  ${msg}`)
-        };
-        
-        try {
-            const result = await this.agentRunner.run(options);
-            return {
-                success: result.success,
-                output: result.output
-            };
-        } finally {
-            // Clear the agent run ID when done
-            this.currentAgentRunId = undefined;
-            
-            // Release agent back to pool
-            this.releaseAgent(agentName);
-            
-            // Clean up temp log file (streaming was for real-time terminal viewing)
-            try {
-                if (fs.existsSync(logFile)) {
-                    fs.unlinkSync(logFile);
-                }
-            } catch { /* ignore cleanup errors */ }
-        }
-    }
-    
-    private parseReviewResult(output: string): { approved: boolean; feedback: string } {
-        const resultMatch = output.match(/###?\s*Review\s*Result:\s*(APPROVED|CHANGES_REQUESTED)/i);
-        const approved = resultMatch 
-            ? resultMatch[1].toUpperCase() === 'APPROVED'
-            : true; // Default to approved if can't parse
-        
-        // Extract issues/feedback
-        const issuesMatch = output.match(/####?\s*Issues\s*Found[\s\S]*?(?=####|$)/i);
-        const feedback = issuesMatch 
-            ? issuesMatch[0].replace(/####?\s*Issues\s*Found\s*/i, '').trim()
-            : '';
-        
-        return { approved, feedback };
-    }
-    
-    /**
-     * Extract files modified from agent output
-     * Uses multiple patterns to catch various agent output formats
-     */
-    private extractFilesFromOutput(output: string): string[] {
-        const files = new Set<string>();
-        const workspaceRoot = this.stateManager.getWorkspaceRoot();
-        
-        // Pattern 1: FILES_MODIFIED section (explicit listing)
-        const filesModifiedMatch = output.match(/FILES_MODIFIED:[\s\S]*?(?=```|###|\n\n|$)/i);
-        if (filesModifiedMatch) {
-            const lines = filesModifiedMatch[0].split('\n')
-                .filter(line => line.trim().startsWith('-'))
-                .map(line => line.replace(/^-\s*/, '').trim())
-                .filter(f => f.length > 0 && f.includes('.'));
-            lines.forEach(f => files.add(f));
-        }
-        
-        // Pattern 2: Tool call patterns (write_file, search_replace)
-        // Matches: "file_path": "path/to/file.ts" or file_path="path/to/file.ts"
-        const toolCallPatterns = [
-            /"file_path"\s*:\s*"([^"]+\.\w+)"/gi,
-            /file_path\s*=\s*"([^"]+\.\w+)"/gi,
-            /"target_file"\s*:\s*"([^"]+\.\w+)"/gi,
-            /target_file\s*=\s*"([^"]+\.\w+)"/gi
-        ];
-        
-        for (const pattern of toolCallPatterns) {
-            let match;
-            while ((match = pattern.exec(output)) !== null) {
-                files.add(match[1]);
-            }
-        }
-        
-        // Pattern 3: Common agent output patterns
-        const agentPatterns = [
-            /(?:Created|Creating|Wrote|Writing|Edited|Editing|Modified|Modifying)\s+[`'"]?([^\s`'"]+\.\w+)[`'"]?/gi,
-            /(?:Updated|Updating)\s+[`'"]?([^\s`'"]+\.\w+)[`'"]?/gi,
-            /(?:File|Saved to)\s*:\s*[`'"]?([^\s`'"]+\.\w+)[`'"]?/gi
-        ];
-        
-        for (const pattern of agentPatterns) {
-            let match;
-            while ((match = pattern.exec(output)) !== null) {
-                const file = match[1];
-                // Skip common false positives
-                if (!file.includes('http') && !file.startsWith('.') && file.includes('.')) {
-                    files.add(file);
-                }
-            }
-        }
-        
-        // Validate files exist (filter out non-existent files)
-        const validFiles: string[] = [];
-        for (const file of files) {
-            // Try both relative and absolute paths
-            const relativePath = path.join(workspaceRoot, file);
-            if (fs.existsSync(file) || fs.existsSync(relativePath)) {
-                validFiles.push(file);
-            }
-        }
-        
-        // Log if we found files vs validated files
-        if (files.size > validFiles.length) {
-            this.log(`  File tracking: found ${files.size} mentioned, ${validFiles.length} validated`);
-        }
-        
-        return validFiles.length > 0 ? validFiles : Array.from(files);
-    }
     
     private async updateTaskCheckbox(completed: boolean): Promise<void> {
         if (!fs.existsSync(this.planPath)) return;

@@ -57,7 +57,7 @@ export class DependencyMapPanel {
     private sessionId: string;
     private vsCodeClient: VsCodeClient | null;
     private disposables: vscode.Disposable[] = [];
-    private refreshInterval?: NodeJS.Timeout;
+    private eventUnsubscribers: Array<() => void> = [];
     private viewMode: ViewMode = 'session';  // Toggle between session and global view
     private sessionColorMap: Map<string, number> = new Map();  // Session ID to color index
     private openedFromGlobal: boolean = false;  // If true, don't show session/global toggle
@@ -89,15 +89,45 @@ export class DependencyMapPanel {
             this.disposables
         );
 
-        // Auto-refresh every 3 seconds when visible
-        this.refreshInterval = setInterval(() => {
-            if (this.panel.visible) {
-                this.updateWebviewContent();
-            }
-        }, 3000);
+        // Subscribe to events that affect task status (instead of polling)
+        this.subscribeToEvents();
 
         // Set initial content
         this.updateWebviewContent();
+    }
+
+    /**
+     * Subscribe to daemon events that affect task status
+     */
+    private subscribeToEvents(): void {
+        if (!this.vsCodeClient) return;
+
+        // Debounce refresh to avoid multiple rapid updates
+        let refreshTimeout: NodeJS.Timeout | undefined;
+        const debouncedRefresh = () => {
+            if (refreshTimeout) clearTimeout(refreshTimeout);
+            refreshTimeout = setTimeout(() => {
+                if (this.panel.visible) {
+                    this.updateWebviewContent();
+                }
+            }, 300);  // 300ms debounce
+        };
+
+        // Subscribe to workflow events (task status changes)
+        this.eventUnsubscribers.push(
+            this.vsCodeClient.subscribe('workflow.started', debouncedRefresh)
+        );
+        this.eventUnsubscribers.push(
+            this.vsCodeClient.subscribe('workflow.completed', debouncedRefresh)
+        );
+        this.eventUnsubscribers.push(
+            this.vsCodeClient.subscribe('workflow.failed', debouncedRefresh)
+        );
+
+        // Subscribe to session updates (plan changes, etc.)
+        this.eventUnsubscribers.push(
+            this.vsCodeClient.subscribe('session.updated', debouncedRefresh)
+        );
     }
 
     /**
@@ -149,9 +179,7 @@ export class DependencyMapPanel {
         instance.viewMode = initialViewMode;
         instance.openedFromGlobal = isGlobalOpen;
         DependencyMapPanel.currentPanel = instance;
-        
-        // Refresh to apply initial view mode
-        instance.updateWebviewContent();
+        // Constructor already calls updateWebviewContent(), no need to call again
     }
 
     /**
@@ -200,12 +228,10 @@ export class DependencyMapPanel {
             dependencies: string[];  // Full IDs (e.g., ["ps_000001_T2", "ps_000002_T5"])
             dependents: string[];    // Full IDs
             priority: number;
-            currentWorkflow?: string;
-            workflowHistory?: string[];
+            activeWorkflow?: { id: string; type: string; status: string };
             targetFiles?: string[];
         }
 
-        log.debug(`getTasks() called, viewMode: ${this.viewMode}, sessionId: ${this.sessionId}`);
 
         if (!this.vsCodeClient) {
             log.error('vsCodeClient is not initialized');
@@ -238,7 +264,7 @@ export class DependencyMapPanel {
             dependencies: string[];
             dependents: string[];
             priority: number;
-            currentWorkflow?: string;
+            activeWorkflow?: { id: string; type: string; status: string };
             targetFiles?: string[];
         }
 
@@ -256,15 +282,25 @@ export class DependencyMapPanel {
         const tasksFromFile: TaskFromFile[] = fileData.tasks || [];
         
         // Get active workflows (returns array of WorkflowSummary)
-        // Convert to Map keyed by workflow ID for easy lookup
-        const activeWorkflowsMap = new Map<string, { type: string; status: string; taskId?: string }>();
+        // Create two maps: by workflow ID and by task ID for flexible matching
+        const workflowsByIdMap = new Map<string, { type: string; status: string; taskId?: string }>();
+        const workflowsByTaskIdMap = new Map<string, { type: string; status: string }>();
         try {
             const workflows = await this.vsCodeClient!.send<Array<{ id: string; type: string; status: string; taskId?: string }>>('workflow.list', { sessionId: this.sessionId });
             if (Array.isArray(workflows)) {
                 for (const wf of workflows) {
-                    activeWorkflowsMap.set(wf.id, wf);
+                    workflowsByIdMap.set(wf.id, wf);
+                    // Also index by taskId for matching tasks that don't have activeWorkflow set
+                    if (wf.taskId) {
+                        // Store with full task ID format (sessionId_taskId) - UPPERCASE for consistency
+                        const fullTaskId = wf.taskId.includes('_') 
+                            ? wf.taskId.toUpperCase() 
+                            : `${this.sessionId.toUpperCase()}_${wf.taskId.toUpperCase()}`;
+                        workflowsByTaskIdMap.set(fullTaskId, wf);
+                        // Also store with short taskId (uppercase)
+                        workflowsByTaskIdMap.set(wf.taskId.toUpperCase(), wf);
+                    }
                 }
-                log.debug(`Session view: Found ${workflows.length} active workflows`);
             }
         } catch (e) {
             log.warn('Could not fetch workflows:', e);
@@ -272,11 +308,12 @@ export class DependencyMapPanel {
         
         // Collect all foreign dependency IDs (deps from other sessions)
         const foreignDepIds = new Set<string>();
+        const normalizedSessionPrefix = this.sessionId.toUpperCase() + '_';
         for (const task of tasksFromFile) {
             for (const depId of task.dependencies) {
-                // Check if this dependency is from another session
-                if (!depId.startsWith(this.sessionId + '_')) {
-                    foreignDepIds.add(depId);
+                // Check if this dependency is from another session (case-insensitive)
+                if (!depId.toUpperCase().startsWith(normalizedSessionPrefix)) {
+                    foreignDepIds.add(depId.toUpperCase());
                 }
             }
         }
@@ -290,12 +327,12 @@ export class DependencyMapPanel {
                 const allTasks = await this.vsCodeClient!.send<Array<{ id: string; globalId?: string; sessionId: string; description: string; status: string }>>('task.list', {});
                 if (Array.isArray(allTasks)) {
                     for (const task of allTasks) {
-                        const taskId = task.globalId || task.id;
-                        if (foreignDepIds.has(taskId) || foreignDepIds.has(`${task.sessionId}_${task.id}`)) {
-                            const fullId = taskId.includes('_') ? taskId : `${task.sessionId}_${task.id}`;
-                            foreignTaskMap.set(fullId, { 
-                                id: fullId,
-                                sessionId: task.sessionId,
+                        // All IDs should now be in global format PS_XXXXXX_TN - normalize to uppercase
+                        const taskId = (task.globalId || task.id).toUpperCase();
+                        if (foreignDepIds.has(taskId)) {
+                            foreignTaskMap.set(taskId, { 
+                                id: taskId,
+                                sessionId: task.sessionId.toUpperCase(),
                                 description: task.description,
                                 status: task.status,
                                 dependencies: [],
@@ -312,27 +349,70 @@ export class DependencyMapPanel {
         
         // Convert to TaskNode format
         const taskNodes: TaskNode[] = tasksFromFile.map(t => {
-            const shortId = t.id.replace(`${t.sessionId}_`, '');
+            // Extract short ID - use uppercase normalization to handle case mismatches
+            const normalizedId = t.id.toUpperCase();
+            const normalizedPrefix = `${t.sessionId.toUpperCase()}_`;
+            const shortId = normalizedId.startsWith(normalizedPrefix) 
+                ? normalizedId.slice(normalizedPrefix.length)
+                : normalizedId;
             
+            // Try to find active workflow for this task
             let workflowType: string | undefined;
-            if (t.currentWorkflow) {
-                const wf = activeWorkflowsMap.get(t.currentWorkflow);
+            
+            // First try: use activeWorkflow type directly from task
+            if (t.activeWorkflow) {
+                workflowType = t.activeWorkflow.type;
+            }
+            
+            // Second try: match by workflow ID in session workflows
+            if (!workflowType && t.activeWorkflow?.id) {
+                const wf = workflowsByIdMap.get(t.activeWorkflow.id);
                 if (wf) {
                     workflowType = wf.type;
                 }
             }
             
+            // Third try: match by taskId (workflow may not have activeWorkflow set)
+            // Map keys are UPPERCASE, so normalize lookups
+            if (!workflowType) {
+                // Build global task ID if not already present
+                const globalId = normalizedId.startsWith(normalizedPrefix) 
+                    ? normalizedId 
+                    : `${normalizedPrefix}${normalizedId}`;
+                    
+                // Try global task ID first (e.g., "PS_000001_T1")
+                let wf = workflowsByTaskIdMap.get(globalId);
+                // Try short task ID (e.g., "T1")
+                if (!wf) {
+                    wf = workflowsByTaskIdMap.get(shortId);
+                }
+                if (wf) {
+                    workflowType = wf.type;
+                }
+            }
+            
+            // Build normalized global ID for tasks stored in short form
+            const globalId = normalizedId.startsWith(normalizedPrefix) 
+                ? normalizedId 
+                : `${normalizedPrefix}${normalizedId}`;
+            
             return {
-                id: t.id,
+                id: globalId,  // Always use normalized global ID
                 shortId: shortId,
-                sessionId: t.sessionId,
+                sessionId: t.sessionId.toUpperCase(),
                 description: t.description,
                 status: t.status,
                 workflowType,
                 isForeign: false,
-                // Keep full IDs for dependencies to support cross-plan
-                dependencies: t.dependencies,
-                dependents: t.dependents
+                // Normalize dependencies to global format
+                dependencies: (t.dependencies || []).map((dep: string) => {
+                    const depUpper = dep.toUpperCase();
+                    return depUpper.match(/^PS_\d{6}_/) ? depUpper : `${normalizedPrefix}${depUpper}`;
+                }),
+                dependents: (t.dependents || []).map((dep: string) => {
+                    const depUpper = dep.toUpperCase();
+                    return depUpper.match(/^PS_\d{6}_/) ? depUpper : `${normalizedPrefix}${depUpper}`;
+                })
             };
         });
         
@@ -351,7 +431,6 @@ export class DependencyMapPanel {
             });
         }
         
-        log.debug(`Session view: ${tasksFromFile.length} tasks + ${foreignTaskMap.size} foreign deps`);
         return { tasks: taskNodes };
     }
 
@@ -369,21 +448,18 @@ export class DependencyMapPanel {
             dependencies: string[];
             dependents: string[];
             priority: number;
-            currentWorkflow?: string;
+            activeWorkflow?: { id: string; type: string; status: string };
             targetFiles?: string[];
         }
 
         const fs = require('fs');
         
         // Get all task file paths from daemon (scans all session folders including completed)
-        log.debug('Global view: Fetching task file paths...');
         // Note: API returns the data array directly (not wrapped in { data: ... })
         const filePaths = await this.vsCodeClient!.send<Array<{ sessionId: string; filePath: string; exists: boolean }>>('task.listAllFilePaths', {});
         
-        log.debug('Global view: Response:', JSON.stringify(filePaths));
         
         if (!filePaths || !Array.isArray(filePaths) || filePaths.length === 0) {
-            log.debug('Global view: No task files found in response');
             return { tasks: [], sessionList: [] };
         }
         
@@ -421,17 +497,30 @@ export class DependencyMapPanel {
         });
         
         // Get active workflows from daemon for status enrichment
-        // Map: sessionId -> Map<workflowId, workflowInfo>
-        const activeWorkflowsBySession = new Map<string, Map<string, { type: string; status: string }>>();
+        // For each session: Map by workflow ID and by task ID
+        interface WorkflowMaps {
+            byId: Map<string, { type: string; status: string; taskId?: string }>;
+            byTaskId: Map<string, { type: string; status: string }>;
+        }
+        const activeWorkflowsBySession = new Map<string, WorkflowMaps>();
         try {
             for (const sessionId of sessionList) {
-                const workflows = await this.vsCodeClient!.send<Array<{ id: string; type: string; status: string }>>('workflow.list', { sessionId });
+                const workflows = await this.vsCodeClient!.send<Array<{ id: string; type: string; status: string; taskId?: string }>>('workflow.list', { sessionId });
                 if (Array.isArray(workflows)) {
-                    const wfMap = new Map<string, { type: string; status: string }>();
+                    const byId = new Map<string, { type: string; status: string; taskId?: string }>();
+                    const byTaskId = new Map<string, { type: string; status: string }>();
                     for (const wf of workflows) {
-                        wfMap.set(wf.id, wf);
+                        byId.set(wf.id, wf);
+                        if (wf.taskId) {
+                            // Normalize to UPPERCASE for consistent lookup
+                            const fullTaskId = wf.taskId.includes('_') 
+                                ? wf.taskId.toUpperCase() 
+                                : `${sessionId.toUpperCase()}_${wf.taskId.toUpperCase()}`;
+                            byTaskId.set(fullTaskId, wf);
+                            byTaskId.set(wf.taskId.toUpperCase(), wf);
+                        }
                     }
-                    activeWorkflowsBySession.set(sessionId, wfMap);
+                    activeWorkflowsBySession.set(sessionId, { byId, byTaskId });
                 }
             }
         } catch (e) {
@@ -440,34 +529,80 @@ export class DependencyMapPanel {
         
         // Convert to TaskNode format
         const taskNodes: TaskNode[] = allTasks.map(t => {
-            const shortId = t.id.replace(`${t.sessionId}_`, '');
+            // Extract short ID - use uppercase normalization to handle case mismatches
+            const normalizedId = t.id.toUpperCase();
+            const normalizedPrefix = `${t.sessionId.toUpperCase()}_`;
+            const shortId = normalizedId.startsWith(normalizedPrefix) 
+                ? normalizedId.slice(normalizedPrefix.length)
+                : normalizedId;
             
             // Check if task has an active workflow
             let workflowType: string | undefined;
-            const sessionWorkflowsMap = activeWorkflowsBySession.get(t.sessionId);
-            if (t.currentWorkflow && sessionWorkflowsMap) {
-                const wf = sessionWorkflowsMap.get(t.currentWorkflow);
-                if (wf) {
-                    workflowType = wf.type;
+            
+            // First try: use activeWorkflow type directly from task
+            if (t.activeWorkflow) {
+                workflowType = t.activeWorkflow.type;
+            }
+            
+            // Second try: match from session workflows
+            // Map keys are UPPERCASE, so use normalizedSessionId
+            if (!workflowType) {
+                const normalizedSessionId = t.sessionId.toUpperCase();
+                const sessionWorkflows = activeWorkflowsBySession.get(t.sessionId) || 
+                                        activeWorkflowsBySession.get(normalizedSessionId);
+                if (sessionWorkflows) {
+                    // Try by workflow ID first
+                    if (t.activeWorkflow?.id) {
+                        const wf = sessionWorkflows.byId.get(t.activeWorkflow.id);
+                        if (wf) {
+                            workflowType = wf.type;
+                        }
+                    }
+                    // Try by task ID - use normalized IDs
+                    if (!workflowType) {
+                        // Build global ID if task stored in short form
+                        const globalId = normalizedId.startsWith(normalizedPrefix)
+                            ? normalizedId
+                            : `${normalizedPrefix}${normalizedId}`;
+                        let wf = sessionWorkflows.byTaskId.get(globalId);
+                        if (!wf) {
+                            wf = sessionWorkflows.byTaskId.get(shortId);
+                        }
+                        if (wf) {
+                            workflowType = wf.type;
+                        }
+                    }
                 }
             }
             
+            // Build normalized global ID for tasks stored in short form
+            const globalId = normalizedId.startsWith(normalizedPrefix)
+                ? normalizedId
+                : `${normalizedPrefix}${normalizedId}`;
+            
+            const normalizedSessionId = t.sessionId.toUpperCase();
+            
             return {
-                id: t.id,
-                shortId: `${t.sessionId.slice(-3)}:${shortId}`,  // e.g., "001:T1"
-                sessionId: t.sessionId,
+                id: globalId,  // Always use normalized global ID
+                shortId: `${normalizedSessionId.slice(-3)}:${shortId}`,  // e.g., "001:T1"
+                sessionId: normalizedSessionId,
                 description: t.description,
                 status: t.status,
                 workflowType,
                 isForeign: false,
-                sessionColor: this.sessionColorMap.get(t.sessionId),
-                // Keep full dependency IDs for cross-plan visualization
-                dependencies: t.dependencies || [],
-                dependents: t.dependents || []
+                sessionColor: this.sessionColorMap.get(t.sessionId) || this.sessionColorMap.get(normalizedSessionId),
+                // Normalize dependency IDs to global format
+                dependencies: (t.dependencies || []).map((dep: string) => {
+                    const depUpper = dep.toUpperCase();
+                    return depUpper.match(/^PS_\d{6}_/) ? depUpper : `${normalizedPrefix}${depUpper}`;
+                }),
+                dependents: (t.dependents || []).map((dep: string) => {
+                    const depUpper = dep.toUpperCase();
+                    return depUpper.match(/^PS_\d{6}_/) ? depUpper : `${normalizedPrefix}${depUpper}`;
+                })
             };
         });
         
-        log.debug(`Global view: ${taskNodes.length} tasks from ${sessionList.length} sessions (read from files)`);
         return { tasks: taskNodes, sessionList };
     }
 
@@ -570,11 +705,9 @@ export class DependencyMapPanel {
      * Update the webview content
      */
     private async updateWebviewContent(): Promise<void> {
-        log.debug(`Fetching tasks for session: ${this.sessionId}, viewMode: ${this.viewMode}`);
         const { tasks, sessionList } = await this.getTasks();
         const layoutedTasks = this.calculateLayout(tasks);
         
-        log.debug(`Found ${tasks.length} tasks`);
         
         // Update panel title based on view mode
         if (this.viewMode === 'global') {
@@ -923,55 +1056,33 @@ export class DependencyMapPanel {
         .task-node.in_progress {
             background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%);
             border-color: #60a5fa;
-            animation: pulse 2s infinite;
         }
         
-        /* Animated glowing border for tasks with active workflows */
+        /* Colored border for tasks with active workflows (matches legend) */
         .task-node[data-workflow]:not([data-workflow=""]) {
-            --workflow-color: #3b82f6;
             border-width: 3px;
             border-style: solid;
-            animation: workflowBorderGlow 1.5s ease-in-out infinite;
         }
         
         /* Workflow-specific border colors */
         .task-node[data-workflow="task_implementation"] {
-            --workflow-color: #3b82f6;  /* Blue for implementation */
-            border-color: #3b82f6;
+            border-color: #3b82f6;  /* Blue for implementation */
         }
         
         .task-node[data-workflow="context_gathering"] {
-            --workflow-color: #a855f7;  /* Purple for context */
-            border-color: #a855f7;
+            border-color: #a855f7;  /* Purple for context */
         }
         
         .task-node[data-workflow="error_resolution"] {
-            --workflow-color: #ef4444;  /* Red for error fixing */
-            border-color: #ef4444;
+            border-color: #ef4444;  /* Red for error fixing */
         }
         
         .task-node[data-workflow="planning_new"] {
-            --workflow-color: #10b981;  /* Green for planning */
-            border-color: #10b981;
+            border-color: #10b981;  /* Green for planning */
         }
         
         .task-node[data-workflow="planning_revision"] {
-            --workflow-color: #f59e0b;  /* Orange for revision */
-            border-color: #f59e0b;
-        }
-        
-        @keyframes workflowBorderGlow {
-            0%, 100% { 
-                box-shadow: 0 0 5px var(--workflow-color), 
-                            0 0 10px var(--workflow-color),
-                            inset 0 0 3px rgba(255,255,255,0.2);
-            }
-            50% { 
-                box-shadow: 0 0 15px var(--workflow-color), 
-                            0 0 25px var(--workflow-color),
-                            0 0 35px var(--workflow-color),
-                            inset 0 0 5px rgba(255,255,255,0.3);
-            }
+            border-color: #f59e0b;  /* Orange for revision */
         }
         
         .task-node.created {
@@ -1036,10 +1147,6 @@ export class DependencyMapPanel {
         .session-badge-4 { background: #8b5cf6; }  /* Purple */
         .session-badge-5 { background: #06b6d4; }  /* Cyan */
         
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.85; }
-        }
         
         .task-id {
             font-size: 1.1em;
@@ -1464,9 +1571,11 @@ export class DependencyMapPanel {
     public dispose(): void {
         DependencyMapPanel.currentPanel = undefined;
 
-        if (this.refreshInterval) {
-            clearInterval(this.refreshInterval);
+        // Unsubscribe from all events
+        for (const unsubscribe of this.eventUnsubscribers) {
+            unsubscribe();
         }
+        this.eventUnsubscribers = [];
 
         this.panel.dispose();
 

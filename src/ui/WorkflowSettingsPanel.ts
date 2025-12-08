@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as yaml from 'yaml';
 import { Logger } from '../utils/Logger';
 import { VsCodeClient } from '../vscode/VsCodeClient';
 import { getSettingsCommonStyles } from './webview/styles/settingsCommon';
@@ -480,21 +481,26 @@ export class WorkflowSettingsPanel {
 
     /**
      * Fetch and send custom workflows to the webview
+     * Uses daemon if connected, otherwise falls back to local folder scan
      */
     private async sendCustomWorkflows(): Promise<void> {
         try {
-            if (!this.vsCodeClient.isConnected()) {
-                this.panel.webview.postMessage({ 
-                    command: 'setCustomWorkflows', 
-                    workflows: [],
-                    error: 'Daemon not connected'
-                });
-                return;
-            }
+            let workflows: CustomWorkflowInfo[] = [];
             
-            const response = await this.vsCodeClient.send('workflow.custom.list', {});
-            // VsCodeClient.send() already unwraps response.data, so response IS the workflows array
-            const workflows = Array.isArray(response) ? response : [];
+            if (this.vsCodeClient.isConnected()) {
+                // Try daemon first when connected
+                try {
+                    const response = await this.vsCodeClient.send('workflow.custom.list', {});
+                    // VsCodeClient.send() already unwraps response.data, so response IS the workflows array
+                    workflows = Array.isArray(response) ? response : [];
+                } catch (e: any) {
+                    log.warn('Failed to fetch from daemon, falling back to local scan:', e.message);
+                    workflows = await this.scanCustomWorkflowsLocally();
+                }
+            } else {
+                // Daemon not connected - scan locally
+                workflows = await this.scanCustomWorkflowsLocally();
+            }
             
             this.panel.webview.postMessage({ 
                 command: 'setCustomWorkflows', 
@@ -507,6 +513,64 @@ export class WorkflowSettingsPanel {
                 workflows: [],
                 error: e.message
             });
+        }
+    }
+    
+    /**
+     * Scan custom workflows from local folder when daemon is not available
+     * This is a lightweight scan that reads YAML files directly
+     */
+    private async scanCustomWorkflowsLocally(): Promise<CustomWorkflowInfo[]> {
+        const workflowsDir = path.join(this.workspaceRoot, '_AiDevLog', 'Workflows');
+        const workflows: CustomWorkflowInfo[] = [];
+        
+        try {
+            if (!fs.existsSync(workflowsDir)) {
+                log.debug('Workflows directory does not exist:', workflowsDir);
+                return [];
+            }
+            
+            const files = await fs.promises.readdir(workflowsDir);
+            const yamlFiles = files.filter(f => f.endsWith('.yaml') || f.endsWith('.yml'));
+            
+            for (const file of yamlFiles) {
+                try {
+                    const filePath = path.join(workflowsDir, file);
+                    const content = await fs.promises.readFile(filePath, 'utf-8');
+                    const graph = yaml.parse(content);
+                    
+                    if (!graph || !graph.name) {
+                        log.warn(`Invalid workflow file (missing name): ${file}`);
+                        continue;
+                    }
+                    
+                    // Generate workflow type from filename (same logic as ScriptableWorkflowRegistry)
+                    const baseName = path.basename(file, path.extname(file));
+                    const workflowType = `custom:${baseName}`;
+                    
+                    workflows.push({
+                        type: workflowType,
+                        name: graph.name,
+                        version: graph.version || '1.0',
+                        description: graph.description || '',
+                        parameters: graph.parameters || [],
+                        variables: graph.variables || [],
+                        nodeCount: graph.nodes?.length || 0,
+                        filePath: filePath,
+                        requiresUnity: graph.nodes?.some((n: any) => 
+                            n.type === 'event' && n.config?.event_type?.includes('unity')
+                        ) || false
+                    });
+                } catch (parseError: any) {
+                    log.warn(`Failed to parse workflow file ${file}:`, parseError.message);
+                }
+            }
+            
+            log.info(`Scanned ${workflows.length} custom workflows locally`);
+            return workflows;
+        } catch (e: any) {
+            log.error('Failed to scan workflows directory:', e);
+            return [];
         }
     }
 

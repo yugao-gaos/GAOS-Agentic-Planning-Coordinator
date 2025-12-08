@@ -234,12 +234,23 @@ function renderSystemReadyBox(
     let unityHtml = '';
     if (unityEnabled) {
         const unityBadge = getUnityBadgeStyle(unity);
+        // Show prep button when Unity is idle and queue is empty
+        const canTriggerPrep = unity.connected && 
+                               !unity.isCompiling && 
+                               !unity.isPlaying && 
+                               !unity.currentTask && 
+                               unity.queueLength === 0;
+        const prepBtnHtml = canTriggerPrep 
+            ? `<button class="coord-icon-btn" id="unityPrepBtn" title="Trigger Unity Prep (compile)">🔄</button>`
+            : '';
+        
         unityHtml = `
             <div class="status-boxes-row" style="margin-top: 6px;">
                 <div class="status-box">
                     <span class="status-box-label">Unity</span>
                     <span class="unity-badge" style="background: ${unityBadge.background};">${unityBadge.text}</span>
                     ${unity.queueLength > 0 ? `<span class="unity-queue">(${unity.queueLength})</span>` : ''}
+                    ${prepBtnHtml}
                 </div>
             </div>
         `;

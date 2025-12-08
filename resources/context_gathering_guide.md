@@ -25,7 +25,7 @@ apc workflow dispatch ps_000001 context_gathering --input '{
   "targets": ["Assets/Scripts/Combat", "Assets/Scripts/AI"],
   "depth": "deep",
   "focusAreas": ["enemy AI patterns", "combat state machine"],
-  "taskId": "T3"
+  "taskId": "ps_000001_T3"
 }'
 ```
 
@@ -37,7 +37,7 @@ apc workflow dispatch ps_000001 context_gathering --input '{
   "targets": ["Assets/Scripts/UI/MenuSystem.cs", "Assets/Scripts/UI/DialogManager.cs"],
   "depth": "deep",
   "focusAreas": ["UI event handling", "state management"],
-  "taskId": "T7"
+  "taskId": "ps_000001_T7"
 }'
 ```
 
@@ -52,7 +52,7 @@ apc workflow dispatch ps_000001 context_gathering --input '{
   "targets": ["Assets/Prefabs/UI", "Assets/Scenes", "Assets/Resources/UI"],
   "depth": "shallow",
   "focusAreas": ["available UI prefabs", "menu structure", "dialog system"],
-  "taskId": "T12"
+  "taskId": "ps_000001_T12"
 }'
 ```
 
@@ -75,7 +75,7 @@ When you provide a `taskId`, the context gathering workflow will:
 2. **Include task metadata** in the context file header
 3. **Link the context** to the specific task for future reference
 
-Example output filename: `_AiDevLog/Context/task_T5_context.md`
+Example output filename: `_AiDevLog/Context/task_ps_000001_T5_context.md`
 
 ## Coordinator Integration Example
 
@@ -85,18 +85,18 @@ Here's how the coordinator agent can use context gathering:
 # Step 1: Check which tasks are ready
 apc task list
 
-# Step 2: Identify a task that needs asset knowledge (e.g., T5: "Create enemy spawn UI")
+# Step 2: Identify a task that needs asset knowledge (e.g., ps_000001_T5: "Create enemy spawn UI")
 # Step 3: Gather context about available UI assets
 apc workflow dispatch ps_000001 context_gathering --input '{
   "targets": ["Assets/Prefabs/UI", "Assets/Scripts/UI"],
   "depth": "shallow",
   "focusAreas": ["UI prefabs", "spawn system", "existing enemy UI"],
-  "taskId": "T5"
+  "taskId": "ps_000001_T5"
 }'
 
 # Step 4: Wait for context gathering to complete (check workflow status)
 # Step 5: Create the implementation task - engineer can now read the task-specific context
-apc task create --session ps_000001 --id T5 --desc "Create enemy spawn UI" --type implementation
+apc task create --session ps_000001 --id ps_000001_T5 --desc "Create enemy spawn UI" --type implementation
 ```
 
 ## Output Location
@@ -131,16 +131,16 @@ Context summaries are written to `_AiDevLog/Context/`:
 
 ```
 1. Coordinator triggered (task completed or agent available)
-2. Check task list - find T5: "Create gem collection UI"
-3. Notice T5 involves UI prefabs (asset-heavy task)
+2. Check task list - find ps_000001_T5: "Create gem collection UI"
+3. Notice ps_000001_T5 involves UI prefabs (asset-heavy task)
 4. Decision: Dispatch context_gathering FIRST
    - targets: ["Assets/Prefabs/UI/Gems", "Assets/Scripts/UI"]
    - depth: "shallow"
    - focusAreas: ["gem UI patterns", "collection displays"]
-   - taskId: "T5"
+   - taskId: "ps_000001_T5"
 5. Wait for context gathering to complete
-6. Then dispatch task_implementation for T5
-   - Engineer can now read _AiDevLog/Context/task_T5_context.md
+6. Then dispatch task_implementation for ps_000001_T5
+   - Engineer can now read _AiDevLog/Context/task_ps_000001_T5_context.md
    - Engineer knows what gem UI prefabs are available
    - Engineer can follow existing patterns
 ```

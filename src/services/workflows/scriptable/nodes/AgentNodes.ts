@@ -189,6 +189,21 @@ export const AgenticWorkNodeDefinition: INodeDefinition = {
                 label: 'Parse JSON Response',
                 description: 'Try to parse the agent response as JSON',
                 defaultValue: false
+            },
+            {
+                name: 'stage',
+                type: 'select',
+                label: 'CLI Callback Stage',
+                description: 'Stage for CLI callback completion signal',
+                options: [
+                    { value: 'implementation', label: 'Implementation' },
+                    { value: 'review', label: 'Review' },
+                    { value: 'analysis', label: 'Analysis' },
+                    { value: 'context', label: 'Context' },
+                    { value: 'planning', label: 'Planning' },
+                    { value: 'finalization', label: 'Finalization' }
+                ],
+                defaultValue: 'implementation'
             }
         ]
     }
@@ -204,6 +219,7 @@ export const AgenticWorkNodeExecutor: NodeExecutor = async (
     const model = node.config.model;
     const releaseAfter = node.config.releaseAfter;
     const parseJson = node.config.parseJson;
+    const stage = node.config.stage || 'implementation';
     
     if (!agentName) {
         throw new Error('Agent reference is required');
@@ -216,12 +232,13 @@ export const AgenticWorkNodeExecutor: NodeExecutor = async (
     // Render the prompt template with context
     const prompt = context.renderTemplate(promptTemplate);
     
-    context.log(`Running agent task with ${agentName}`, 'info');
+    context.log(`Running agent task with ${agentName} (stage: ${stage})`, 'info');
     
     try {
         const result = await context.runAgentTask(agentName, prompt, {
             model,
-            timeoutMs: node.timeoutMs
+            timeoutMs: node.timeoutMs,
+            stage
         });
         
         let output = result.output;

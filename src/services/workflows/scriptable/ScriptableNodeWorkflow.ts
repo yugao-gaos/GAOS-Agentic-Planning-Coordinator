@@ -15,8 +15,6 @@ import { ExecutionContext } from './ExecutionContext';
 import { NodeExecutionEngine, DebugEventCallback } from './NodeExecutionEngine';
 import { NodeGraphLoader } from './NodeGraphLoader';
 import { registerBuiltinNodes, areBuiltinNodesRegistered } from './nodes';
-import { ServiceLocator } from '../../ServiceLocator';
-import { AgentRunner } from '../../AgentBackend';
 import { Logger } from '../../../utils/Logger';
 
 const log = Logger.create('Daemon', 'ScriptableNodeWorkflow');
@@ -65,7 +63,6 @@ export class ScriptableNodeWorkflow extends BaseWorkflow {
     private executionContext: ExecutionContext | null = null;
     private engine: NodeExecutionEngine | null = null;
     private graphLoader: NodeGraphLoader;
-    private agentRunner: AgentRunner;
     private debugMode: boolean = false;
     private debugOptions?: IDebugOptions;
     private debugCallback?: DebugEventCallback;
@@ -83,7 +80,6 @@ export class ScriptableNodeWorkflow extends BaseWorkflow {
         }
         
         this.graphLoader = new NodeGraphLoader();
-        this.agentRunner = ServiceLocator.resolve(AgentRunner);
         
         // Extract input
         const input = config.input as ScriptableNodeWorkflowInput;
@@ -252,40 +248,56 @@ export class ScriptableNodeWorkflow extends BaseWorkflow {
     }
     
     /**
-     * Run an agent task with a custom prompt
+     * Run an agent task with CLI callback requirement
      */
     private async runAgentWithPrompt(
         agentName: string,
         prompt: string,
-        options?: { model?: string; timeoutMs?: number }
-    ): Promise<{ success: boolean; output: string }> {
-        const model = options?.model || 'claude-sonnet-4-20250514';
+        options?: { model?: string; timeoutMs?: number; stage?: 'implementation' | 'review' | 'analysis' | 'context' | 'planning' | 'finalization' }
+    ): Promise<{ success: boolean; output: string; fromCallback?: boolean }> {
+        const stage = options?.stage || 'implementation';
         const timeoutMs = options?.timeoutMs || 600000;
+        const model = options?.model || 'claude-sonnet-4-20250514';
         
         try {
-            const result = await this.agentRunner.run({
-                id: `${this.id}_${agentName}_${Date.now()}`,
+            // Use CLI callback for structured completion
+            const result = await this.runAgentTaskWithCallback(
+                `scriptable_${agentName}`,
                 prompt,
-                model,
-                cwd: process.cwd(),
-                timeoutMs,
-                onProgress: (msg) => this.log(`  [${agentName}] ${msg}`),
-                metadata: {
-                    workflowId: this.id,
-                    sessionId: this.sessionId,
+                'engineer',  // Default to engineer role for scriptable workflows
+                {
+                    expectedStage: stage,
+                    timeout: timeoutMs,
+                    model,
+                    cwd: process.cwd(),
                     agentName
                 }
-            });
+            );
             
-            return {
-                success: result.success,
-                output: result.output || ''
-            };
+            if (result.fromCallback && this.isAgentSuccess(result)) {
+                return {
+                    success: true,
+                    output: result.payload?.message || '',
+                    fromCallback: true
+                };
+            } else if (!result.fromCallback) {
+                throw new Error(
+                    'Agent did not use CLI callback (`apc agent complete`). ' +
+                    'All agents must report results via CLI callback.'
+                );
+            } else {
+                return {
+                    success: false,
+                    output: result.payload?.error || 'Agent task failed',
+                    fromCallback: true
+                };
+            }
         } catch (error) {
             const errorMsg = error instanceof Error ? error.message : String(error);
             return {
                 success: false,
-                output: errorMsg
+                output: errorMsg,
+                fromCallback: false
             };
         }
     }

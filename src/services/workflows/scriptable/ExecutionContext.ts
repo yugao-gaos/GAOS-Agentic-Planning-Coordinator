@@ -129,7 +129,7 @@ export class ExecutionContext implements IExecutionContextAPI {
     // Callbacks for workflow integration
     private onAgentRequest?: (roleId: string) => Promise<string>;
     private onAgentRelease?: (agentName: string) => void;
-    private onAgentTask?: (agentName: string, prompt: string, options?: any) => Promise<{ success: boolean; output: string }>;
+    private onAgentTask?: (agentName: string, prompt: string, options?: any) => Promise<{ success: boolean; output: string; fromCallback?: boolean }>;
     private onEventEmit?: (eventType: string, payload?: any) => void;
     private onEventWait?: (eventType: string, timeoutMs?: number) => Promise<any>;
     
@@ -293,8 +293,8 @@ export class ExecutionContext implements IExecutionContextAPI {
     async runAgentTask(
         agentName: string, 
         prompt: string, 
-        options?: { model?: string; timeoutMs?: number }
-    ): Promise<{ success: boolean; output: string }> {
+        options?: { model?: string; timeoutMs?: number; stage?: 'implementation' | 'review' | 'analysis' | 'context' | 'planning' | 'finalization' }
+    ): Promise<{ success: boolean; output: string; fromCallback?: boolean }> {
         if (this.onAgentTask) {
             return this.onAgentTask(agentName, prompt, options);
         }
@@ -321,7 +321,7 @@ export class ExecutionContext implements IExecutionContextAPI {
     ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
         const { exec } = await import('child_process');
         const { promisify } = await import('util');
-        const execAsync = promisify(exec);
+        const execAsyncRaw = promisify(exec);
         
         const timeoutMs = options?.timeoutMs ?? 60000;
         const cwd = options?.cwd ?? process.cwd();
@@ -329,10 +329,11 @@ export class ExecutionContext implements IExecutionContextAPI {
         this.log(`Executing command: ${command}`, 'debug');
         
         try {
-            const { stdout, stderr } = await execAsync(command, {
+            const { stdout, stderr } = await execAsyncRaw(command, {
                 cwd,
                 timeout: timeoutMs,
-                maxBuffer: 10 * 1024 * 1024 // 10MB
+                maxBuffer: 10 * 1024 * 1024, // 10MB
+                windowsHide: true  // Hide terminal windows on Windows
             });
             
             return { exitCode: 0, stdout, stderr };

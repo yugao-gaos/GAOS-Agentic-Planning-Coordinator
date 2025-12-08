@@ -59,29 +59,30 @@
 ## 5. Task Checklist
 
 <!-- 
-IMPORTANT: Tasks MUST use checkbox format for tracking
-Format: - [ ] **T{N}**: {Task Name} | Deps: {dependencies} | Engineer: {name}
+IMPORTANT: Tasks MUST use GLOBAL task ID format for tracking
+Format: - [ ] **{SESSION_ID}_T{N}**: {Task Name} | Deps: {dependencies} | Engineer: {name}
+Example: - [ ] **ps_000001_T1**: Setup project | Deps: None | Engineer: TBD
 -->
 
 ### Phase 1: Foundation
-- [ ] **T1**: {{TASK_1_NAME}} | Deps: None | Engineer: TBD
-- [ ] **T2**: {{TASK_2_NAME}} | Deps: T1 | Engineer: TBD
+- [ ] **{{SESSION_ID}}_T1**: {{TASK_1_NAME}} | Deps: None | Engineer: TBD
+- [ ] **{{SESSION_ID}}_T2**: {{TASK_2_NAME}} | Deps: {{SESSION_ID}}_T1 | Engineer: TBD
 
 ### Phase 2: Core Implementation
-- [ ] **T3**: {{TASK_3_NAME}} | Deps: T1 | Engineer: TBD
-- [ ] **T4**: {{TASK_4_NAME}} | Deps: T2, T3 | Engineer: TBD
+- [ ] **{{SESSION_ID}}_T3**: {{TASK_3_NAME}} | Deps: {{SESSION_ID}}_T1 | Engineer: TBD
+- [ ] **{{SESSION_ID}}_T4**: {{TASK_4_NAME}} | Deps: {{SESSION_ID}}_T2, {{SESSION_ID}}_T3 | Engineer: TBD
 
 ### Phase 3: Integration & Testing
-- [ ] **T5**: {{TASK_5_NAME}} | Deps: T4 | Engineer: TBD
+- [ ] **{{SESSION_ID}}_T5**: {{TASK_5_NAME}} | Deps: {{SESSION_ID}}_T4 | Engineer: TBD
 
 ---
 
 ## 6. Dependency Graph
 
 ```
-T1 ────┬───> T2 ───> T4 ───> T5
-       │
-       └───> T3 ───────┘
+{{SESSION_ID}}_T1 ────┬───> {{SESSION_ID}}_T2 ───> {{SESSION_ID}}_T4 ───> {{SESSION_ID}}_T5
+                      │
+                      └───> {{SESSION_ID}}_T3 ───────────┘
 ```
 
 ---

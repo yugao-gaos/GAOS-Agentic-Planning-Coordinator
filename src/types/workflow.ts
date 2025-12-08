@@ -443,62 +443,6 @@ export function getWorkflowStatusColor(status: WorkflowStatus): string {
 }
 
 // ============================================================================
-// Failed Task Tracking
-// ============================================================================
-
-/**
- * Information about a task that failed after retry attempts
- */
-export interface FailedTask {
-    /** Task ID from the plan */
-    taskId: string;
-    
-    /** Workflow ID that was running the task */
-    workflowId: string;
-    
-    /** Task description */
-    description: string;
-    
-    /** Number of attempts made */
-    attempts: number;
-    
-    /** The error message from the last attempt */
-    lastError: string;
-    
-    /** Error classification (transient/permanent/unknown/needs_clarity) */
-    errorType: 'transient' | 'permanent' | 'unknown' | 'needs_clarity';
-    
-    /** When the task failed */
-    failedAt: string;
-    
-    /** Whether manual retry is possible */
-    canRetry: boolean;
-    
-    /** Task IDs that are blocked because this task failed */
-    blockedDependents: string[];
-    
-    /** Question for user if errorType is 'needs_clarity' (last resort after autonomous attempts) */
-    clarityQuestion?: string;
-}
-
-/**
- * Summary of failed tasks for UI display
- */
-export interface FailedTaskSummary {
-    /** Total number of failed tasks */
-    count: number;
-    
-    /** Number that can be retried */
-    retriableCount: number;
-    
-    /** Number of tasks blocked by failures */
-    blockedCount: number;
-    
-    /** The failed task entries */
-    tasks: FailedTask[];
-}
-
-// ============================================================================
 // Workflow Settings (User Customization)
 // ============================================================================
 
