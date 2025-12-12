@@ -798,7 +798,7 @@ export class DependencyService {
     
     /**
      * Test Unity MCP connectivity via agent session
-     * Runs a quick agent that calls mcp_unity-mcp_manage_editor with GetState
+     * Runs a quick agent that calls mcp_unity-mcp_get_unity_editor_state
      * Optionally can also create the temp scene if missing
      * 
      * NOTE: This should only be called in daemon context (caller should check ServiceLocator.isRegistered(AgentRunner))
@@ -830,12 +830,13 @@ export class DependencyService {
             let stderrBuffer = '';
             
             // Build prompt based on whether we need to create temp scene
+            // Tool names from CoplayDev/unity-mcp: get_unity_editor_state, create_scene, etc.
             const basePrompt = tryCreateTempScene 
                 ? `Test Unity MCP connectivity AND create temp scene.
 
 INSTRUCTIONS:
-1. First, call: mcp_unity-mcp_manage_scene with Action="Create", Name="_TempCompileCheck", Path="Assets/Scenes/_TempCompileCheck.unity"
-2. Then, call: mcp_unity-mcp_manage_editor with Action="GetState" to verify connection
+1. First, call: mcp_unity-mcp_create_scene with name="_TempCompileCheck", save_path="Assets/Scenes/_TempCompileCheck.unity"
+2. Then, call: mcp_unity-mcp_get_unity_editor_state to verify connection
 3. Based on the result, reply with ONLY ONE of these exact formats:
    - If successful: CONNECTED
    - If failed: ERROR: <brief reason>
@@ -844,7 +845,7 @@ CRITICAL: Your entire response must be ONLY the word "CONNECTED" or "ERROR: reas
                 : `Test Unity MCP connectivity by calling the MCP tool.
 
 INSTRUCTIONS:
-1. Call the MCP tool: mcp_unity-mcp_manage_editor with Action="GetState"
+1. Call the MCP tool: mcp_unity-mcp_get_unity_editor_state
 2. Based on the result, reply with ONLY ONE of these exact formats:
    - If successful: CONNECTED
    - If failed: ERROR: <brief reason>

@@ -1296,9 +1296,10 @@ After running "apc plan add-task", the revision process takes 3-5 minutes to com
                 cancellable: false
             }, async () => {
                 // Trigger daemon to refresh dependencies (authoritative check)
+                // Use 4-minute timeout since Unity MCP connectivity test can take ~3 minutes
                 if (vsCodeClient.isConnected()) {
                     try {
-                        await vsCodeClient.send('deps.refresh');
+                        await vsCodeClient.sendWithTimeout('deps.refresh', undefined, 240000);
                         log.info('Daemon refreshed dependencies');
                     } catch (err) {
                         log.warn('Failed to refresh via daemon:', err);

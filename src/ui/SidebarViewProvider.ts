@@ -339,11 +339,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     // Immediately set UI to checking state before triggering daemon refresh
                     this.setCheckingState();
                     // Trigger daemon dependency refresh and wait for completion
+                    // Note: Only call stateProxy.refreshDependencies() here, NOT the command
+                    // The command also calls deps.refresh which would cause duplicate checks
                     if (this.stateProxy) {
                         await this.stateProxy.refreshDependencies();
                     }
-                    // Also trigger the command for any other listeners
-                    vscode.commands.executeCommand('agenticPlanning.refreshDependencies');
                     // Now refresh UI with the actual results
                     this.refresh();
                     break;

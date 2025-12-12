@@ -192,7 +192,8 @@ namespace ApcBridge
         #region Compilation
         
         /// <summary>
-        /// Trigger a script compilation refresh
+        /// Trigger a script compilation refresh.
+        /// Returns immediately after starting - daemon should wait for compileComplete event.
         /// </summary>
         public static async Task<ApcResponse> TriggerCompileAsync()
         {
@@ -205,34 +206,27 @@ namespace ApcBridge
                 };
             }
             
-            var opId = StateManager.Instance.StartOperation("compile");
-            if (opId == null)
-            {
-                return new ApcResponse { success = false, error = "Failed to start operation" };
-            }
-            
             try
             {
-                // Request script compilation
+                // Request script compilation - this triggers Unity to recompile
                 AssetDatabase.Refresh(ImportAssetOptions.ForceUpdate);
                 
-                // Wait for compilation to start
-                await Task.Delay(500);
+                // Brief delay to let compilation start
+                await Task.Delay(100);
                 
-                // Wait for compilation to complete
-                await WaitForConditionAsync(() => !EditorApplication.isCompiling, 120000); // 2 minute timeout
-                
-                StateManager.Instance.CompleteOperation(opId, true);
-                
+                // Return immediately - don't wait for compilation to complete
+                // The daemon will wait for the compileComplete event from StateManager
                 return new ApcResponse
                 {
                     success = true,
-                    data = new { operationId = opId }
+                    data = new { 
+                        compiling = EditorApplication.isCompiling,
+                        message = "Compilation triggered"
+                    }
                 };
             }
             catch (Exception ex)
             {
-                StateManager.Instance.CompleteOperation(opId, false);
                 return new ApcResponse
                 {
                     success = false,
@@ -311,62 +305,222 @@ namespace ApcBridge
         [DllImport("user32.dll")]
         private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
         
+        [DllImport("user32.dll")]
+        private static extern bool BringWindowToTop(IntPtr hWnd);
+        
+        [DllImport("user32.dll")]
+        private static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
+        
+        [DllImport("user32.dll")]
+        private static extern bool IsIconic(IntPtr hWnd);
+        
+        [DllImport("user32.dll")]
+        private static extern bool FlashWindow(IntPtr hWnd, bool bInvert);
+        
+        [DllImport("user32.dll")]
+        private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+        
+        [DllImport("user32.dll")]
+        private static extern bool AllowSetForegroundWindow(int dwProcessId);
+        
+        [DllImport("user32.dll")]
+        private static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref uint pvParam, uint fWinIni);
+        
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+        
+        [DllImport("user32.dll")]
+        private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+        
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+        
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+        
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        
         private const int SW_RESTORE = 9;
         private const int SW_SHOW = 5;
+        private const int SW_SHOWNOACTIVATE = 4;
+        
+        private const byte VK_MENU = 0x12; // Alt key
+        private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
+        private const uint KEYEVENTF_KEYUP = 0x0002;
+        
+        private const uint SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000;
+        private const uint SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001;
+        private const uint SPIF_SENDCHANGE = 0x0002;
+        
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        private static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_SHOWWINDOW = 0x0040;
+        
+        private const int ASFW_ANY = -1;
 #endif
         
         /// <summary>
-        /// Focus the Unity Editor window and bring to foreground
+        /// Focus the Unity Editor window and bring to foreground.
+        /// Uses multiple aggressive techniques to overcome Windows SetForegroundWindow restrictions.
         /// </summary>
         public static void FocusEditor()
         {
-            EditorApplication.delayCall += () =>
+            // Don't use delayCall - we need this to run immediately
+            try
             {
+#if UNITY_EDITOR_WIN
+                FocusEditorWindows();
+#else
+                // On other platforms, just focus any window
+                EditorWindow.FocusWindowIfItsOpen<SceneView>();
+#endif
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[APC] FocusEditor error: {ex.Message}");
+            }
+        }
+        
+#if UNITY_EDITOR_WIN
+        /// <summary>
+        /// Windows-specific focus implementation with multiple fallback techniques.
+        /// </summary>
+        private static void FocusEditorWindows()
+        {
+            var process = System.Diagnostics.Process.GetCurrentProcess();
+            var hWnd = process.MainWindowHandle;
+            
+            if (hWnd == IntPtr.Zero)
+            {
+                // Try to find Unity window by enumerating windows for this process
+                hWnd = FindUnityMainWindow(process.Id);
+            }
+            
+            if (hWnd == IntPtr.Zero)
+            {
+                Debug.LogWarning("[APC] FocusEditor: Could not find Unity window handle");
+                FocusEditorWindowInternal();
+                return;
+            }
+            
+            Debug.Log($"[APC] FocusEditor: Attempting to focus window handle {hWnd}");
+            
+            // TECHNIQUE 1: Disable foreground lock timeout temporarily
+            uint oldTimeout = 0;
+            SystemParametersInfo(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ref oldTimeout, 0);
+            uint zero = 0;
+            SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, ref zero, SPIF_SENDCHANGE);
+            
+            try
+            {
+                // TECHNIQUE 2: Allow any process to set foreground window
+                AllowSetForegroundWindow(ASFW_ANY);
+                
+                // TECHNIQUE 3: Simulate Alt key press
+                keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY, UIntPtr.Zero);
+                keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, UIntPtr.Zero);
+                
+                // Get foreground window info for thread attachment
+                var foregroundWindow = GetForegroundWindow();
+                uint foregroundThread = GetWindowThreadProcessId(foregroundWindow, out _);
+                uint currentThread = GetCurrentThreadId();
+                
+                bool attached = false;
+                if (foregroundThread != currentThread && foregroundThread != 0)
+                {
+                    attached = AttachThreadInput(currentThread, foregroundThread, true);
+                }
+                
                 try
                 {
-#if UNITY_EDITOR_WIN
-                    // Get the Unity main window handle
-                    var process = System.Diagnostics.Process.GetCurrentProcess();
-                    var hWnd = process.MainWindowHandle;
-                    
-                    if (hWnd != IntPtr.Zero)
+                    // Restore if minimized
+                    if (IsIconic(hWnd))
                     {
-                        // Get foreground window thread
-                        var foregroundWindow = GetForegroundWindow();
-                        var foregroundThread = GetWindowThreadProcessId(foregroundWindow, IntPtr.Zero);
-                        var currentThread = GetCurrentThreadId();
-                        
-                        // Attach thread input to allow SetForegroundWindow
-                        if (foregroundThread != currentThread)
-                        {
-                            AttachThreadInput(currentThread, foregroundThread, true);
-                        }
-                        
-                        // Show and bring to foreground
                         ShowWindow(hWnd, SW_RESTORE);
-                        SetForegroundWindow(hWnd);
-                        
-                        // Detach thread input
-                        if (foregroundThread != currentThread)
-                        {
-                            AttachThreadInput(currentThread, foregroundThread, false);
-                        }
+                    }
+                    else
+                    {
+                        ShowWindow(hWnd, SW_SHOW);
                     }
                     
-                    // Also focus an editor window
-                    var editorWindow = EditorWindow.focusedWindow ?? EditorWindow.GetWindow<SceneView>();
-                    editorWindow?.Focus();
-#else
-                    // On other platforms, just focus any window
-                    EditorWindow.FocusWindowIfItsOpen<SceneView>();
-#endif
+                    // TECHNIQUE 4: Temporarily make topmost then remove topmost
+                    SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                    SetWindowPos(hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+                    
+                    // TECHNIQUE 5: Standard focus methods
+                    BringWindowToTop(hWnd);
+                    SetForegroundWindow(hWnd);
+                    SwitchToThisWindow(hWnd, true);
+                    
+                    // Check result
+                    if (GetForegroundWindow() != hWnd)
+                    {
+                        // Flash as last resort to get user attention
+                        FlashWindow(hWnd, true);
+                        Debug.Log("[APC] FocusEditor: Window flash triggered (focus may have failed)");
+                    }
+                    else
+                    {
+                        Debug.Log("[APC] FocusEditor: Successfully brought Unity to foreground");
+                    }
                 }
-                catch
+                finally
                 {
-                    // Ignore focus errors
+                    if (attached)
+                    {
+                        AttachThreadInput(currentThread, foregroundThread, false);
+                    }
                 }
-            };
+            }
+            finally
+            {
+                // Restore foreground lock timeout
+                SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, ref oldTimeout, SPIF_SENDCHANGE);
+            }
+            
+            // Also focus Unity's internal editor window
+            FocusEditorWindowInternal();
         }
+        
+        /// <summary>
+        /// Find Unity's main window by process ID
+        /// </summary>
+        private static IntPtr FindUnityMainWindow(int processId)
+        {
+            IntPtr foundWindow = IntPtr.Zero;
+            
+            EnumWindows((hWnd, lParam) =>
+            {
+                GetWindowThreadProcessId(hWnd, out uint windowProcessId);
+                if (windowProcessId == processId)
+                {
+                    foundWindow = hWnd;
+                    return false; // Stop enumeration
+                }
+                return true; // Continue
+            }, IntPtr.Zero);
+            
+            return foundWindow;
+        }
+        
+        /// <summary>
+        /// Focus Unity's internal editor window
+        /// </summary>
+        private static void FocusEditorWindowInternal()
+        {
+            try
+            {
+                var editorWindow = EditorWindow.focusedWindow ?? EditorWindow.GetWindow<SceneView>();
+                editorWindow?.Focus();
+            }
+            catch
+            {
+                // Ignore focus errors
+            }
+        }
+#endif
         
         #endregion
         

@@ -84,6 +84,15 @@ export interface IApcClient {
     send<T = unknown>(cmd: string, params?: Record<string, unknown>): Promise<T>;
     
     /**
+     * Send a command with a custom timeout
+     * @param cmd Command string (e.g., 'pool.status', 'session.create')
+     * @param params Command parameters
+     * @param timeoutMs Custom timeout in milliseconds
+     * @returns Promise with response data
+     */
+    sendWithTimeout<T = unknown>(cmd: string, params: Record<string, unknown> | undefined, timeoutMs: number): Promise<T>;
+    
+    /**
      * Send a request without waiting for response (fire-and-forget)
      */
     sendAsync(cmd: string, params?: Record<string, unknown>): void;
@@ -234,6 +243,10 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
     // ========================================================================
     
     async send<T = unknown>(cmd: string, params?: Record<string, unknown>): Promise<T> {
+        return this.sendWithTimeout<T>(cmd, params, this.options.requestTimeout);
+    }
+    
+    async sendWithTimeout<T = unknown>(cmd: string, params: Record<string, unknown> | undefined, timeoutMs: number): Promise<T> {
         if (!this.isConnected()) {
             throw new Error('Not connected to APC daemon');
         }
@@ -250,7 +263,7 @@ export abstract class BaseApcClient extends EventEmitter implements IApcClient {
             const timeout = setTimeout(() => {
                 this.pendingRequests.delete(request.id);
                 reject(new Error(`Request timeout for ${cmd}`));
-            }, this.options.requestTimeout);
+            }, timeoutMs);
             
             // Store pending request
             this.pendingRequests.set(request.id, { resolve, reject, timeout });

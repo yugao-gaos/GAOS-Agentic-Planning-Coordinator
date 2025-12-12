@@ -79,6 +79,7 @@ namespace ApcBridge
             _connection.OnStatusChanged += OnConnectionStatusChanged;
             _connection.OnEventReceived += OnEventReceived;
             _connection.OnResponseReceived += OnResponseReceived;
+            _connection.OnRequestReceived += OnRequestReceived;
             _connection.OnError += OnConnectionError;
             
             // Load settings
@@ -138,6 +139,14 @@ namespace ApcBridge
         public void SendEvent(string eventName, object data)
         {
             _connection?.SendEvent(eventName, data);
+        }
+        
+        /// <summary>
+        /// Send a response back to the daemon
+        /// </summary>
+        public void SendResponse(ApcResponse response)
+        {
+            _connection?.SendResponse(response);
         }
         
         /// <summary>
@@ -232,6 +241,34 @@ namespace ApcBridge
         private void OnConnectionError(string error)
         {
             Debug.LogWarning($"[APC] Connection error: {error}");
+        }
+        
+        private async void OnRequestReceived(ApcRequest request)
+        {
+            try
+            {
+                Debug.Log($"[APC] Request received: {request.cmd}");
+                
+                // Use params directly - may be null or empty
+                var parameters = request.@params ?? new Dictionary<string, object>();
+                
+                // Handle the command
+                var response = await HandleCommandAsync(request.cmd, parameters);
+                response.id = request.id;
+                
+                // Send response back
+                SendResponse(response);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"[APC] Error handling request: {ex}");
+                SendResponse(new ApcResponse
+                {
+                    id = request.id,
+                    success = false,
+                    error = ex.Message
+                });
+            }
         }
         
         #endregion

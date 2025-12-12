@@ -675,6 +675,9 @@ export class ApcDaemon {
             await this.handleRequest(client, message.payload);
         } else if (message.type === 'event' && client.type === 'unity') {
             this.handleUnityEvent(client, message.payload);
+        } else if (message.type === 'response' && client.type === 'unity') {
+            // Unity responses are handled by sendRequestToUnity's response handler
+            // This is expected - don't log a warning
         } else {
             this.log('warn', `Unknown message type from ${client.id}: ${message.type}`);
         }
@@ -779,6 +782,45 @@ export class ApcDaemon {
                 return;
             }
             // Services ready - fall through to ApiHandler
+        }
+        
+        // Handle unity.register specially - daemon needs to manage Unity client registration
+        // This must be handled here because ApiHandler doesn't have access to client info
+        if (request.cmd === 'unity.register') {
+            const projectPath = request.params?.projectPath as string;
+            const unityVersion = request.params?.unityVersion as string;
+            
+            if (!projectPath) {
+                this.sendResponse(client, {
+                    id: request.id,
+                    success: false,
+                    error: 'Missing projectPath parameter'
+                });
+                return;
+            }
+            
+            const result = this.registerUnityClient(client.id, projectPath);
+            
+            if (result.success) {
+                this.sendResponse(client, {
+                    id: request.id,
+                    success: true,
+                    data: {
+                        registered: true,
+                        clientId: client.id,
+                        projectPath,
+                        unityVersion
+                    },
+                    message: 'Unity client registered'
+                });
+            } else {
+                this.sendResponse(client, {
+                    id: request.id,
+                    success: false,
+                    error: result.error
+                });
+            }
+            return;
         }
         
         // Route to API handler

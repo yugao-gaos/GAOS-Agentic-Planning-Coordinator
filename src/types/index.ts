@@ -141,12 +141,13 @@ FILES_MODIFIED:
         allowedMcpTools: null, // All tools allowed
         documents: ['_AiDevLog/Docs/', '_AiDevLog/Errors/error_registry.md'],
         // Unity-specific additions (applied when Unity features enabled)
+        // CoplayDev/unity-mcp tool names: get_unity_editor_state, get_unity_logs, execute_menu_item, etc.
         unityPromptAddendum: `
 ## Unity Integration
-- Use MCP tools for asset info: mcp_unityMCP_manage_asset (search/get_info)
+- Use MCP tools for Unity info: mcp_unity-mcp_get_unity_editor_state, mcp_unity-mcp_get_unity_logs
 - Do NOT check compilation errors with read_console - the Unity pipeline handles that after your work
 - The coordinator will redeploy you if compilation or tests fail`,
-        unityMcpTools: ['mcp_unityMCP_manage_asset', 'mcp_unityMCP_manage_scene', 'mcp_unityMCP_manage_gameobject']
+        unityMcpTools: ['mcp_unity-mcp_get_unity_editor_state', 'mcp_unity-mcp_get_unity_logs', 'mcp_unity-mcp_execute_menu_item']
     },
 
     // ========================================================================
@@ -255,7 +256,7 @@ Also scan:
 - Asset pipeline configuration
 - Assembly definitions
 - PlayMode vs EditMode test organization`,
-        unityMcpTools: ['mcp_unityMCP_manage_scene', 'mcp_unityMCP_manage_asset']
+        unityMcpTools: ['mcp_unity-mcp_get_unity_editor_state', 'mcp_unity-mcp_get_unity_logs']
     },
 
     planner: {

@@ -1,6 +1,6 @@
 {
     "name": "com.gaos.apc.bridge",
-    "version": "0.2.0",
+    "version": "0.5.2",
     "displayName": "APC Unity Bridge",
     "description": "Direct WebSocket connection between Unity Editor and APC Daemon for real-time Unity control operations.",
     "unity": "2021.3",

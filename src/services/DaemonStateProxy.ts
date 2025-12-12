@@ -1085,7 +1085,8 @@ export class DaemonStateProxy {
                 }>;
                 missingCount?: number;
                 hasCriticalMissing?: boolean;
-            } = await this.vsCodeClient.send('deps.refresh');
+            // Use 4-minute timeout for deps.refresh since Unity MCP connectivity test can take ~3 minutes
+            } = await this.vsCodeClient.sendWithTimeout('deps.refresh', undefined, 240000);
             
             return {
                 missingDependencies: response.missingDependencies || [],

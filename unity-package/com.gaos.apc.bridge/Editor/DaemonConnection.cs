@@ -31,7 +31,7 @@ namespace ApcBridge
         #region Constants
         
         private const int DEFAULT_PORT = 19840;
-        private const int RECONNECT_INTERVAL_MS = 10000; // 10 seconds
+        private const int RECONNECT_INTERVAL_MS = 5000; // 5 seconds
         private const int RECEIVE_BUFFER_SIZE = 8192;
         private const int SEND_TIMEOUT_MS = 5000;
         private const int CONNECT_TIMEOUT_MS = 5000;
@@ -44,6 +44,7 @@ namespace ApcBridge
         public event Action<string> OnMessageReceived;
         public event Action<ApcResponse> OnResponseReceived;
         public event Action<ApcEvent> OnEventReceived;
+        public event Action<ApcRequest> OnRequestReceived;
         public event Action<string> OnError;
         
         #endregion
@@ -65,6 +66,13 @@ namespace ApcBridge
         
         // Message queue for thread-safe sending
         private readonly ConcurrentQueue<string> _sendQueue = new ConcurrentQueue<string>();
+        
+        // Incoming message queue for main thread processing
+        private readonly ConcurrentQueue<string> _receiveQueue = new ConcurrentQueue<string>();
+        
+        // Timer to force Unity to process messages even when not focused
+        private System.Threading.Timer _processTimer;
+        private bool _isProcessing = false;
         
         #endregion
         
@@ -100,6 +108,18 @@ namespace ApcBridge
         {
             _port = DEFAULT_PORT;
             UpdateDaemonUrl();
+            
+            // Start timer to process messages even when Unity is not focused
+            // This runs every 100ms to ensure responsive message handling
+            _processTimer = new System.Threading.Timer(
+                ProcessQueuedMessages, 
+                null, 
+                100, 
+                100
+            );
+            
+            // Also subscribe to EditorApplication.update for when Unity IS focused
+            EditorApplication.update += ProcessQueuedMessagesOnMainThread;
         }
         
         #endregion
@@ -195,6 +215,7 @@ namespace ApcBridge
             catch (OperationCanceledException)
             {
                 Status = ConnectionStatus.Disconnected;
+                ScheduleReconnectIfEnabled();
                 return false;
             }
             catch (Exception ex)
@@ -202,7 +223,23 @@ namespace ApcBridge
                 Debug.LogWarning($"[APC] Connection failed: {ex.Message}");
                 Status = ConnectionStatus.Error;
                 OnError?.Invoke(ex.Message);
+                ScheduleReconnectIfEnabled();
                 return false;
+            }
+        }
+        
+        /// <summary>
+        /// Schedule a reconnection attempt if auto-reconnect is enabled
+        /// </summary>
+        private async void ScheduleReconnectIfEnabled()
+        {
+            if (_autoReconnect && !_isDisposed)
+            {
+                await Task.Delay(RECONNECT_INTERVAL_MS);
+                if (_autoReconnect && !_isDisposed)
+                {
+                    _ = ConnectAsync();
+                }
             }
         }
         
@@ -267,6 +304,17 @@ namespace ApcBridge
             if (!IsConnected) return;
             
             string message = JsonHelper.CreateEventMessage(eventName, data);
+            _sendQueue.Enqueue(message);
+        }
+        
+        /// <summary>
+        /// Send a response back to the daemon
+        /// </summary>
+        public void SendResponse(ApcResponse response)
+        {
+            if (!IsConnected) return;
+            
+            string message = JsonHelper.CreateResponseMessage(response);
             _sendQueue.Enqueue(message);
         }
         
@@ -387,49 +435,107 @@ namespace ApcBridge
         
         private void ProcessMessage(string message)
         {
+            // Queue message for main thread processing
+            // Don't use delayCall - it doesn't run when Unity is not focused
+            _receiveQueue.Enqueue(message);
+            
+            // Force Unity to process the queue
+            // QueuePlayerLoopUpdate triggers the editor update loop
             try
             {
-                // Invoke on main thread
-                EditorApplication.delayCall += () =>
+                EditorApplication.QueuePlayerLoopUpdate();
+            }
+            catch
+            {
+                // Ignore - might fail if called from wrong thread
+            }
+        }
+        
+        /// <summary>
+        /// Timer callback to process queued messages (runs on thread pool)
+        /// </summary>
+        private void ProcessQueuedMessages(object state)
+        {
+            if (_receiveQueue.IsEmpty || _isProcessing) return;
+            
+            // Force Unity to run its update loop to process queued messages
+            try
+            {
+                EditorApplication.QueuePlayerLoopUpdate();
+            }
+            catch
+            {
+                // Ignore - might fail if Unity is not ready
+            }
+        }
+        
+        /// <summary>
+        /// Process queued messages on main thread (called from EditorApplication.update)
+        /// </summary>
+        private void ProcessQueuedMessagesOnMainThread()
+        {
+            if (_isProcessing) return;
+            _isProcessing = true;
+            
+            try
+            {
+                // Process all queued messages
+                while (_receiveQueue.TryDequeue(out string message))
                 {
                     try
                     {
-                        OnMessageReceived?.Invoke(message);
-                        
-                        // Parse message type
-                        if (message.Contains("\"type\":\"response\""))
-                        {
-                            // Extract the response from the message
-                            var response = ParseResponse(message);
-                            if (response != null)
-                            {
-                                OnResponseReceived?.Invoke(response);
-                                
-                                // Complete pending request
-                                if (_pendingRequests.TryRemove(response.id, out var tcs))
-                                {
-                                    tcs.TrySetResult(response);
-                                }
-                            }
-                        }
-                        else if (message.Contains("\"type\":\"event\""))
-                        {
-                            var evt = ParseEvent(message);
-                            if (evt != null)
-                            {
-                                OnEventReceived?.Invoke(evt);
-                            }
-                        }
+                        ProcessMessageOnMainThread(message);
                     }
                     catch (Exception ex)
                     {
                         Debug.LogError($"[APC] Error processing message: {ex}");
                     }
-                };
+                }
             }
-            catch (Exception ex)
+            finally
             {
-                Debug.LogError($"[APC] ProcessMessage error: {ex}");
+                _isProcessing = false;
+            }
+        }
+        
+        /// <summary>
+        /// Process a single message on the main thread
+        /// </summary>
+        private void ProcessMessageOnMainThread(string message)
+        {
+            OnMessageReceived?.Invoke(message);
+            
+            // Parse message type
+            if (message.Contains("\"type\":\"response\""))
+            {
+                // Extract the response from the message
+                var response = ParseResponse(message);
+                if (response != null)
+                {
+                    OnResponseReceived?.Invoke(response);
+                    
+                    // Complete pending request
+                    if (_pendingRequests.TryRemove(response.id, out var tcs))
+                    {
+                        tcs.TrySetResult(response);
+                    }
+                }
+            }
+            else if (message.Contains("\"type\":\"event\""))
+            {
+                var evt = ParseEvent(message);
+                if (evt != null)
+                {
+                    OnEventReceived?.Invoke(evt);
+                }
+            }
+            else if (message.Contains("\"type\":\"request\""))
+            {
+                var request = ParseRequest(message);
+                if (request != null)
+                {
+                    OnRequestReceived?.Invoke(request);
+                }
             }
         }
         
@@ -508,6 +614,42 @@ namespace ApcBridge
             return null;
         }
         
+        private ApcRequest ParseRequest(string message)
+        {
+            try
+            {
+                int payloadStart = message.IndexOf("\"payload\":");
+                if (payloadStart >= 0)
+                {
+                    int objStart = message.IndexOf("{", payloadStart + 10);
+                    if (objStart >= 0)
+                    {
+                        int depth = 0;
+                        int objEnd = objStart;
+                        for (int i = objStart; i < message.Length; i++)
+                        {
+                            if (message[i] == '{') depth++;
+                            else if (message[i] == '}') depth--;
+                            
+                            if (depth == 0)
+                            {
+                                objEnd = i;
+                                break;
+                            }
+                        }
+                        
+                        string requestJson = message.Substring(objStart, objEnd - objStart + 1);
+                        return JsonUtility.FromJson<ApcRequest>(requestJson);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[APC] Failed to parse request: {ex.Message}");
+            }
+            return null;
+        }
+        
         private async Task CloseConnectionAsync()
         {
             try
@@ -568,6 +710,13 @@ namespace ApcBridge
             _cancellationSource?.Cancel();
             _webSocket?.Dispose();
             _cancellationSource?.Dispose();
+            
+            // Clean up timer
+            _processTimer?.Dispose();
+            _processTimer = null;
+            
+            // Unsubscribe from EditorApplication.update
+            EditorApplication.update -= ProcessQueuedMessagesOnMainThread;
         }
         
         #endregion

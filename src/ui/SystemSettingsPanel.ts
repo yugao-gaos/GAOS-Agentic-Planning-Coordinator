@@ -825,9 +825,10 @@ export class SystemSettingsPanel {
             await vscode.commands.executeCommand('agenticPlanning.refreshDependencies');
             
             // Also refresh via daemon (server-side comprehensive check)
+            // Use 4-minute timeout since Unity MCP connectivity test can take ~3 minutes
             if (this.vsCodeClient.isConnected()) {
                 try {
-                    await this.vsCodeClient.send('deps.refresh');
+                    await this.vsCodeClient.sendWithTimeout('deps.refresh', undefined, 240000);
                     log.info('Daemon dependency check completed');
                 } catch (err) {
                     log.warn('Failed to refresh dependencies on daemon:', err);

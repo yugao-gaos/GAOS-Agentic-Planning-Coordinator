@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 
@@ -233,20 +234,24 @@ namespace ApcBridge
             if (obj is int || obj is long || obj is float || obj is double)
                 return obj.ToString();
             
-            if (obj is IDictionary<string, object> dict)
+            // Use non-generic IDictionary for better compatibility with Unity's Mono runtime
+            // The generic IDictionary<string, object> pattern matching may fail when object is boxed
+            if (obj is IDictionary dict)
             {
                 var parts = new List<string>();
-                foreach (var kvp in dict)
+                foreach (DictionaryEntry kvp in dict)
                 {
-                    parts.Add($"\"{kvp.Key}\":{SimpleJsonSerialize(kvp.Value)}");
+                    string key = kvp.Key?.ToString() ?? "";
+                    parts.Add($"\"{EscapeString(key)}\":{SimpleJsonSerialize(kvp.Value)}");
                 }
                 return "{" + string.Join(",", parts) + "}";
             }
             
-            if (obj is IEnumerable<object> list)
+            // Handle generic lists/enumerables
+            if (obj is IEnumerable enumerable && !(obj is string))
             {
                 var parts = new List<string>();
-                foreach (var item in list)
+                foreach (var item in enumerable)
                 {
                     parts.Add(SimpleJsonSerialize(item));
                 }
@@ -303,6 +308,29 @@ namespace ApcBridge
         {
             var timestamp = DateTime.UtcNow.ToString("o");
             return $"{{\"type\":\"event\",\"payload\":{{\"event\":\"{eventName}\",\"data\":{ToJson(data)},\"timestamp\":\"{timestamp}\"}}}}";
+        }
+        
+        /// <summary>
+        /// Create a response message to send back to daemon
+        /// </summary>
+        public static string CreateResponseMessage(ApcResponse response)
+        {
+            var parts = new System.Collections.Generic.List<string>();
+            parts.Add($"\"id\":\"{EscapeString(response.id)}\"");
+            parts.Add($"\"success\":{(response.success ? "true" : "false")}");
+            
+            if (!string.IsNullOrEmpty(response.error))
+            {
+                parts.Add($"\"error\":\"{EscapeString(response.error)}\"");
+            }
+            
+            if (response.data != null)
+            {
+                parts.Add($"\"data\":{ToJson(response.data)}");
+            }
+            
+            var payload = "{" + string.Join(",", parts) + "}";
+            return $"{{\"type\":\"response\",\"payload\":{payload}}}";
         }
     }
     

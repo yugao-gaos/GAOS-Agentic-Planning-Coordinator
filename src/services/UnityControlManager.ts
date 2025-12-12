@@ -2,7 +2,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { TypedEventEmitter } from './TypedEventEmitter';
 import { spawn } from 'child_process';
-import { focusUnityEditor } from '../utils/windowFocus';
 import {
     UnityTask,
     UnityTaskType,
@@ -139,6 +138,7 @@ export class UnityControlManager {
     onUnityClientConnected(): void {
         this.log('Unity client connected via WebSocket');
         this.unityClientConnected = true;
+        this.emitStatusUpdate();  // Notify UI of connection
     }
     
     /**
@@ -159,6 +159,8 @@ export class UnityControlManager {
             this.testCompleteResolve({ passed: 0, failed: 0, skipped: 0, duration: 0 });
             this.testCompleteResolve = null;
         }
+        
+        this.emitStatusUpdate();  // Notify UI of disconnection
     }
     
     // ========================================================================
@@ -544,19 +546,27 @@ export class UnityControlManager {
             this.emitStatusUpdate();
             
             // Tell Unity Bridge to trigger compile
-            await this.executeViaDirect('unity.direct.compile');
+            const compileResult = await this.executeViaDirect('unity.direct.compile');
             
-            // Wait for compilation to complete
-            this.log('Waiting for Unity to finish compilation...');
-            const compilationSuccess = await this.waitForCompilationViaDirect(120);
+            // Check if compilation actually started
+            const isCompiling = compileResult?.data?.compiling ?? false;
+            
+            if (isCompiling) {
+                // Wait for compilation to complete
+                this.log('Waiting for Unity to finish compilation...');
+                const compilationSuccess = await this.waitForCompilationViaDirect(120);
 
-            if (!compilationSuccess) {
-                errors.push({
-                    id: `err_${Date.now()}`,
-                    type: 'compilation',
-                    message: 'Compilation timed out',
-                    timestamp: new Date().toISOString()
-                });
+                if (!compilationSuccess) {
+                    errors.push({
+                        id: `err_${Date.now()}`,
+                        type: 'compilation',
+                        message: 'Compilation timed out',
+                        timestamp: new Date().toISOString()
+                    });
+                }
+            } else {
+                // Nothing to compile - proceed immediately
+                this.log('No compilation needed (no script changes)');
             }
             
             // Focus back to Cursor
@@ -853,26 +863,25 @@ export class UnityControlManager {
     // ========================================================================
 
     /**
-     * Focus Unity Editor window
-     * Uses Unity Bridge when available (more reliable on Windows)
-     * Falls back to platform-specific methods when bridge not connected
+     * Focus Unity Editor window via Unity Bridge.
+     * Requires Unity Bridge to be connected.
      */
     private async focusUnityEditor(): Promise<void> {
-        // Prefer Unity Bridge direct command when connected - more reliable on Windows
-        if (this.isDirectConnectionAvailable() && this.sendToUnityClient) {
-            try {
-                const result = await this.executeViaDirect('unity.direct.focusEditor');
-                if (result?.success) {
-                    this.log('Focused Unity Editor via bridge');
-                    return;
-                }
-            } catch (err) {
-                this.log(`Unity Bridge focus failed, falling back to platform method: ${err}`);
-            }
+        if (!this.isDirectConnectionAvailable() || !this.sendToUnityClient) {
+            this.log('Cannot focus Unity: Unity Bridge not connected');
+            return;
         }
         
-        // Fallback to platform-specific method
-        return focusUnityEditor();
+        try {
+            const result = await this.executeViaDirect('unity.direct.focusEditor');
+            if (result?.success) {
+                this.log('Focused Unity Editor via bridge');
+            } else {
+                this.log(`Failed to focus Unity Editor: ${result?.error || 'unknown error'}`);
+            }
+        } catch (err) {
+            this.log(`Failed to focus Unity Editor: ${err}`);
+        }
     }
 
     /**
@@ -1121,15 +1130,22 @@ export class UnityControlManager {
                 return false;
             }
             
-            // Step 3: Wait for compilation to complete
-            this.log('Waiting for Unity compilation to complete...');
-            const compileSuccess = await this.waitForCompilationViaDirect(120); // 2 minute timeout
+            // Check if compilation actually started
+            const isCompiling = result?.data?.compiling ?? false;
+            
+            if (isCompiling) {
+                // Step 3: Wait for compilation to complete
+                this.log('Waiting for Unity compilation to complete...');
+                await this.waitForCompilationViaDirect(120); // 2 minute timeout
+            } else {
+                this.log('No compilation needed (no script changes)');
+            }
             
             // Step 4: Focus back to Cursor
             this.log('Compilation complete, focusing back to Cursor...');
             await this.focusCursorEditor();
             
-            return compileSuccess;
+            return true;
         } catch (err) {
             this.log(`Compile failed: ${err}`);
             // Try to focus back to Cursor even on failure
@@ -1155,9 +1171,13 @@ export class UnityControlManager {
     /**
      * Focus Cursor editor window
      * Works on macOS, Windows, and Linux
+     * Uses aggressive techniques to overcome Windows foreground restrictions
      */
     private async focusCursorEditor(): Promise<void> {
         const platform = process.platform;
+        
+        // Get workspace name to match window title
+        const workspaceName = path.basename(this.workspaceRoot);
 
         if (platform === 'darwin') {
             // macOS - use AppleScript
@@ -1167,26 +1187,75 @@ export class UnityControlManager {
                 proc.on('error', reject);
             });
         } else if (platform === 'win32') {
-            // Windows - use PowerShell to focus Cursor window
+            // Windows - use PowerShell with aggressive focus techniques
+            // Match by window title containing workspace name for accuracy
             await new Promise<void>((resolve) => {
                 const psScript = `
-                    Add-Type @"
-                    using System;
-                    using System.Runtime.InteropServices;
-                    public class Win32 {
-                        [DllImport("user32.dll")]
-                        public static extern bool SetForegroundWindow(IntPtr hWnd);
-                        [DllImport("user32.dll")]
-                        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-                    }
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32Focus {
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+    [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref uint pvParam, uint fWinIni);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+    [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(int dwProcessId);
+    public const byte VK_MENU = 0x12;
+    public const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
+    public const uint KEYEVENTF_KEYUP = 0x0002;
+    public const uint SPI_GETFOREGROUNDLOCKTIMEOUT = 0x2000;
+    public const uint SPI_SETFOREGROUNDLOCKTIMEOUT = 0x2001;
+    public const uint SPIF_SENDCHANGE = 0x0002;
+    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
+    public const uint SWP_NOMOVE = 0x0002;
+    public const uint SWP_NOSIZE = 0x0001;
+    public const uint SWP_SHOWWINDOW = 0x0040;
+    public const int SW_RESTORE = 9;
+    public const int ASFW_ANY = -1;
+    
+    public static void FocusWindow(IntPtr hWnd) {
+        uint oldTimeout = 0;
+        SystemParametersInfo(SPI_GETFOREGROUNDLOCKTIMEOUT, 0, ref oldTimeout, 0);
+        uint zero = 0;
+        SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, ref zero, SPIF_SENDCHANGE);
+        try {
+            AllowSetForegroundWindow(ASFW_ANY);
+            keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY, UIntPtr.Zero);
+            keybd_event(VK_MENU, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, UIntPtr.Zero);
+            if (IsIconic(hWnd)) { ShowWindow(hWnd, SW_RESTORE); } else { ShowWindow(hWnd, 5); }
+            SetWindowPos(hWnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            SetWindowPos(hWnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+            BringWindowToTop(hWnd);
+            SetForegroundWindow(hWnd);
+            SwitchToThisWindow(hWnd, true);
+        } finally {
+            SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, ref oldTimeout, SPIF_SENDCHANGE);
+        }
+    }
+}
 "@
-                    $cursor = Get-Process -Name "Cursor" -ErrorAction SilentlyContinue | Select-Object -First 1
-                    if ($cursor) {
-                        [Win32]::ShowWindow($cursor.MainWindowHandle, 9)
-                        [Win32]::SetForegroundWindow($cursor.MainWindowHandle)
-                    }
-                `.replace(/\n\s*/g, ' ');
-                
+# First try to find by window title containing workspace name (most accurate)
+$workspaceName = "${workspaceName}"
+$cursor = Get-Process -Name "Cursor" -ErrorAction SilentlyContinue | Where-Object { 
+    $_.MainWindowHandle -ne [IntPtr]::Zero -and $_.MainWindowTitle -like "*$workspaceName*"
+} | Select-Object -First 1
+
+# Fallback to any Cursor window with a handle
+if (-not $cursor) {
+    $cursor = Get-Process -Name "Cursor" -ErrorAction SilentlyContinue | Where-Object { 
+        $_.MainWindowHandle -ne [IntPtr]::Zero 
+    } | Select-Object -First 1
+}
+
+if ($cursor) {
+    [Win32Focus]::FocusWindow($cursor.MainWindowHandle)
+}
+`;
                 const proc = spawn('powershell', ['-Command', psScript], { 
                     windowsHide: true,
                     stdio: 'ignore'

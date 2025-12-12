@@ -162,6 +162,14 @@ export class AgentRunner implements IAgentBackend {
     private backend: IAgentBackend | null = null;
     private backendType: AgentBackendType = 'cursor';
     
+    // Rate limiting: Track last agent run time to space out runs
+    private lastAgentRunTime: number = 0;
+    private static readonly MIN_RUN_INTERVAL_MS = 20000; // 20 seconds minimum
+    private static readonly MAX_JITTER_MS = 10000; // Up to 10 seconds random jitter (so 20-30s total)
+    
+    // Mutex for serializing rate limit checks (prevents race conditions)
+    private rateLimitQueue: Promise<void> = Promise.resolve();
+    
     /**
      * Bootstrap all backend services with ServiceLocator.
      * 
@@ -273,10 +281,72 @@ export class AgentRunner implements IAgentBackend {
     // =========================================================================
     
     /**
-     * Run an agent with the given options
+     * Run an agent with the given options.
+     * Rate-limited to ensure runs are at least 20-30 seconds apart.
      */
     async run(options: AgentRunOptions): Promise<AgentRunResult> {
+        // Rate limiting: Ensure minimum interval between agent runs
+        await this.enforceRateLimit(options.id);
+        
         return this.ensureBackend().run(options);
+    }
+    
+    /**
+     * Enforce rate limiting between agent runs.
+     * Uses a queue to serialize concurrent calls and adds random jitter.
+     * 
+     * When multiple runs are triggered simultaneously:
+     * 1. They queue up and are processed one at a time
+     * 2. Each checks the updated timestamp from the previous run
+     * 3. Random jitter (0-10s) is added on top of the 20s minimum
+     * 
+     * This ensures runs are spaced 20-30 seconds apart even under concurrent load.
+     */
+    private async enforceRateLimit(runId: string): Promise<void> {
+        // Chain onto the queue to serialize rate limit checks
+        // This prevents race conditions when multiple runs are triggered simultaneously
+        const myTurn = this.rateLimitQueue.then(async () => {
+            await this.doRateLimitCheck(runId);
+        });
+        
+        // Update the queue for the next caller
+        this.rateLimitQueue = myTurn.catch(() => {}); // Prevent unhandled rejection
+        
+        // Wait for our turn
+        await myTurn;
+    }
+    
+    /**
+     * Perform the actual rate limit check (called within the queue)
+     */
+    private async doRateLimitCheck(runId: string): Promise<void> {
+        const now = Date.now();
+        const timeSinceLastRun = now - this.lastAgentRunTime;
+        
+        // Add random jitter (0-10 seconds) on top of the minimum interval
+        const jitter = Math.floor(Math.random() * AgentRunner.MAX_JITTER_MS);
+        const requiredInterval = AgentRunner.MIN_RUN_INTERVAL_MS + jitter;
+        
+        if (this.lastAgentRunTime > 0 && timeSinceLastRun < requiredInterval) {
+            const waitTime = requiredInterval - timeSinceLastRun;
+            console.log(`[AgentRunner] Rate limiting: Waiting ${(waitTime / 1000).toFixed(1)}s before starting run '${runId}' (last run was ${(timeSinceLastRun / 1000).toFixed(1)}s ago, jitter: ${(jitter / 1000).toFixed(1)}s)`);
+            await this.delay(waitTime);
+        } else if (jitter > 0 && this.lastAgentRunTime > 0) {
+            // Even if enough time has passed, add some jitter for concurrent calls
+            console.log(`[AgentRunner] Adding jitter delay: ${(jitter / 1000).toFixed(1)}s for run '${runId}'`);
+            await this.delay(jitter);
+        }
+        
+        // Update timestamp AFTER waiting (so the next queued call sees accurate timing)
+        this.lastAgentRunTime = Date.now();
+        console.log(`[AgentRunner] Run '${runId}' proceeding at ${new Date(this.lastAgentRunTime).toISOString()}`);
+    }
+    
+    /**
+     * Utility delay function
+     */
+    private delay(ms: number): Promise<void> {
+        return new Promise(resolve => setTimeout(resolve, ms));
     }
     
     /**
