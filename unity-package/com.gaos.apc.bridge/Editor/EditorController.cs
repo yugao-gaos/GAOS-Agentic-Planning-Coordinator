@@ -621,6 +621,81 @@ namespace ApcBridge
         
         #endregion
         
+        #region Play Mode
+        
+        /// <summary>
+        /// Enter play mode
+        /// </summary>
+        public static async Task<ApcResponse> EnterPlayModeAsync()
+        {
+            if (!StateManager.Instance.IsReady)
+            {
+                return new ApcResponse
+                {
+                    success = false,
+                    error = $"Unity is busy: {StateManager.Instance.CurrentOperation ?? "compiling"}"
+                };
+            }
+            
+            if (EditorApplication.isPlaying)
+            {
+                return new ApcResponse { success = true, message = "Already in play mode" };
+            }
+            
+            var opId = StateManager.Instance.StartOperation("enterPlayMode");
+            if (opId == null)
+            {
+                return new ApcResponse { success = false, error = "Failed to start operation" };
+            }
+            
+            try
+            {
+                EditorApplication.EnterPlaymode();
+                await WaitForConditionAsync(() => EditorApplication.isPlaying, 10000);
+                
+                StateManager.Instance.CompleteOperation(opId, true);
+                return new ApcResponse { success = true, data = new { operationId = opId } };
+            }
+            catch (Exception ex)
+            {
+                StateManager.Instance.CompleteOperation(opId, false);
+                return new ApcResponse { success = false, error = ex.Message };
+            }
+        }
+        
+        /// <summary>
+        /// Exit play mode
+        /// </summary>
+        public static async Task<ApcResponse> ExitPlayModeAsync()
+        {
+            if (!EditorApplication.isPlaying)
+            {
+                return new ApcResponse { success = true, message = "Already not in play mode" };
+            }
+            
+            var opId = StateManager.Instance.StartOperation("exitPlayMode");
+            if (opId == null)
+            {
+                return new ApcResponse { success = false, error = "Failed to start operation" };
+            }
+            
+            try
+            {
+                EditorApplication.ExitPlaymode();
+                await WaitForConditionAsync(() => !EditorApplication.isPlaying, 10000);
+                
+                StateManager.Instance.CompleteOperation(opId, true);
+                return new ApcResponse { success = true, data = new { operationId = opId } };
+            }
+            catch (Exception ex)
+            {
+                StateManager.Instance.CompleteOperation(opId, false);
+                return new ApcResponse { success = false, error = ex.Message };
+            }
+        }
+        
+        #endregion
+        
         #region Helpers
         
         private static async Task WaitForConditionAsync(Func<bool> condition, int timeoutMs)

@@ -246,7 +246,7 @@ export class DependencyService {
         
         // Unity dependencies (if enabled)
         if (this.unityEnabled && this.isUnityProject()) {
-            dependencies.push('MCP for Unity', 'APC Unity Bridge', 'Unity Temp Scene');
+            dependencies.push('APC Unity Bridge', 'MCP for Unity', 'Unity Temp Scene');
         }
         
         return dependencies;
@@ -1172,10 +1172,16 @@ Exit code is 0: ${result.exitCode === 0}
         addAndNotify(apcWslResult);
 
         // ====================================================================
-        // Phase 3: Unity dependencies (expensive, requires cursor-agent)
+        // Phase 3: Unity dependencies
         // ====================================================================
         if (this.unityEnabled) {
-            // Check if we can test Unity MCP (requires cursor-agent)
+            // APC Unity Bridge check (fast, only for Unity projects) - check first
+            if (this.isUnityProject()) {
+                const bridgeResult = this.checkApcUnityBridge();
+                addAndNotify(bridgeResult);
+            }
+
+            // MCP for Unity check (expensive, requires cursor-agent)
             if (cursorAgentResult.installed) {
                 // cursor-agent available - run the expensive connectivity test
                 log.info('✓ cursor-agent found - starting Unity MCP connectivity test (may take 15+ seconds)...');
@@ -1196,12 +1202,6 @@ Exit code is 0: ${result.exitCode === 0}
                     platform: 'all',
                     installUrl: 'https://github.com/CoplayDev/unity-mcp'
                 });
-            }
-
-            // APC Unity Bridge check (fast, only for Unity projects)
-            if (this.isUnityProject()) {
-                const bridgeResult = this.checkApcUnityBridge();
-                addAndNotify(bridgeResult);
             }
             
             // Unity temp scene check (fast, only for Unity projects)
@@ -1463,9 +1463,15 @@ Exit code is 0: ${result.exitCode === 0}
     }
     
     /**
-     * Check if APC Unity Bridge package is installed in the Unity project's Packages folder.
+     * Check if APC Unity Bridge package is installed in the Unity project's Packages folder
+     * AND if the Unity Bridge is connected to the daemon.
+     * 
      * This package provides direct WebSocket communication between Unity and the daemon,
      * eliminating the need for MCP-based polling for basic operations.
+     * 
+     * Returns installed=true only if:
+     * 1. Package is installed with correct version
+     * 2. Unity Bridge is connected to daemon (Unity Editor is running and connected)
      */
     private checkApcUnityBridge(): DependencyStatus {
         if (!this.workspaceRoot) {
@@ -1514,12 +1520,28 @@ Exit code is 0: ${result.exitCode === 0}
                     };
                 }
                 
+                // Package installed with correct version - now check connection status
+                const isConnected = this.isUnityBridgeConnected();
+                
+                if (!isConnected) {
+                    return {
+                        name: 'APC Unity Bridge',
+                        installed: false, // Not ready until connected
+                        version: installedVersion,
+                        required: true,
+                        description: `Package v${installedVersion} installed - waiting for Unity Editor connection`,
+                        platform: 'all',
+                        installType: 'retry' // Allow retry to re-check connection
+                    };
+                }
+                
+                // Package installed AND connected
                 return {
                     name: 'APC Unity Bridge',
                     installed: true,
                     version: installedVersion,
                     required: true, // Required for efficient Unity control
-                    description: `Direct WebSocket control (v${installedVersion})`,
+                    description: `Connected (v${installedVersion})`,
                     platform: 'all'
                 };
             } catch {
@@ -1555,6 +1577,26 @@ Exit code is 0: ${result.exitCode === 0}
             platform: 'all',
             installType: 'unity-bridge'
         };
+    }
+    
+    /**
+     * Check if Unity Bridge is connected to the daemon.
+     * Uses UnityControlManager to check connection status.
+     */
+    private isUnityBridgeConnected(): boolean {
+        try {
+            // Dynamic import to avoid circular dependency issues
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const { UnityControlManager } = require('./UnityControlManager');
+            const unityManager = ServiceLocator.resolve<InstanceType<typeof UnityControlManager>>(UnityControlManager);
+            if (unityManager && typeof unityManager.isDirectConnectionAvailable === 'function') {
+                return unityManager.isDirectConnectionAvailable();
+            }
+            return false;
+        } catch {
+            // UnityControlManager not available yet
+            return false;
+        }
     }
     
     /**

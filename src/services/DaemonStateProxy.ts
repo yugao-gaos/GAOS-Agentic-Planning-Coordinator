@@ -186,44 +186,7 @@ export class DaemonStateProxy {
             };
         });
         
-        // Listen for player test popup request
-        this.vsCodeClient.on('unity.playerTestRequest', (data: any) => {
-            this.handlePlayerTestRequest(data.pipelineId, data.stepIndex);
-        });
-    }
-    
-    // Player test popup handling
-    private playerTestPopup: any = null;
-    private currentPlayerTestPipelineId: string | null = null;
-    
-    /**
-     * Handle player test popup request from daemon
-     */
-    private async handlePlayerTestRequest(pipelineId: string, stepIndex: number): Promise<void> {
-        log.info(`[DaemonStateProxy] Player test requested for pipeline ${pipelineId}`);
-        
-        // Dynamically import to avoid circular dependency
-        const { PlayerTestPopup } = await import('../ui/PlayerTestPopup');
-        
-        this.currentPlayerTestPipelineId = pipelineId;
-        
-        const popup = PlayerTestPopup.getInstance();
-        popup.show(this.extensionUri, {
-            onStartTest: () => {
-                log.info('[DaemonStateProxy] User started player test');
-                this.vsCodeClient.sendPlayerTestStart(pipelineId);
-            },
-            onFinishTest: () => {
-                log.info('[DaemonStateProxy] User finished player test');
-                this.vsCodeClient.sendPlayerTestFinish(pipelineId);
-                this.currentPlayerTestPipelineId = null;
-            },
-            onCancel: () => {
-                log.info('[DaemonStateProxy] User cancelled player test');
-                this.vsCodeClient.sendPlayerTestCancel(pipelineId);
-                this.currentPlayerTestPipelineId = null;
-            }
-        });
+        // Note: Player test popup is now handled in Unity - no VS Code popup needed
     }
     
     /**

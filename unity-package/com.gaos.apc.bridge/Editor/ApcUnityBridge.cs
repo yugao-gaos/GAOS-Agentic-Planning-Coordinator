@@ -210,13 +210,18 @@ namespace ApcBridge
         
         #region Event Handlers
         
-        private void OnConnectionStatusChanged(ConnectionStatus status)
+        private async void OnConnectionStatusChanged(ConnectionStatus status)
         {
             Debug.Log($"[APC] Connection status: {status}");
             
             if (status == ConnectionStatus.Disconnected)
             {
                 _isRegistered = false;
+            }
+            else if (status == ConnectionStatus.Connected && !_isRegistered)
+            {
+                // Auto-register on reconnect
+                await RegisterWithDaemonAsync();
             }
             
             // Repaint toolbar
@@ -310,6 +315,12 @@ namespace ApcBridge
                     
                     case UnityDirectCommands.GetConsole:
                         return HandleGetConsole(parameters);
+                    
+                    case UnityDirectCommands.PlayerTest:
+                        return await HandlePlayerTestAsync(parameters);
+                    
+                    case UnityDirectCommands.RunPipeline:
+                        return await HandleRunPipelineAsync(parameters);
                     
                     default:
                         return new ApcResponse
@@ -464,6 +475,162 @@ namespace ApcBridge
             }
             
             return EditorController.GetConsoleEntries(count);
+        }
+        
+        private async Task<ApcResponse> HandlePlayerTestAsync(Dictionary<string, object> parameters)
+        {
+            string pipelineId = parameters?.TryGetValue("pipelineId", out object pidObj) == true 
+                ? pidObj as string : "unknown";
+            string scenePath = parameters?.TryGetValue("scenePath", out object sceneObj) == true 
+                ? sceneObj as string : "Assets/Scenes/Main.unity";
+            
+            if (!StateManager.Instance.IsReady)
+            {
+                return new ApcResponse
+                {
+                    success = false,
+                    error = $"Unity is busy: {StateManager.Instance.CurrentOperation ?? "compiling"}"
+                };
+            }
+            
+            try
+            {
+                // Show popup and wait for user to click "Start Testing"
+                var startAction = await UI.PlayerTestPopup.ShowAndWaitAsync(pipelineId, scenePath);
+                
+                if (startAction == "cancel")
+                {
+                    return new ApcResponse
+                    {
+                        success = false,
+                        error = "Player test cancelled by user",
+                        data = new { action = "cancel", phase = "start" }
+                    };
+                }
+                
+                // Load scene and enter play mode
+                var loadResult = await EditorController.LoadSceneAsync(scenePath);
+                if (!loadResult.success)
+                {
+                    return new ApcResponse
+                    {
+                        success = false,
+                        error = $"Failed to load scene: {loadResult.error}"
+                    };
+                }
+                
+                var playResult = await EditorController.EnterPlayModeAsync();
+                if (!playResult.success)
+                {
+                    return new ApcResponse
+                    {
+                        success = false,
+                        error = $"Failed to enter play mode: {playResult.error}"
+                    };
+                }
+                
+                // Transition popup to "playing" phase
+                UI.PlayerTestPopup.TransitionToPlaying();
+                
+                // Wait for user to finish testing
+                var finishAction = await UI.PlayerTestPopup.ShowAndWaitAsync(pipelineId, scenePath);
+                
+                // Exit play mode
+                await EditorController.ExitPlayModeAsync();
+                
+                return new ApcResponse
+                {
+                    success = finishAction == "finish",
+                    data = new { 
+                        action = finishAction,
+                        phase = "finish"
+                    }
+                };
+            }
+            catch (Exception ex)
+            {
+                // Try to exit play mode on error
+                if (EditorApplication.isPlaying)
+                {
+                    await EditorController.ExitPlayModeAsync();
+                }
+                
+                return new ApcResponse
+                {
+                    success = false,
+                    error = ex.Message
+                };
+            }
+        }
+        
+        private async Task<ApcResponse> HandleRunPipelineAsync(Dictionary<string, object> parameters)
+        {
+            string pipelineId = parameters?.TryGetValue("pipelineId", out object pidObj) == true 
+                ? pidObj as string : $"pip_{DateTime.Now:yyyyMMddHHmmss}";
+            
+            string[] operations = null;
+            if (parameters?.TryGetValue("operations", out object opsObj) == true)
+            {
+                if (opsObj is string[] opsArray)
+                {
+                    operations = opsArray;
+                }
+                else if (opsObj is List<object> opsList)
+                {
+                    operations = opsList.ConvertAll(o => o?.ToString()).ToArray();
+                }
+                else if (opsObj is object[] opsObjArray)
+                {
+                    operations = Array.ConvertAll(opsObjArray, o => o?.ToString());
+                }
+            }
+            
+            if (operations == null || operations.Length == 0)
+            {
+                return new ApcResponse
+                {
+                    success = false,
+                    error = "No operations specified"
+                };
+            }
+            
+            string testScene = parameters?.TryGetValue("testScene", out object sceneObj) == true 
+                ? sceneObj as string : null;
+            
+            if (!StateManager.Instance.IsReady)
+            {
+                return new ApcResponse
+                {
+                    success = false,
+                    error = $"Unity is busy: {StateManager.Instance.CurrentOperation ?? "compiling"}"
+                };
+            }
+            
+            try
+            {
+                var executor = new Pipeline.PipelineExecutor(pipelineId, operations, testScene);
+                var result = await executor.ExecuteAsync();
+                
+                return new ApcResponse
+                {
+                    success = result.Success,
+                    data = new
+                    {
+                        success = result.Success,
+                        failedAtStep = result.FailedAtStep,
+                        logFolder = result.LogFolder,
+                        stepResults = result.StepResults
+                    }
+                };
+            }
+            catch (Exception ex)
+            {
+                return new ApcResponse
+                {
+                    success = false,
+                    error = ex.Message
+                };
+            }
         }
         
         #endregion

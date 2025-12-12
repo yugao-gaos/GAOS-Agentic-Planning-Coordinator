@@ -266,31 +266,35 @@ export class TaskAgent {
     }
     
     /**
-     * Handle Unity errors by creating error_fix tasks
+     * Handle Unity errors and test failures by creating error_fix tasks
      * 
-     * @param errors - Array of Unity errors
+     * @param errors - Array of Unity compilation errors
+     * @param context - Additional context (test failures, log folder path)
      * @returns IDs of created error_fix tasks
      */
-    async handleUnityErrors(errors: Array<{
-        id: string;
-        message: string;
-        file?: string;
-        line?: number;
-    }>): Promise<string[]> {
-        this.log(`Handling ${errors.length} Unity errors`);
+    async handleUnityErrors(
+        errors: Array<{
+            id: string;
+            message: string;
+            file?: string;
+            line?: number;
+        }>,
+        context?: {
+            testFailures?: Array<{
+                testName: string;
+                message: string;
+                stackTrace?: string;
+            }>;
+            logFolder?: string;
+        }
+    ): Promise<string[]> {
+        const testFailures = context?.testFailures || [];
+        const logFolder = context?.logFolder;
+        
+        this.log(`Handling ${errors.length} Unity errors, ${testFailures.length} test failures (logFolder: ${logFolder || 'none'})`);
         
         const taskManager = ServiceLocator.resolve(TaskManager);
         const createdTaskIds: string[] = [];
-        
-        // Group errors by file for efficient task creation
-        const errorsByFile = new Map<string, typeof errors>();
-        for (const error of errors) {
-            const file = error.file || 'unknown';
-            if (!errorsByFile.has(file)) {
-                errorsByFile.set(file, []);
-            }
-            errorsByFile.get(file)!.push(error);
-        }
         
         // Find affected session (prioritize by file paths)
         const stateManager = ServiceLocator.resolve(StateManager);
@@ -305,24 +309,37 @@ export class TaskAgent {
         // Use first approved session (could be smarter about routing)
         const targetSession = approvedSessions[0];
         
-        // Create error_fix task for each file with errors
+        // Get existing error tasks for numbering
+        const existingTasks = taskManager.getTasksForSession(targetSession.id);
+        let errorTaskNum = existingTasks.filter(t => t.id.includes('_ERR')).length;
+        
+        // Group compilation errors by file
+        const errorsByFile = new Map<string, typeof errors>();
+        for (const error of errors) {
+            const file = error.file || 'unknown';
+            if (!errorsByFile.has(file)) {
+                errorsByFile.set(file, []);
+            }
+            errorsByFile.get(file)!.push(error);
+        }
+        
+        // Create error_fix task for each file with compilation errors
         for (const [file, fileErrors] of errorsByFile) {
             const errorText = fileErrors.map(e => 
                 `${e.file || 'unknown'}(${e.line || 0}): ${e.message}`
             ).join('\n');
             
-            // Generate task ID
-            const existingTasks = taskManager.getTasksForSession(targetSession.id);
-            const errorTaskNum = existingTasks.filter(t => t.id.includes('_ERR')).length + 1;
+            errorTaskNum++;
             const taskId = `${targetSession.id.toUpperCase()}_ERR${errorTaskNum}`;
             
             const result = taskManager.createTaskFromCli({
                 sessionId: targetSession.id,
                 taskId,
-                description: `Fix errors in ${path.basename(file)}`,
+                description: `Fix compilation errors in ${path.basename(file)}`,
                 taskType: 'error_fix',
                 errorText,
-                priority: 1  // High priority
+                logFolder,
+                priority: 1  // High priority - compilation errors block everything
             });
             
             if (result.success) {
@@ -330,6 +347,56 @@ export class TaskAgent {
                 this.log(`Created error task ${taskId} for ${file}`);
             } else {
                 this.log(`Failed to create error task: ${result.error}`);
+            }
+        }
+        
+        // Group test failures by test class/suite (extract from test name)
+        // Test names are typically: "Namespace.TestClass.TestMethod"
+        const testsByClass = new Map<string, typeof testFailures>();
+        for (const failure of testFailures) {
+            // Extract class name from test name (e.g., "MyTests.PlayerTests.TestMovement" -> "MyTests.PlayerTests")
+            const parts = failure.testName.split('.');
+            const className = parts.length > 1 ? parts.slice(0, -1).join('.') : failure.testName;
+            
+            if (!testsByClass.has(className)) {
+                testsByClass.set(className, []);
+            }
+            testsByClass.get(className)!.push(failure);
+        }
+        
+        // Create error_fix task for each test class with failures
+        for (const [className, classFailures] of testsByClass) {
+            const errorText = classFailures.map(f => {
+                let text = `TEST FAILED: ${f.testName}\n  ${f.message}`;
+                if (f.stackTrace) {
+                    // Include first few lines of stack trace for context
+                    const stackLines = f.stackTrace.split('\n').slice(0, 5);
+                    text += `\n  Stack:\n    ${stackLines.join('\n    ')}`;
+                }
+                return text;
+            }).join('\n\n');
+            
+            errorTaskNum++;
+            const taskId = `${targetSession.id.toUpperCase()}_ERR${errorTaskNum}`;
+            
+            // Extract short class name for description
+            const shortClassName = className.split('.').pop() || className;
+            
+            const result = taskManager.createTaskFromCli({
+                sessionId: targetSession.id,
+                taskId,
+                description: `Fix ${classFailures.length} failing test(s) in ${shortClassName}`,
+                taskType: 'error_fix',
+                errorText,
+                logFolder,
+                priority: 2  // Slightly lower than compilation errors
+            });
+            
+            if (result.success) {
+                createdTaskIds.push(taskId);
+                this.log(`Created test fix task ${taskId} for ${className} (${classFailures.length} failures)`);
+            } else {
+                this.log(`Failed to create test fix task: ${result.error}`);
             }
         }
         

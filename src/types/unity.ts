@@ -270,6 +270,8 @@ export interface PipelineStepResult {
         failed: number;
         failures?: TestResult[];
     };
+    // Log file path (relative to pipeline log folder)
+    logPath?: string;
 }
 
 /**
@@ -312,5 +314,8 @@ export interface PipelineResult {
     // Aggregated errors for easy access
     allErrors: UnityError[];
     allTestFailures: TestResult[];
+    
+    // Log folder path (relative to project root)
+    logFolder?: string;
 }
 

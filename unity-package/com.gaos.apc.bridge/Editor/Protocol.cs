@@ -18,10 +18,12 @@ namespace ApcBridge
     [Serializable]
     public class ApcRequest
     {
-        public string id;
-        public string cmd;
-        public Dictionary<string, object> @params;
-        public string clientId;
+        public string id = "";
+        public string cmd = "";
+        public Dictionary<string, object> @params = new Dictionary<string, object>();
+        public string clientId = "";
+        
+        public ApcRequest() { }
         
         public ApcRequest(string command, Dictionary<string, object> parameters = null)
         {
@@ -37,11 +39,11 @@ namespace ApcBridge
     [Serializable]
     public class ApcResponse
     {
-        public string id;
+        public string id = "";
         public bool success;
-        public object data;
-        public string error;
-        public string message;
+        public object data = null;
+        public string error = null;
+        public string message = null;
     }
     
     /// <summary>
@@ -50,10 +52,10 @@ namespace ApcBridge
     [Serializable]
     public class ApcEvent
     {
-        public string @event;
-        public object data;
-        public string timestamp;
-        public string sessionId;
+        public string @event = "";
+        public object data = null;
+        public string timestamp = "";
+        public string sessionId = null;
     }
     
     /// <summary>
@@ -62,8 +64,8 @@ namespace ApcBridge
     [Serializable]
     public class ApcMessage
     {
-        public string type; // "request", "response", "event"
-        public object payload;
+        public string type = ""; // "request", "response", "event"
+        public object payload = null;
     }
     
     #endregion
@@ -80,10 +82,10 @@ namespace ApcBridge
         public bool isPlaying;
         public bool isPaused;
         public bool isBusy;
-        public string currentOperation;
+        public string currentOperation = null;
         public bool editorReady;
-        public string projectPath;
-        public string unityVersion;
+        public string projectPath = "";
+        public string unityVersion = "";
         
         public static UnityStateResponse GetCurrentState(bool isBusy = false, string currentOp = null)
         {
@@ -174,6 +176,8 @@ namespace ApcBridge
         public const string Compile = "unity.direct.compile";
         public const string FocusEditor = "unity.direct.focusEditor";
         public const string GetConsole = "unity.direct.getConsole";
+        public const string PlayerTest = "unity.direct.playerTest";
+        public const string RunPipeline = "unity.direct.runPipeline";
     }
     
     /// <summary>
@@ -189,6 +193,9 @@ namespace ApcBridge
         public const string TestProgress = "unity.testProgress";
         public const string TestComplete = "unity.testComplete";
         public const string Error = "unity.error";
+        public const string PipelineStarted = "unity.pipelineStarted";
+        public const string PipelineProgress = "unity.pipelineProgress";
+        public const string PipelineCompleted = "unity.pipelineCompleted";
     }
     
     #endregion

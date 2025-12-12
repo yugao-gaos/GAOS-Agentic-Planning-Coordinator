@@ -73,6 +73,9 @@ export interface TaskCreateParams {
     targetFiles?: string[];
     notes?: string;
     
+    /** Log folder path for detailed error/test logs (Unity pipeline) */
+    logFolder?: string;
+    
     /** Number of previous fix attempts (for error_fix tasks) */
     previousAttempts?: number;
     
@@ -105,6 +108,7 @@ export interface ManagedTask {
     planSection?: string;         // Relevant plan excerpt
     targetFiles?: string[];       // Expected files to modify
     notes?: string;               // Additional context
+    logFolder?: string;           // Log folder path for detailed error/test logs
     
     // Timing
     createdAt: string;
@@ -1027,6 +1031,7 @@ export class TaskManager {
             planSection,
             targetFiles,
             notes,
+            logFolder,
             previousAttempts,
             previousFixSummary,
             unityPipeline,
@@ -1161,6 +1166,7 @@ export class TaskManager {
             planSection,
             targetFiles,
             notes,
+            logFolder,
             
             // Timing
             createdAt: new Date().toISOString(),

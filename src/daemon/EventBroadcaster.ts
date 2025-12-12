@@ -567,20 +567,7 @@ export class EventBroadcaster extends EventEmitter implements IEventBroadcaster 
         }, sessionId);
     }
     
-    /**
-     * Request player test popup from VS Code extension
-     * Used during test_player_playmode pipeline step
-     */
-    unityPlayerTestRequest(
-        pipelineId: string,
-        stepIndex: number
-    ): void {
-        this.broadcast('unity.playerTestRequest', {
-            pipelineId,
-            stepIndex,
-            timestamp: new Date().toISOString()
-        });
-    }
+    // Note: Player test popup is now handled in Unity - no VS Code popup needed
     
     /**
      * Broadcast error

@@ -320,26 +320,7 @@ export class VsCodeClient extends BaseApcClient {
         }
     }
     
-    /**
-     * Send player test start action
-     */
-    async sendPlayerTestStart(pipelineId: string): Promise<void> {
-        await this.send('unity.playerTestStart', { pipelineId });
-    }
-    
-    /**
-     * Send player test finish action
-     */
-    async sendPlayerTestFinish(pipelineId: string): Promise<void> {
-        await this.send('unity.playerTestFinish', { pipelineId });
-    }
-    
-    /**
-     * Send player test cancel action
-     */
-    async sendPlayerTestCancel(pipelineId: string): Promise<void> {
-        await this.send('unity.playerTestCancel', { pipelineId });
-    }
+    // Note: Player test popup is now handled in Unity - no VS Code methods needed
     
     /**
      * Kill orphan cursor-agent processes

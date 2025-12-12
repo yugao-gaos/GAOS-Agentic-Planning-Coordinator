@@ -22,7 +22,6 @@ import {
 } from '../types/unity';
 import { OutputChannelManager } from './OutputChannelManager';
 import { AgentRoleRegistry } from './AgentRoleRegistry';
-import { UnityLogMonitor, LogMonitorResult } from './UnityLogMonitor';
 import { TaskManager, ERROR_RESOLUTION_SESSION_ID } from './TaskManager';
 import { UnifiedCoordinatorService } from './UnifiedCoordinatorService';
 import { StateManager } from './StateManager';
@@ -37,7 +36,7 @@ import { getFolderStructureManager } from './FolderStructureManager';
 /**
  * Unity Editor state tracked via Unity Bridge events.
  * 
- * Note: Error tracking is handled by UnityLogMonitor via direct log file reading.
+ * Note: Error tracking and log capture is handled by Unity Bridge internally.
  * Editor state (isCompiling, isPlaying, isPaused) is pushed from Unity Bridge.
  */
 interface UnityEditorStatus {
@@ -103,13 +102,6 @@ export class UnityControlManager {
     // Agent Role Registry for customizable prompts
     private agentRoleRegistry: AgentRoleRegistry | null = null;
     
-    // Player test popup state (for test_player_playmode step)
-    private playerTestPipelineId: string | null = null;
-    private playerTestResolve: ((action: 'start' | 'finish' | 'cancel') => void) | null = null;
-    
-    // Unity log monitor for capturing console output with timestamps
-    private logMonitor: UnityLogMonitor;
-    
     // Direct Unity WebSocket connection (via daemon)
     private unityClientConnected: boolean = false;
     private sendToUnityClient?: (cmd: string, params?: Record<string, unknown>) => Promise<any>;
@@ -117,7 +109,6 @@ export class UnityControlManager {
 
     constructor() {
         this.outputManager = ServiceLocator.resolve(OutputChannelManager);
-        this.logMonitor = new UnityLogMonitor();
     }
     
     /**
@@ -406,15 +397,6 @@ export class UnityControlManager {
     }
     
     /**
-     * Set workspace root for log monitor persistence
-     */
-    private initializeLogMonitor(): void {
-        if (this.workspaceRoot) {
-            this.logMonitor.setWorkspaceRoot(this.workspaceRoot);
-        }
-    }
-    
-    /**
      * Set the agent role registry (for customizable prompts)
      */
     setAgentRoleRegistry(registry: AgentRoleRegistry): void {
@@ -430,9 +412,6 @@ export class UnityControlManager {
         
         // Initialize log file in the configured Logs folder
         this.initializeLogFile();
-        
-        // Initialize log monitor with workspace for log persistence
-        this.initializeLogMonitor();
 
         this.log('Initializing Unity Control Manager...');
         this.log(`Workspace: ${workspaceRoot}`);
@@ -489,374 +468,8 @@ export class UnityControlManager {
         }
     }
 
-
-    /**
-     * Execute prep_editor task (reimport + compile)
-     * Uses direct Unity Bridge connection - no MCP fallback
-     */
-    private async executePrepEditor(task: UnityTask): Promise<UnityTaskResult> {
-        this.status = 'waiting_unity';
-        task.phase = 'preparing';
-        this.emitStatusUpdate();
-
-        const errors: UnityError[] = [];
-        const warnings: UnityWarning[] = [];
-
-        // Check connection first
-        if (!this.isDirectConnectionAvailable()) {
-            return {
-                success: false,
-                errors: [{
-                    id: `err_${Date.now()}`,
-                    type: 'runtime',
-                    message: 'prep_editor failed: Unity Bridge not connected',
-                    timestamp: new Date().toISOString()
-                }],
-                warnings: []
-            };
-        }
-
-        try {
-            // Step 1: Ensure temp scene exists
-            await this.ensureTempSceneExists();
-
-            // Step 2: Exit playmode if needed and load temp scene via direct connection
-            this.log('Preparing Unity Editor via direct connection...');
-            
-            // Query current state
-            const state = await this.queryUnityState?.();
-            if (state?.isPlaying) {
-                this.log('Exiting play mode...');
-                await this.exitPlayMode();
-            }
-            
-            // Load temp scene
-            this.log('Loading temp scene...');
-            await this.loadScene(this.tempScenePath);
-
-            // Step 3: Focus Unity to trigger reimport/recompile
-            this.log('Focusing Unity Editor...');
-            task.phase = 'waiting_import';
-            this.emitStatusUpdate();
-            await this.focusUnityEditor();
-
-            // Step 4: Trigger compile and wait
-            this.log('Triggering compilation...');
-            task.phase = 'waiting_compile';
-            this.emitStatusUpdate();
-            
-            // Tell Unity Bridge to trigger compile
-            const compileResult = await this.executeViaDirect('unity.direct.compile');
-            
-            // Check if compilation actually started
-            const isCompiling = compileResult?.data?.compiling ?? false;
-            
-            if (isCompiling) {
-                // Wait for compilation to complete
-                this.log('Waiting for Unity to finish compilation...');
-                const compilationSuccess = await this.waitForCompilationViaDirect(120);
-
-                if (!compilationSuccess) {
-                    errors.push({
-                        id: `err_${Date.now()}`,
-                        type: 'compilation',
-                        message: 'Compilation timed out',
-                        timestamp: new Date().toISOString()
-                    });
-                }
-            } else {
-                // Nothing to compile - proceed immediately
-                this.log('No compilation needed (no script changes)');
-            }
-            
-            // Focus back to Cursor
-            this.log('Compilation complete, focusing back to Cursor...');
-            await this.focusCursorEditor();
-
-            // Note: Console errors are now captured by UnityLogMonitor at the pipeline step level
-            // with accurate timestamps (100ms precision). See executePipelineStep().
-
-            return {
-                success: errors.filter(e => e.type === 'compilation').length === 0,
-                errors,
-                warnings
-            };
-
-        } catch (error) {
-            // Try to focus back to Cursor even on failure
-            await this.focusCursorEditor();
-            
-            return {
-                success: false,
-                errors: [{
-                    id: `err_${Date.now()}`,
-                    type: 'runtime',
-                    message: `prep_editor failed: ${error}`,
-                    timestamp: new Date().toISOString()
-                }],
-                warnings
-            };
-        }
-    }
-
-    /**
-     * Execute test_framework_editmode task
-     * Uses direct Unity Bridge connection - no MCP fallback
-     */
-    private async executeTestFrameworkEditMode(task: UnityTask): Promise<UnityTaskResult> {
-        this.status = 'executing';
-        task.phase = 'running_tests';
-        this.emitStatusUpdate();
-
-        // Check connection first
-        if (!this.isDirectConnectionAvailable()) {
-            return {
-                success: false,
-                errors: [{
-                    id: `err_${Date.now()}`,
-                    type: 'runtime',
-                    message: 'test_framework_editmode failed: Unity Bridge not connected',
-                    timestamp: new Date().toISOString()
-                }],
-                warnings: []
-            };
-        }
-
-        // Run EditMode tests via direct connection
-        this.log('Running EditMode tests via direct connection...');
-        
-        try {
-            const result = await this.runTests('EditMode', task.testFilter);
-            
-            if (!result) {
-                return {
-                    success: false,
-                    errors: [{
-                        id: `err_${Date.now()}`,
-                        type: 'test_failure',
-                        message: 'EditMode tests returned no result',
-                        timestamp: new Date().toISOString()
-                    }],
-                    warnings: []
-                };
-            }
-            
-            return {
-                success: result.failed === 0,
-                errors: [],
-                warnings: [],
-                testsPassed: result.passed,
-                testsFailed: result.failed,
-                testResults: result.failures
-            };
-        } catch (err) {
-            return {
-                success: false,
-                errors: [{
-                    id: `err_${Date.now()}`,
-                    type: 'test_failure',
-                    message: `EditMode tests failed: ${err}`,
-                    timestamp: new Date().toISOString()
-                }],
-                warnings: []
-            };
-        }
-    }
-
-    /**
-     * Execute test_framework_playmode task
-     * Uses direct Unity Bridge connection - no MCP fallback
-     */
-    private async executeTestFrameworkPlayMode(task: UnityTask): Promise<UnityTaskResult> {
-        this.status = 'executing';
-        task.phase = 'running_tests';
-        this.emitStatusUpdate();
-
-        // Check connection first
-        if (!this.isDirectConnectionAvailable()) {
-            return {
-                success: false,
-                errors: [{
-                    id: `err_${Date.now()}`,
-                    type: 'runtime',
-                    message: 'test_framework_playmode failed: Unity Bridge not connected',
-                    timestamp: new Date().toISOString()
-                }],
-                warnings: []
-            };
-        }
-
-        // Run PlayMode tests via direct connection
-        this.log('Running PlayMode tests via direct connection...');
-        
-        try {
-            const result = await this.runTests('PlayMode', task.testFilter);
-            
-            if (!result) {
-                return {
-                    success: false,
-                    errors: [{
-                        id: `err_${Date.now()}`,
-                        type: 'test_failure',
-                        message: 'PlayMode tests returned no result',
-                        timestamp: new Date().toISOString()
-                    }],
-                    warnings: []
-                };
-            }
-            
-            return {
-                success: result.failed === 0,
-                errors: [],
-                warnings: [],
-                testsPassed: result.passed,
-                testsFailed: result.failed,
-                testResults: result.failures
-            };
-        } catch (err) {
-            return {
-                success: false,
-                errors: [{
-                    id: `err_${Date.now()}`,
-                    type: 'test_failure',
-                    message: `PlayMode tests failed: ${err}`,
-                    timestamp: new Date().toISOString()
-                }],
-                warnings: []
-            };
-        }
-    }
-
-    /**
-     * Execute test_player_playmode task (manual player testing)
-     * Uses popup-driven flow: shows popup, waits for user to start/finish testing
-     * Uses direct Unity Bridge connection - no MCP fallback
-     */
-    private async executeTestPlayerPlayMode(task: UnityTask): Promise<UnityTaskResult> {
-        this.status = 'monitoring';
-        task.phase = 'monitoring';
-        this.emitStatusUpdate();
-
-        // Check connection first
-        if (!this.isDirectConnectionAvailable()) {
-            return {
-                success: false,
-                errors: [{
-                    id: `err_${Date.now()}`,
-                    type: 'runtime',
-                    message: 'test_player_playmode failed: Unity Bridge not connected',
-                    timestamp: new Date().toISOString()
-                }],
-                warnings: [],
-                exitReason: 'error'
-            };
-        }
-
-        const startTime = Date.now();
-        const maxDuration = task.maxDuration || 600; // 10 minutes default
-        const pipelineId = this.currentPipeline?.id || `player_test_${Date.now()}`;
-
-        try {
-            // Step 1: Request popup from VS Code extension
-            this.log(`[PlayerTest] Requesting popup for pipeline ${pipelineId}`);
-            
-            try {
-                const broadcaster = ServiceLocator.resolve(EventBroadcaster);
-                broadcaster.unityPlayerTestRequest(pipelineId, this.currentPipeline?.currentStep || 0);
-            } catch (e) {
-                this.log(`[PlayerTest] Failed to broadcast popup request: ${e}`);
-            }
-            
-            // Step 2: Wait for user to click "Start Testing"
-            this.log('[PlayerTest] Waiting for user to click Start Testing...');
-            const startAction = await this.waitForPlayerTestAction(pipelineId);
-            
-            if (startAction === 'cancel') {
-                this.log('[PlayerTest] User cancelled before starting');
-                this.clearPlayerTestState();
-                return {
-                    success: false,
-                    errors: [{
-                        id: `err_${Date.now()}`,
-                        type: 'runtime',
-                        message: 'Player test cancelled by user',
-                        timestamp: new Date().toISOString()
-                    }],
-                    warnings: [],
-                    exitReason: 'stopped'
-                };
-            }
-            
-            // Step 3: Load scene and enter play mode
-            const testScene = task.testScene || 'Assets/Scenes/Main.unity';
-            this.log(`[PlayerTest] Starting player test in scene: ${testScene}`);
-
-            await this.loadScene(testScene);
-            await this.enterPlayMode();
-
-            // Focus Unity for player
-            await this.focusUnityEditor();
-
-            this.log('🎮 Player Test Started - Play the game in Unity');
-            
-            // Step 4: Wait for user to click "Finished Testing" OR timeout
-            // Create a race between user finish and timeout
-            const finishPromise = this.waitForPlayerTestAction(pipelineId);
-            const timeoutPromise = new Promise<'timeout'>((resolve) => {
-                setTimeout(() => resolve('timeout'), maxDuration * 1000);
-            });
-            
-            const finishAction = await Promise.race([finishPromise, timeoutPromise]);
-            
-            let exitReason: 'player_exit' | 'timeout' | 'error' | 'stopped' = 'player_exit';
-            
-            if (finishAction === 'timeout') {
-                this.log('[PlayerTest] Player test timed out');
-                exitReason = 'timeout';
-            } else if (finishAction === 'cancel') {
-                this.log('[PlayerTest] User cancelled during testing');
-                exitReason = 'stopped';
-            } else {
-                this.log('[PlayerTest] User finished testing');
-            }
-            
-            // Step 5: Exit play mode and focus back to Cursor
-            await this.exitPlayMode();
-            await this.focusCursorEditor();
-            
-            this.clearPlayerTestState();
-
-            // Errors are captured via UnityLogMonitor
-            return {
-                success: exitReason === 'player_exit',
-                errors: exitReason === 'stopped' ? [{
-                    id: `err_${Date.now()}`,
-                    type: 'runtime',
-                    message: 'Player test cancelled by user',
-                    timestamp: new Date().toISOString()
-                }] : [],
-                warnings: [],
-                playDuration: (Date.now() - startTime) / 1000,
-                exitReason
-            };
-
-        } catch (error) {
-            this.clearPlayerTestState();
-            await this.focusCursorEditor();
-            
-            return {
-                success: false,
-                errors: [{
-                    id: `err_${Date.now()}`,
-                    type: 'runtime',
-                    message: `Player test failed: ${error}`,
-                    timestamp: new Date().toISOString()
-                }],
-                warnings: [],
-                exitReason: 'error'
-            };
-        }
-    }
+    // Note: Individual step execution methods removed - Unity Bridge handles all pipeline
+    // steps internally via unity.direct.runPipeline command
 
     // ========================================================================
     // Helper Methods
@@ -931,7 +544,7 @@ export class UnityControlManager {
 
     /**
      * Read Unity console for errors via direct connection
-     * Note: Most error detection is now done via UnityLogMonitor for accurate timestamps
+     * Note: Error detection is primarily done by Unity Bridge during pipeline execution
      */
     private async readUnityConsole(): Promise<{ errors: UnityError[]; warnings: UnityWarning[] }> {
         if (!this.isDirectConnectionAvailable()) {
@@ -1346,7 +959,7 @@ if ($cursor) {
      * Emit status update
      * 
      * Note: Error status is determined by pipeline results, not state events.
-     * Error detection happens via UnityLogMonitor during pipeline operations.
+     * Error detection happens via Unity Bridge during pipeline operations.
      */
     private emitStatusUpdate(): void {
         this._onStatusChanged.fire(this.getState());
@@ -1365,7 +978,7 @@ if ($cursor) {
         }
         
         // Note: hasErrors and errorCount are determined by pipeline results.
-        // Errors are detected via UnityLogMonitor during operations.
+        // Errors are detected by Unity Bridge during pipeline operations.
         
         // Compute queue length (pipeline queue + current pipeline if running)
         const queueLength = this.pipelineQueue.length + (this.currentPipeline ? 1 : 0);
@@ -1632,56 +1245,9 @@ if ($cursor) {
     // ========================================================================
     
     /**
-     * Handle user clicking "Start Testing" in popup
-     */
-    handlePlayerTestStart(pipelineId: string): void {
-        if (this.playerTestPipelineId === pipelineId && this.playerTestResolve) {
-            this.log(`[PlayerTest] User started testing for pipeline ${pipelineId}`);
-            this.playerTestResolve('start');
-        }
-    }
-    
-    /**
-     * Handle user clicking "Finished Testing" in popup
-     */
-    handlePlayerTestFinish(pipelineId: string): void {
-        if (this.playerTestPipelineId === pipelineId && this.playerTestResolve) {
-            this.log(`[PlayerTest] User finished testing for pipeline ${pipelineId}`);
-            this.playerTestResolve('finish');
-        }
-    }
-    
-    /**
-     * Handle user cancelling player test popup
-     */
-    handlePlayerTestCancel(pipelineId: string): void {
-        if (this.playerTestPipelineId === pipelineId && this.playerTestResolve) {
-            this.log(`[PlayerTest] User cancelled testing for pipeline ${pipelineId}`);
-            this.playerTestResolve('cancel');
-        }
-    }
-    
-    /**
-     * Wait for user action from player test popup
-     * Returns a Promise that resolves when user clicks Start, Finish, or Cancel
-     */
-    private waitForPlayerTestAction(pipelineId: string): Promise<'start' | 'finish' | 'cancel'> {
-        return new Promise((resolve) => {
-            this.playerTestPipelineId = pipelineId;
-            this.playerTestResolve = resolve;
-        });
-    }
-    
-    /**
-     * Clear player test state
-     */
-    private clearPlayerTestState(): void {
-        this.playerTestPipelineId = null;
-        this.playerTestResolve = null;
-    }
-
-    /**
-     * Process the pipeline queue
+     * Process the pipeline queue.
+     * Sends entire pipeline to Unity Bridge for execution.
+     * Unity handles all steps, log capture, and screenshot capture internally.
      */
     private async processPipelineQueue(): Promise<void> {
         if (this.pipelineQueue.length === 0 || this.currentPipeline) {
@@ -1698,6 +1264,10 @@ if ($cursor) {
 
         this.log(`Starting pipeline ${this.currentPipeline.id}: ${this.currentPipeline.operations.join(' → ')}`);
 
+        // Focus Unity before pipeline execution
+        this.log('Focusing Unity Editor for pipeline execution...');
+        await this.focusUnityEditor();
+
         // Broadcast pipeline started event to all clients
         try {
             const broadcaster = ServiceLocator.resolve(EventBroadcaster);
@@ -1708,43 +1278,62 @@ if ($cursor) {
                 this.currentPipeline.coordinatorId
             );
         } catch (e) {
-            // Broadcaster may not be available in some contexts
             console.warn('[UnityControlManager] Failed to broadcast pipeline start:', e);
         }
 
-        // Execute each operation in sequence
         let allSuccess = true;
         let failedAtStep: PipelineOperation | null = null;
+        let logFolder: string | null = null;
 
-        for (let i = 0; i < this.currentPipeline.operations.length; i++) {
-            const operation = this.currentPipeline.operations[i];
-            this.currentPipeline.currentStep = i;
-            this.emitStatusUpdate();
-
-            this.log(`Pipeline step ${i + 1}/${this.currentPipeline.operations.length}: ${operation}`);
-
-            // Broadcast progress
+        // Check Unity Bridge connection
+        if (!this.isDirectConnectionAvailable()) {
+            this.log('Pipeline failed: Unity Bridge not connected');
+            allSuccess = false;
+            failedAtStep = this.currentPipeline.operations[0];
+        } else {
+            // Send entire pipeline to Unity Bridge for execution
             try {
-                const broadcaster = ServiceLocator.resolve(EventBroadcaster);
-                broadcaster.unityPipelineProgress(
-                    this.currentPipeline.id,
-                    i + 1,
-                    this.currentPipeline.operations.length,
-                    operation,
-                    this.currentPipeline.coordinatorId
-                );
-            } catch (e) {
-                console.warn('[UnityControlManager] Failed to broadcast pipeline progress:', e);
-            }
+                this.log('Sending pipeline to Unity Bridge...');
+                
+                const unityResult = await this.executeViaDirect('unity.direct.runPipeline', {
+                    pipelineId: this.currentPipeline.id,
+                    operations: this.currentPipeline.operations,
+                    testScene: 'Assets/Scenes/Main.unity'
+                });
 
-            const stepResult = await this.executePipelineStep(operation);
-            this.currentPipeline.stepResults.push(stepResult);
+                if (unityResult?.data) {
+                    allSuccess = unityResult.data.success;
+                    failedAtStep = unityResult.data.failedAtStep || null;
+                    logFolder = unityResult.data.logFolder || null;
 
-            if (!stepResult.success) {
+                    // Convert Unity step results to our format
+                    if (unityResult.data.stepResults) {
+                        for (const step of unityResult.data.stepResults) {
+                            this.currentPipeline.stepResults.push({
+                                operation: step.op || step.Operation,
+                                success: step.success || step.Success,
+                                duration: 0, // Unity doesn't track per-step duration yet
+                                errors: step.error ? [{
+                                    id: `err_${Date.now()}`,
+                                    type: 'runtime',
+                                    message: step.error || step.Error,
+                                    timestamp: new Date().toISOString()
+                                }] : [],
+                                logPath: step.logPath || step.LogPath
+                            });
+                        }
+                    }
+
+                    this.log(`Pipeline executed by Unity: success=${allSuccess}, logFolder=${logFolder}`);
+                } else {
+                    allSuccess = false;
+                    failedAtStep = this.currentPipeline.operations[0];
+                    this.log('Pipeline failed: No result from Unity Bridge');
+                }
+            } catch (err) {
                 allSuccess = false;
-                failedAtStep = operation;
-                this.log(`Pipeline failed at step: ${operation}`);
-                break;  // Fail-fast
+                failedAtStep = this.currentPipeline.operations[0];
+                this.log(`Pipeline failed: ${err}`);
             }
         }
 
@@ -1761,10 +1350,15 @@ if ($cursor) {
             stepResults: this.currentPipeline.stepResults,
             tasksInvolved: this.currentPipeline.tasksInvolved,
             allErrors: this.aggregateErrors(this.currentPipeline.stepResults),
-            allTestFailures: this.aggregateTestFailures(this.currentPipeline.stepResults)
+            allTestFailures: this.aggregateTestFailures(this.currentPipeline.stepResults),
+            logFolder: logFolder || undefined
         };
 
         this.log(`Pipeline ${this.currentPipeline.id} ${allSuccess ? 'completed' : 'failed'}`);
+
+        // Focus back to Cursor at end of pipeline
+        this.log('Pipeline complete, focusing back to Cursor...');
+        await this.focusCursorEditor();
 
         // Notify coordinator (and handle errors if any)
         await this.notifyPipelineComplete(result, duration);
@@ -1780,167 +1374,8 @@ if ($cursor) {
         }
     }
 
-    /**
-     * Execute a single pipeline step
-     * 
-     * Uses UnityLogMonitor to capture console output with accurate timestamps
-     * during the operation execution.
-     */
-    private async executePipelineStep(operation: PipelineOperation): Promise<PipelineStepResult> {
-        const startTime = Date.now();
-        let result: PipelineStepResult;
-
-        // Start log monitoring for this step (captures console output with timestamps)
-        const logMonitorStarted = this.logMonitor.startMonitoring();
-        if (logMonitorStarted) {
-            this.log(`[LogMonitor] Started monitoring for ${operation}`);
-        }
-
-        try {
-            switch (operation) {
-                case 'prep':
-                    const prepResult = await this.executePrepEditor({
-                        id: `step_prep_${Date.now()}`,
-                        type: 'prep_editor',
-                        priority: 1,
-                        requestedBy: [],
-                        status: 'executing',
-                        createdAt: new Date().toISOString()
-                    });
-                    result = {
-                        operation,
-                        success: prepResult.success,
-                        duration: Date.now() - startTime,
-                        errors: prepResult.errors,
-                        warnings: prepResult.warnings
-                    };
-                    break;
-
-                case 'test_editmode':
-                    const editResult = await this.executeTestFrameworkEditMode({
-                        id: `step_editmode_${Date.now()}`,
-                        type: 'test_framework_editmode',
-                        priority: 2,
-                        requestedBy: [],
-                        status: 'executing',
-                        createdAt: new Date().toISOString()
-                    });
-                    result = {
-                        operation,
-                        success: editResult.success,
-                        duration: Date.now() - startTime,
-                        errors: editResult.errors,
-                        warnings: editResult.warnings,
-                        testResults: editResult.testsPassed !== undefined ? {
-                            passed: editResult.testsPassed,
-                            failed: editResult.testsFailed || 0,
-                            failures: editResult.testResults
-                        } : undefined
-                    };
-                    break;
-
-                case 'test_playmode':
-                    const playResult = await this.executeTestFrameworkPlayMode({
-                        id: `step_playmode_${Date.now()}`,
-                        type: 'test_framework_playmode',
-                        priority: 3,
-                        requestedBy: [],
-                        status: 'executing',
-                        createdAt: new Date().toISOString()
-                    });
-                    result = {
-                        operation,
-                        success: playResult.success,
-                        duration: Date.now() - startTime,
-                        errors: playResult.errors,
-                        warnings: playResult.warnings,
-                        testResults: playResult.testsPassed !== undefined ? {
-                            passed: playResult.testsPassed,
-                            failed: playResult.testsFailed || 0,
-                            failures: playResult.testResults
-                        } : undefined
-                    };
-                    break;
-
-                case 'test_player_playmode':
-                    const playerResult = await this.executeTestPlayerPlayMode({
-                        id: `step_player_${Date.now()}`,
-                        type: 'test_player_playmode',
-                        priority: 4,
-                        requestedBy: [],
-                        status: 'executing',
-                        createdAt: new Date().toISOString()
-                    });
-                    result = {
-                        operation,
-                        success: playerResult.success,
-                        duration: Date.now() - startTime,
-                        errors: playerResult.errors,
-                        warnings: playerResult.warnings
-                    };
-                    break;
-
-                default:
-                    result = {
-                        operation,
-                        success: false,
-                        duration: Date.now() - startTime,
-                        errors: [{
-                            id: `err_${Date.now()}`,
-                            type: 'runtime',
-                            message: `Unknown operation: ${operation}`,
-                            timestamp: new Date().toISOString()
-                        }]
-                    };
-            }
-        } catch (error) {
-            result = {
-                operation,
-                success: false,
-                duration: Date.now() - startTime,
-                errors: [{
-                    id: `err_${Date.now()}`,
-                    type: 'runtime',
-                    message: `Pipeline step failed: ${error}`,
-                    timestamp: new Date().toISOString()
-                }]
-            };
-        }
-
-        // Stop log monitoring and capture results
-        let logResult: LogMonitorResult | null = null;
-        if (logMonitorStarted) {
-            const pipelineId = this.currentPipeline?.id || `step_${operation}_${Date.now()}`;
-            logResult = this.logMonitor.stopMonitoring(pipelineId);
-            
-            this.log(`[LogMonitor] Captured ${logResult.totalSegments} segments for ${operation}`);
-            this.log(`[LogMonitor] Errors: ${logResult.errorCount}, Exceptions: ${logResult.exceptionCount}, Warnings: ${logResult.warningCount}`);
-            
-            if (logResult.persistedPath) {
-                this.log(`[LogMonitor] Logs persisted to: ${logResult.persistedPath}`);
-            }
-            
-            // Update success based on detected errors/exceptions
-            // Coordinator will analyze the persisted log file for full context
-            if (logResult.errorCount > 0 || logResult.exceptionCount > 0) {
-                result.success = false;
-                
-                // Add a summary error entry pointing to the log file
-                // Full error details are in the persisted log for AI analysis
-                if (!result.errors) result.errors = [];
-                result.errors.push({
-                    id: `log_${Date.now()}`,
-                    type: 'compilation',
-                    message: `Detected ${logResult.errorCount} error(s) and ${logResult.exceptionCount} exception(s). See log file for details.`,
-                    timestamp: new Date().toISOString(),
-                    // Store the path in a way the coordinator can access
-                    file: logResult.persistedPath || undefined
-                });
-            }
-        }
-
-        return result;
-    }
+    // Note: Pipeline step execution is now handled by Unity Bridge via runPipeline command
+    // Each step's log capture and screenshot capture is done internally by Unity
 
     /**
      * Aggregate errors from all pipeline steps
@@ -2012,10 +1447,10 @@ if ($cursor) {
             console.warn('[UnityControlManager] Failed to broadcast pipeline completion:', e);
         }
 
-        // If there are errors, route them to global error handling
-        if (result.allErrors.length > 0) {
-            this.log(`Routing ${result.allErrors.length} errors to global error handler...`);
-            await this.handlePipelineErrors(result.allErrors);
+        // If there are errors or test failures, route them to global error handling
+        if (result.allErrors.length > 0 || result.allTestFailures.length > 0) {
+            this.log(`Routing ${result.allErrors.length} errors and ${result.allTestFailures.length} test failures to global error handler...`);
+            await this.handlePipelineErrors(result);
         }
     }
 
@@ -2058,36 +1493,29 @@ if ($cursor) {
      * 2. Routes errors to TaskAgent which creates error_fix tasks
      * 3. Coordinator then dispatches error_resolution workflows
      * 
-     * @param errors - Array of Unity errors from pipeline
+     * @param result - Full pipeline result with errors, test failures, and log paths
      * @returns IDs of created error-fixing tasks
      */
-    async handlePipelineErrors(errors: UnityError[]): Promise<string[]> {
-        if (errors.length === 0) {
-            this.log('handlePipelineErrors: No errors to process');
+    async handlePipelineErrors(result: PipelineResult): Promise<string[]> {
+        const errors = result.allErrors;
+        const testFailures = result.allTestFailures;
+        const logFolder = result.logFolder;
+        
+        if (errors.length === 0 && testFailures.length === 0) {
+            this.log('handlePipelineErrors: No errors or test failures to process');
             return [];
         }
 
-        this.log(`handlePipelineErrors: Processing ${errors.length} errors`);
-
-        // Get global TaskManager
-        const taskManager = ServiceLocator.resolve(TaskManager);
-
-        // Extract files from errors
-        const errorFiles = errors
-            .filter(e => e.file)
-            .map(e => e.file!);
-
-        if (errorFiles.length === 0) {
-            this.log('handlePipelineErrors: No files identified in errors');
+        this.log(`handlePipelineErrors: Processing ${errors.length} errors, ${testFailures.length} test failures (logFolder: ${logFolder || 'none'})`);
+        
+        // Also log step-level log paths for debugging
+        for (const step of result.stepResults) {
+            if (step.logPath) {
+                this.log(`  Step ${step.operation}: logPath=${step.logPath}`);
+            }
         }
 
-        // 1. Find affected tasks across all plans
-        const affected = taskManager.findAffectedTasksAcrossPlans(errorFiles);
-        this.log(`handlePipelineErrors: Found ${affected.length} affected tasks across plans`);
-
-        const affectedTaskIds = affected.map(a => a.taskId);
-
-        // 2. Route to TaskAgent to create error_fix tasks
+        // Route to TaskAgent to create error_fix tasks
         let createdTaskIds: string[] = [];
         try {
             const { TaskAgent } = await import('./TaskAgent');
@@ -2109,7 +1537,17 @@ if ($cursor) {
                 line: e.line
             }));
             
-            createdTaskIds = await taskAgent.handleUnityErrors(taskAgentErrors);
+            // Convert test failures to TaskAgent format
+            const taskAgentTestFailures = testFailures.map(t => ({
+                testName: t.testName,
+                message: t.message || 'Test failed',
+                stackTrace: t.stackTrace
+            }));
+            
+            createdTaskIds = await taskAgent.handleUnityErrors(taskAgentErrors, {
+                testFailures: taskAgentTestFailures,
+                logFolder
+            });
             this.log(`handlePipelineErrors: TaskAgent created ${createdTaskIds.length} error_fix tasks`);
         } catch (e) {
             // TaskAgent is the only handler for error task creation
@@ -2169,7 +1607,17 @@ if ($cursor) {
 
         if (compilationErrors.length > 0) {
             this.log(`Detected ${compilationErrors.length} compilation errors, routing to global handler`);
-            await this.handlePipelineErrors(compilationErrors);
+            // Build minimal PipelineResult for ad-hoc error handling
+            const result: PipelineResult = {
+                pipelineId: `adhoc_${Date.now()}`,
+                success: false,
+                failedAtStep: 'prep',
+                stepResults: [],
+                tasksInvolved: [],
+                allErrors: compilationErrors,
+                allTestFailures: []
+            };
+            await this.handlePipelineErrors(result);
         }
     }
 
