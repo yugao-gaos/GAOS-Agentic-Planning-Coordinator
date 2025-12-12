@@ -30,11 +30,32 @@ export interface SidebarState {
     /** Current initialization step (for initializing/checking states) */
     initializationStep?: string;
     sessions: SessionInfo[];
+    /** Completed sessions (most recent first, limited to 5 for sidebar display) */
+    completedSessions: CompletedSessionSummary[];
+    /** Total count of completed sessions */
+    completedSessionsTotal: number;
     agents: AgentInfo[];
     unity: UnityInfo;
     unityEnabled: boolean;
     coordinatorStatus: CoordinatorStatusInfo;
     connectionHealth: ConnectionHealthInfo;
+}
+
+/**
+ * Lightweight summary of a completed session for sidebar display
+ */
+export interface CompletedSessionSummary {
+    id: string;
+    requirement: string;
+    completedAt: string;
+    createdAt: string;
+    planPath?: string;
+    /** Task progress at completion */
+    taskProgress?: {
+        completed: number;
+        total: number;
+        percentage: number;
+    };
 }
 
 export interface ConnectionHealthInfo {
@@ -99,12 +120,14 @@ export interface SessionInfo {
     executionStatus?: string;
     activeWorkflows: WorkflowInfo[];
     workflowHistory: WorkflowInfo[];  // Completed workflows (newest first)
-    isRevising: boolean;
+    // Note: Check status === 'revising' instead of separate isRevising flag
     sessionAgents: AgentInfo[];  // All agents associated with this session (for workflow display)
     /** True if the plan is partial/incomplete (workflow was interrupted) */
     hasPartialPlan?: boolean;
     /** Reason the plan was interrupted, if applicable */
     interruptReason?: string;
+    /** True if session is ready for manual completion (approved + all tasks done) */
+    readyForCompletion?: boolean;
 }
 
 export interface AgentInfo {
@@ -132,5 +155,39 @@ export interface UnityInfo {
         type: string;
         phase?: string;
     };
+}
+
+/**
+ * Format Unity task type for short display (status bar).
+ * Returns concise names suitable for inline status text.
+ */
+export function formatTaskTypeShort(type: string): string {
+    const typeMap: Record<string, string> = {
+        'prep': 'Prep',
+        'prep_editor': 'Prep',
+        'test_editmode': 'EditMode',
+        'test_playmode': 'PlayMode',
+        'test_player_playmode': 'Player',
+        'test_framework_editmode': 'EditMode',
+        'test_framework_playmode': 'PlayMode'
+    };
+    return typeMap[type] || type;
+}
+
+/**
+ * Format Unity task type for detailed display (tooltips, expanded views).
+ * Returns descriptive names with context.
+ */
+export function formatTaskTypeDetailed(type: string): string {
+    const typeMap: Record<string, string> = {
+        'prep': 'Prep (compile)',
+        'prep_editor': 'Prep (compile)',
+        'test_editmode': 'EditMode Tests',
+        'test_playmode': 'PlayMode Tests',
+        'test_player_playmode': 'Player Test',
+        'test_framework_editmode': 'EditMode Tests',
+        'test_framework_playmode': 'PlayMode Tests'
+    };
+    return typeMap[type] || type;
 }
 

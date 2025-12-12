@@ -199,6 +199,8 @@ const Canvas = {
     
     handleDrop(e) {
         e.preventDefault();
+        e.stopPropagation(); // Prevent double-handling when event bubbles from nodesLayer to container
+        
         const nodeType = e.dataTransfer.getData('nodeType');
         if (!nodeType) return;
         

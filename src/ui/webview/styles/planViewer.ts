@@ -428,6 +428,16 @@ export function getPlanViewerStyles(): string {
             opacity: 0.7;
         }
         
+        /* Unity pipeline badges */
+        .task-meta-item.unity-full {
+            color: #22c55e;
+            font-weight: 500;
+        }
+        
+        .task-meta-item.unity-readonly {
+            color: #3b82f6;
+        }
+        
         /* ========================================
            Markdown View
            ======================================== */

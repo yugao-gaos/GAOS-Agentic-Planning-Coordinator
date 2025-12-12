@@ -19,6 +19,7 @@ import {
     AgentStageResult,
     AgentCompletionPayload
 } from '../../types/workflow';
+import { ModelTier } from '../../types';
 import { StateManager } from '../StateManager';
 import { AgentPoolService } from '../AgentPoolService';
 import { AgentRoleRegistry } from '../AgentRoleRegistry';
@@ -27,7 +28,6 @@ import { OutputChannelManager } from '../OutputChannelManager';
 import { ProcessManager, ProcessState } from '../ProcessManager';
 import { ServiceLocator } from '../ServiceLocator';
 import { Logger } from '../../utils/Logger';
-import { TaskManager, ActiveWorkflowState } from '../TaskManager';
 
 const log = Logger.create('Daemon', 'BaseWorkflow');
 
@@ -84,17 +84,26 @@ export abstract class BaseWorkflow implements IWorkflow {
     protected input: Record<string, any>;
     protected priority: number;
     
-    // Pause/resume control
-    private pauseRequested: boolean = false;
-    private pausePromise: Promise<void> | null = null;
-    private pauseResolve: (() => void) | null = null;
+    /** Extra instruction to inject into all agent prompts (e.g., from user clarifications) */
+    protected extraInstruction?: string;
     
     // Agent waiting state
     protected waitingForAgent: boolean = false;
     protected waitingForAgentRole: string | undefined;
     
+    // Agent work counter - increments each time an agent is put to work
+    // Used for unique log file naming: {workflowId}_{workCount}_{agentName}.log
+    protected agentWorkCount: number = 0;
+    
     // Track if workflow has started running (becomes true after first agent allocation)
     private hasStartedRunning: boolean = false;
+    
+    // Pending event responses - for waitForWorkflowEvent
+    private pendingEventWaiters: Map<string, {
+        resolve: (value: any) => void;
+        reject: (error: Error) => void;
+        timeoutId?: NodeJS.Timeout;
+    }> = new Map();
     
     // ========================================================================
     // Events (from IWorkflow)
@@ -106,11 +115,23 @@ export abstract class BaseWorkflow implements IWorkflow {
     readonly onAgentNeeded = new TypedEventEmitter<AgentRequest>();
     readonly onAgentReleased = new TypedEventEmitter<string>();
     readonly onAgentDemotedToBench = new TypedEventEmitter<string>();
+    readonly onWorkflowEvent = new TypedEventEmitter<{ eventType: string; payload?: any }>();
     readonly onAgentTerminated = new TypedEventEmitter<{
         agentName: string;
         runId: string;
         reason: 'external_kill' | 'timeout' | 'error' | 'health_check_failed';
         phase?: string;
+    }>();
+    
+    /** Fired when an agent starts working on a task (with correct log file path) */
+    readonly onAgentWorkStarted = new TypedEventEmitter<{
+        agentName: string;
+        sessionId: string;
+        roleId: string;
+        workflowId: string;
+        taskId: string;
+        workCount: number;
+        logFile: string;
     }>();
     
     // Task occupancy/conflict events
@@ -129,22 +150,11 @@ export abstract class BaseWorkflow implements IWorkflow {
     protected conflictingTaskIds: string[] = [];
     
     // ========================================================================
-    // Agent Tracking (for pause/resume)
+    // Agent Tracking
     // ========================================================================
     
     /** Current agent run ID (if an agent is actively running) */
     protected currentAgentRunId: string | undefined;
-    
-    /** Saved continuation context from a paused agent */
-    protected continuationContext: {
-        phaseName: string;
-        partialOutput: string;
-        filesModified: string[];
-        whatWasDone: string;
-    } | undefined;
-    
-    /** Whether pause should force-kill the agent vs wait for phase boundary */
-    private forcePauseRequested: boolean = false;
     
     /** ProcessManager callback IDs for cleanup */
     private processManagerCallbackIds: string[] = [];
@@ -275,6 +285,11 @@ export abstract class BaseWorkflow implements IWorkflow {
         this.outputManager = services.outputManager;
         this.processManager = ServiceLocator.resolve(ProcessManager);
         this.unityEnabled = services.unityEnabled;
+        
+        // Extract extra instruction from input (e.g., user clarifications)
+        if (config.input?.extraInstruction) {
+            this.extraInstruction = config.input.extraInstruction;
+        }
         
         // Initialize workflow log file (persistent)
         this.initializeWorkflowLog();
@@ -413,6 +428,9 @@ export abstract class BaseWorkflow implements IWorkflow {
             // For error resolution, try to get taskId from the first error's relatedTaskId
             const errors = this.input.errors as Array<{ relatedTaskId?: string }>;
             taskId = errors[0]?.relatedTaskId;
+        } else if (this.type === 'context_gathering' && 'taskId' in this.input) {
+            // For context_gathering, taskId is optional - used when gathering context for a specific task
+            taskId = this.input.taskId as string;
         }
         
         return {
@@ -455,7 +473,7 @@ export abstract class BaseWorkflow implements IWorkflow {
         try {
             await this.runPhases();
             
-            this.status = 'completed';
+            this.status = 'succeeded';
             const result: WorkflowResult = {
                 success: true,
                 output: this.getOutput(),
@@ -463,9 +481,6 @@ export abstract class BaseWorkflow implements IWorkflow {
             };
             
             this.log(`Workflow completed successfully`);
-            
-            // Clear persisted state on successful completion
-            this.clearPersistedState();
             
             this.onComplete.fire(result);
             return result;
@@ -482,9 +497,6 @@ export abstract class BaseWorkflow implements IWorkflow {
             
             this.log(`Workflow failed: ${errorMessage}`);
             
-            // Clear persisted state on failure (no point resuming a failed workflow)
-            this.clearPersistedState();
-            
             this.onError.fire(error instanceof Error ? error : new Error(errorMessage));
             this.onComplete.fire(result);
             return result;
@@ -495,239 +507,10 @@ export abstract class BaseWorkflow implements IWorkflow {
         }
     }
     
-    /**
-     * Pause the workflow
-     * 
-     * @param options.force If true, immediately kill any running agent and save state.
-     *                      If false (default), pause happens at next phase boundary.
-     * @param options.reason Why the workflow is being paused (for persistence)
-     */
-    async pause(options?: { 
-        force?: boolean; 
-        reason?: 'user_request' | 'conflict' | 'error' | 'timeout' | 'daemon_shutdown';
-    }): Promise<void> {
-        // Allow pausing workflows in pending, running, or blocked states
-        if (this.status !== 'pending' && this.status !== 'running' && this.status !== 'blocked') {
-            return;
-        }
-        
-        const force = options?.force ?? false;
-        const reason = options?.reason ?? 'user_request';
-        this.log(`Pause requested (force: ${force}, reason: ${reason})`);
-        this.pauseRequested = true;
-        this.forcePauseRequested = force;
-        
-        // If force pause and an agent is running, kill it and save state
-        if (force && this.currentAgentRunId) {
-            await this.forceKillCurrentAgent();
-        }
-        
-        // Release task occupancy when paused (coordinator can reassign)
-        // Store the IDs so we can re-acquire on resume
-        if (this.occupiedTaskIds.length > 0) {
-            this.log(`Releasing ${this.occupiedTaskIds.length} task occupancies on pause`);
-            this.releaseTaskOccupancy([...this.occupiedTaskIds]);
-        }
-        
-        // Create a promise that will be resolved when resume is called
-        this.pausePromise = new Promise((resolve) => {
-            this.pauseResolve = resolve;
-        });
-        
-        this.status = 'paused';
-        
-        // Persist state to disk for cross-restart recovery
-        await this.persistState(reason);
-        
-        this.emitProgress();
-    }
-    
-    /**
-     * Force kill the current agent and save continuation context
-     */
-    private async forceKillCurrentAgent(): Promise<void> {
-        if (!this.currentAgentRunId) return;
-        
-        const { AgentRunner } = await import('../AgentBackend');
-        const agentRunner = ServiceLocator.resolve(AgentRunner);
-        
-        // Get partial output before killing (method only available on underlying CursorAgentRunner)
-        const partialOutput = (agentRunner as any).getPartialOutput?.(this.currentAgentRunId) || '';
-        
-        // Kill the agent
-        const killed = await agentRunner.stop(this.currentAgentRunId);
-        
-        if (killed) {
-            this.log(`Force-killed agent ${this.currentAgentRunId}`);
-            
-            // Save continuation context
-            const phases = this.getPhases();
-            this.continuationContext = {
-                phaseName: phases[this.phaseIndex] || 'unknown',
-                partialOutput,
-                filesModified: this.extractFilesFromPartialOutput(partialOutput),
-                whatWasDone: this.analyzePartialProgress(partialOutput)
-            };
-            
-            this.log(`Saved continuation context (${partialOutput.length} chars of output)`);
-        }
-        
-        this.currentAgentRunId = undefined;
-    }
-    
-    /**
-     * Extract files modified from partial agent output
-     */
-    private extractFilesFromPartialOutput(output: string): string[] {
-        const files: string[] = [];
-        
-        // Look for FILES_MODIFIED section
-        const filesMatch = output.match(/FILES_MODIFIED:[\s\S]*?(?=```|$)/i);
-        if (filesMatch) {
-            const lines = filesMatch[0].split('\n').filter(l => l.trim().startsWith('-'));
-            for (const line of lines) {
-                const file = line.replace(/^-\s*/, '').trim();
-                if (file && file.includes('.')) {
-                    files.push(file);
-                }
-            }
-        }
-        
-        // Look for common file modification patterns
-        const patterns = [
-            /(?:Creating|Writing|Editing|Modifying)\s+[`"]?([^\s`"]+\.\w+)[`"]?/gi,
-            /(?:created|wrote|edited|modified)\s+[`"]?([^\s`"]+\.\w+)[`"]?/gi
-        ];
-        
-        for (const pattern of patterns) {
-            let match;
-            while ((match = pattern.exec(output)) !== null) {
-                if (!files.includes(match[1])) {
-                    files.push(match[1]);
-                }
-            }
-        }
-        
-        return files;
-    }
-    
-    /**
-     * Analyze partial output to understand what was done
-     */
-    private analyzePartialProgress(output: string): string {
-        const indicators: string[] = [];
-        
-        // Look for success indicators
-        const lines = output.split('\n');
-        for (const line of lines) {
-            if (line.includes('✓') || line.includes('✅') || 
-                line.includes('Done') || line.includes('Completed') ||
-                line.includes('Created') || line.includes('Wrote')) {
-                const trimmed = line.trim();
-                if (trimmed.length > 10 && trimmed.length < 200) {
-                    indicators.push(trimmed);
-                }
-            }
-        }
-        
-        if (indicators.length > 0) {
-            return indicators.slice(-5).join('\n');
-        }
-        
-        return 'Progress unknown - review files and partial output';
-    }
-    
-    async resume(): Promise<void> {
-        if (this.status !== 'paused') {
-            return;
-        }
-        
-        this.log(`Resuming`);
-        this.pauseRequested = false;
-        this.forcePauseRequested = false;
-        
-        // Clear persisted state when resuming - workflow is no longer paused
-        // If it pauses again later, a new checkpoint will be saved
-        this.clearPersistedState();
-        
-        // If we already have agents allocated, set status to running immediately
-        // Otherwise, status will change to running when first agent is allocated
-        if (this.allocatedAgents.length > 0) {
-            this.status = 'running';
-            this.hasStartedRunning = true;
-            this.log(`Resuming with ${this.allocatedAgents.length} allocated agents`);
-        } else {
-            this.log(`Resuming - will change to running when agent is allocated`);
-        }
-        
-        this.emitProgress();
-        
-        // Log continuation context if we have it
-        if (this.continuationContext) {
-            this.log(`Continuation context available from phase: ${this.continuationContext.phaseName}`);
-            this.log(`Files modified before pause: ${this.continuationContext.filesModified.join(', ') || 'none'}`);
-        }
-        
-        // Resolve the pause promise to continue execution
-        if (this.pauseResolve) {
-            this.pauseResolve();
-            this.pauseResolve = null;
-            this.pausePromise = null;
-        }
-    }
-    
-    /**
-     * Get continuation context if we were force-paused mid-agent
-     * Subclasses can use this to prepend to the next agent prompt
-     */
-    protected getContinuationPrompt(): string | undefined {
-        if (!this.continuationContext) return undefined;
-        
-        const ctx = this.continuationContext;
-        
-        return `## ⚠️ SESSION CONTINUATION
-
-This task was paused mid-execution. You are continuing where the previous agent left off.
-
-### Phase When Paused: ${ctx.phaseName}
-
-### Files Modified Before Pause
-${ctx.filesModified.length > 0 ? ctx.filesModified.map(f => `- ${f}`).join('\n') : '- None yet'}
-
-### What Was Done
-${ctx.whatWasDone}
-
-### Important Instructions
-1. **DO NOT** redo work that appears to be complete (check the files!)
-2. Review the partial output below for context
-3. Continue the task from where it stopped
-
-### Partial Output From Previous Agent
-\`\`\`
-${ctx.partialOutput.slice(-3000)}
-\`\`\`
-
----
-
-`;
-    }
-    
-    /**
-     * Clear continuation context after it's been used
-     */
-    protected clearContinuationContext(): void {
-        this.continuationContext = undefined;
-    }
-    
     async cancel(): Promise<void> {
         this.log(`Cancelling`);
         this.status = 'cancelled';
         this.emitProgress();
-        
-        // Release pause if paused
-        if (this.pauseResolve) {
-            this.pauseResolve();
-        }
         
         // Release task occupancy
         if (this.occupiedTaskIds.length > 0) {
@@ -746,14 +529,10 @@ ${ctx.partialOutput.slice(-3000)}
         // Kill any running agent
         if (this.currentAgentRunId) {
             const { AgentRunner } = await import('../AgentBackend');
-        const agentRunner = ServiceLocator.resolve(AgentRunner);
+            const agentRunner = ServiceLocator.resolve(AgentRunner);
             await agentRunner.stop(this.currentAgentRunId);
             this.currentAgentRunId = undefined;
         }
-        
-        // CRITICAL: Clear persisted state on cancel to prevent ghost workflows on restart
-        // Without this, cancelled workflows would be restored as paused on daemon restart
-        this.clearPersistedState();
         
         this.onComplete.fire({
             success: false,
@@ -815,43 +594,6 @@ ${ctx.partialOutput.slice(-3000)}
         return false;
     }
     
-    // ========================================================================
-    // State Restoration (for recovery after extension restart)
-    // ========================================================================
-    
-    /**
-     * Restore workflow state from saved state
-     * Used during session recovery to set workflow back to its paused position
-     * 
-     * @param savedState State from task.activeWorkflow (persisted in tasks.json)
-     */
-    restoreFromSavedState(savedState: {
-        phaseIndex: number;
-        phaseName?: string;
-        phaseProgress?: 'not_started' | 'in_progress' | 'completed';
-        filesModified?: string[];
-        continuationContext?: {
-            phaseName: string;
-            partialOutput: string;
-            filesModified: string[];
-            whatWasDone: string;
-        };
-    }): void {
-        // Restore phase progress
-        this.phaseIndex = savedState.phaseIndex;
-        this.status = 'paused';
-        
-        // Restore continuation context if we were mid-agent
-        if (savedState.continuationContext) {
-            this.continuationContext = savedState.continuationContext;
-        }
-        
-        this.log(`Restored state: phase ${savedState.phaseIndex} (${savedState.phaseName || 'unknown'})`);
-        
-        // Emit progress to notify UI
-        this.emitProgress();
-    }
-    
     /**
      * Get the input used to create this workflow (for re-creation during recovery)
      */
@@ -871,114 +613,6 @@ ${ctx.partialOutput.slice(-3000)}
      */
     getAllocatedAgentNames(): string[] {
         return [...this.allocatedAgents, ...this.benchedAgents];
-    }
-    
-    /**
-     * Persist workflow state to disk for cross-restart recovery
-     * 
-     * Called:
-     * - When workflow is paused (user_request, conflict, daemon_shutdown)
-     * - After each phase completion (checkpoint)
-     * 
-     * The saved state includes everything needed to:
-     * - Recreate the workflow object on daemon restart
-     * - Resume from the correct phase
-     * - Restore agent allocations
-     * 
-     * @param reason Why the state is being saved
-     */
-    async persistState(reason: 'user_request' | 'conflict' | 'error' | 'timeout' | 'daemon_shutdown' | 'checkpoint'): Promise<void> {
-        const phases = this.getPhases();
-        const phaseName = phases[this.phaseIndex] || 'unknown';
-        
-        // Get taskId from input - only task_implementation workflows have this
-        const taskId = (this.input as any).taskId;
-        if (!taskId) {
-            // Non-task workflows (like planning workflows) don't persist to tasks
-            this.log(`Skipping persist for non-task workflow (reason: ${reason})`);
-            return;
-        }
-        
-        // Build workflow status for persistence
-        let workflowStatus: ActiveWorkflowState['status'] = 'running';
-        if (this.status === 'paused') {
-            workflowStatus = 'paused';
-        } else if (this.status === 'blocked') {
-            workflowStatus = 'blocked';
-        } else if (this.status === 'pending') {
-            workflowStatus = 'pending';
-        }
-        
-        // Build continuation context if we have partial work
-        const continuationContext = this.continuationContext ? {
-            partialOutput: this.continuationContext.partialOutput || '',
-            filesModified: this.continuationContext.filesModified || [],
-            whatWasDone: this.continuationContext.whatWasDone || 
-                (this.phaseIndex > 0 ? `Completed phases: ${phases.slice(0, this.phaseIndex).join(', ')}` : 'Just started')
-        } : undefined;
-        
-        // Build the active workflow state to persist
-        const activeWorkflowState: Partial<ActiveWorkflowState> = {
-            status: workflowStatus,
-            phaseIndex: this.phaseIndex,
-            phaseName,
-            allocatedAgents: this.getAllocatedAgentNames(),
-            pausedAt: new Date().toISOString(),
-            continuationContext
-        };
-        
-        // Save to task via TaskManager
-        // taskId should already be in global format PS_XXXXXX_TN - just normalize to uppercase
-        const globalTaskId = taskId.toUpperCase();
-        const taskManager = ServiceLocator.resolve(TaskManager);
-        taskManager.saveActiveWorkflowState(globalTaskId, activeWorkflowState);
-        this.log(`Persisted state (reason: ${reason}, phase: ${this.phaseIndex}/${phases.length})`);
-    }
-    
-    /**
-     * Build continuation prompt from saved context
-     */
-    private buildContinuationPromptFromContext(): string {
-        if (!this.continuationContext) return '';
-        
-        const lines: string[] = [
-            '## ⚠️ SESSION CONTINUATION',
-            '',
-            'This task was paused mid-execution. You are continuing from where the previous agent left off.',
-            '',
-            `### Phase: ${this.continuationContext.phaseName}`,
-            '',
-            '### What Was Done',
-            this.continuationContext.whatWasDone || 'Unknown - check files modified',
-            '',
-            '### Files Modified So Far',
-            this.continuationContext.filesModified.length > 0 
-                ? this.continuationContext.filesModified.map(f => `- ${f}`).join('\n')
-                : '- None yet',
-            '',
-            '### Instructions',
-            'Continue the work from where the previous agent left off. Do not repeat completed work.',
-            ''
-        ];
-        
-        return lines.join('\n');
-    }
-    
-    /**
-     * Clear persisted state (called after successful completion or cancellation)
-     */
-    clearPersistedState(): void {
-        const taskId = (this.input as any).taskId;
-        if (!taskId) {
-            // Non-task workflows don't have persisted state in tasks
-            return;
-        }
-        
-        // taskId should already be in global format PS_XXXXXX_TN - just normalize to uppercase
-        const globalTaskId = taskId.toUpperCase();
-        const taskManager = ServiceLocator.resolve(TaskManager);
-        taskManager.clearActiveWorkflow(globalTaskId);
-        this.log('Cleared persisted state');
     }
     
     // ========================================================================
@@ -1001,25 +635,7 @@ ${ctx.partialOutput.slice(-3000)}
             this.releaseTaskOccupancy(this.occupiedTaskIds);
         }
         
-        // Clear continuation context (memory cleanup)
-        // Explicitly release large strings
-        if (this.continuationContext) {
-            this.continuationContext.partialOutput = '';
-            this.continuationContext.filesModified = [];
-            this.continuationContext.whatWasDone = '';
-            this.continuationContext = undefined;
-        }
         this.currentAgentRunId = undefined;
-        
-        // Clear pause state
-        this.pauseRequested = false;
-        this.forcePauseRequested = false;
-        if (this.pauseResolve) {
-            // Resolve any pending pause to prevent hanging promises
-            this.pauseResolve();
-        }
-        this.pausePromise = null;
-        this.pauseResolve = null;
         
         // Clear allocated agents array
         this.allocatedAgents = [];
@@ -1036,9 +652,20 @@ ${ctx.partialOutput.slice(-3000)}
         this.onAgentNeeded.dispose();
         this.onAgentReleased.dispose();
         this.onAgentTerminated.dispose();
+        this.onAgentWorkStarted.dispose();
         this.onTaskOccupancyDeclared.dispose();
         this.onTaskOccupancyReleased.dispose();
         this.onTaskConflictDeclared.dispose();
+        this.onWorkflowEvent.dispose();
+        
+        // Reject any pending event waiters
+        for (const [eventType, waiter] of this.pendingEventWaiters) {
+            if (waiter.timeoutId) {
+                clearTimeout(waiter.timeoutId);
+            }
+            waiter.reject(new Error(`Workflow disposed while waiting for event: ${eventType}`));
+        }
+        this.pendingEventWaiters.clear();
         
         // Clear input to release any large objects
         this.input = {};
@@ -1061,102 +688,40 @@ ${ctx.partialOutput.slice(-3000)}
                 return;
             }
             
-            // Check for pause
-            if (this.pauseRequested && this.pausePromise) {
-                this.log(`Paused at phase ${this.phaseIndex}: ${phases[this.phaseIndex]}`);
-                await this.pausePromise;
-                
-                // Check if cancelled during pause (use local var due to TS narrowing)
-                const pauseStatus: WorkflowStatus = this.status;
-                if (pauseStatus === 'cancelled') {
-                    return;
-                }
-            }
-            
             this.log(`Phase ${this.phaseIndex + 1}/${phases.length}: ${phases[this.phaseIndex]}`);
             this.emitProgress();
             
-            // Execute phase with retry support
-            await this.executePhaseWithRetry(this.phaseIndex);
+            // Execute phase (errors propagate up, coordinator handles retry)
+            await this.runPhase(this.phaseIndex);
             this.phaseIndex++;
-            
-            // Checkpoint after each phase completion (for cross-restart recovery)
-            // Don't persist if we're about to complete (no more phases)
-            if (this.phaseIndex < phases.length) {
-                await this.persistState('checkpoint');
-            }
         }
     }
     
     /**
-     * Execute a phase with retry logic
+     * Run a phase with error classification
      * 
-     * Uses exponential backoff with configurable retry settings.
-     * Subclasses can override getRetryPolicy() to customize retry behavior.
+     * When a phase fails:
+     * 1. Error is classified and logged
+     * 2. Error propagates up to start()
+     * 3. Workflow fails and releases all agents via releaseAllAgents()
+     * 4. Coordinator sees the failed task and can spawn a new workflow to retry
      */
-    protected async executePhaseWithRetry(phaseIndex: number): Promise<void> {
-        const { RetryPolicy } = await import('./RetryPolicy');
+    protected async runPhase(phaseIndex: number): Promise<void> {
         const { ErrorClassifier } = await import('./ErrorClassifier');
-        
-        const policy = new RetryPolicy(this.type);
         const classifier = ServiceLocator.resolve(ErrorClassifier);
         const phases = this.getPhases();
         const phaseName = phases[phaseIndex];
         
-        while (true) {
-            try {
-                await this.executePhase(phaseIndex);
-                policy.recordSuccess();
-                return; // Success!
-                
-            } catch (error) {
-                const errorMessage = error instanceof Error ? error.message : String(error);
-                const decision = policy.recordFailure(errorMessage);
-                const classification = classifier.classify(errorMessage);
-                
-                this.log(`Phase ${phaseName} failed: ${errorMessage.substring(0, 100)}`);
-                this.log(`  Error type: ${classification.type} (${classification.category})`);
-                this.log(`  Attempt: ${policy.getAttemptCount()}/${policy.getMaxAttempts()}`);
-                
-                if (!decision.shouldRetry) {
-                    // No more retries - propagate the error
-                    this.log(`  ❌ Giving up: ${decision.reason}`);
-                    throw error;
-                }
-                
-                // Cancel any pending completion signals before retry
-                // This prevents "Already waiting for completion signal" errors when
-                // retrying phases that spawn agents with waitForAgentCompletion
-                try {
-                    const { UnifiedCoordinatorService } = await import('../UnifiedCoordinatorService');
-                    const coordinator = ServiceLocator.resolve(UnifiedCoordinatorService);
-                    coordinator.cancelPendingSignal(this.id);
-                    this.log(`  🧹 Cleared pending completion signals for retry`);
-                } catch (cleanupError) {
-                    // Non-fatal: just log and continue
-                    this.log(`  ⚠️ Failed to clear pending signals: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`);
-                }
-                
-                // Wait before retry
-                this.log(`  🔄 Retrying in ${Math.round(decision.delayMs / 1000)}s...`);
-                await RetryPolicy.delay(decision.delayMs);
-                
-                // Check for cancellation/pause before retry
-                const statusBeforeRetry: WorkflowStatus = this.status;
-                if (statusBeforeRetry === 'cancelled') {
-                    throw new Error('Workflow cancelled during retry');
-                }
-                
-                if (this.pauseRequested && this.pausePromise) {
-                    this.log(`  ⏸️ Paused during retry`);
-                    await this.pausePromise;
-                    
-                    const statusAfterPause: WorkflowStatus = this.status;
-                    if (statusAfterPause === 'cancelled') {
-                        throw new Error('Workflow cancelled during retry pause');
-                    }
-                }
-            }
+        try {
+            await this.executePhase(phaseIndex);
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            const classification = classifier.classify(errorMessage);
+            
+            this.log(`Phase ${phaseName} failed: ${errorMessage.substring(0, 100)}`);
+            this.log(`  Error type: ${classification.type} (${classification.category})`);
+            this.log(`  ❌ Workflow will fail - coordinator handles retry at task level`);
+            throw error;
         }
     }
     
@@ -1391,22 +956,40 @@ ${ctx.partialOutput.slice(-3000)}
         return this.unityEnabled && this.unityManager !== undefined;
     }
     
+    /**
+     * Append extra instruction to a prompt if available.
+     * Used by subclasses when building agent prompts.
+     * 
+     * @param basePrompt The base prompt to append to
+     * @returns The prompt with extra instruction appended, if any
+     */
+    protected appendExtraInstruction(basePrompt: string): string {
+        if (!this.extraInstruction) {
+            return basePrompt;
+        }
+        
+        return `${basePrompt}
+
+## Additional Instructions from User
+${this.extraInstruction}`;
+    }
+    
     // ========================================================================
-    // Agent Task Execution with CLI Callback Support
+    // Agent Task Execution with Output Parsing
     // ========================================================================
     
     /**
-     * Run an agent task and wait for CLI callback or process completion
+     * Run an agent task and parse output to determine result
      * 
      * This is the primary method for running agent tasks with structured results.
-     * The agent MUST call `apc agent complete` to signal completion.
-     * If the process exits without calling the CLI callback, the workflow fails.
+     * The workflow waits for the agent process to exit, then parses the output
+     * to determine the result. Agents do NOT need to call any CLI commands.
      * 
-     * The race works as follows:
-     * 1. Start the agent process
-     * 2. Wait for EITHER:
-     *    a) CLI callback (`apc agent complete`) - required for success
-     *    b) Process exit without callback - throws an error
+     * The flow is:
+     * 1. Start the agent process with summary instructions
+     * 2. Wait for process to exit
+     * 3. Parse output (task summary block or stage-specific patterns)
+     * 4. Return structured result based on parsed output + exit code
      * 
      * @param taskId Human-readable task ID for logging
      * @param prompt The prompt to send to the agent
@@ -1419,12 +1002,12 @@ ${ctx.partialOutput.slice(-3000)}
         prompt: string,
         roleId: string,
         options: {
-            /** Stage name for CLI callback matching (e.g., 'implementation', 'review') */
+            /** Stage name for result mapping (e.g., 'implementation', 'review') */
             expectedStage: AgentStage;
             /** Timeout in milliseconds (default 10 minutes) */
             timeout?: number;
-            /** Custom model to use instead of role default */
-            model?: string;
+            /** Custom model tier to use instead of role default (low/mid/high) */
+            model?: ModelTier;
             /** Working directory for the agent */
             cwd?: string;
             /** Pre-allocated agent name - if provided, uses this agent instead of requesting a new one */
@@ -1435,13 +1018,11 @@ ${ctx.partialOutput.slice(-3000)}
     ): Promise<AgentTaskResult> {
         const { AgentRunner } = await import('../AgentBackend');
         const agentRunner = ServiceLocator.resolve(AgentRunner);
-        const { UnifiedCoordinatorService } = await import('../UnifiedCoordinatorService');
-        const coordinator = ServiceLocator.resolve(UnifiedCoordinatorService);
         
         const role = this.getRole(roleId);
         const timeout = options.timeout ?? role?.timeoutMs ?? 600000;
         
-        this.log(`Starting agent task [${taskId}] with CLI callback (stage: ${options.expectedStage})`);
+        this.log(`Starting agent task [${taskId}] (stage: ${options.expectedStage})`);
         
         // ============ TIMING: Track agent allocation ============
         const allocationStart = Date.now();
@@ -1470,12 +1051,10 @@ ${ctx.partialOutput.slice(-3000)}
                     const benchIndex = this.benchedAgents.indexOf(agentName);
                     if (benchIndex >= 0) {
                         this.benchedAgents.splice(benchIndex, 1);
-                        this.log(`  🔧 FIX: Removed ${agentName} from benchedAgents (was at index ${benchIndex})`);
                     }
                     // Add to allocatedAgents (agent is now active for this workflow)
                     if (!this.allocatedAgents.includes(agentName)) {
                         this.allocatedAgents.push(agentName);
-                        this.log(`  🔧 FIX: Added ${agentName} to allocatedAgents`);
                     }
                 } else {
                     this.log(`  ⚠️ Failed to promote ${agentName} to busy`);
@@ -1493,8 +1072,8 @@ ${ctx.partialOutput.slice(-3000)}
             this.log(`  Agent ${agentName} allocated for ${roleId} [allocation: ${allocationDuration}ms]`);
         }
         
-        // Inject CLI callback instructions into prompt (include taskId for parallel task support)
-        const enhancedPrompt = this.injectCliCallbackInstructions(
+        // Inject summary instructions into prompt (no CLI callback required)
+        const enhancedPrompt = this.injectSummaryInstructions(
             prompt,
             options.expectedStage,
             roleId,
@@ -1505,123 +1084,101 @@ ${ctx.partialOutput.slice(-3000)}
         const runId = `${this.id}_${taskId}_${Date.now()}`;
         this.currentAgentRunId = runId;
         
-        // Set up log file for streaming - temp file with agent name
+        // Increment work counter for unique log file per agent task
+        this.agentWorkCount++;
+        const workCount = this.agentWorkCount;
+        
+        // Set up log file for streaming - unique per agent work assignment
+        // Format: {workflowId}_{workCount}_{agentName}.log
         const logDir = path.join(this.stateManager.getPlanFolder(this.sessionId), 'logs', 'agents');
         if (!fs.existsSync(logDir)) {
             fs.mkdirSync(logDir, { recursive: true });
         }
-        const logFile = path.join(logDir, `${this.id}_${agentName}.log`);
+        const logFile = path.join(logDir, `${this.id}_${workCount}_${agentName}.log`);
         
         // Log the agent's log file as clickable file URI
         const fileUri = `file:///${logFile.replace(/\\/g, '/')}`;
         this.log(`  📋 Agent log: ${fileUri}`);
         
-        const agentPromise = agentRunner.run({
-            id: runId,
-            prompt: enhancedPrompt,
-            model: options.model ?? role?.defaultModel ?? 'sonnet-4.5',
-            cwd: options.cwd ?? process.cwd(),
-            logFile,
-            planFile: options.planFile,
-            timeoutMs: timeout,
-            onProgress: (msg) => this.log(`  ${msg}`),
-            metadata: {
-                roleId,
-                coordinatorId: this.id,
-                sessionId: this.sessionId,
-                taskId,
-                agentName,
-                workflowType: this.type
-            }
+        // Fire event with correct log file path for terminal streaming
+        this.onAgentWorkStarted.fire({
+            agentName,
+            sessionId: this.sessionId,
+            roleId,
+            workflowId: this.id,
+            taskId,
+            workCount,
+            logFile
         });
         
-        // IMPORTANT: The agent runner (CursorAgentRunner) already registers the process
-        // with ProcessManager in its run() method via registerExternalProcess().
-        // ProcessManager will now monitor the process health and call our callbacks
-        // (setupProcessManagerMonitoring) if the process gets stuck or times out.
-        // This provides automatic detection of external kills without duplicating logic.
-        
-        // Wait for CLI callback from coordinator (include taskId for parallel task support)
-        const callbackPromise = coordinator.waitForAgentCompletion(
-            this.id,
-            options.expectedStage,
-            timeout,
-            taskId
-        );
-        
         try {
-            // Race: CLI callback required, process exit without callback is an error
-            const result = await Promise.race([
-                callbackPromise.then(signal => ({ type: 'callback' as const, signal })),
-                agentPromise.then(result => ({ type: 'process' as const, result }))
-            ]);
+            // Wait for agent process to complete
+            const processResult = await agentRunner.run({
+                id: runId,
+                prompt: enhancedPrompt,
+                model: options.model ?? role?.defaultModel ?? 'mid' as ModelTier,
+                cwd: options.cwd ?? process.cwd(),
+                logFile,
+                planFile: options.planFile,
+                timeoutMs: timeout,
+                onProgress: (msg) => this.log(`  ${msg}`),
+                metadata: {
+                    roleId,
+                    coordinatorId: this.id,
+                    sessionId: this.sessionId,
+                    taskId,
+                    agentName,
+                    workflowType: this.type
+                }
+            });
             
             this.currentAgentRunId = undefined;
+            const exitCode = processResult.exitCode ?? 0;
+            this.log(`Agent [${taskId}] process exited (exit code: ${exitCode})`);
             
-            if (result.type === 'callback') {
-                // Clean termination via CLI callback - preferred path
-                const signal = result.signal;
-                this.log(`Agent [${taskId}] completed via CLI callback: ${signal.result}`);
-                
-                // Kill the agent process since we got the callback
-                // (it should exit on its own, but just in case)
-                await agentRunner.stop(runId).catch(() => {});
-                
-                return {
-                    success: signal.result !== 'failed',
-                    result: signal.result,
-                    payload: signal.payload,
-                    fromCallback: true
-                };
-                
-            } else {
-                // Process exited without CLI callback - NOT ALLOWED
-                const processResult = result.result;
-                this.log(`Agent [${taskId}] process exited without CLI callback`);
-                
-                // Cancel the pending callback wait (include taskId for parallel task support)
-                coordinator.cancelPendingSignal(this.id, options.expectedStage, taskId);
-                
-                // All agents must use CLI callback for structured data
-                throw new Error(
-                    `Agent [${taskId}] did not use CLI callback (\`apc agent complete\`). ` +
-                    'All agents must report results via CLI callback for structured data. ' +
-                    'Legacy output parsing is no longer supported. ' +
-                    `Process exit code: ${processResult.success ? 'success' : 'failed'}`
-                );
-            }
+            // Parse output to determine result
+            return await this.parseAgentOutputForResult(
+                logFile,
+                options.expectedStage,
+                exitCode,
+                taskId
+            );
             
         } catch (error) {
             this.currentAgentRunId = undefined;
-            
-            // Timeout or other error (include taskId for parallel task support)
-            coordinator.cancelPendingSignal(this.id, options.expectedStage, taskId);
             await agentRunner.stop(runId).catch(() => {});
             
             const errorMessage = error instanceof Error ? error.message : String(error);
             this.log(`Agent [${taskId}] failed: ${errorMessage}`);
             
-            // Try a nudge session before giving up - fast model just asks agent to call CLI
-            // This recovers cases where agent did the work but forgot to signal completion
-            if (errorMessage.includes('Timeout') || errorMessage.includes('did not use CLI callback')) {
-                const nudgeResult = await this.tryCliNudgeSession(
-                    taskId,
-                    options.expectedStage,
-                    agentName,
+            // Try to parse any output that was produced before the error
+            try {
+                const partialResult = await this.parseAgentOutputForResult(
                     logFile,
-                    options.cwd
+                    options.expectedStage,
+                    1, // Assume non-zero exit for error cases
+                    taskId
                 );
-                if (nudgeResult) {
-                    return nudgeResult; // Nudge succeeded!
+                
+                // If we got a meaningful result from partial output, use it
+                if (partialResult.result !== 'needs_review') {
+                    this.log(`  → Extracted result from partial output: ${partialResult.result}`);
+                    return partialResult;
                 }
-                // Nudge failed - fall through to return failure (retry system will handle it)
+            } catch {
+                // Ignore parse errors for partial output
             }
             
+            // Return needs_review for coordinator to verify
+            this.log(`  → Marking as 'needs_review' for coordinator to verify`);
             return {
-                success: false,
-                result: 'failed',
-                payload: { error: errorMessage },
-                fromCallback: false
+                success: true,  // Mark success so task goes to awaiting_decision
+                result: 'needs_review',
+                payload: { 
+                    message: errorMessage,
+                    needsCoordinatorDecision: true
+                },
+                fromCallback: true
             };
         }
         // NOTE: Agent lifecycle is managed by the caller, not here.
@@ -1631,241 +1188,376 @@ ${ctx.partialOutput.slice(-3000)}
     }
     
     /**
-     * Try a fast "nudge" session to get the agent to call CLI
+     * Parse agent output to determine the task result
      * 
-     * When an agent does work but forgets to call CLI, this runs a quick
-     * follow-up session with a fast model that just asks them to call CLI.
-     * The agent reads the log file to understand what was done.
+     * Looks for:
+     * 1. Task summary block (===TASK_SUMMARY_START===...===TASK_SUMMARY_END===)
+     * 2. Stage-specific patterns
+     * 3. Falls back to exit code based defaults
      * 
-     * @param taskId The task identifier
-     * @param stage The expected stage for CLI callback
-     * @param agentName The agent to nudge (same Cursor window)
-     * @param logFile Path to the agent's log from the previous session
-     * @param cwd Working directory
-     * @returns AgentTaskResult if nudge succeeded, null if failed
+     * @param logFile Path to agent log file
+     * @param stage The expected stage for result mapping
+     * @param exitCode The process exit code
+     * @param taskId Task ID for logging
+     * @returns Parsed result
      */
-    private async tryCliNudgeSession(
-        taskId: string,
-        stage: AgentStage,
-        agentName: string,
+    private async parseAgentOutputForResult(
         logFile: string,
-        cwd?: string
-    ): Promise<AgentTaskResult | null> {
-        const NUDGE_TIMEOUT = 60000; // 60 seconds
+        stage: AgentStage,
+        exitCode: number,
+        taskId?: string
+    ): Promise<AgentTaskResult> {
+        // Try to extract task summary block first
+        this.log(`  → Parsing agent output for result...`);
+        const summary = await this.extractTaskSummary(logFile);
         
-        this.log(`\n🔔 NUDGE: Trying quick CLI completion session for ${agentName}...`);
-        
-        try {
-            const { AgentRunner } = await import('../AgentBackend');
-            const agentRunner = ServiceLocator.resolve(AgentRunner);
-            const { UnifiedCoordinatorService } = await import('../UnifiedCoordinatorService');
-            const coordinator = ServiceLocator.resolve(UnifiedCoordinatorService);
-            const { getDefaultSystemPrompt } = await import('../../types');
+        if (summary.found) {
+            this.log(`  📋 Found task summary: result=${summary.result}, message="${summary.message}"`);
             
-            // Get the cli_nudge prompt template from settings
-            const nudgeConfig = getDefaultSystemPrompt('cli_nudge');
-            if (!nudgeConfig) {
-                this.log(`  ⚠️ NUDGE: No cli_nudge prompt configured, skipping`);
-                return null;
-            }
-            
-            // Build the CLI command
-            const apc = this.apcCommand;
-            const taskParamInline = taskId ? ` --task ${taskId}` : '';
+            // Map summary result to valid stage result
             const { resultOptions } = this.getStageCallbackInfo(stage, taskId);
-            const exampleResult = resultOptions[0] || 'success';
-            const cliCommand = `${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage ${stage}${taskParamInline} --result ${exampleResult} --data '{}'`;
+            let finalResult = 'needs_review';
+            let needsCoordinatorDecision = false;
             
-            // Inject variables into the template
-            let nudgePrompt = nudgeConfig.promptTemplate || '';
-            nudgePrompt = nudgePrompt.replace('{{LOG_FILE_PATH}}', logFile);
-            nudgePrompt = nudgePrompt.replace('{{CLI_COMMAND}}', cliCommand);
-            nudgePrompt = nudgePrompt.replace('{{RESULT_OPTIONS}}', resultOptions.map(r => `\`${r}\``).join(', '));
-            
-            const nudgeRunId = `${this.id}_nudge_${taskId}_${Date.now()}`;
-            const nudgeLogFile = logFile.replace('.log', '_nudge.log');
-            const nudgeModel = nudgeConfig.defaultModel || 'haiku-3.5';
-            
-            this.log(`  📋 Nudge log: file:///${nudgeLogFile.replace(/\\/g, '/')}`);
-            this.log(`  🚀 Starting nudge agent (${nudgeModel})...`);
-            
-            // Start nudge agent
-            const nudgePromise = agentRunner.run({
-                id: nudgeRunId,
-                prompt: nudgePrompt,
-                model: nudgeModel,
-                cwd: cwd ?? process.cwd(),
-                logFile: nudgeLogFile,
-                timeoutMs: NUDGE_TIMEOUT,
-                onProgress: (msg) => this.log(`  [nudge] ${msg}`),
-                metadata: {
-                    roleId: 'cli_nudge',
-                    coordinatorId: this.id,
-                    sessionId: this.sessionId,
-                    taskId: `nudge_${taskId}`,
-                    agentName,
-                    workflowType: this.type
+            if (summary.result) {
+                const normalizedResult = summary.result.toLowerCase();
+                const lowerOptions = resultOptions.map(r => r.toLowerCase());
+                
+                if (lowerOptions.includes(normalizedResult)) {
+                    finalResult = normalizedResult;
+                } else {
+                    // Map to closest equivalent
+                    const successAliases = ['success', 'complete', 'pass', 'approved', 'done', 'ok'];
+                    const changesAliases = ['changes_requested', 'minor', 'needs_work', 'revise'];
+                    const failureAliases = ['failed', 'critical', 'error', 'rejected'];
+                    
+                    if (successAliases.includes(normalizedResult)) {
+                        finalResult = lowerOptions.find(o => successAliases.includes(o)) 
+                            || resultOptions[0] || 'success';
+                    } else if (changesAliases.includes(normalizedResult)) {
+                        finalResult = lowerOptions.find(o => changesAliases.includes(o)) 
+                            || lowerOptions.find(o => failureAliases.includes(o))
+                            || 'failed';
+                    } else if (failureAliases.includes(normalizedResult)) {
+                        finalResult = lowerOptions.find(o => failureAliases.includes(o)) 
+                            || 'failed';
+                    }
                 }
-            });
-            
-            // Wait for CLI callback
-            const nudgeCallbackPromise = coordinator.waitForAgentCompletion(
-                this.id,
-                stage,
-                NUDGE_TIMEOUT,
-                taskId
-            );
-            
-            const result = await Promise.race([
-                nudgeCallbackPromise.then(signal => ({ type: 'callback' as const, signal })),
-                nudgePromise.then(result => ({ type: 'process' as const, result }))
-            ]);
-            
-            if (result.type === 'callback') {
-                // Success! Agent called CLI
-                const signal = result.signal;
-                this.log(`  ✓ NUDGE succeeded! Agent called CLI: ${signal.result}`);
-                
-                await agentRunner.stop(nudgeRunId).catch(() => {});
-                
-                return {
-                    success: signal.result !== 'failed',
-                    result: signal.result,
-                    payload: signal.payload,
-                    fromCallback: true
-                };
             } else {
-                // Nudge also failed - agent still didn't call CLI
-                this.log(`  ✗ NUDGE failed - agent still didn't call CLI`);
-                coordinator.cancelPendingSignal(this.id, stage, taskId);
-                await agentRunner.stop(nudgeRunId).catch(() => {});
-                return null;
+                // Summary found but result is undefined - likely truncated
+                needsCoordinatorDecision = true;
+                this.log(`  ⚠️ Summary found but RESULT field is missing/undefined`);
             }
             
-        } catch (nudgeError) {
-            this.log(`  ✗ NUDGE error: ${nudgeError instanceof Error ? nudgeError.message : String(nudgeError)}`);
-            return null;
+            this.log(`  ✓ Result from summary: ${finalResult}${needsCoordinatorDecision ? ' (needs coordinator decision)' : ''}`);
+            
+            const isSuccess = finalResult !== 'failed' || needsCoordinatorDecision;
+            return {
+                success: isSuccess,
+                result: finalResult as AgentStageResult,
+                payload: {
+                    message: summary.message,
+                    files: summary.files,
+                    needsCoordinatorDecision: needsCoordinatorDecision || undefined
+                },
+                fromCallback: true
+            };
+        }
+        
+        // No summary block - try stage-specific pattern extraction
+        this.log(`  → No summary block found, trying stage-specific pattern extraction...`);
+        const extracted = await this.extractResultFromOutput(logFile, stage);
+        
+        if (extracted) {
+            this.log(`  ✓ Pattern extraction succeeded: ${extracted.result}`);
+            
+            const isSuccess = extracted.result !== 'failed' && extracted.result !== 'critical';
+            return {
+                success: isSuccess,
+                result: extracted.result as AgentStageResult,
+                payload: extracted.message || extracted.files 
+                    ? { message: extracted.message, files: extracted.files } 
+                    : undefined,
+                fromCallback: true
+            };
+        }
+        
+        // No patterns matched - use exit code based logic
+        this.log(`  → No pattern matched in output`);
+        
+        if (exitCode !== 0) {
+            // Non-zero exit code indicates crash/error
+            this.log(`  → Exit code ${exitCode} indicates crash/error`);
+            this.log(`  → Marking as 'needs_review' for coordinator to verify`);
+            return {
+                success: true,  // Mark success so task goes to awaiting_decision
+                result: 'needs_review',
+                payload: { 
+                    message: `Agent process exited with code ${exitCode}. No recognizable output pattern found.`,
+                    needsCoordinatorDecision: true
+                },
+                fromCallback: true
+            };
+        }
+        
+        // Exit code 0 but no patterns - use stage defaults
+        this.log(`  → Exit code 0 but no recognizable output - using stage default`);
+        const stageDefaults: Record<AgentStage, { result: AgentStageResult; success: boolean }> = {
+            'implementation': { result: 'success', success: true },
+            'fix': { result: 'success', success: true },
+            'review': { result: 'needs_review', success: true },
+            'analysis': { result: 'needs_review', success: true },
+            'plan': { result: 'needs_review', success: true },
+            'context_gathering': { result: 'success', success: true }
+        };
+        
+        const stageDefault = stageDefaults[stage] || { result: 'needs_review', success: true };
+        this.log(`  → Stage '${stage}' default: ${stageDefault.result}`);
+        
+        return {
+            success: stageDefault.success,
+            result: stageDefault.result,
+            payload: { 
+                message: `Agent completed (exit code 0) but no recognizable output. Using stage default: ${stageDefault.result}`,
+                needsCoordinatorDecision: stageDefault.result === 'needs_review'
+            },
+            fromCallback: true
+        };
+    }
+    
+    /**
+     * Extract task summary from log file (if agent wrote one)
+     * Looks for ===TASK_SUMMARY_START=== / ===TASK_SUMMARY_END=== markers
+     * 
+     * @param logFile Path to the agent's log file
+     * @returns Parsed summary or { found: false } if no summary
+     */
+    private async extractTaskSummary(logFile: string): Promise<{
+        found: boolean;
+        result?: string;
+        message?: string;
+        files?: string[];
+    }> {
+        try {
+            const content = await fs.promises.readFile(logFile, 'utf-8');
+            
+            // Look for summary markers
+            const startMarker = '===TASK_SUMMARY_START===';
+            const endMarker = '===TASK_SUMMARY_END===';
+            
+            const startIdx = content.lastIndexOf(startMarker);
+            const endIdx = content.lastIndexOf(endMarker);
+            
+            if (startIdx === -1 || endIdx === -1 || endIdx <= startIdx) {
+                return { found: false };
+            }
+            
+            const summaryBlock = content.substring(startIdx + startMarker.length, endIdx).trim();
+            
+            // Parse the structured summary
+            const lines = summaryBlock.split('\n');
+            let result: string | undefined;
+            let message: string | undefined;
+            let files: string[] | undefined;
+            
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (trimmed.startsWith('RESULT:')) {
+                    result = trimmed.substring(7).trim().toLowerCase();
+                } else if (trimmed.startsWith('MESSAGE:')) {
+                    message = trimmed.substring(8).trim();
+                } else if (trimmed.startsWith('FILES:')) {
+                    const filesStr = trimmed.substring(6).trim();
+                    if (filesStr && filesStr.toLowerCase() !== 'none') {
+                        files = filesStr.split(',').map(f => f.trim()).filter(Boolean);
+                    }
+                }
+            }
+            
+            return {
+                found: true,
+                result,
+                message,
+                files
+            };
+        } catch (error) {
+            this.log(`  ⚠️ Could not read log for summary extraction: ${error}`);
+            return { found: false };
         }
     }
     
     /**
-     * Inject CLI callback instructions into the agent prompt
+     * Extract result from agent output using stage-specific pattern matching
      * 
-     * Uses "sandwich" technique: brief reminder at START + detailed instructions at END.
-     * This ensures the AI doesn't forget to call the callback even for long tasks.
+     * This is a fallback when the agent didn't write a TASK_SUMMARY block.
+     * It tries to parse known output patterns for each stage type.
+     * 
+     * @param logFile Path to the agent's log file
+     * @param stage The stage to extract result for
+     * @returns Extracted result or null if no pattern matched
+     */
+    private async extractResultFromOutput(
+        logFile: string,
+        stage: AgentStage
+    ): Promise<{
+        result: string;
+        message?: string;
+        files?: string[];
+    } | null> {
+        try {
+            const content = await fs.promises.readFile(logFile, 'utf-8');
+            
+            // Stage-specific pattern matching
+            switch (stage) {
+                case 'review': {
+                    // Look for "### Review Result: APPROVED" or "### Review Result: CHANGES_REQUESTED"
+                    const reviewMatch = content.match(/###\s*Review\s*Result:\s*(APPROVED|CHANGES_REQUESTED)/i);
+                    if (reviewMatch) {
+                        const result = reviewMatch[1].toLowerCase();
+                        
+                        // Try to extract feedback for changes_requested
+                        let message: string | undefined;
+                        if (result === 'changes_requested') {
+                            // Look for "#### Issues Found" section
+                            const issuesMatch = content.match(/####\s*Issues\s*Found[\s\S]*?(?=####|$)/i);
+                            if (issuesMatch) {
+                                message = issuesMatch[0].trim().substring(0, 500); // Limit length
+                            }
+                        }
+                        
+                        this.log(`  📋 Extracted review result from output: ${result}`);
+                        return { result, message };
+                    }
+                    break;
+                }
+                
+                case 'implementation': {
+                    // For implementation, look for success indicators
+                    // Pattern: "✓" success markers, "Implementation complete", "files modified", etc.
+                    const successPatterns = [
+                        /implementation\s+complete/i,
+                        /successfully\s+implemented/i,
+                        /✓.*(?:complete|done|finished)/i,
+                        /files?\s+(?:modified|created|updated)/i
+                    ];
+                    
+                    for (const pattern of successPatterns) {
+                        if (pattern.test(content)) {
+                            // Try to extract modified files
+                            const filesMatch = content.match(/(?:modified|created|updated|changed).*?:\s*([^\n]+)/gi);
+                            const files: string[] = [];
+                            if (filesMatch) {
+                                for (const match of filesMatch) {
+                                    const fileNames = match.match(/[\w\-./\\]+\.\w+/g);
+                                    if (fileNames) {
+                                        files.push(...fileNames);
+                                    }
+                                }
+                            }
+                            
+                            this.log(`  📋 Extracted implementation success from output patterns`);
+                            return { result: 'success', files: files.length > 0 ? files : undefined };
+                        }
+                    }
+                    break;
+                }
+                
+                case 'analysis': {
+                    // Look for analyst verdict patterns
+                    const analysisMatch = content.match(/(?:verdict|result):\s*(pass|critical|minor)/i);
+                    if (analysisMatch) {
+                        this.log(`  📋 Extracted analysis result from output: ${analysisMatch[1]}`);
+                        return { result: analysisMatch[1].toLowerCase() };
+                    }
+                    break;
+                }
+                
+                case 'fix': {
+                    // For error fix, look for success indicators
+                    const fixPatterns = [
+                        /fix\s+(?:applied|complete|successful)/i,
+                        /error\s+(?:resolved|fixed)/i,
+                        /✓.*fix/i
+                    ];
+                    
+                    for (const pattern of fixPatterns) {
+                        if (pattern.test(content)) {
+                            this.log(`  📋 Extracted fix success from output patterns`);
+                            return { result: 'success' };
+                        }
+                    }
+                    break;
+                }
+                
+                // Other stages: no specific patterns, return null
+                default:
+                    break;
+            }
+            
+            return null;
+        } catch (error) {
+            this.log(`  ⚠️ Could not read log for output extraction: ${error}`);
+            return null;
+        }
+    }
+    
+    
+    /**
+     * Inject task summary instructions into the agent prompt
+     * 
+     * Agents are asked to write a structured summary at the end of their work.
+     * The workflow system will parse this summary after the agent exits to
+     * determine the result - agents do NOT need to call any CLI commands.
      * 
      * @param prompt The original prompt
      * @param stage The agent stage
      * @param roleId The role ID
      * @param taskId Optional task ID for parallel task support
      */
-    private injectCliCallbackInstructions(
+    private injectSummaryInstructions(
         prompt: string,
         stage: AgentStage,
         roleId: string,
         taskId?: string
     ): string {
-        // Get stage-specific result options and payload schema
-        const { resultOptions, payloadSchema, examples } = this.getStageCallbackInfo(stage, taskId);
-        
-        // Include --task parameter inline if taskId is provided (for parallel tasks)
-        const taskParamInline = taskId ? ` --task ${taskId}` : '';
-        
-        // Get absolute path to apc CLI for reliable execution
-        const apc = this.apcCommand;
+        // Get stage-specific result options
+        const { resultOptions } = this.getStageCallbackInfo(stage, taskId);
         
         // Use first concrete example from examples section
         const exampleResult = resultOptions[0] || 'success';
-        const exampleCommand = `${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage ${stage}${taskParamInline} --result ${exampleResult} --data '{}'`;
         
-        // Get role rules to inject
-        const role = this.getRole(roleId);
-        const roleRules = role?.rules || [];
-        const rulesSection = roleRules.length > 0 
-            ? `\n## Rules You Must Follow\n${roleRules.map(r => `- ${r}`).join('\n')}\n` 
-            : '';
-        
-        // MANDATORY WORKFLOW HEADER - extremely prominent with immediate acknowledgment requirement
-        const workflowHeader = `
-╔══════════════════════════════════════════════════════════════════════════════════════╗
-║  🚨🚨🚨 CRITICAL: YOU MUST RUN A CLI COMMAND TO COMPLETE - WORKFLOW FAILS WITHOUT IT 🚨🚨🚨  ║
-╚══════════════════════════════════════════════════════════════════════════════════════╝
+        // Instructions for writing task summary - NO CLI callback required
+        const summaryInstructions = `
 
-## ⚡ IMMEDIATE ACTION REQUIRED
+---
 
-Before doing ANY work, acknowledge this requirement by thinking: "I must run the apc agent complete command when done."
+## 📝 WHEN YOU FINISH - WRITE YOUR SUMMARY
 
-Your REQUIRED completion command (run this when your work is finished):
-\`\`\`bash
-${exampleCommand}
+When you have completed the task above, output a summary in this EXACT format:
+
+\`\`\`
+===TASK_SUMMARY_START===
+RESULT: ${resultOptions.join(' | ')}
+MESSAGE: Brief description of what was done or what went wrong
+FILES: comma-separated list of modified files (or "none")
+===TASK_SUMMARY_END===
 \`\`\`
 
-## YOUR WORKFLOW
-
-1. **DO**: Complete the task described below
-2. **THEN**: Run the command above in the terminal (use run_terminal_cmd tool)  
-3. **VERIFY**: The command outputs success before finishing
-
-❌ **FAILURE MODE**: Exiting without running the command = WORKFLOW FAILS
-✅ **SUCCESS MODE**: Task complete + CLI command run successfully = WORKFLOW SUCCEEDS
-${rulesSection}
----
-
-`;
-        
-        // MID-PROMPT REMINDER - inserted after main task
-        const midPromptReminder = `
-
----
-🔔 **REMINDER**: When you finish the task above, you MUST run this command:
-\`\`\`bash
-${exampleCommand}
+Example:
 \`\`\`
----
-
-`;
-        
-        // DETAILED INSTRUCTIONS at END - reinforcement
-        const callbackInstructions = `
-
----
-
-## 📡 FINAL STEP: RUN THE COMPLETION COMMAND (MANDATORY)
-
-You have completed the work above. Now you MUST run the completion command using the \`run_terminal_cmd\` tool.
-
-### ⛔ STOP - DO NOT FINISH WITHOUT RUNNING THIS COMMAND
-
-The workflow system is actively waiting for this CLI callback signal. Your text responses are NOT sufficient.
-You must execute this terminal command:
-
-\`\`\`bash
-${exampleCommand}
+===TASK_SUMMARY_START===
+RESULT: ${exampleResult}
+MESSAGE: Implemented the requested feature successfully
+FILES: Assets/Scripts/Example.cs, Assets/Scripts/Helper.cs
+===TASK_SUMMARY_END===
 \`\`\`
 
 ### Result Options: ${resultOptions.map(r => `\`${r}\``).join(', ')}
 
-### Payload Schema (for --data parameter)
-\`\`\`json
-${payloadSchema}
-\`\`\`
-
-### Complete Examples
-${examples}
-
-### Troubleshooting
-- If command fails: Wait 2 seconds and retry (up to 3 times)
-- Check daemon status: \`${apc} status\`
-
-### ✅ FINAL CHECKLIST - ALL MUST BE TRUE
-- [ ] I completed my assigned work  
-- [ ] I ran the \`${apc} agent complete\` command using run_terminal_cmd
-- [ ] The command returned successfully (exit code 0)
-
-🛑 **YOUR RESPONSE IS NOT COMPLETE UNTIL YOU RUN THE CLI COMMAND** 🛑
+**That's it!** Just write this summary when you're done. The workflow system will automatically detect your completion.
 `;
 
-        return workflowHeader + prompt + midPromptReminder + callbackInstructions;
+        return prompt + summaryInstructions;
     }
     
     /**
@@ -2064,18 +1756,18 @@ ${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage 
     }
     
     /**
-     * Declare task conflicts - tells coordinator these tasks should be paused
+     * Declare task conflicts - tells coordinator these tasks should be cancelled
      * 
      * Use this when your workflow needs exclusive access to certain tasks,
      * e.g., revision workflow declares conflicts with affected tasks.
      * 
      * @param taskIds Tasks that conflict with this workflow
-     * @param resolution How coordinator should handle: pause_others, wait_for_others, abort_if_occupied
+     * @param resolution How coordinator should handle: cancel_others, wait_for_others, abort_if_occupied
      * @param reason Optional reason for logging/UI
      */
     protected declareTaskConflicts(
         taskIds: string[],
-        resolution: 'pause_others' | 'wait_for_others' | 'abort_if_occupied' = 'pause_others',
+        resolution: 'cancel_others' | 'wait_for_others' | 'abort_if_occupied' = 'cancel_others',
         reason?: string
     ): void {
         // Store for getConflictingTaskIds()
@@ -2098,6 +1790,73 @@ ${apc} agent complete --session ${this.sessionId} --workflow ${this.id} --stage 
         if (this.conflictingTaskIds.length > 0) {
             this.log(`Clearing conflicts: ${this.conflictingTaskIds.join(', ')}`);
             this.conflictingTaskIds = [];
+        }
+    }
+    
+    // ========================================================================
+    // Workflow Events (for UI interaction)
+    // ========================================================================
+    
+    /**
+     * Emit a workflow event to connected clients
+     * Used for things like implementation review requests that need user interaction
+     * 
+     * @param eventType Event type (e.g., 'implementation_review.request')
+     * @param payload Event payload
+     */
+    protected emitWorkflowEvent(eventType: string, payload?: any): void {
+        this.log(`Emitting workflow event: ${eventType}`);
+        this.onWorkflowEvent.fire({ eventType, payload });
+    }
+    
+    /**
+     * Wait for a workflow event response
+     * Used to pause workflow execution until user responds to a request
+     * 
+     * @param eventType Event type to wait for (e.g., 'implementation_review.response')
+     * @param timeoutMs Timeout in milliseconds (default 30 minutes)
+     * @returns Promise that resolves with the event payload
+     */
+    protected waitForWorkflowEvent(eventType: string, timeoutMs: number = 30 * 60 * 1000): Promise<any> {
+        this.log(`Waiting for workflow event: ${eventType} (timeout: ${timeoutMs}ms)`);
+        
+        return new Promise((resolve, reject) => {
+            const timeoutId = setTimeout(() => {
+                this.pendingEventWaiters.delete(eventType);
+                this.log(`Timeout waiting for event: ${eventType}`);
+                resolve(null);  // Resolve with null on timeout (not reject)
+            }, timeoutMs);
+            
+            this.pendingEventWaiters.set(eventType, {
+                resolve: (value: any) => {
+                    clearTimeout(timeoutId);
+                    this.pendingEventWaiters.delete(eventType);
+                    resolve(value);
+                },
+                reject: (error: Error) => {
+                    clearTimeout(timeoutId);
+                    this.pendingEventWaiters.delete(eventType);
+                    reject(error);
+                },
+                timeoutId
+            });
+        });
+    }
+    
+    /**
+     * Handle an incoming workflow event response
+     * Called by coordinator when it receives a response from a client
+     * 
+     * @param eventType The event type
+     * @param payload The response payload
+     */
+    public handleWorkflowEventResponse(eventType: string, payload: any): void {
+        const waiter = this.pendingEventWaiters.get(eventType);
+        if (waiter) {
+            this.log(`Received event response: ${eventType}`);
+            waiter.resolve(payload);
+        } else {
+            this.log(`Received event response for non-waiting event: ${eventType}`);
         }
     }
 }

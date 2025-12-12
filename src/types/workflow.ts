@@ -20,7 +20,10 @@ export type WorkflowType =
     | 'error_resolution'       // Error fixing after Unity failure
     
     // Context workflows
-    | 'context_gathering';     // Standalone: Gather → Summarize → Persist to Context folder
+    | 'context_gathering'      // Standalone: Gather → Summarize → Persist to Context folder
+    
+    // Review workflows
+    | 'implementation_review'; // Manual: 3 analysts review completed code → User confirms fixes
 
 /**
  * Workflow lifecycle states
@@ -28,10 +31,9 @@ export type WorkflowType =
 export type WorkflowStatus = 
     | 'pending'      // Created but not started
     | 'running'      // Actively executing
-    | 'paused'       // Paused by user/system
     | 'blocked'      // Waiting on external dependency
-    | 'completed'    // Successfully finished
-    | 'failed'       // Failed with error
+    | 'succeeded'    // Successfully finished
+    | 'failed'       // Failed with error (workflows CAN fail, tasks cannot)
     | 'cancelled'    // Cancelled by user
     | 'not_found';   // Workflow was cleaned up from memory
 
@@ -102,8 +104,8 @@ export interface RevisionState {
     /** Task IDs transitively affected (depend on affected tasks) */
     transitivelyAffectedTaskIds: string[];
     
-    /** Workflow IDs that were paused due to revision */
-    pausedWorkflowIds: string[];
+    /** Workflow IDs that were cancelled due to revision */
+    cancelledWorkflowIds: string[];
     
     /** Whether this is a global revision affecting all tasks */
     isGlobalRevision: boolean;
@@ -115,7 +117,7 @@ export interface RevisionState {
 export interface CompletedWorkflowSummary {
     id: string;
     type: string;
-    status: 'completed' | 'failed' | 'cancelled';
+    status: 'succeeded' | 'failed' | 'cancelled';
     taskId?: string;
     startedAt: string;
     completedAt: string;
@@ -146,11 +148,10 @@ export interface SessionWorkflowState {
     completedWorkflows: string[];    // Workflow IDs that finished
     workflowHistory: CompletedWorkflowSummary[];  // Completed workflow details (newest first)
     
-    // Cross-workflow state
-    isRevising: boolean;             // Planning revision in progress
-    pausedForRevision: string[];     // Workflow IDs paused for revision
+    // Note: Revision state is tracked via session.status === 'revising'
+    // and pausedSessions map - no separate isRevising flag needed
     
-    /** Detailed revision state for selective pausing */
+    /** Detailed revision state for selective task handling */
     revisionState?: RevisionState;
 }
 
@@ -168,11 +169,18 @@ export interface WorkflowSummary {
 }
 
 /**
+ * Requirement complexity levels for planning
+ * Guides task breakdown and validation
+ */
+export type RequirementComplexity = 'tiny' | 'small' | 'medium' | 'large' | 'huge';
+
+/**
  * Planning workflow specific input
  */
 export interface PlanningWorkflowInput {
     requirement: string;
     docs?: string[];
+    complexity?: RequirementComplexity;  // User-confirmed complexity level
     existingPlanPath?: string;  // For revision
     userFeedback?: string;      // For revision
 }
@@ -208,6 +216,24 @@ export interface ErrorResolutionInput {
     
     /** Summary of what the previous fix attempt tried */
     previousFixSummary?: string;
+}
+
+/**
+ * Implementation review workflow specific input
+ * Reviews completed task implementations using the 3 analysts
+ */
+export interface ImplementationReviewInput {
+    /** Task IDs to review (single task or multiple for session-level review) */
+    taskIds: string[];
+    
+    /** Session ID containing the tasks */
+    sessionId: string;
+    
+    /** Plan path for context */
+    planPath: string;
+    
+    /** Whether this is a session-level review (all completed tasks) */
+    isSessionReview?: boolean;
 }
 
 // ============================================================================
@@ -367,6 +393,8 @@ export type AgentStageResult =
     | 'minor'
     // Generic completion
     | 'complete'
+    // Recovery results
+    | 'needs_review'      // Work may be done but couldn't be verified - needs coordinator decision
     | string;             // Allow custom results
 
 /**
@@ -396,6 +424,9 @@ export interface AgentCompletionPayload {
     // Generic
     message?: string;              // Human-readable message
     error?: string;                // Error message if failed
+    
+    // Recovery
+    needsCoordinatorDecision?: boolean;  // Set when work may be done but needs verification
 }
 
 /**
@@ -408,6 +439,7 @@ export function getWorkflowTypeName(type: WorkflowType): string {
         case 'task_implementation': return 'Task Implementation';
         case 'error_resolution': return 'Error Resolution';
         case 'context_gathering': return 'Context Gathering';
+        case 'implementation_review': return 'Implementation Review';
         default: return type;
     }
 }
@@ -422,6 +454,7 @@ export function getWorkflowTypeIcon(type: WorkflowType): string {
         case 'task_implementation': return 'tools';
         case 'error_resolution': return 'bug';
         case 'context_gathering': return 'search';
+        case 'implementation_review': return 'eye';
         default: return 'circle-outline';
     }
 }
@@ -433,9 +466,8 @@ export function getWorkflowStatusColor(status: WorkflowStatus): string {
     switch (status) {
         case 'pending': return 'charts.gray';
         case 'running': return 'charts.blue';
-        case 'paused': return 'charts.orange';
         case 'blocked': return 'charts.yellow';
-        case 'completed': return 'charts.green';
+        case 'succeeded': return 'charts.green';
         case 'failed': return 'charts.red';
         case 'cancelled': return 'charts.gray';
         default: return 'charts.gray';

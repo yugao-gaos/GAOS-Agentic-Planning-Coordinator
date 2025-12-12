@@ -125,6 +125,7 @@ export class ExecutionContext implements IExecutionContextAPI {
     private logs: Array<{ timestamp: string; level: string; message: string }> = [];
     private stopped: boolean = false;
     private allocatedAgents: string[] = [];
+    private benchSeats: Map<number, string> = new Map(); // Agent bench: seatIndex -> agentName
     
     // Callbacks for workflow integration
     private onAgentRequest?: (roleId: string) => Promise<string>;
@@ -287,6 +288,32 @@ export class ExecutionContext implements IExecutionContextAPI {
         }
         if (this.onAgentRelease) {
             this.onAgentRelease(agentName);
+        }
+    }
+    
+    /**
+     * Set an agent on a bench seat
+     */
+    setAgentOnBench(seatIndex: number, agentName: string): void {
+        this.benchSeats.set(seatIndex, agentName);
+        this.log(`Agent ${agentName} placed on bench seat ${seatIndex + 1}`, 'debug');
+    }
+    
+    /**
+     * Get an agent from a bench seat
+     */
+    getAgentFromBench(seatIndex: number): string | undefined {
+        return this.benchSeats.get(seatIndex);
+    }
+    
+    /**
+     * Remove an agent from a bench seat
+     */
+    removeAgentFromBench(seatIndex: number): void {
+        const agentName = this.benchSeats.get(seatIndex);
+        if (agentName) {
+            this.benchSeats.delete(seatIndex);
+            this.log(`Agent ${agentName} removed from bench seat ${seatIndex + 1}`, 'debug');
         }
     }
     

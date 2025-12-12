@@ -16,6 +16,74 @@ const ConnectionManager = {
     startPortId: null,
     startPortType: null,
     
+    // Cancel connection with optional status message
+    cancelConnection(message) {
+        if (message) {
+            StatusBar.setStatus(message);
+            setTimeout(() => StatusBar.setStatus('Ready'), 2000);
+        }
+        ConnectionRenderer.removeTempLine();
+        this.clearPortHighlights();
+        GraphState.isConnecting = false;
+        this.startNodeId = null;
+        this.startPortId = null;
+        this.startPortType = null;
+    },
+    
+    // Check if a connection between two ports is valid considering loop boundaries
+    // Returns { valid: true } or { valid: false, reason: 'error message' }
+    isLoopConnectionValid(fromNodeId, fromPortId, toNodeId, toPortId) {
+        const fromNode = GraphState.getNode(fromNodeId);
+        const toNode = GraphState.getNode(toNodeId);
+        if (!fromNode || !toNode) return { valid: false, reason: 'Node not found' };
+        
+        const fromPortEl = document.querySelector('[data-node="' + fromNodeId + '"][data-port="' + fromPortId + '"]');
+        const toPortEl = document.querySelector('[data-node="' + toNodeId + '"][data-port="' + toPortId + '"]');
+        
+        const fromIsInternal = fromPortEl?.dataset?.internal === 'true';
+        const toIsInternal = toPortEl?.dataset?.internal === 'true';
+        const fromInLoop = this.getContainingLoop(fromNodeId);
+        const toInLoop = this.getContainingLoop(toNodeId);
+        const fromIsLoop = fromNode.type === 'for_loop';
+        const toIsLoop = toNode.type === 'for_loop';
+        
+        // Internal output from loop - can only connect to nodes inside this loop
+        if (fromIsInternal && fromIsLoop) {
+            const loopContained = (fromNode.config?.containedNodeIds || '').split(',').map(s => s.trim());
+            if (!loopContained.includes(toNodeId) && !toIsInternal) {
+                return { valid: false, reason: 'Internal loop port can only connect to nodes inside the loop' };
+            }
+        }
+        
+        // Internal input to loop - can only receive from nodes inside this loop
+        if (toIsInternal && toIsLoop) {
+            const loopContained = (toNode.config?.containedNodeIds || '').split(',').map(s => s.trim());
+            if (!loopContained.includes(fromNodeId) && !fromIsInternal) {
+                return { valid: false, reason: 'Internal loop port can only receive from nodes inside the loop' };
+            }
+        }
+        
+        // Node inside a loop can only connect to same loop or its internal ports
+        if (fromInLoop !== null && !fromIsLoop) {
+            const allowedTarget = toInLoop === fromInLoop ||
+                (toIsLoop && toIsInternal && toNodeId === fromInLoop);
+            if (!allowedTarget) {
+                return { valid: false, reason: 'Cannot connect from inside a loop to outside' };
+            }
+        }
+        
+        // Node inside a loop can only receive from same loop or its internal ports
+        if (toInLoop !== null && !toIsLoop) {
+            const allowedSource = fromInLoop === toInLoop ||
+                (fromIsLoop && fromIsInternal && fromNodeId === toInLoop);
+            if (!allowedSource) {
+                return { valid: false, reason: 'Cannot connect from outside a loop to inside' };
+            }
+        }
+        
+        return { valid: true };
+    },
+    
     // Start drawing a connection
     startConnection(nodeId, portId, dataType) {
         // Check if port is interactable based on view mode
@@ -96,17 +164,19 @@ const ConnectionManager = {
             
             // Check if target port is interactable based on view mode
             if (!this.isPortInteractable(toPortType)) {
-                ConnectionRenderer.removeTempLine();
-                this.clearPortHighlights();
-                GraphState.isConnecting = false;
-                this.startNodeId = null;
-                this.startPortId = null;
-                this.startPortType = null;
+                this.cancelConnection();
                 return;
             }
             
             // Validate connection
             if (toNodeId !== this.startNodeId) {
+                // Validate loop boundary constraints
+                const loopCheck = this.isLoopConnectionValid(this.startNodeId, this.startPortId, toNodeId, toPortId);
+                if (!loopCheck.valid) {
+                    this.cancelConnection(loopCheck.reason);
+                    return;
+                }
+                
                 if (this.areTypesCompatible(this.startPortType, toPortType)) {
                     // Check if connection already exists
                     const exists = GraphState.graph?.connections?.some(c =>
@@ -203,13 +273,7 @@ const ConnectionManager = {
         }
         
         // Cleanup
-        ConnectionRenderer.removeTempLine();
-        this.clearPortHighlights();
-        
-        GraphState.isConnecting = false;
-        this.startNodeId = null;
-        this.startPortId = null;
-        this.startPortType = null;
+        this.cancelConnection();
     },
     
     // Check if port types are compatible
@@ -285,6 +349,13 @@ const ConnectionManager = {
                 return;
             }
             
+            // Check loop boundary constraints using shared validation
+            const loopCheck = this.isLoopConnectionValid(this.startNodeId, this.startPortId, nodeId, portId);
+            if (!loopCheck.valid) {
+                port.classList.add('incompatible');
+                return;
+            }
+            
             // For trigger connections, check 1:1 constraint
             if (sourceType === 'trigger') {
                 if (sourceAlreadyConnected) {
@@ -350,6 +421,18 @@ const ConnectionManager = {
         document.querySelectorAll('.port-dot').forEach(port => {
             port.classList.remove('compatible', 'incompatible');
         });
+    },
+    
+    // Get the loop container that contains a node (if any)
+    getContainingLoop(nodeId) {
+        const loopNodes = GraphState.graph?.nodes?.filter(n => n.type === 'for_loop') || [];
+        for (const loop of loopNodes) {
+            const containedIds = (loop.config?.containedNodeIds || '').split(',').map(s => s.trim());
+            if (containedIds.includes(nodeId)) {
+                return loop.id;
+            }
+        }
+        return null;
     }
 };
 `;

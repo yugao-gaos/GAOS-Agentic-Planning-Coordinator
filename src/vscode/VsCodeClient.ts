@@ -20,7 +20,8 @@ import {
     SessionListResponse,
     PlanCreateResponse,
     PoolStatusResponse,
-    UnityStatusResponse
+    UnityStatusResponse,
+    CompletedSessionListResponse
 } from '../client/Protocol';
 import { Logger } from '../utils/Logger';
 
@@ -237,6 +238,21 @@ export class VsCodeClient extends BaseApcClient {
     }
     
     /**
+     * List completed sessions (from disk, not in memory)
+     */
+    async listCompletedSessions(limit?: number): Promise<CompletedSessionListResponse> {
+        return this.send<CompletedSessionListResponse>('session.listCompleted', { limit });
+    }
+    
+    /**
+     * Reopen a completed session for review
+     */
+    async reopenSession(sessionId: string): Promise<{ sessionId: string; status: string }> {
+        const response = await this.send<{ sessionId: string; status: string }>('session.reopen', { id: sessionId });
+        return response;
+    }
+    
+    /**
      * Create a new planning session
      */
     async createPlan(prompt: string, docs?: string[]): Promise<PlanCreateResponse> {
@@ -288,6 +304,44 @@ export class VsCodeClient extends BaseApcClient {
     }
     
     /**
+     * Trigger Unity pipeline with specified operations
+     * Operations: 'prep', 'test_editmode', 'test_playmode', 'test_player_playmode'
+     */
+    async triggerUnityPipeline(operations: string[]): Promise<{ success: boolean; pipelineId?: string; error?: string }> {
+        try {
+            const response = await this.send<{ pipelineId: string }>('unity.pipeline', {
+                operations,
+                coordinatorId: 'manual-gui',
+                mergeEnabled: true
+            });
+            return { success: true, pipelineId: response.pipelineId };
+        } catch (err) {
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Send player test start action
+     */
+    async sendPlayerTestStart(pipelineId: string): Promise<void> {
+        await this.send('unity.playerTestStart', { pipelineId });
+    }
+    
+    /**
+     * Send player test finish action
+     */
+    async sendPlayerTestFinish(pipelineId: string): Promise<void> {
+        await this.send('unity.playerTestFinish', { pipelineId });
+    }
+    
+    /**
+     * Send player test cancel action
+     */
+    async sendPlayerTestCancel(pipelineId: string): Promise<void> {
+        await this.send('unity.playerTestCancel', { pipelineId });
+    }
+    
+    /**
      * Kill orphan cursor-agent processes
      * Delegates to daemon's ProcessManager
      */
@@ -331,30 +385,6 @@ export class VsCodeClient extends BaseApcClient {
     }
     
     /**
-     * Pause execution for a session
-     */
-    async pauseExecution(sessionId: string): Promise<{ success: boolean; error?: string }> {
-        try {
-            await this.send('exec.pause', { sessionId });
-            return { success: true };
-        } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-        }
-    }
-    
-    /**
-     * Resume execution for a session
-     */
-    async resumeExecution(sessionId: string): Promise<{ success: boolean; error?: string }> {
-        try {
-            await this.send('exec.resume', { sessionId });
-            return { success: true };
-        } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-        }
-    }
-    
-    /**
      * Stop execution for a session
      */
     async stopExecution(sessionId: string): Promise<{ success: boolean; error?: string }> {
@@ -382,30 +412,6 @@ export class VsCodeClient extends BaseApcClient {
      */
     async getSession(sessionId: string): Promise<any> {
         return this.send('session.get', { id: sessionId });
-    }
-    
-    /**
-     * Pause a session
-     */
-    async pauseSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
-        try {
-            await this.send('session.pause', { id: sessionId });
-            return { success: true };
-        } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-        }
-    }
-    
-    /**
-     * Resume a session
-     */
-    async resumeSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
-        try {
-            await this.send('session.resume', { id: sessionId });
-            return { success: true };
-        } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-        }
     }
     
     /**
@@ -489,30 +495,6 @@ export class VsCodeClient extends BaseApcClient {
     async releaseAgent(agentName: string): Promise<{ success: boolean; error?: string }> {
         try {
             await this.send('agent.release', { agentName });
-            return { success: true };
-        } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-        }
-    }
-    
-    /**
-     * Pause a workflow
-     */
-    async pauseWorkflow(sessionId: string, workflowId: string): Promise<{ success: boolean; error?: string }> {
-        try {
-            await this.send('workflow.pause', { sessionId, workflowId });
-            return { success: true };
-        } catch (err) {
-            return { success: false, error: err instanceof Error ? err.message : String(err) };
-        }
-    }
-    
-    /**
-     * Resume a paused workflow
-     */
-    async resumeWorkflow(sessionId: string, workflowId: string): Promise<{ success: boolean; error?: string }> {
-        try {
-            await this.send('workflow.resume', { sessionId, workflowId });
             return { success: true };
         } catch (err) {
             return { success: false, error: err instanceof Error ? err.message : String(err) };
@@ -687,15 +669,15 @@ export class VsCodeClient extends BaseApcClient {
     
     /**
      * Request graceful shutdown of the daemon coordinator
-     * This pauses all workflows (saving state) and releases agents
-     * Should be called before disconnecting if workflows should be resumable
+     * This cancels all active workflows and releases agents
+     * Should be called before disconnecting
      */
-    async requestGracefulShutdown(): Promise<{ success: boolean; workflowsPaused?: number; agentsReleased?: number; error?: string }> {
+    async requestGracefulShutdown(): Promise<{ success: boolean; workflowsCancelled?: number; agentsReleased?: number; error?: string }> {
         try {
-            const response = await this.send<{ workflowsPaused: number; agentsReleased: number }>('coordinator.shutdown');
+            const response = await this.send<{ workflowsCancelled: number; agentsReleased: number }>('coordinator.shutdown');
             return { 
                 success: true, 
-                workflowsPaused: response.workflowsPaused,
+                workflowsCancelled: response.workflowsCancelled,
                 agentsReleased: response.agentsReleased
             };
         } catch (err) {

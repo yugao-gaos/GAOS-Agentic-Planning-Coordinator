@@ -30,8 +30,102 @@ import {
 import { initializeServices } from './standalone';
 import { bootstrapDaemonServices } from '../services/DaemonBootstrap';
 import { Logger } from '../utils/Logger';
+import { execSync } from 'child_process';
+import * as net from 'net';
 
 const log = Logger.create('Daemon', 'Start');
+
+// ============================================================================
+// Port Management Utilities
+// ============================================================================
+
+/**
+ * Check if a port is already in use
+ */
+async function isPortInUse(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+        const server = net.createServer();
+        server.once('error', (err: NodeJS.ErrnoException) => {
+            if (err.code === 'EADDRINUSE') {
+                resolve(true);
+            } else {
+                resolve(false);
+            }
+        });
+        server.once('listening', () => {
+            server.close();
+            resolve(false);
+        });
+        server.listen(port, '127.0.0.1');
+    });
+}
+
+/**
+ * Kill any process listening on the specified port
+ */
+async function killProcessOnPort(port: number): Promise<void> {
+    const isWindows = process.platform === 'win32';
+    
+    try {
+        if (isWindows) {
+            // Windows: Use netstat to find PID, then taskkill
+            try {
+                const result = execSync(
+                    `netstat -ano | findstr :${port} | findstr LISTENING`,
+                    { encoding: 'utf-8', windowsHide: true, timeout: 5000 }
+                ).trim();
+                
+                // Parse PID from netstat output (last column)
+                const lines = result.split('\n');
+                const pids = new Set<number>();
+                for (const line of lines) {
+                    const parts = line.trim().split(/\s+/);
+                    const pid = parseInt(parts[parts.length - 1], 10);
+                    if (!isNaN(pid) && pid > 0) {
+                        pids.add(pid);
+                    }
+                }
+                
+                for (const pid of pids) {
+                    log.info(`Killing process ${pid} on port ${port}...`);
+                    try {
+                        execSync(`taskkill /PID ${pid} /F /T`, { 
+                            windowsHide: true, 
+                            stdio: 'ignore',
+                            timeout: 5000 
+                        });
+                    } catch {
+                        // Process might already be dead
+                    }
+                }
+            } catch {
+                // No process found on port, or command failed
+            }
+        } else {
+            // Unix: Use lsof or fuser
+            try {
+                const result = execSync(
+                    `lsof -ti:${port}`,
+                    { encoding: 'utf-8', timeout: 5000 }
+                ).trim();
+                
+                const pids = result.split('\n').filter(p => p.trim());
+                for (const pid of pids) {
+                    log.info(`Killing process ${pid} on port ${port}...`);
+                    try {
+                        process.kill(parseInt(pid, 10), 'SIGKILL');
+                    } catch {
+                        // Process might already be dead
+                    }
+                }
+            } catch {
+                // No process found on port
+            }
+        }
+    } catch (err) {
+        log.warn(`Failed to kill process on port ${port}: ${err}`);
+    }
+}
 
 // ============================================================================
 // Types
@@ -151,16 +245,19 @@ export async function startDaemon(options: StartOptions): Promise<StartResult> {
 async function startHeadlessMode(config: CoreConfig, verbose: boolean): Promise<ApcDaemon> {
     log.info('Initializing services for headless mode...');
     
-    // Initialize all services
-    const services = await initializeServices(config);
-    
-    // Create daemon with services
+    // Create daemon first to get its configLoader for live config updates
     const daemon = new ApcDaemon({
         port: config.port,
         workspaceRoot: config.workspaceRoot,
-        services,
+        services: undefined,  // Will set services after initialization
         verbose
     });
+    
+    // Initialize all services with daemon's configLoader for live config updates
+    const services = await initializeServices(config, daemon, false, daemon.getConfigLoader());
+    
+    // Set services on daemon
+    daemon.setServices(services);
     
     // Setup shutdown handlers
     setupShutdownHandlers(daemon);
@@ -168,7 +265,7 @@ async function startHeadlessMode(config: CoreConfig, verbose: boolean): Promise<
     // Start daemon
     await daemon.start();
     
-    // Mark services as ready (since initializeServices doesn't have daemon reference)
+    // Mark services as ready
     daemon.setServicesReady();
     
     return daemon;
@@ -178,31 +275,86 @@ async function startHeadlessMode(config: CoreConfig, verbose: boolean): Promise<
  * Start daemon in VS Code mode (services injected later)
  */
 async function startVsCodeMode(config: CoreConfig, verbose: boolean): Promise<ApcDaemon> {
-    log.info('Starting daemon for VS Code...');
+    const startTime = Date.now();
+    const logProgress = (step: string) => {
+        log.info(`[${Date.now() - startTime}ms] ${step}`);
+    };
     
-    // Bootstrap essential services FIRST (EventBroadcaster, etc.)
-    // These are needed by the daemon even before full initialization
+    logProgress('Starting daemon for VS Code...');
+    
+    // ========================================================================
+    // PHASE 1: Clean up stale resources (before any initialization)
+    // ========================================================================
+    
+    // Step 1a: Check if port is already in use (old daemon might still be running)
+    logProgress('Checking if port is in use...');
+    const portInUse = await isPortInUse(config.port);
+    if (portInUse) {
+        log.warn(`Port ${config.port} is already in use - killing process on that port...`);
+        await killProcessOnPort(config.port);
+        // Wait for port to be released
+        await new Promise(resolve => setTimeout(resolve, 500));
+        logProgress('Port cleanup complete');
+    } else {
+        logProgress('Port is available');
+    }
+    
+    // Step 1b: Kill orphan cursor-agent processes (no dependencies needed)
+    // This ensures a clean slate before starting any services
+    logProgress('Checking for orphan cursor-agent processes...');
+    try {
+        const { killOrphanCursorAgents, countCursorAgentProcesses } = await import('../utils/orphanCleanup');
+        logProgress('Orphan cleanup module loaded');
+        const beforeCount = countCursorAgentProcesses();
+        logProgress(`Counted ${beforeCount} cursor-agent processes`);
+        if (beforeCount > 0) {
+            log.info(`Found ${beforeCount} orphan cursor-agent processes - cleaning up...`);
+            const killed = await killOrphanCursorAgents(new Set(), '[DaemonStartup]');
+            // Brief wait for processes to terminate
+            await new Promise(resolve => setTimeout(resolve, 300));
+            const afterCount = countCursorAgentProcesses();
+            if (afterCount === 0) {
+                logProgress(`✅ Cleaned up ${killed} orphan processes`);
+            } else {
+                logProgress(`${afterCount} cursor-agent processes remain (likely Cursor IDE worker-server)`);
+            }
+        } else {
+            logProgress('No orphan cursor-agent processes found');
+        }
+    } catch (err) {
+        logProgress(`Orphan cleanup skipped: ${err}`);
+    }
+    
+    // ========================================================================
+    // PHASE 2: Initialize services
+    // ========================================================================
+    
+    // Bootstrap essential services (EventBroadcaster, etc.)
+    logProgress('Bootstrapping essential services...');
     const { bootstrapDaemonServices } = await import('../services/DaemonBootstrap');
     bootstrapDaemonServices();
-    log.info('Essential services bootstrapped');
+    logProgress('Essential services bootstrapped');
     
     // Create daemon without full services (will initialize in background)
+    logProgress('Creating ApcDaemon instance...');
     const daemon = new ApcDaemon({
         port: config.port,
         workspaceRoot: config.workspaceRoot,
         services: undefined,  // No full services yet
         verbose
     });
+    logProgress('ApcDaemon instance created');
     
     // Start daemon FIRST (writes port file, HTTP server starts)
     // This allows client to connect immediately!
+    logProgress('Starting HTTP server and writing port file...');
     await daemon.start();
-    log.info('Daemon HTTP server started - client can connect');
+    logProgress('Daemon HTTP server started - client can connect');
     
     // Initialize full services in background
     // Services will broadcast progress via WebSocket as they initialize
     log.info('Initializing services in background...');
-    initializeServices(config, daemon).then(services => {
+    initializeServices(config, daemon, true /* skipOrphanCleanup - already done above */, daemon.getConfigLoader()).then(services => {
         log.info('Services initialization complete');
         // Set services on daemon once ready
         daemon.setServices(services);

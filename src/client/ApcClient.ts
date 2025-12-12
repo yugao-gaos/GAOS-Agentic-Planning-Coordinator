@@ -443,8 +443,6 @@ export interface IApcClientExtended extends IApcClient {
     // Sessions
     listSessions(): Promise<SessionListResponse>;
     getSessionStatus(id: string): Promise<SessionStatusResponse>;
-    pauseSession(id: string): Promise<void>;
-    resumeSession(id: string): Promise<void>;
     
     // Plans
     listPlans(): Promise<PlanListResponse>;
@@ -455,8 +453,6 @@ export interface IApcClientExtended extends IApcClient {
     
     // Execution
     startExecution(sessionId: string): Promise<ExecStartResponse>;
-    pauseExecution(sessionId: string): Promise<void>;
-    resumeExecution(sessionId: string): Promise<void>;
     stopExecution(sessionId: string): Promise<void>;
     getExecutionStatus(sessionId: string): Promise<ExecStatusResponse>;
     

@@ -93,11 +93,11 @@ export const STATUS_COLORS: Record<string, string> = {
     'debating': '#007acc',      // Blue
     'reviewing': '#a855f7',     // Purple
     'revising': '#f97316',      // Orange
+    'verifying': '#38bdf8',     // Sky blue - TaskAgent verifying tasks
     'approved': '#73c991',      // Green
     'cancelled': '#6b7280',     // Gray
     'stopped': '#6b7280',       // Gray
     'executing': '#007acc',     // Blue
-    'paused': '#f97316',        // Orange
     'completed': '#73c991',     // Green
     'failed': '#f14c4c',        // Red
     

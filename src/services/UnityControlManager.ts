@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { TypedEventEmitter } from './TypedEventEmitter';
 import { spawn } from 'child_process';
+import { focusUnityEditor } from '../utils/windowFocus';
 import {
     UnityTask,
     UnityTaskType,
@@ -21,11 +22,11 @@ import {
     TestResult
 } from '../types/unity';
 import { OutputChannelManager } from './OutputChannelManager';
-import { AgentRunner, AgentRunResult } from './AgentBackend';
 import { AgentRoleRegistry } from './AgentRoleRegistry';
 import { UnityLogMonitor, LogMonitorResult } from './UnityLogMonitor';
 import { TaskManager, ERROR_RESOLUTION_SESSION_ID } from './TaskManager';
 import { UnifiedCoordinatorService } from './UnifiedCoordinatorService';
+import { StateManager } from './StateManager';
 import { ServiceLocator } from './ServiceLocator';
 import { EventBroadcaster } from '../daemon/EventBroadcaster';
 import { getFolderStructureManager } from './FolderStructureManager';
@@ -35,10 +36,10 @@ import { getFolderStructureManager } from './FolderStructureManager';
 // ============================================================================
 
 /**
- * Unity Editor state tracked by polling agent
+ * Unity Editor state tracked via Unity Bridge events.
  * 
- * Note: Error tracking is now handled by UnityLogMonitor via direct log file reading.
- * The polling agent only monitors editor state (isCompiling, isPlaying, isPaused).
+ * Note: Error tracking is handled by UnityLogMonitor via direct log file reading.
+ * Editor state (isCompiling, isPlaying, isPaused) is pushed from Unity Bridge.
  */
 interface UnityEditorStatus {
     isCompiling: boolean;
@@ -52,24 +53,21 @@ interface UnityEditorStatus {
  * 
  * This service runs in the background and manages:
  * - Task queue for operations that can freeze Unity (compile, reimport, tests, playmode)
- * - Unity Editor state monitoring via long-running polling agent
+ * - Unity Editor state monitoring via Unity Bridge WebSocket events
  * - Error collection and routing
  * 
- * IMPORTANT: Engineers CAN call MCP tools directly for READ operations:
- * - mcp_unityMCP_read_console (read errors/warnings)
- * - mcp_unityMCP_manage_editor with action: get_state
- * - mcp_unityMCP_manage_scene with action: get_active, get_hierarchy
+ * All Unity operations are executed via the Unity Bridge package, which provides
+ * direct WebSocket communication between Unity Editor and this daemon.
  * 
  * Engineers MUST use this manager (via CLI) for WRITE/BLOCKING operations:
  * - Compilation (prep_editor) - freezes Unity
  * - Tests (editmode/playmode) - requires exclusive access
  * - Play mode control - only one can run at a time
  * 
- * POLLING AGENT:
- * - A long-running cursor-agent process that polls Unity state every 5 seconds
- * - Lives at least 1 minute when tasks are in queue
- * - Max lifetime 15 minutes (then restarts if needed)
- * - Notifies manager via CLI: apc unity notify-status
+ * UNITY BRIDGE:
+ * - Unity package (com.gaos.apc.bridge) connects via WebSocket to daemon
+ * - Pushes state change events (compile, playmode, test progress)
+ * - Receives commands (compile, runTests, enterPlayMode, etc.)
  * 
  * Only ONE Unity blocking operation can run at a time.
  * 
@@ -78,14 +76,11 @@ interface UnityEditorStatus {
  */
 export class UnityControlManager {
     private workspaceRoot: string = '';
-    private queue: UnityTask[] = [];
-    private currentTask: UnityTask | null = null;
     private status: UnityControlManagerStatus = 'idle';
-    private isRunning: boolean = false;
     private tempScenePath: string = 'Assets/Scenes/_TempCompileCheck.unity';
     private errorRegistryPath: string = '';
 
-    // Pipeline queue system (new)
+    // Pipeline queue system
     private pipelineQueue: PipelineRequest[] = [];
     private currentPipeline: PipelineRequest | null = null;
     private pipelineIdCounter: number = 0;
@@ -93,44 +88,319 @@ export class UnityControlManager {
     // Callback for notifying coordinator of pipeline completion
     private onPipelineCompleteCallback?: (result: PipelineResult) => void;
 
-    // Polling agent state
-    private agentRunner: AgentRunner;
-    private pollingAgentId: string = 'unity_polling_agent';
-    private pollingAgentRunning: boolean = false;
-    private pollingAgentStartTime: number = 0;
-    private pollingAgentMinLifetime: number = 60000;  // 1 minute minimum
-    private pollingAgentMaxLifetime: number = 900000; // 15 minutes maximum
+    // Unity editor status (updated via bridge events)
     private lastUnityStatus: UnityEditorStatus | null = null;
-    private waitingForCompileComplete: boolean = false;
-    private compileCompleteResolve: (() => void) | null = null;
-    private pollingAgentRestartTimeout: NodeJS.Timeout | null = null;  // Track restart timeout
 
     // Event emitters
     private _onStatusChanged = new TypedEventEmitter<UnityControlManagerState>();
     readonly onStatusChanged = this._onStatusChanged.event;
-
-    private _onTaskCompleted = new TypedEventEmitter<{ task: UnityTask; result: UnityTaskResult }>();
-    readonly onTaskCompleted = this._onTaskCompleted.event;
 
     // Output channel for logging
     private outputManager: OutputChannelManager;
     
     // Log file path for Unity pipeline logs
     private logFilePath: string | null = null;
-
-    // Task ID counter
-    private taskIdCounter: number = 0;
     
     // Agent Role Registry for customizable prompts
     private agentRoleRegistry: AgentRoleRegistry | null = null;
     
+    // Player test popup state (for test_player_playmode step)
+    private playerTestPipelineId: string | null = null;
+    private playerTestResolve: ((action: 'start' | 'finish' | 'cancel') => void) | null = null;
+    
     // Unity log monitor for capturing console output with timestamps
     private logMonitor: UnityLogMonitor;
+    
+    // Direct Unity WebSocket connection (via daemon)
+    private unityClientConnected: boolean = false;
+    private sendToUnityClient?: (cmd: string, params?: Record<string, unknown>) => Promise<any>;
+    private queryUnityState?: () => Promise<{ isCompiling: boolean; isPlaying: boolean; isBusy: boolean; editorReady: boolean } | null>;
 
     constructor() {
         this.outputManager = ServiceLocator.resolve(OutputChannelManager);
-        this.agentRunner = ServiceLocator.resolve(AgentRunner);
         this.logMonitor = new UnityLogMonitor();
+    }
+    
+    /**
+     * Set up callbacks for direct Unity WebSocket communication.
+     * Called by daemon when services are initialized.
+     */
+    setUnityDirectCallbacks(
+        sendCommand: (cmd: string, params?: Record<string, unknown>) => Promise<any>,
+        queryState: () => Promise<{ isCompiling: boolean; isPlaying: boolean; isBusy: boolean; editorReady: boolean } | null>
+    ): void {
+        this.sendToUnityClient = sendCommand;
+        this.queryUnityState = queryState;
+    }
+    
+    /**
+     * Called by daemon when Unity client connects
+     */
+    onUnityClientConnected(): void {
+        this.log('Unity client connected via WebSocket');
+        this.unityClientConnected = true;
+    }
+    
+    /**
+     * Called by daemon when Unity client disconnects
+     */
+    onUnityClientDisconnected(): void {
+        this.log('Unity client disconnected');
+        this.unityClientConnected = false;
+        
+        // Clear any pending compile wait
+        if (this.compileCompleteResolve) {
+            this.compileCompleteResolve();
+            this.compileCompleteResolve = null;
+        }
+        
+        // Clear test complete wait
+        if (this.testCompleteResolve) {
+            this.testCompleteResolve({ passed: 0, failed: 0, skipped: 0, duration: 0 });
+            this.testCompleteResolve = null;
+        }
+    }
+    
+    // ========================================================================
+    // Unity Bridge Event Reception
+    // ========================================================================
+    
+    /** Pending promise resolve for compile completion */
+    private compileCompleteResolve: (() => void) | null = null;
+    
+    /** Pending promise resolve for test completion */
+    private testCompleteResolve: ((result: { passed: number; failed: number; skipped: number; duration: number }) => void) | null = null;
+    
+    /** Last test progress data */
+    private lastTestProgress: { phase: string; testCount?: number } | null = null;
+    
+    /**
+     * Receive events from Unity Bridge (via daemon).
+     * Called when Unity pushes state changes, compile events, test events, etc.
+     */
+    receiveUnityEvent(eventName: string, data: any): void {
+        this.log(`Received Unity event: ${eventName}`);
+        
+        switch (eventName) {
+            case 'unity.stateChanged':
+                this.handleStateChangedEvent(data);
+                break;
+            case 'unity.compileStarted':
+                this.handleCompileStartedEvent(data);
+                break;
+            case 'unity.compileComplete':
+                this.handleCompileCompleteEvent(data);
+                break;
+            case 'unity.playModeChanged':
+                this.handlePlayModeChangedEvent(data);
+                break;
+            case 'unity.testProgress':
+                this.handleTestProgressEvent(data);
+                break;
+            case 'unity.testComplete':
+                this.handleTestCompleteEvent(data);
+                break;
+            case 'unity.error':
+                this.handleUnityErrorEvent(data);
+                break;
+            default:
+                this.log(`Unknown Unity event: ${eventName}`);
+        }
+    }
+    
+    /**
+     * Handle state changed event from Unity.
+     * Updates internal status and broadcasts to UI.
+     */
+    private handleStateChangedEvent(data: {
+        isCompiling: boolean;
+        isPlaying: boolean;
+        isPaused: boolean;
+        isBusy: boolean;
+        currentOperation?: string;
+        editorReady: boolean;
+    }): void {
+        const wasCompiling = this.lastUnityStatus?.isCompiling ?? false;
+        const nowCompiling = data.isCompiling;
+        
+        this.lastUnityStatus = {
+            isCompiling: data.isCompiling,
+            isPlaying: data.isPlaying,
+            isPaused: data.isPaused,
+            timestamp: Date.now()
+        };
+        
+        // Detect compilation transitions
+        if (!wasCompiling && nowCompiling) {
+            this.log('Unity compilation started (from state event)');
+            this.focusUnityEditor();
+        } else if (wasCompiling && !nowCompiling) {
+            this.log('Unity compilation complete (from state event)');
+            this.resolveCompileComplete();
+        }
+        
+        this.emitStatusUpdate();
+    }
+    
+    /**
+     * Handle compile started event from Unity.
+     */
+    private handleCompileStartedEvent(data: { timestamp: string }): void {
+        this.log(`Compile started at ${data.timestamp}`);
+        
+        this.lastUnityStatus = {
+            ...this.lastUnityStatus,
+            isCompiling: true,
+            timestamp: Date.now()
+        } as UnityEditorStatus;
+        
+        this.focusUnityEditor();
+        this.emitStatusUpdate();
+    }
+    
+    /**
+     * Handle compile complete event from Unity.
+     */
+    private handleCompileCompleteEvent(data: { timestamp: string }): void {
+        this.log(`Compile complete at ${data.timestamp}`);
+        
+        this.lastUnityStatus = {
+            ...this.lastUnityStatus,
+            isCompiling: false,
+            timestamp: Date.now()
+        } as UnityEditorStatus;
+        
+        this.resolveCompileComplete();
+        this.emitStatusUpdate();
+    }
+    
+    /**
+     * Handle play mode changed event from Unity.
+     */
+    private handlePlayModeChangedEvent(data: {
+        state: string;
+        isPlaying: boolean;
+        isPaused: boolean;
+        timestamp: string;
+    }): void {
+        this.log(`Play mode changed: ${data.state}`);
+        
+        this.lastUnityStatus = {
+            ...this.lastUnityStatus,
+            isPlaying: data.isPlaying,
+            isPaused: data.isPaused,
+            timestamp: Date.now()
+        } as UnityEditorStatus;
+        
+        this.emitStatusUpdate();
+    }
+    
+    /**
+     * Handle test progress event from Unity.
+     */
+    private handleTestProgressEvent(data: { phase: string; testCount?: number }): void {
+        this.log(`Test progress: ${data.phase}${data.testCount ? ` (${data.testCount} tests)` : ''}`);
+        this.lastTestProgress = data;
+    }
+    
+    /**
+     * Handle test complete event from Unity.
+     */
+    private handleTestCompleteEvent(data: {
+        operationId: string;
+        mode: string;
+        passed: number;
+        failed: number;
+        skipped: number;
+        duration: number;
+        failures?: Array<{ testName: string; message: string; stackTrace?: string }>;
+    }): void {
+        this.log(`Tests complete: ${data.passed} passed, ${data.failed} failed, ${data.skipped} skipped`);
+        
+        // Resolve any pending test wait
+        if (this.testCompleteResolve) {
+            this.testCompleteResolve({
+                passed: data.passed,
+                failed: data.failed,
+                skipped: data.skipped,
+                duration: data.duration
+            });
+            this.testCompleteResolve = null;
+        }
+        
+        this.lastTestProgress = null;
+    }
+    
+    /**
+     * Handle error event from Unity.
+     */
+    private handleUnityErrorEvent(data: { message: string; stackTrace?: string }): void {
+        this.log(`Unity error: ${data.message}`);
+    }
+    
+    /**
+     * Resolve compile complete promise if waiting.
+     */
+    private resolveCompileComplete(): void {
+        if (this.compileCompleteResolve) {
+            this.compileCompleteResolve();
+            this.compileCompleteResolve = null;
+        }
+    }
+    
+    /**
+     * Wait for compilation to complete via Unity Bridge events.
+     * Returns true when compilation completes, false on timeout.
+     */
+    private waitForCompilationViaEvents(timeoutSeconds: number): Promise<boolean> {
+        return new Promise((resolve) => {
+            // Check if already not compiling
+            if (this.lastUnityStatus && !this.lastUnityStatus.isCompiling) {
+                resolve(true);
+                return;
+            }
+            
+            // Set up timeout
+            const timeoutId = setTimeout(() => {
+                this.log('Compile wait timed out');
+                this.compileCompleteResolve = null;
+                resolve(false);
+            }, timeoutSeconds * 1000);
+            
+            // Store resolve function for event handler
+            this.compileCompleteResolve = () => {
+                clearTimeout(timeoutId);
+                resolve(true);
+            };
+        });
+    }
+    
+    /**
+     * Wait for test completion via Unity Bridge events.
+     * Returns test results when complete, or timeout result.
+     */
+    private waitForTestCompletionViaEvents(timeoutSeconds: number): Promise<{ passed: number; failed: number; skipped: number; duration: number }> {
+        return new Promise((resolve) => {
+            // Set up timeout
+            const timeoutId = setTimeout(() => {
+                this.log('Test wait timed out');
+                this.testCompleteResolve = null;
+                resolve({ passed: 0, failed: 0, skipped: 0, duration: 0 });
+            }, timeoutSeconds * 1000);
+            
+            // Store resolve function for event handler
+            this.testCompleteResolve = (result) => {
+                clearTimeout(timeoutId);
+                resolve(result);
+            };
+        });
+    }
+    
+    /**
+     * Check if direct Unity connection is available
+     */
+    isDirectConnectionAvailable(): boolean {
+        return this.unityClientConnected && !!this.sendToUnityClient;
     }
     
     /**
@@ -174,14 +444,12 @@ export class UnityControlManager {
         // Ensure temp scene exists
         await this.ensureTempSceneExists();
 
-        // Start the queue processor
-        this.startQueueProcessor();
-
         this.log('Unity Control Manager initialized');
     }
 
     /**
      * Ensure temp scene exists for compilation checks
+     * Uses direct Unity Bridge connection to create if missing
      */
     async ensureTempSceneExists(): Promise<boolean> {
         const fullPath = path.join(this.workspaceRoot, this.tempScenePath);
@@ -192,23 +460,25 @@ export class UnityControlManager {
             return true;
         }
 
-        // Need to create via MCP
-        this.log('Temp scene not found, will create via MCP when Unity is available');
+        // Need to create via direct connection
+        this.log('Temp scene not found, creating via Unity Bridge...');
 
-        // For now, we'll try to create it via cursor-agent CLI call
-        // This is a one-time setup operation
+        if (!this.isDirectConnectionAvailable()) {
+            this.log('Cannot create temp scene: Unity Bridge not connected');
+            return false;
+        }
+
         try {
-            const result = await this.runCursorAgentCommand(
-                `Use mcp_unityMCP_manage_scene to create a new scene. ` +
-                `Action: 'create', name: '_TempCompileCheck', path: 'Assets/Scenes'. ` +
-                `If it already exists, that's fine. Reply only: 'CREATED' or 'EXISTS' or 'ERROR: reason'`
-            );
+            const result = await this.executeViaDirect('unity.direct.createScene', {
+                name: '_TempCompileCheck',
+                path: 'Assets/Scenes'
+            });
 
-            if (result.includes('CREATED') || result.includes('EXISTS')) {
-                this.log('Temp scene created/verified via MCP');
+            if (result?.success) {
+                this.log('Temp scene created via Unity Bridge');
                 return true;
             } else {
-                this.log(`Failed to create temp scene: ${result}`);
+                this.log(`Failed to create temp scene: ${result?.error || 'unknown error'}`);
                 return false;
             }
         } catch (error) {
@@ -217,196 +487,10 @@ export class UnityControlManager {
         }
     }
 
-    /**
-     * Queue a Unity task
-     */
-    queueTask(
-        type: UnityTaskType,
-        requestedBy: TaskRequester | TaskRequester[],
-        options: {
-            testScene?: string;
-            maxDuration?: number;
-            testFilter?: string[];
-        } = {}
-    ): string {
-        const taskId = `unity_${++this.taskIdCounter}_${Date.now()}`;
-
-        const task: UnityTask = {
-            id: taskId,
-            type,
-            priority: this.getPriority(type),
-            requestedBy: Array.isArray(requestedBy) ? requestedBy : [requestedBy],
-            testScene: options.testScene,
-            maxDuration: options.maxDuration,
-            testFilter: options.testFilter,
-            status: 'queued',
-            createdAt: new Date().toISOString()
-        };
-
-        // Check for combinable tasks
-        const combined = this.tryCombineTask(task);
-        if (!combined) {
-            this.queue.push(task);
-            this.sortQueue();
-        }
-
-        this.log(`Task queued: ${type} (ID: ${taskId}) from ${task.requestedBy.map(r => r.agentName).join(', ')}`);
-        this.emitStatusUpdate();
-
-        // Ensure polling agent is running when we have tasks
-        this.ensurePollingAgentIfNeeded();
-
-        return taskId;
-    }
-
-    /**
-     * Get task priority (lower = higher priority)
-     */
-    private getPriority(type: UnityTaskType): number {
-        switch (type) {
-            case 'prep_editor': return 1;
-            case 'test_framework_editmode': return 2;
-            case 'test_framework_playmode': return 3;
-            case 'test_player_playmode': return 4;
-            default: return 5;
-        }
-    }
-
-    /**
-     * Try to combine task with existing queued task
-     */
-    private tryCombineTask(newTask: UnityTask): boolean {
-        // Only prep_editor tasks can be combined
-        if (newTask.type !== 'prep_editor') {
-            return false;
-        }
-
-        const existingPrepTask = this.queue.find(t => t.type === 'prep_editor' && t.status === 'queued');
-        if (existingPrepTask) {
-            // Combine requesters
-            existingPrepTask.requestedBy.push(...newTask.requestedBy);
-            this.log(`Combined prep_editor task with existing (now ${existingPrepTask.requestedBy.length} requesters)`);
-            return true;
-        }
-
-        return false;
-    }
-
-    /**
-     * Sort queue by priority
-     */
-    private sortQueue(): void {
-        this.queue.sort((a, b) => a.priority - b.priority);
-    }
-
-    /**
-     * Start the queue processor loop
-     */
-    private startQueueProcessor(): void {
-        if (this.isRunning) return;
-        this.isRunning = true;
-
-        this.processQueue();
-    }
-
-    /**
-     * Main queue processing loop
-     */
-    private async processQueue(): Promise<void> {
-        // Minimum time a task must be visible in queue before processing (ms)
-        const QUEUE_COOLING_PERIOD = 1000;
-        
-        while (this.isRunning) {
-            if (this.queue.length === 0 || this.currentTask) {
-                await this.sleep(500);
-                continue;
-            }
-
-            // Get next task, but check cooling period first
-            const nextTask = this.queue[0];
-            if (!nextTask) continue;
-            
-            // Calculate time since queued
-            const queuedTime = new Date(nextTask.createdAt).getTime();
-            const timeSinceQueued = Date.now() - queuedTime;
-            
-            // Wait for cooling period if task was just added
-            if (timeSinceQueued < QUEUE_COOLING_PERIOD) {
-                await this.sleep(QUEUE_COOLING_PERIOD - timeSinceQueued);
-            }
-            
-            // Now dequeue and process
-            const task = this.queue.shift();
-            if (!task) continue;
-
-            this.currentTask = task;
-            task.status = 'executing';
-            task.startedAt = new Date().toISOString();
-            this.emitStatusUpdate();
-
-            this.log(`Executing task: ${task.type} (ID: ${task.id})`);
-
-            try {
-                const result = await this.executeTask(task);
-                task.result = result;
-                task.status = result.success ? 'completed' : 'failed';
-            } catch (error) {
-                task.status = 'failed';
-                task.result = {
-                    success: false,
-                    errors: [{
-                        id: `err_${Date.now()}`,
-                        type: 'runtime',
-                        message: `Task execution failed: ${error}`,
-                        timestamp: new Date().toISOString()
-                    }],
-                    warnings: []
-                };
-            }
-
-            task.completedAt = new Date().toISOString();
-            this._onTaskCompleted.fire({ task, result: task.result! });
-
-            this.log(`Task completed: ${task.type} - ${task.status}`);
-
-            this.currentTask = null;
-            this.status = 'idle';
-            this.emitStatusUpdate();
-
-            // Buffer between tasks
-            await this.sleep(2000);
-        }
-    }
-
-    /**
-     * Execute a Unity task
-     */
-    private async executeTask(task: UnityTask): Promise<UnityTaskResult> {
-        switch (task.type) {
-            case 'prep_editor':
-                return this.executePrepEditor(task);
-            case 'test_framework_editmode':
-                return this.executeTestFrameworkEditMode(task);
-            case 'test_framework_playmode':
-                return this.executeTestFrameworkPlayMode(task);
-            case 'test_player_playmode':
-                return this.executeTestPlayerPlayMode(task);
-            default:
-                return {
-                    success: false,
-                    errors: [{
-                        id: `err_${Date.now()}`,
-                        type: 'runtime',
-                        message: `Unknown task type: ${task.type}`,
-                        timestamp: new Date().toISOString()
-                    }],
-                    warnings: []
-                };
-        }
-    }
 
     /**
      * Execute prep_editor task (reimport + compile)
+     * Uses direct Unity Bridge connection - no MCP fallback
      */
     private async executePrepEditor(task: UnityTask): Promise<UnityTaskResult> {
         this.status = 'waiting_unity';
@@ -416,23 +500,37 @@ export class UnityControlManager {
         const errors: UnityError[] = [];
         const warnings: UnityWarning[] = [];
 
+        // Check connection first
+        if (!this.isDirectConnectionAvailable()) {
+            return {
+                success: false,
+                errors: [{
+                    id: `err_${Date.now()}`,
+                    type: 'runtime',
+                    message: 'prep_editor failed: Unity Bridge not connected',
+                    timestamp: new Date().toISOString()
+                }],
+                warnings: []
+            };
+        }
+
         try {
             // Step 1: Ensure temp scene exists
             await this.ensureTempSceneExists();
 
-            // Step 2: Exit playmode and load temp scene via MCP
-            this.log('Preparing Unity Editor via MCP...');
-            const prepResult = await this.runCursorAgentCommand(
-                `Prepare Unity for compilation check:
-                1. Check editor state with fetch_mcp_resource uri='unity://editor/state'
-                2. If isPlaying is true, use mcp_unityMCP_manage_editor action='stop'
-                3. Load temp scene: mcp_unityMCP_manage_scene action='load' path='Assets/Scenes/_TempCompileCheck.unity'
-                Reply: 'PREPARED' if successful, 'ERROR: reason' if failed`
-            );
-
-            if (prepResult.includes('ERROR')) {
-                this.log(`Prep failed: ${prepResult}`);
+            // Step 2: Exit playmode if needed and load temp scene via direct connection
+            this.log('Preparing Unity Editor via direct connection...');
+            
+            // Query current state
+            const state = await this.queryUnityState?.();
+            if (state?.isPlaying) {
+                this.log('Exiting play mode...');
+                await this.exitPlayMode();
             }
+            
+            // Load temp scene
+            this.log('Loading temp scene...');
+            await this.loadScene(this.tempScenePath);
 
             // Step 3: Focus Unity to trigger reimport/recompile
             this.log('Focusing Unity Editor...');
@@ -440,11 +538,17 @@ export class UnityControlManager {
             this.emitStatusUpdate();
             await this.focusUnityEditor();
 
-            // Step 4: Poll until compilation complete
-            this.log('Waiting for Unity to finish compilation...');
+            // Step 4: Trigger compile and wait
+            this.log('Triggering compilation...');
             task.phase = 'waiting_compile';
             this.emitStatusUpdate();
-            const compilationSuccess = await this.waitForCompilation(120);
+            
+            // Tell Unity Bridge to trigger compile
+            await this.executeViaDirect('unity.direct.compile');
+            
+            // Wait for compilation to complete
+            this.log('Waiting for Unity to finish compilation...');
+            const compilationSuccess = await this.waitForCompilationViaDirect(120);
 
             if (!compilationSuccess) {
                 errors.push({
@@ -454,6 +558,10 @@ export class UnityControlManager {
                     timestamp: new Date().toISOString()
                 });
             }
+            
+            // Focus back to Cursor
+            this.log('Compilation complete, focusing back to Cursor...');
+            await this.focusCursorEditor();
 
             // Note: Console errors are now captured by UnityLogMonitor at the pipeline step level
             // with accurate timestamps (100ms precision). See executePipelineStep().
@@ -465,6 +573,9 @@ export class UnityControlManager {
             };
 
         } catch (error) {
+            // Try to focus back to Cursor even on failure
+            await this.focusCursorEditor();
+            
             return {
                 success: false,
                 errors: [{
@@ -480,43 +591,61 @@ export class UnityControlManager {
 
     /**
      * Execute test_framework_editmode task
+     * Uses direct Unity Bridge connection - no MCP fallback
      */
     private async executeTestFrameworkEditMode(task: UnityTask): Promise<UnityTaskResult> {
         this.status = 'executing';
         task.phase = 'running_tests';
         this.emitStatusUpdate();
 
-        // Note: Compilation errors are now detected via UnityLogMonitor during the prep step.
-        // If tests are run after prep, any compilation errors will have been captured.
-        // If compilation errors exist, Unity's test runner will fail appropriately.
-
-        // Run EditMode tests via MCP
-        this.log('Running EditMode tests...');
-        const result = await this.runCursorAgentCommand(
-            `Run Unity EditMode tests:
-            Use mcp_unityMCP_run_tests with mode='EditMode'
-            Wait for completion (up to 5 minutes)
-            Reply with JSON: { "passed": N, "failed": N, "failures": [...] }`
-        );
-
-        // Parse test results
-        try {
-            const testResult = JSON.parse(result);
+        // Check connection first
+        if (!this.isDirectConnectionAvailable()) {
             return {
-                success: testResult.failed === 0,
+                success: false,
+                errors: [{
+                    id: `err_${Date.now()}`,
+                    type: 'runtime',
+                    message: 'test_framework_editmode failed: Unity Bridge not connected',
+                    timestamp: new Date().toISOString()
+                }],
+                warnings: []
+            };
+        }
+
+        // Run EditMode tests via direct connection
+        this.log('Running EditMode tests via direct connection...');
+        
+        try {
+            const result = await this.runTests('EditMode', task.testFilter);
+            
+            if (!result) {
+                return {
+                    success: false,
+                    errors: [{
+                        id: `err_${Date.now()}`,
+                        type: 'test_failure',
+                        message: 'EditMode tests returned no result',
+                        timestamp: new Date().toISOString()
+                    }],
+                    warnings: []
+                };
+            }
+            
+            return {
+                success: result.failed === 0,
                 errors: [],
                 warnings: [],
-                testsPassed: testResult.passed,
-                testsFailed: testResult.failed,
-                testResults: testResult.failures
+                testsPassed: result.passed,
+                testsFailed: result.failed,
+                testResults: result.failures
             };
-        } catch {
+        } catch (err) {
             return {
                 success: false,
                 errors: [{
                     id: `err_${Date.now()}`,
                     type: 'test_failure',
-                    message: `Failed to parse test results: ${result}`,
+                    message: `EditMode tests failed: ${err}`,
                     timestamp: new Date().toISOString()
                 }],
                 warnings: []
@@ -526,38 +655,61 @@ export class UnityControlManager {
 
     /**
      * Execute test_framework_playmode task
+     * Uses direct Unity Bridge connection - no MCP fallback
      */
     private async executeTestFrameworkPlayMode(task: UnityTask): Promise<UnityTaskResult> {
         this.status = 'executing';
         task.phase = 'running_tests';
         this.emitStatusUpdate();
 
-        // Similar to EditMode but with PlayMode
-        this.log('Running PlayMode tests...');
-        const result = await this.runCursorAgentCommand(
-            `Run Unity PlayMode tests:
-            Use mcp_unityMCP_run_tests with mode='PlayMode'
-            Wait for completion (up to 10 minutes)
-            Reply with JSON: { "passed": N, "failed": N, "failures": [...] }`
-        );
-
-        try {
-            const testResult = JSON.parse(result);
+        // Check connection first
+        if (!this.isDirectConnectionAvailable()) {
             return {
-                success: testResult.failed === 0,
+                success: false,
+                errors: [{
+                    id: `err_${Date.now()}`,
+                    type: 'runtime',
+                    message: 'test_framework_playmode failed: Unity Bridge not connected',
+                    timestamp: new Date().toISOString()
+                }],
+                warnings: []
+            };
+        }
+
+        // Run PlayMode tests via direct connection
+        this.log('Running PlayMode tests via direct connection...');
+        
+        try {
+            const result = await this.runTests('PlayMode', task.testFilter);
+            
+            if (!result) {
+                return {
+                    success: false,
+                    errors: [{
+                        id: `err_${Date.now()}`,
+                        type: 'test_failure',
+                        message: 'PlayMode tests returned no result',
+                        timestamp: new Date().toISOString()
+                    }],
+                    warnings: []
+                };
+            }
+            
+            return {
+                success: result.failed === 0,
                 errors: [],
                 warnings: [],
-                testsPassed: testResult.passed,
-                testsFailed: testResult.failed,
-                testResults: testResult.failures
+                testsPassed: result.passed,
+                testsFailed: result.failed,
+                testResults: result.failures
             };
-        } catch {
+        } catch (err) {
             return {
                 success: false,
                 errors: [{
                     id: `err_${Date.now()}`,
                     type: 'test_failure',
-                    message: `Failed to parse test results: ${result}`,
+                    message: `PlayMode tests failed: ${err}`,
                     timestamp: new Date().toISOString()
                 }],
                 warnings: []
@@ -567,82 +719,121 @@ export class UnityControlManager {
 
     /**
      * Execute test_player_playmode task (manual player testing)
+     * Uses popup-driven flow: shows popup, waits for user to start/finish testing
+     * Uses direct Unity Bridge connection - no MCP fallback
      */
     private async executeTestPlayerPlayMode(task: UnityTask): Promise<UnityTaskResult> {
         this.status = 'monitoring';
         task.phase = 'monitoring';
         this.emitStatusUpdate();
 
-        const errors: UnityError[] = [];
+        // Check connection first
+        if (!this.isDirectConnectionAvailable()) {
+            return {
+                success: false,
+                errors: [{
+                    id: `err_${Date.now()}`,
+                    type: 'runtime',
+                    message: 'test_player_playmode failed: Unity Bridge not connected',
+                    timestamp: new Date().toISOString()
+                }],
+                warnings: [],
+                exitReason: 'error'
+            };
+        }
+
         const startTime = Date.now();
         const maxDuration = task.maxDuration || 600; // 10 minutes default
+        const pipelineId = this.currentPipeline?.id || `player_test_${Date.now()}`;
 
         try {
-            // Load game scene and enter playmode
+            // Step 1: Request popup from VS Code extension
+            this.log(`[PlayerTest] Requesting popup for pipeline ${pipelineId}`);
+            
+            try {
+                const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+                broadcaster.unityPlayerTestRequest(pipelineId, this.currentPipeline?.currentStep || 0);
+            } catch (e) {
+                this.log(`[PlayerTest] Failed to broadcast popup request: ${e}`);
+            }
+            
+            // Step 2: Wait for user to click "Start Testing"
+            this.log('[PlayerTest] Waiting for user to click Start Testing...');
+            const startAction = await this.waitForPlayerTestAction(pipelineId);
+            
+            if (startAction === 'cancel') {
+                this.log('[PlayerTest] User cancelled before starting');
+                this.clearPlayerTestState();
+                return {
+                    success: false,
+                    errors: [{
+                        id: `err_${Date.now()}`,
+                        type: 'runtime',
+                        message: 'Player test cancelled by user',
+                        timestamp: new Date().toISOString()
+                    }],
+                    warnings: [],
+                    exitReason: 'stopped'
+                };
+            }
+            
+            // Step 3: Load scene and enter play mode
             const testScene = task.testScene || 'Assets/Scenes/Main.unity';
-            this.log(`Starting player test in scene: ${testScene}`);
+            this.log(`[PlayerTest] Starting player test in scene: ${testScene}`);
 
-            await this.runCursorAgentCommand(
-                `Start player playtest:
-                1. Load scene: mcp_unityMCP_manage_scene action='load' path='${testScene}'
-                2. Enter playmode: mcp_unityMCP_manage_editor action='play'
-                Reply: 'STARTED' or 'ERROR: reason'`
-            );
+            await this.loadScene(testScene);
+            await this.enterPlayMode();
 
             // Focus Unity for player
             await this.focusUnityEditor();
 
-            // Log notification
-            this.log('🎮 Player Test Started - Play the game and exit playmode when done');
-
-            // Monitor loop
-            let lastCheckTime = Date.now();
+            this.log('🎮 Player Test Started - Play the game in Unity');
+            
+            // Step 4: Wait for user to click "Finished Testing" OR timeout
+            // Create a race between user finish and timeout
+            const finishPromise = this.waitForPlayerTestAction(pipelineId);
+            const timeoutPromise = new Promise<'timeout'>((resolve) => {
+                setTimeout(() => resolve('timeout'), maxDuration * 1000);
+            });
+            
+            const finishAction = await Promise.race([finishPromise, timeoutPromise]);
+            
             let exitReason: 'player_exit' | 'timeout' | 'error' | 'stopped' = 'player_exit';
-
-            while (true) {
-                await this.sleep(30000); // Check every 30 seconds
-
-                // Check if still in playmode
-                const state = await this.getEditorState();
-                if (!state.isPlaying) {
-                    this.log('Player exited playmode');
-                    break;
-                }
-
-                // Collect errors since last check
-                const newErrors = await this.readUnityConsoleSince(lastCheckTime);
-                errors.push(...newErrors.errors);
-                lastCheckTime = Date.now();
-
-                // Timeout check
-                const elapsed = (Date.now() - startTime) / 1000;
-                if (elapsed > maxDuration) {
-                    this.log('Player test timeout');
-                    exitReason = 'timeout';
-                    await this.runCursorAgentCommand(
-                        `Exit playmode: mcp_unityMCP_manage_editor action='stop'`
-                    );
-                    break;
-                }
-
-                // Log error count
-                if (errors.length > 0) {
-                    this.log(`🎮 Playing... (${errors.length} errors collected)`);
-                }
+            
+            if (finishAction === 'timeout') {
+                this.log('[PlayerTest] Player test timed out');
+                exitReason = 'timeout';
+            } else if (finishAction === 'cancel') {
+                this.log('[PlayerTest] User cancelled during testing');
+                exitReason = 'stopped';
+            } else {
+                this.log('[PlayerTest] User finished testing');
             }
+            
+            // Step 5: Exit play mode and focus back to Cursor
+            await this.exitPlayMode();
+            await this.focusCursorEditor();
+            
+            this.clearPlayerTestState();
 
-            // Deduplicate errors
-            const uniqueErrors = this.deduplicateErrors(errors);
-
+            // Errors are captured via UnityLogMonitor
             return {
-                success: uniqueErrors.length === 0,
-                errors: uniqueErrors,
+                success: exitReason === 'player_exit',
+                errors: exitReason === 'stopped' ? [{
+                    id: `err_${Date.now()}`,
+                    type: 'runtime',
+                    message: 'Player test cancelled by user',
+                    timestamp: new Date().toISOString()
+                }] : [],
                 warnings: [],
                 playDuration: (Date.now() - startTime) / 1000,
                 exitReason
             };
 
         } catch (error) {
+            this.clearPlayerTestState();
+            await this.focusCursorEditor();
+            
             return {
                 success: false,
                 errors: [{
@@ -663,82 +854,60 @@ export class UnityControlManager {
 
     /**
      * Focus Unity Editor window
-     * Works on macOS, Windows, and Linux
+     * Uses Unity Bridge when available (more reliable on Windows)
+     * Falls back to platform-specific methods when bridge not connected
      */
     private async focusUnityEditor(): Promise<void> {
-        const platform = process.platform;
-
-        if (platform === 'darwin') {
-            // macOS - use AppleScript
-            await new Promise<void>((resolve, reject) => {
-                const proc = spawn('osascript', ['-e', 'tell application "Unity" to activate']);
-                proc.on('close', () => resolve());
-                proc.on('error', reject);
-            });
-        } else if (platform === 'win32') {
-            // Windows - use PowerShell to focus Unity window
-            await new Promise<void>((resolve, reject) => {
-                const psScript = `
-                    Add-Type @"
-                    using System;
-                    using System.Runtime.InteropServices;
-                    public class Win32 {
-                        [DllImport("user32.dll")]
-                        public static extern bool SetForegroundWindow(IntPtr hWnd);
-                        [DllImport("user32.dll")]
-                        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-                    }
-"@
-                    $unity = Get-Process -Name "Unity" -ErrorAction SilentlyContinue | Select-Object -First 1
-                    if ($unity) {
-                        [Win32]::ShowWindow($unity.MainWindowHandle, 9)
-                        [Win32]::SetForegroundWindow($unity.MainWindowHandle)
-                    }
-                `.replace(/\n\s*/g, ' ');
-                
-                const proc = spawn('powershell', ['-Command', psScript], { 
-                    windowsHide: true,
-                    stdio: 'ignore'
-                });
-                proc.on('close', () => resolve());
-                proc.on('error', () => resolve()); // Don't fail if PowerShell fails
-            });
-        } else {
-            // Linux - use wmctrl or xdotool if available
-            await new Promise<void>((resolve) => {
-                const proc = spawn('wmctrl', ['-a', 'Unity'], { stdio: 'ignore' });
-                proc.on('close', () => resolve());
-                proc.on('error', () => {
-                    // Try xdotool as fallback
-                    const proc2 = spawn('xdotool', ['search', '--name', 'Unity', 'windowactivate'], { stdio: 'ignore' });
-                    proc2.on('close', () => resolve());
-                    proc2.on('error', () => resolve());
-                });
-            });
+        // Prefer Unity Bridge direct command when connected - more reliable on Windows
+        if (this.isDirectConnectionAvailable() && this.sendToUnityClient) {
+            try {
+                const result = await this.executeViaDirect('unity.direct.focusEditor');
+                if (result?.success) {
+                    this.log('Focused Unity Editor via bridge');
+                    return;
+                }
+            } catch (err) {
+                this.log(`Unity Bridge focus failed, falling back to platform method: ${err}`);
+            }
         }
+        
+        // Fallback to platform-specific method
+        return focusUnityEditor();
     }
 
     /**
      * Wait for Unity compilation to complete
-     * Uses the polling agent for efficient monitoring
+     * Uses direct Unity Bridge connection for monitoring
      */
     private async waitForCompilation(timeoutSeconds: number): Promise<boolean> {
-        // Use polling agent-based waiting (more efficient)
-        return this.waitForCompilationViaPollingAgent(timeoutSeconds);
+        return this.waitForCompilationViaDirect(timeoutSeconds);
     }
 
     /**
-     * Get Unity editor state via MCP
+     * Get Unity editor state via direct connection
      */
     private async getEditorState(): Promise<UnityEditorState> {
-        const result = await this.runCursorAgentCommand(
-            `Get Unity editor state:
-            Use fetch_mcp_resource with uri='unity://editor/state'
-            Reply with JSON: { "isPlaying": bool, "isCompiling": bool, "isPaused": bool }`
-        );
+        if (!this.isDirectConnectionAvailable() || !this.queryUnityState) {
+            return {
+                isPlaying: false,
+                isPaused: false,
+                isCompiling: false,
+                applicationPath: '',
+                projectPath: '',
+                unityVersion: ''
+            };
+        }
 
         try {
-            return JSON.parse(result);
+            const state = await this.queryUnityState();
+            return {
+                isPlaying: state?.isPlaying ?? false,
+                isPaused: false, // Not tracked in direct connection
+                isCompiling: state?.isCompiling ?? false,
+                applicationPath: '',
+                projectPath: '',
+                unityVersion: ''
+            };
         } catch {
             return {
                 isPlaying: false,
@@ -752,20 +921,23 @@ export class UnityControlManager {
     }
 
     /**
-     * Read Unity console for errors
+     * Read Unity console for errors via direct connection
+     * Note: Most error detection is now done via UnityLogMonitor for accurate timestamps
      */
     private async readUnityConsole(): Promise<{ errors: UnityError[]; warnings: UnityWarning[] }> {
-        const result = await this.runCursorAgentCommand(
-            `Read Unity console:
-            Use mcp_unityMCP_read_console with action='get' count='100' types=['error','warning']
-            Parse the output and reply with JSON:
-            { "errors": [{ "code": "CS...", "message": "...", "file": "...", "line": N }], "warnings": [...] }`
-        );
+        if (!this.isDirectConnectionAvailable()) {
+            return { errors: [], warnings: [] };
+        }
 
         try {
-            const parsed = JSON.parse(result);
+            const result = await this.executeViaDirect('unity.direct.getConsole', { count: 100 });
+            
+            if (!result) {
+                return { errors: [], warnings: [] };
+            }
+            
             return {
-                errors: (parsed.errors || []).map((e: any, i: number) => ({
+                errors: (result.errors || []).map((e: any, i: number) => ({
                     id: `err_${Date.now()}_${i}`,
                     type: 'compilation' as const,
                     code: e.code,
@@ -774,7 +946,7 @@ export class UnityControlManager {
                     line: e.line,
                     timestamp: new Date().toISOString()
                 })),
-                warnings: (parsed.warnings || []).map((w: any) => ({
+                warnings: (result.warnings || []).map((w: any) => ({
                     code: w.code,
                     message: w.message,
                     file: w.file,
@@ -785,31 +957,6 @@ export class UnityControlManager {
         } catch {
             return { errors: [], warnings: [] };
         }
-    }
-
-    /**
-     * Read Unity console since timestamp
-     * Filters results to only include messages newer than the given timestamp
-     */
-    private async readUnityConsoleSince(sinceTimestamp: number): Promise<{ errors: UnityError[]; warnings: UnityWarning[] }> {
-        const allMessages = await this.readUnityConsole();
-        
-        // Filter errors by timestamp
-        const filteredErrors = allMessages.errors.filter(e => {
-            const errorTime = new Date(e.timestamp).getTime();
-            return errorTime > sinceTimestamp;
-        });
-        
-        // Filter warnings by timestamp
-        const filteredWarnings = allMessages.warnings.filter(w => {
-            const warningTime = new Date(w.timestamp).getTime();
-            return warningTime > sinceTimestamp;
-        });
-        
-        return {
-            errors: filteredErrors,
-            warnings: filteredWarnings
-        };
     }
 
     /**
@@ -824,63 +971,262 @@ export class UnityControlManager {
             return true;
         });
     }
-
-    /**
-     * Run cursor-agent CLI command using AgentRunner
-     * Provides consistent timeout handling and retry support
-     */
-    private async runCursorAgentCommand(prompt: string, retries: number = 2): Promise<string> {
-        const agentRunner = ServiceLocator.resolve(AgentRunner);
-        const processId = `unity_cmd_${Date.now()}`;
-        
-        let lastError: Error | null = null;
-        
-        for (let attempt = 0; attempt <= retries; attempt++) {
-            try {
-                if (attempt > 0) {
-                    this.log(`Retrying Unity command (attempt ${attempt + 1}/${retries + 1})...`);
-                }
-                
-                let output = '';
-                
-                const result = await agentRunner.run({
-                    id: `${processId}_${attempt}`,
-                    prompt,
-                    cwd: this.workspaceRoot,
-                    model: 'gpt-4o-mini',
-                    timeoutMs: 300000, // 5 minute timeout
-                    metadata: { 
-                        type: 'unity_command', 
-                        prompt: prompt.substring(0, 100),
-                        attempt 
-                    },
-                    onOutput: (text) => {
-                        output += text;
-                    }
-                });
-                
-                if (result.success) {
-                    // Get last line as result (for backward compatibility)
-                    const fullOutput = output || result.output || '';
-                    const lines = fullOutput.trim().split('\n');
-                    return lines[lines.length - 1] || '';
-                } else {
-                    lastError = new Error(result.error || `Unity command failed (exit code: ${result.exitCode})`);
-                }
-            } catch (err) {
-                lastError = err instanceof Error ? err : new Error(String(err));
-                this.log(`Unity command attempt ${attempt + 1} failed: ${lastError.message}`);
-            }
-        }
-        
-        throw lastError || new Error('Unity command failed after all retries');
-    }
-
     /**
      * Sleep utility
      */
     private sleep(ms: number): Promise<void> {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+    
+    // ========================================================================
+    // Direct Unity WebSocket Communication
+    // ========================================================================
+    
+    /**
+     * Query Unity state before executing an operation.
+     * Requires Unity Bridge connection.
+     */
+    private async queryUnityStateBeforeOperation(): Promise<{
+        ready: boolean;
+        reason?: string;
+        state?: { isCompiling: boolean; isPlaying: boolean; isBusy: boolean; editorReady: boolean };
+    }> {
+        if (!this.isDirectConnectionAvailable() || !this.queryUnityState) {
+            return { ready: false, reason: 'Unity Bridge not connected' };
+        }
+        
+        try {
+            const state = await this.queryUnityState();
+            if (!state) {
+                return { ready: false, reason: 'Failed to query Unity state' };
+            }
+            
+            if (state.isBusy) {
+                return { ready: false, reason: 'Unity is busy with another operation', state };
+            }
+            if (state.isCompiling) {
+                return { ready: false, reason: 'Unity is compiling', state };
+            }
+            if (!state.editorReady) {
+                return { ready: false, reason: 'Unity Editor is not ready', state };
+            }
+            
+            return { ready: true, state };
+        } catch (err) {
+            this.log(`Failed to query Unity state: ${err}`);
+            return { ready: false, reason: `Query failed: ${err}` };
+        }
+    }
+    
+    /**
+     * Execute a Unity command via direct WebSocket connection.
+     * Throws error if connection not available.
+     */
+    private async executeViaDirect(cmd: string, params?: Record<string, unknown>): Promise<any> {
+        if (!this.isDirectConnectionAvailable() || !this.sendToUnityClient) {
+            throw new Error('Unity Bridge not connected');
+        }
+        
+        try {
+            // Query state first
+            const stateCheck = await this.queryUnityStateBeforeOperation();
+            if (!stateCheck.ready) {
+                this.log(`Cannot execute ${cmd}: ${stateCheck.reason}`);
+                throw new Error(stateCheck.reason || 'Unity not ready');
+            }
+            
+            // Execute command
+            this.log(`Executing via direct WebSocket: ${cmd}`);
+            const result = await this.sendToUnityClient(cmd, params);
+            return result;
+        } catch (err) {
+            this.log(`Direct execution failed: ${err}`);
+            throw err;
+        }
+    }
+    
+    /**
+     * Enter play mode - requires direct connection
+     */
+    async enterPlayMode(): Promise<boolean> {
+        if (!this.isDirectConnectionAvailable()) {
+            this.log('Cannot enter play mode: Unity Bridge not connected');
+            return false;
+        }
+        
+        try {
+            const result = await this.executeViaDirect('unity.direct.enterPlayMode');
+            return result?.success ?? false;
+        } catch (err) {
+            this.log(`Failed to enter play mode: ${err}`);
+            return false;
+        }
+    }
+    
+    /**
+     * Exit play mode - requires direct connection
+     */
+    async exitPlayMode(): Promise<boolean> {
+        if (!this.isDirectConnectionAvailable()) {
+            this.log('Cannot exit play mode: Unity Bridge not connected');
+            return false;
+        }
+        
+        try {
+            const result = await this.executeViaDirect('unity.direct.exitPlayMode');
+            return result?.success ?? false;
+        } catch (err) {
+            this.log(`Failed to exit play mode: ${err}`);
+            return false;
+        }
+    }
+    
+    /**
+     * Load a scene - requires direct connection
+     */
+    async loadScene(scenePath: string): Promise<boolean> {
+        if (!this.isDirectConnectionAvailable()) {
+            this.log('Cannot load scene: Unity Bridge not connected');
+            return false;
+        }
+        
+        try {
+            const result = await this.executeViaDirect('unity.direct.loadScene', { path: scenePath });
+            return result?.success ?? false;
+        } catch (err) {
+            this.log(`Failed to load scene: ${err}`);
+            return false;
+        }
+    }
+    
+    /**
+     * Trigger compilation - focuses Unity, waits for compile, then focuses back to Cursor
+     * Requires direct connection for state monitoring
+     */
+    async triggerCompile(): Promise<boolean> {
+        if (!this.isDirectConnectionAvailable()) {
+            this.log('Cannot trigger compile: Unity Bridge not connected');
+            return false;
+        }
+        
+        try {
+            // Step 1: Focus Unity Editor to trigger reimport/recompile
+            this.log('Focusing Unity Editor to trigger compile...');
+            await this.focusUnityEditor();
+            
+            // Step 2: Tell Unity Bridge we're triggering compile (it will track state)
+            const result = await this.executeViaDirect('unity.direct.compile');
+            if (!result?.success) {
+                this.log('Unity Bridge compile command failed');
+                return false;
+            }
+            
+            // Step 3: Wait for compilation to complete
+            this.log('Waiting for Unity compilation to complete...');
+            const compileSuccess = await this.waitForCompilationViaDirect(120); // 2 minute timeout
+            
+            // Step 4: Focus back to Cursor
+            this.log('Compilation complete, focusing back to Cursor...');
+            await this.focusCursorEditor();
+            
+            return compileSuccess;
+        } catch (err) {
+            this.log(`Compile failed: ${err}`);
+            // Try to focus back to Cursor even on failure
+            await this.focusCursorEditor();
+            return false;
+        }
+    }
+    
+    /**
+     * Wait for compilation to complete via Unity Bridge events.
+     * Uses event-driven approach - Unity pushes compileComplete event when done.
+     */
+    private async waitForCompilationViaDirect(timeoutSeconds: number): Promise<boolean> {
+        if (!this.isDirectConnectionAvailable()) {
+            this.log('Cannot wait for compile: Unity Bridge not connected');
+            return false;
+        }
+        
+        // Use event-driven waiting
+        return this.waitForCompilationViaEvents(timeoutSeconds);
+    }
+    
+    /**
+     * Focus Cursor editor window
+     * Works on macOS, Windows, and Linux
+     */
+    private async focusCursorEditor(): Promise<void> {
+        const platform = process.platform;
+
+        if (platform === 'darwin') {
+            // macOS - use AppleScript
+            await new Promise<void>((resolve, reject) => {
+                const proc = spawn('osascript', ['-e', 'tell application "Cursor" to activate']);
+                proc.on('close', () => resolve());
+                proc.on('error', reject);
+            });
+        } else if (platform === 'win32') {
+            // Windows - use PowerShell to focus Cursor window
+            await new Promise<void>((resolve) => {
+                const psScript = `
+                    Add-Type @"
+                    using System;
+                    using System.Runtime.InteropServices;
+                    public class Win32 {
+                        [DllImport("user32.dll")]
+                        public static extern bool SetForegroundWindow(IntPtr hWnd);
+                        [DllImport("user32.dll")]
+                        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+                    }
+"@
+                    $cursor = Get-Process -Name "Cursor" -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($cursor) {
+                        [Win32]::ShowWindow($cursor.MainWindowHandle, 9)
+                        [Win32]::SetForegroundWindow($cursor.MainWindowHandle)
+                    }
+                `.replace(/\n\s*/g, ' ');
+                
+                const proc = spawn('powershell', ['-Command', psScript], { 
+                    windowsHide: true,
+                    stdio: 'ignore'
+                });
+                proc.on('close', () => resolve());
+                proc.on('error', () => resolve());
+            });
+        } else {
+            // Linux - use wmctrl or xdotool if available
+            await new Promise<void>((resolve) => {
+                const proc = spawn('wmctrl', ['-a', 'Cursor'], { stdio: 'ignore' });
+                proc.on('close', () => resolve());
+                proc.on('error', () => {
+                    const proc2 = spawn('xdotool', ['search', '--name', 'Cursor', 'windowactivate'], { stdio: 'ignore' });
+                    proc2.on('close', () => resolve());
+                    proc2.on('error', () => resolve());
+                });
+            });
+        }
+    }
+    
+    /**
+     * Run tests - requires direct connection
+     */
+    async runTests(mode: 'EditMode' | 'PlayMode', filter?: string[]): Promise<any | null> {
+        if (!this.isDirectConnectionAvailable()) {
+            this.log('Cannot run tests: Unity Bridge not connected');
+            return null;
+        }
+        
+        try {
+            const result = await this.executeViaDirect('unity.direct.runTests', {
+                mode,
+                filter
+            });
+            return result;
+        } catch (err) {
+            this.log(`Failed to run tests: ${err}`);
+            return null;
+        }
     }
 
     /**
@@ -930,8 +1276,7 @@ export class UnityControlManager {
     /**
      * Emit status update
      * 
-     * Note: Error status is now determined by pipeline results, not polling.
-     * The polling agent only monitors editor state (isCompiling, isPlaying, isPaused).
+     * Note: Error status is determined by pipeline results, not state events.
      * Error detection happens via UnityLogMonitor during pipeline operations.
      */
     private emitStatusUpdate(): void {
@@ -950,15 +1295,29 @@ export class UnityControlManager {
             overallStatus = 'testing';
         }
         
-        // Note: hasErrors and errorCount are now always false/0 from polling.
-        // Errors are detected via UnityLogMonitor and reported through pipeline results.
+        // Note: hasErrors and errorCount are determined by pipeline results.
+        // Errors are detected via UnityLogMonitor during operations.
+        
+        // Compute queue length (pipeline queue + current pipeline if running)
+        const queueLength = this.pipelineQueue.length + (this.currentPipeline ? 1 : 0);
+        
+        // Build current task info if there's an active pipeline
+        const currentTask = this.currentPipeline ? {
+            id: this.currentPipeline.id,
+            type: this.currentPipeline.operations[this.currentPipeline.currentStep] || this.currentPipeline.operations[0],
+            phase: this.currentPipeline.status
+        } : undefined;
+        
         broadcaster.unityStatusChanged(
             overallStatus,
+            this.isDirectConnectionAvailable(),  // connected - true if Unity Bridge is connected
             this.lastUnityStatus?.isCompiling ?? false,
             this.lastUnityStatus?.isPlaying ?? false,
             this.lastUnityStatus?.isPaused ?? false,
-            false,  // hasErrors - now determined by pipeline, not polling
-            0       // errorCount - now determined by pipeline, not polling
+            false,  // hasErrors - determined by pipeline results
+            0,      // errorCount - determined by pipeline results
+            queueLength,
+            currentTask
         );
     }
 
@@ -966,10 +1325,30 @@ export class UnityControlManager {
      * Get current state
      */
     getState(): UnityControlManagerState {
+        // Build current task from active pipeline if one is running
+        let currentTask: UnityTask | undefined;
+        
+        if (this.currentPipeline) {
+            const currentOp = this.currentPipeline.operations[this.currentPipeline.currentStep] || this.currentPipeline.operations[0];
+            currentTask = {
+                id: this.currentPipeline.id,
+                type: currentOp as UnityTaskType,
+                priority: 1,
+                requestedBy: [{ coordinatorId: this.currentPipeline.coordinatorId, agentName: 'pipeline' }],
+                status: this.currentPipeline.status === 'running' ? 'executing' : 'queued',
+                phase: this.currentPipeline.status === 'running' ? 'running_tests' : undefined,
+                createdAt: this.currentPipeline.createdAt,
+                startedAt: this.currentPipeline.startedAt
+            };
+        }
+        
+        // Queue length includes pipeline queue + current pipeline if running
+        const queueLength = this.pipelineQueue.length + (this.currentPipeline ? 1 : 0);
+        
         return {
             status: this.status,
-            currentTask: this.currentTask || undefined,
-            queueLength: this.queue.length,
+            currentTask,
+            queueLength,
             tempScenePath: this.tempScenePath,
             lastActivity: new Date().toISOString(),
             errorRegistryPath: this.errorRegistryPath
@@ -977,54 +1356,59 @@ export class UnityControlManager {
     }
 
     /**
-     * Get queue
+     * Get pipeline queue
      */
-    getQueue(): UnityTask[] {
-        return [...this.queue];
+    getPipelineQueue(): PipelineRequest[] {
+        return [...this.pipelineQueue];
     }
 
     /**
-     * Get last Unity editor status (from polling agent)
+     * Get last Unity editor status (from Unity Bridge events)
      */
     getUnityStatus(): UnityEditorStatus | null {
         return this.lastUnityStatus;
     }
 
     /**
-     * Check if polling agent is running
+     * Check if Unity Bridge is connected (replaces polling agent)
      */
-    isPollingAgentRunning(): boolean {
-        return this.pollingAgentRunning;
+    isUnityBridgeConnected(): boolean {
+        return this.unityClientConnected;
     }
 
     /**
-     * Estimate wait time for a new task
-     * Based on queue length and average task duration
+     * Estimate wait time for a new pipeline
+     * Based on queue length and average operation duration
      */
-    getEstimatedWaitTime(taskType: UnityTaskType): number {
-        // Average durations in milliseconds
-        const avgDurations: Record<UnityTaskType, number> = {
-            'prep_editor': 45000,           // 45 seconds
-            'test_framework_editmode': 60000, // 60 seconds
-            'test_framework_playmode': 120000, // 2 minutes
+    getEstimatedWaitTime(): number {
+        // Average durations in milliseconds per operation
+        const avgDurations: Record<PipelineOperation, number> = {
+            'prep': 45000,                    // 45 seconds
+            'test_editmode': 60000,           // 60 seconds
+            'test_playmode': 120000,          // 2 minutes
             'test_player_playmode': 300000    // 5 minutes (variable)
         };
 
-        // Calculate wait based on queue
         let waitTime = 0;
 
-        // Add current task remaining time (estimate half done)
-        if (this.currentTask) {
-            waitTime += avgDurations[this.currentTask.type] / 2;
+        // Add current pipeline remaining time (estimate half done)
+        if (this.currentPipeline) {
+            const remainingOps = this.currentPipeline.operations.slice(this.currentPipeline.currentStep);
+            for (const op of remainingOps) {
+                waitTime += avgDurations[op] / 2;  // Assume half done on current
+            }
         }
 
-        // Add queued tasks
-        for (const task of this.queue) {
-            waitTime += avgDurations[task.type];
+        // Add queued pipelines
+        for (const pipeline of this.pipelineQueue) {
+            for (const op of pipeline.operations) {
+                waitTime += avgDurations[op];
+            }
         }
 
-        // Add buffer (10 seconds per task for transitions)
-        waitTime += (this.queue.length + (this.currentTask ? 1 : 0)) * 10000;
+        // Add buffer (10 seconds per pipeline for transitions)
+        const totalPipelines = this.pipelineQueue.length + (this.currentPipeline ? 1 : 0);
+        waitTime += totalPipelines * 10000;
 
         return waitTime;
     }
@@ -1034,305 +1418,20 @@ export class UnityControlManager {
      */
     getQueueStatus(): {
         queueLength: number;
-        currentTaskType?: UnityTaskType;
+        currentOperation?: PipelineOperation;
         estimatedTotalWaitMs: number;
         isIdle: boolean;
     } {
+        const currentOp = this.currentPipeline
+            ? this.currentPipeline.operations[this.currentPipeline.currentStep]
+            : undefined;
+        
         return {
-            queueLength: this.queue.length,
-            currentTaskType: this.currentTask?.type,
-            estimatedTotalWaitMs: this.getEstimatedWaitTime('prep_editor'), // Use compile as baseline
-            isIdle: this.status === 'idle' && this.queue.length === 0
+            queueLength: this.pipelineQueue.length + (this.currentPipeline ? 1 : 0),
+            currentOperation: currentOp,
+            estimatedTotalWaitMs: this.getEstimatedWaitTime(),
+            isIdle: this.status === 'idle' && this.pipelineQueue.length === 0
         };
-    }
-
-    // ========================================================================
-    // Polling Agent - Long-running agent for Unity state monitoring
-    // ========================================================================
-
-    /**
-     * Start the polling agent if not already running
-     * The polling agent continuously monitors Unity state and notifies via CLI
-     */
-    private async startPollingAgent(): Promise<void> {
-        // Already running?
-        if (this.pollingAgentRunning || this.agentRunner.isRunning(this.pollingAgentId)) {
-            this.log('Polling agent already running');
-            return;
-        }
-
-        this.log('Starting Unity polling agent...');
-        this.pollingAgentRunning = true;
-        this.pollingAgentStartTime = Date.now();
-
-        const logFile = path.join(this.workspaceRoot, '_AiDevLog/Logs/unity_polling_agent.log');
-        
-        // Ensure log directory exists
-        const logDir = path.dirname(logFile);
-        if (!fs.existsSync(logDir)) {
-            fs.mkdirSync(logDir, { recursive: true });
-        }
-
-        try {
-            const result = await this.agentRunner.run({
-                id: this.pollingAgentId,
-                prompt: this.getPollingAgentPrompt(),
-                cwd: this.workspaceRoot,
-                model: 'gpt-4o-mini',
-                logFile,
-                timeoutMs: this.pollingAgentMaxLifetime,
-                onOutput: (text, type) => this.handlePollingAgentOutput(text, type),
-                onProgress: (msg) => this.log(`[PollingAgent] ${msg}`),
-                onStart: (pid) => this.log(`[PollingAgent] Started with PID: ${pid}`)
-            });
-
-            this.handlePollingAgentExit(result);
-        } catch (error) {
-            this.log(`[PollingAgent] Error: ${error}`);
-            this.pollingAgentRunning = false;
-        }
-    }
-
-    /**
-     * Stop the polling agent
-     */
-    private async stopPollingAgent(): Promise<void> {
-        // Clear any pending restart timeout
-        if (this.pollingAgentRestartTimeout) {
-            clearTimeout(this.pollingAgentRestartTimeout);
-            this.pollingAgentRestartTimeout = null;
-        }
-        
-        if (!this.pollingAgentRunning) {
-            return;
-        }
-
-        this.log('Stopping polling agent...');
-        await this.agentRunner.stop(this.pollingAgentId);
-        this.pollingAgentRunning = false;
-    }
-
-    /**
-     * Handle polling agent exit - restart if needed
-     */
-    private handlePollingAgentExit(result: AgentRunResult): void {
-        this.pollingAgentRunning = false;
-        const lifetime = Date.now() - this.pollingAgentStartTime;
-
-        this.log(`[PollingAgent] Exited after ${Math.round(lifetime / 1000)}s, success: ${result.success}`);
-
-        // Clear any existing restart timeout
-        if (this.pollingAgentRestartTimeout) {
-            clearTimeout(this.pollingAgentRestartTimeout);
-            this.pollingAgentRestartTimeout = null;
-        }
-
-        // Check if we should restart
-        const hasWork = this.queue.length > 0 || this.currentTask !== null;
-        const minLifetimeMet = lifetime >= this.pollingAgentMinLifetime;
-
-        if (hasWork && minLifetimeMet) {
-            // Queue has work, restart the polling agent
-            this.log('[PollingAgent] Queue has work, restarting polling agent...');
-            this.pollingAgentRestartTimeout = setTimeout(() => this.startPollingAgent(), 2000);
-        } else if (!hasWork && minLifetimeMet) {
-            this.log('[PollingAgent] Queue empty, polling agent stopped');
-        } else if (!minLifetimeMet) {
-            // Didn't run long enough - might be an error, restart with delay
-            this.log('[PollingAgent] Exited too early, will restart in 5s...');
-            this.pollingAgentRestartTimeout = setTimeout(() => this.startPollingAgent(), 5000);
-        }
-    }
-
-    /**
-     * Handle output from polling agent
-     * Parses status updates and updates internal state
-     */
-    private handlePollingAgentOutput(text: string, type: string): void {
-        // Look for status markers in the output
-        // The polling agent outputs status in a parseable format
-        
-        // Try to parse JSON status
-        try {
-            if (text.includes('"unity_status"')) {
-                const match = text.match(/\{[^}]*"unity_status"[^}]*\}/);
-                if (match) {
-                    const status = JSON.parse(match[0]);
-                    this.updateUnityStatus(status);
-                }
-            }
-        } catch {
-            // Not JSON, ignore
-        }
-
-        // Also look for simple markers
-        if (text.includes('COMPILE_COMPLETE')) {
-            this.onCompileComplete();
-        } else if (text.includes('COMPILE_STARTED')) {
-            this.lastUnityStatus = {
-                ...this.lastUnityStatus,
-                isCompiling: true,
-                timestamp: Date.now()
-            } as UnityEditorStatus;
-        }
-    }
-
-    /**
-     * Update Unity status from polling agent
-     * 
-     * Note: Error tracking is now handled by UnityLogMonitor, not the polling agent.
-     */
-    private updateUnityStatus(status: Partial<UnityEditorStatus>): void {
-        const wasCompiling = this.lastUnityStatus?.isCompiling ?? false;
-        
-        this.lastUnityStatus = {
-            isCompiling: status.isCompiling ?? false,
-            isPlaying: status.isPlaying ?? false,
-            isPaused: status.isPaused ?? false,
-            timestamp: Date.now()
-        };
-
-        // Detect compilation complete
-        if (wasCompiling && !this.lastUnityStatus.isCompiling) {
-            this.onCompileComplete();
-        }
-
-        // Emit status update (which includes broadcast)
-        this.emitStatusUpdate();
-    }
-
-    /**
-     * Called when compilation completes
-     */
-    private onCompileComplete(): void {
-        this.log('Unity compilation complete detected');
-        
-        // Resolve any waiting promises
-        if (this.compileCompleteResolve) {
-            this.compileCompleteResolve();
-            this.compileCompleteResolve = null;
-        }
-
-        this.waitingForCompileComplete = false;
-    }
-
-    /**
-     * Wait for compilation to complete using the polling agent
-     */
-    private async waitForCompilationViaPollingAgent(timeoutSeconds: number): Promise<boolean> {
-        // Ensure polling agent is running
-        if (!this.pollingAgentRunning) {
-            await this.startPollingAgent();
-        }
-
-        this.waitingForCompileComplete = true;
-        const startTime = Date.now();
-
-        return new Promise((resolve) => {
-            // Set up the resolve callback
-            this.compileCompleteResolve = () => resolve(true);
-
-            // Also set up timeout
-            const checkInterval = setInterval(() => {
-                const elapsed = (Date.now() - startTime) / 1000;
-                
-                // Check if compilation is already done
-                if (this.lastUnityStatus && !this.lastUnityStatus.isCompiling) {
-                    clearInterval(checkInterval);
-                    this.waitingForCompileComplete = false;
-                    this.compileCompleteResolve = null;
-                    resolve(true);
-                    return;
-                }
-
-                // Timeout check
-                if (elapsed > timeoutSeconds) {
-                    clearInterval(checkInterval);
-                    this.waitingForCompileComplete = false;
-                    this.compileCompleteResolve = null;
-                    resolve(false);
-                    return;
-                }
-            }, 1000);
-        });
-    }
-
-    /**
-     * Get the prompt for the polling agent
-     */
-    private getPollingAgentPrompt(): string {
-        // Get base prompt from settings
-        const basePrompt = this.agentRoleRegistry?.getEffectiveSystemPrompt('unity_polling');
-        if (!basePrompt) {
-            throw new Error('Missing system prompt for unity_polling - check DefaultSystemPrompts');
-        }
-
-        return `${basePrompt}
-
-========================================
-📋 POLLING SESSION - Editor State Only
-========================================
-
-IMPORTANT: You must keep running and polling continuously. Do NOT exit after one check.
-
-🔧 MCP TOOL YOU USE:
-- fetch_mcp_resource uri="unity://editor/state" → Get isPlaying, isPaused, isCompiling
-
-NOTE: Console/error reading is now handled via direct log file monitoring (UnityLogMonitor).
-Your only job is to report editor state changes.
-
-📜 POLLING LOOP - Repeat every 5 seconds:
-
-**Step 1: Get editor state**
-\`\`\`
-fetch_mcp_resource uri="unity://editor/state"
-\`\`\`
-Returns: { isPlaying, isPaused, isCompiling }
-
-**Step 2: Report status** - Output this JSON line:
-\`\`\`
-{"unity_status": {"isCompiling": false, "isPlaying": false, "isPaused": false}}
-\`\`\`
-
-**Step 3: Track state changes**
-- If was compiling → now not compiling: output "COMPILE_COMPLETE"
-- If was not compiling → now compiling: output "COMPILE_STARTED"
-
-**Step 4: Wait ~5 seconds, then repeat from Step 1**
-
-⚠️ CRITICAL RULES:
-1. Keep polling until timeout (~15 minutes) - DO NOT stop early
-2. Output status JSON after EVERY poll cycle
-3. Track state changes for COMPILE_STARTED/COMPILE_COMPLETE markers
-4. If MCP call fails, log error and continue polling
-5. You do NOT make decisions - you only report status
-
-🔄 ALTERNATIVE: You can also call CLI to report status:
-\`\`\`
-apc unity notify-status --compiling true --playing false
-\`\`\`
-
-Begin polling now. First poll:`;
-    }
-
-    /**
-     * Receive status notification from CLI (called by CliHandler)
-     * This is an alternative to parsing polling agent output
-     */
-    receiveStatusNotification(status: Partial<UnityEditorStatus>): void {
-        this.updateUnityStatus(status);
-    }
-
-    /**
-     * Check if polling agent should be running
-     */
-    private ensurePollingAgentIfNeeded(): void {
-        const hasWork = this.queue.length > 0 || this.currentTask !== null || 
-                        this.pipelineQueue.length > 0 || this.currentPipeline !== null;
-        
-        if (hasWork && !this.pollingAgentRunning) {
-            this.startPollingAgent();
-        }
     }
 
     // ========================================================================
@@ -1400,9 +1499,6 @@ Begin polling now. First poll:`;
         this.log(`Pipeline queued: ${pipelineId} (${operations.join(' → ')}) for ${tasksInvolved.length} task(s)`);
         this.emitStatusUpdate();
 
-        // Ensure polling agent is running
-        this.ensurePollingAgentIfNeeded();
-
         // Start processing if not already
         if (!this.currentPipeline && this.status === 'idle') {
             this.processPipelineQueue();
@@ -1460,6 +1556,59 @@ Begin polling now. First poll:`;
             case 'test_player_playmode': return 4;
             default: return 5;
         }
+    }
+    
+    // ========================================================================
+    // Player Test Popup Handlers (called from ApiHandler)
+    // ========================================================================
+    
+    /**
+     * Handle user clicking "Start Testing" in popup
+     */
+    handlePlayerTestStart(pipelineId: string): void {
+        if (this.playerTestPipelineId === pipelineId && this.playerTestResolve) {
+            this.log(`[PlayerTest] User started testing for pipeline ${pipelineId}`);
+            this.playerTestResolve('start');
+        }
+    }
+    
+    /**
+     * Handle user clicking "Finished Testing" in popup
+     */
+    handlePlayerTestFinish(pipelineId: string): void {
+        if (this.playerTestPipelineId === pipelineId && this.playerTestResolve) {
+            this.log(`[PlayerTest] User finished testing for pipeline ${pipelineId}`);
+            this.playerTestResolve('finish');
+        }
+    }
+    
+    /**
+     * Handle user cancelling player test popup
+     */
+    handlePlayerTestCancel(pipelineId: string): void {
+        if (this.playerTestPipelineId === pipelineId && this.playerTestResolve) {
+            this.log(`[PlayerTest] User cancelled testing for pipeline ${pipelineId}`);
+            this.playerTestResolve('cancel');
+        }
+    }
+    
+    /**
+     * Wait for user action from player test popup
+     * Returns a Promise that resolves when user clicks Start, Finish, or Cancel
+     */
+    private waitForPlayerTestAction(pipelineId: string): Promise<'start' | 'finish' | 'cancel'> {
+        return new Promise((resolve) => {
+            this.playerTestPipelineId = pipelineId;
+            this.playerTestResolve = resolve;
+        });
+    }
+    
+    /**
+     * Clear player test state
+     */
+    private clearPlayerTestState(): void {
+        this.playerTestPipelineId = null;
+        this.playerTestResolve = null;
     }
 
     /**
@@ -1832,14 +1981,13 @@ Begin polling now. First poll:`;
     // ========================================================================
 
     /**
-     * Handle pipeline errors by creating error-fixing tasks and pausing affected work
+     * Handle pipeline errors by routing to TaskAgent for error_fix task creation
      * 
      * This is the main entry point for handling Unity compilation/test errors.
-     * It:
-     * 1. Finds all tasks across all plans that touch the affected files
-     * 2. Pauses those tasks and their dependents
-     * 3. Creates error-fixing tasks in the ERROR_RESOLUTION plan
-     * 4. Tells coordinator to execute ERROR_RESOLUTION plan
+     * New flow with TaskAgent:
+     * 1. Finds affected tasks across all plans
+     * 2. Routes errors to TaskAgent which creates error_fix tasks
+     * 3. Coordinator then dispatches error_resolution workflows
      * 
      * @param errors - Array of Unity errors from pipeline
      * @returns IDs of created error-fixing tasks
@@ -1870,47 +2018,74 @@ Begin polling now. First poll:`;
 
         const affectedTaskIds = affected.map(a => a.taskId);
 
-        if (affectedTaskIds.length > 0) {
-            // Pause affected tasks and their dependents
-            const pausedBySession = taskManager.pauseTasksAndDependents(
-                affectedTaskIds,
-                `Unity error in files: ${errorFiles.slice(0, 3).join(', ')}${errorFiles.length > 3 ? '...' : ''}`
-            );
+        // 2. Route to TaskAgent to create error_fix tasks
+        let createdTaskIds: string[] = [];
+        try {
+            const { TaskAgent } = await import('./TaskAgent');
+            // Create TaskAgent instance (or get from ServiceLocator if registered)
+            let taskAgent: InstanceType<typeof TaskAgent>;
+            try {
+                taskAgent = ServiceLocator.resolve(TaskAgent);
+            } catch {
+                // TaskAgent not registered - create a temporary instance
+                taskAgent = new TaskAgent();
+                taskAgent.setWorkspaceRoot(this.workspaceRoot);
+            }
             
-            this.log(`handlePipelineErrors: Paused tasks in ${pausedBySession.size} session(s)`);
+            // Convert errors to TaskAgent format
+            const taskAgentErrors = errors.map(e => ({
+                id: e.code || 'UNITY_ERR',
+                message: e.message,
+                file: e.file,
+                line: e.line
+            }));
             
-            for (const [sessionId, pausedTaskIds] of pausedBySession) {
-                this.log(`  Session ${sessionId}: ${pausedTaskIds.length} tasks paused`);
+            createdTaskIds = await taskAgent.handleUnityErrors(taskAgentErrors);
+            this.log(`handlePipelineErrors: TaskAgent created ${createdTaskIds.length} error_fix tasks`);
+        } catch (e) {
+            // TaskAgent is the only handler for error task creation
+            // If unavailable, log the error but don't fall back to coordinator
+            this.log(`handlePipelineErrors: TaskAgent unavailable - cannot create error tasks: ${e}`);
+            this.log(`  ${errors.length} errors need manual resolution`);
+            
+            // Log error details for manual debugging
+            for (const err of errors.slice(0, 5)) {
+                this.log(`  - ${err.file || 'unknown'}(${err.line || 0}): ${err.message.substring(0, 80)}`);
+            }
+            if (errors.length > 5) {
+                this.log(`  ... and ${errors.length - 5} more errors`);
             }
         }
 
-        // 2. Build raw error text for coordinator
-        const rawErrorText = errors
-            .map(e => `${e.file || 'unknown'}(${e.line || 0}): ${e.code || ''} ${e.message}`)
-            .join('\n');
-
-        // 3. Trigger coordinator with raw error text - it will create tasks via CLI
-        try {
-            const coordinator = ServiceLocator.resolve(UnifiedCoordinatorService);
-            await coordinator.triggerCoordinatorEvaluation(
-                ERROR_RESOLUTION_SESSION_ID,
-                'unity_error',
-                {
-                    type: 'unity_error',
-                    errorText: rawErrorText,
-                    errorCount: errors.length,
-                    affectedTaskIds,
-                    files: errorFiles
+        // 3. Trigger coordinator to dispatch error_resolution workflows for new error tasks
+        // NOTE: TaskAgent creates tasks, Coordinator only dispatches workflows
+        if (createdTaskIds.length > 0) {
+            try {
+                const coordinator = ServiceLocator.resolve(UnifiedCoordinatorService);
+                const stateManager = ServiceLocator.resolve(StateManager);
+                const approvedSessions = stateManager.getAllPlanningSessions()
+                    .filter(s => s.status === 'approved');
+                
+                if (approvedSessions.length > 0) {
+                    // Notify coordinator that new error_fix tasks are ready for dispatch
+                    // Use 'unity_error' event type - coordinator will dispatch error_resolution workflows
+                    await coordinator.triggerCoordinatorEvaluation(
+                        approvedSessions[0].id,
+                        'unity_error',
+                        {
+                            type: 'unity_error',
+                            taskIds: createdTaskIds,
+                            errorCount: errors.length
+                        }
+                    );
+                    this.log(`handlePipelineErrors: Notified coordinator to dispatch ${createdTaskIds.length} error tasks`);
                 }
-            );
-            this.log(`handlePipelineErrors: Triggered coordinator with ${errors.length} errors`);
-        } catch (e) {
-            // Coordinator may not be initialized yet - that's ok
-            this.log(`handlePipelineErrors: Could not trigger coordinator: ${e}`);
+            } catch (e) {
+                this.log(`handlePipelineErrors: Could not trigger coordinator for dispatch: ${e}`);
+            }
         }
 
-        // Return empty - tasks are now created via CLI by coordinator
-        return [];
+        return createdTaskIds;
     }
 
     /**
@@ -1933,15 +2108,6 @@ Begin polling now. First poll:`;
      * Stop the manager
      */
     async stop(): Promise<void> {
-        this.isRunning = false;
-        
-        // Clear any pending restart timeout
-        if (this.pollingAgentRestartTimeout) {
-            clearTimeout(this.pollingAgentRestartTimeout);
-            this.pollingAgentRestartTimeout = null;
-        }
-        
-        await this.stopPollingAgent();
         this.log('Unity Control Manager stopped');
     }
     
@@ -1954,7 +2120,6 @@ Begin polling now. First poll:`;
         
         // Dispose event emitters
         this._onStatusChanged.dispose();
-        this._onTaskCompleted.dispose();
         
         this.log('Unity Control Manager disposed');
     }

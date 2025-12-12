@@ -235,11 +235,18 @@ export class ContextGatheringWorkflow extends BaseWorkflow {
         const typesToGather = this.getTypesNeedingGather();
         
         if (typesToGather.length === 0) {
-            this.log(`All asset types already gathered successfully`);
+            if (this.detectedTypes.size === 0) {
+                this.log(`⚠️ No asset types detected - no agents will be allocated`);
+                this.log(`   Targets: ${this.targets.join(', ') || '(empty)'}`);
+                this.log(`   Hint: Check that targets exist and match known presets (code, unity_*, etc.)`);
+            } else {
+                this.log(`All asset types already gathered successfully`);
+            }
             return;
         }
         
         this.log(`Gathering context for ${typesToGather.length} asset type(s) in parallel...`);
+        this.log(`📋 Requesting ${typesToGather.length} agent(s) for parallel context gathering...`);
         
         // Run gather tasks in parallel
         const gatherPromises = typesToGather.map(([presetId, files]) => 
@@ -290,7 +297,9 @@ export class ContextGatheringWorkflow extends BaseWorkflow {
         }
         
         // Request an agent from the pool
+        this.log(`  📤 Requesting agent for preset '${presetId}' (${files.length} files)...`);
         const agentName = await this.requestAgent('context_gatherer');
+        this.log(`  ✓ Agent '${agentName}' allocated and promoted to busy for '${presetId}'`);
         
         const role = this.getRole('context_gatherer');
         const prompt = this.buildGatherPrompt(preset, files, role);
@@ -317,14 +326,6 @@ export class ContextGatheringWorkflow extends BaseWorkflow {
                     output: result.payload?.message || '',
                     fileCount: files.length
                 };
-            } else if (!result.fromCallback) {
-                return {
-                    presetId,
-                    success: false,
-                    output: '',
-                    fileCount: files.length,
-                    error: 'Agent did not use CLI callback'
-                };
             } else {
                 return {
                     presetId,
@@ -344,6 +345,7 @@ export class ContextGatheringWorkflow extends BaseWorkflow {
             };
         } finally {
             // Always release the agent back to the pool
+            this.log(`  ⬇️ Releasing agent '${agentName}' for '${presetId}'`);
             this.releaseAgent(agentName);
         }
     }
@@ -425,7 +427,9 @@ ${result.output}
         this.log(`Summarizing ${this.combinedOutput.length} chars of context...`);
         
         // Request an agent for summarization
+        this.log(`📤 Requesting agent for summarization...`);
         const agentName = await this.requestAgent('context_gatherer');
+        this.log(`✓ Agent '${agentName}' allocated for summarization`);
         
         const role = this.getRole('context_gatherer');
         const prompt = this.buildSummarizePrompt(role);
@@ -445,15 +449,10 @@ ${result.output}
                 }
             );
             
-            if (result.fromCallback && this.isAgentSuccess(result)) {
+            if (this.isAgentSuccess(result)) {
                 // Get summarized content from payload or use combined as fallback
                 this.summarizedOutput = result.payload?.message || this.combinedOutput;
-                this.log(`✓ Summarized via CLI callback (${this.summarizedOutput.length} chars)`);
-            } else if (!result.fromCallback) {
-                throw new Error(
-                    'Summarizer did not use CLI callback (`apc agent complete`). ' +
-                    'All agents must report results via CLI callback.'
-                );
+                this.log(`✓ Summarized (${this.summarizedOutput.length} chars)`);
             } else {
                 throw new Error(result.payload?.error || 'Summarization failed');
             }
@@ -461,6 +460,7 @@ ${result.output}
             // No fallback - fail the workflow
             throw new Error(`Summarization failed: ${error instanceof Error ? error.message : String(error)}`);
         } finally {
+            this.log(`⬇️ Releasing summarization agent '${agentName}'`);
             this.releaseAgent(agentName);
         }
     }
@@ -472,7 +472,7 @@ ${result.output}
         const basePrompt = role?.promptTemplate || `You are a context summarization assistant.
 Your job is to create concise, useful summaries of gathered context.`;
         
-        return `${basePrompt}
+        const prompt = `${basePrompt}
 
 ## Task
 Summarize the following gathered context into a concise, actionable reference document.
@@ -498,6 +498,8 @@ Provide a markdown document with:
 - Actionable notes for developers
 
 Focus on information that would help a developer quickly understand and work with this codebase.`;
+        
+        return this.appendExtraInstruction(prompt);
     }
     
     // =========================================================================
@@ -605,7 +607,7 @@ Your job is to read and understand code/assets, identifying patterns, dependenci
             ? '\n\n**Analysis Depth**: Perform a QUICK scan - prioritize breadth over depth. Focus on high-level patterns and structure.'
             : '\n\n**Analysis Depth**: Perform a THOROUGH analysis - be comprehensive. Include detailed patterns, dependencies, and specific examples.';
         
-        return `${basePrompt}
+        const prompt = `${basePrompt}
 
 ## Context Gathering Task: ${preset.name}
 
@@ -621,5 +623,7 @@ ${depthInstruction}
 ## Output
 Provide a detailed context report in markdown format. Focus on information that would be useful for developers working in this area.
 ${this.taskId ? `\nThis context is being gathered for task: ${this.taskId}` : ''}`;
+        
+        return this.appendExtraInstruction(prompt);
     }
 }

@@ -7,8 +7,10 @@ import { RoleSettingsPanel } from './ui/RoleSettingsPanel';
 import { WorkflowSettingsPanel } from './ui/WorkflowSettingsPanel';
 import { DependencyMapPanel } from './ui/DependencyMapPanel';
 import { HistoryViewPanel } from './ui/HistoryViewPanel';
+import { CompletedSessionsPanel } from './ui/CompletedSessionsPanel';
 import { SidebarViewProvider } from './ui/SidebarViewProvider';
 import { NodeGraphEditorPanel } from './ui/NodeGraphEditorPanel';
+import { PlanViewerPanel } from './ui/PlanViewerPanel';
 import { DaemonManager } from './vscode/DaemonManager';
 import { VsCodeClient } from './vscode/VsCodeClient';
 import { DaemonStateProxy } from './services/DaemonStateProxy';
@@ -325,21 +327,95 @@ export async function activate(context: vscode.ExtensionContext) {
         );
         
         eventSubscriptions.push(
-            vsCodeClient.subscribe('session.updated', () => {
+            vsCodeClient.subscribe('session.updated', (data: unknown) => {
                 sidebarProvider?.refresh();
+                // Also update PlanViewerPanel if it's showing this session
+                const updateData = data as { sessionId?: string; status?: string };
+                if (updateData.sessionId && updateData.status) {
+                    PlanViewerPanel.updateSessionStatus(updateData.sessionId, updateData.status);
+                }
             })
         );
         
-        // Create agent terminal when an agent is allocated
+        // Handle implementation review request - show popup to user
         eventSubscriptions.push(
-            vsCodeClient.subscribe('agent.allocated', (data: unknown) => {
-                log.debug(`agent.allocated event received:`, JSON.stringify(data));
-                const allocData = data as { agentName: string; sessionId: string; roleId: string; logFile?: string };
-                if (allocData.agentName && allocData.sessionId) {
+            vsCodeClient.subscribe('workflow.event', async (data: unknown) => {
+                const eventData = data as { 
+                    eventType?: string; 
+                    workflowId?: string;
+                    sessionId?: string;
+                    payload?: any;
+                };
+                
+                if (eventData.eventType === 'implementation_review.request') {
+                    const payload = eventData.payload || {};
+                    const verdict = payload.overallVerdict || 'unknown';
+                    const needsFix = payload.needsFix || false;
+                    const filesCount = payload.filesReviewed || 0;
+                    const taskCount = (payload.taskIds || []).length;
+                    
+                    // Show different messages based on verdict
+                    let message: string;
+                    let options: string[];
+                    
+                    if (needsFix) {
+                        message = `📋 Implementation Review: ${verdict.toUpperCase()}\n\n` +
+                            `Reviewed ${taskCount} task(s), ${filesCount} file(s).\n\n` +
+                            `Issues found that need fixing. View details and confirm?`;
+                        options = ['View Details & Fix', 'Dismiss'];
+                    } else {
+                        message = `✅ Implementation Review: PASS\n\n` +
+                            `Reviewed ${taskCount} task(s), ${filesCount} file(s).\n\n` +
+                            `No critical issues found!`;
+                        options = ['OK'];
+                    }
+                    
+                    const result = await vscode.window.showInformationMessage(
+                        message,
+                        ...options
+                    );
+                    
+                    // Send response back to workflow
+                    const action = result === 'View Details & Fix' ? 'confirm_fix' : 'dismiss';
+                    
+                    // If user wants to view details, copy summary to clipboard and open agent chat
+                    if (action === 'confirm_fix' && payload.summary) {
+                        await vscode.env.clipboard.writeText(
+                            `I've reviewed the implementation and found issues. Here's the summary:\n\n` +
+                            `${payload.summary}\n\n` +
+                            `Please help me understand and fix these issues.`
+                        );
+                        await openAgentChat();
+                    }
+                    
+                    // Send response to daemon
+                    try {
+                        await vsCodeClient.send('workflow.event.response', {
+                            workflowId: eventData.workflowId,
+                            eventType: 'implementation_review.response',
+                            payload: {
+                                action,
+                                feedback: ''
+                            }
+                        });
+                    } catch (err) {
+                        log.error('Failed to send review response:', err);
+                    }
+                }
+            })
+        );
+        
+        // Create agent terminal when an agent starts working (has correct log file path)
+        // Note: agent.allocated no longer includes logFile - each work assignment gets a unique log file
+        eventSubscriptions.push(
+            vsCodeClient.subscribe('agent.workStarted', (data: unknown) => {
+                log.debug(`agent.workStarted event received:`, JSON.stringify(data));
+                const workData = data as { agentName: string; sessionId: string; roleId: string; taskId: string; workCount: number; logFile: string };
+                if (workData.agentName && workData.sessionId && workData.logFile) {
                     terminalManager.createAgentTerminal(
-                        allocData.agentName,
-                        allocData.sessionId,
-                        allocData.logFile || '',
+                        workData.agentName,
+                        workData.sessionId,
+                        workData.logFile,
                         workspaceRoot
                     );
                 }
@@ -389,6 +465,8 @@ export async function activate(context: vscode.ExtensionContext) {
             vsCodeClient.subscribe('disconnected', () => {
                 log.warn('Daemon disconnected, refreshing UI');
                 sidebarProvider?.refresh();
+                // Also update Plan Viewer if open
+                PlanViewerPanel.showDaemonUnavailable();
             })
         );
         
@@ -415,6 +493,48 @@ export async function activate(context: vscode.ExtensionContext) {
                 })
             );
         }
+        
+        // Listen for user.questionAsked - coordinator needs user input
+        // Opens a new chat window with prompt for the user
+        eventSubscriptions.push(
+            vsCodeClient.subscribe('user.questionAsked', (data: unknown) => {
+                const questionData = data as {
+                    sessionId: string;
+                    taskId: string;
+                    questionId: string;
+                    taskSummary: string;
+                    question: string;
+                    respondCommand: string;
+                };
+                
+                log.info(`User question asked for task ${questionData.taskId}: ${questionData.question}`);
+                
+                // Build the prompt for the chat agent
+                const userInputPrompt = `The agent working on a task needs clarification from the user.
+
+## Task
+${questionData.taskSummary}
+
+## Question
+${questionData.question}
+
+---
+
+Please ask the user to provide their answer to the question above.
+
+After the user provides their answer, run this command to continue the workflow:
+\`\`\`
+${questionData.respondCommand.replace('<user\'s answer>', '<paste user answer here>')}
+\`\`\`
+
+Replace \`<paste user answer here>\` with the user's actual response.`;
+                
+                // Copy to clipboard and open agent chat
+                vscode.env.clipboard.writeText(userInputPrompt).then(() => {
+                    openAgentChat();
+                });
+            })
+        );
         
         // Listen for daemon.ready event - daemon broadcasts this after all services (including dependency checks) are initialized
         // Flow:
@@ -591,20 +711,39 @@ IMPORTANT: This is REQUIREMENTS GATHERING, not planning.
 - The APC extension creates the execution plan using multi-model analysts
 - You do NOT create the plan - the extension does
 
-When requirements are clear, SUMMARIZE this conversation and run:
-  apc plan new "<requirement summary from conversation>" --docs <paths>
+## COMPLEXITY CLASSIFICATION (REQUIRED before creating plan)
+Before running the plan command, you MUST:
+1. Analyze the requirement scope
+2. Suggest a complexity level to the user
+3. Get user confirmation before proceeding
+
+Complexity Levels:
+- TINY (1-3 tasks): Single feature, minimal scope. Example: "Add a button to reset settings"
+- SMALL (4-12 tasks): Multi-feature but single system. Example: "Create a new inventory UI panel with sorting"
+- MEDIUM (13-25 tasks): Cross-system integration. Example: "Add multiplayer lobby with matchmaking"
+- LARGE (26-50 tasks): Multi-system full product feature. Example: "Implement crafting system with recipes, UI, and economy integration"
+- HUGE (51+ tasks): Complex full product, major initiative. Example: "Build complete quest system with branching narratives"
+
+When requirements are clear:
+1. State your complexity assessment: "Based on our discussion, I estimate this is a [LEVEL] requirement (X-Y tasks expected) because [reasoning]"
+2. Ask for confirmation: "Do you agree with this classification, or should I adjust?"
+3. Only after user confirms, run: apc plan new "<summary>" --complexity <level> --docs <paths>
+
+Command format:
+  apc plan new "<requirement summary>" --complexity tiny|small|medium|large|huge [--docs <paths>]
 
 Workflow:
 1. Gather requirements (this conversation)
 2. Save any docs to _AiDevLog/Docs/
-3. Summarize requirements and run: apc plan new "<summary>"
-4. Review with user: apc plan status <id>
-5. Approve: apc plan approve <id> (auto-starts execution)
+3. Assess complexity and get user confirmation
+4. Run: apc plan new "<summary>" --complexity <level>
+5. Review with user: apc plan status <id>
+6. Approve: apc plan approve <id> (auto-starts execution)
 
 IMPORTANT - Status Polling Timing:
-After running "apc plan new", the planning process takes about 200 seconds to complete.
-- Wait 200 seconds before checking status the first time
-- Then poll every 60 seconds: sleep 60 && apc plan status <id>
+After running "apc plan new", the planning process takes 5-10 minutes to complete.
+- Wait at least 5 minutes (300 seconds) before checking status the first time
+- Then poll every 2 minutes: sleep 120 && apc plan status <id>
 - Do NOT poll more frequently - the multi-agent debate takes time!
 
 Let's get started!`;
@@ -651,46 +790,6 @@ Let's get started!`;
             sidebarProvider.refresh();
         }),
 
-        vscode.commands.registerCommand('agenticPlanning.pauseExecution', async (item?: { session?: { id: string } }) => {
-            if (!vsCodeClient?.isConnected()) {
-                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
-                return;
-            }
-            
-            const sessionId = item?.session?.id;
-            if (!sessionId) {
-                vscode.window.showWarningMessage('No session selected');
-                return;
-            }
-            const result = await vsCodeClient.pauseExecution(sessionId);
-            if (result.success) {
-                vscode.window.showInformationMessage(`Execution paused for ${sessionId}`);
-            } else {
-                vscode.window.showErrorMessage(result.error || 'Failed to pause');
-            }
-            sidebarProvider.refresh();
-        }),
-
-        vscode.commands.registerCommand('agenticPlanning.resumeExecution', async (item?: { session?: { id: string } }) => {
-            if (!vsCodeClient?.isConnected()) {
-                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
-                return;
-            }
-            
-            const sessionId = item?.session?.id;
-            if (!sessionId) {
-                vscode.window.showWarningMessage('No session selected');
-                return;
-            }
-            const result = await vsCodeClient.resumeExecution(sessionId);
-            if (result.success) {
-                vscode.window.showInformationMessage(`Execution resumed for ${sessionId}`);
-            } else {
-                vscode.window.showErrorMessage(result.error || 'Failed to resume');
-            }
-            sidebarProvider.refresh();
-        }),
-
         vscode.commands.registerCommand('agenticPlanning.stopExecution', async (item?: { session?: { id: string } }) => {
             if (!vsCodeClient?.isConnected()) {
                 vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
@@ -728,7 +827,7 @@ Let's get started!`;
                     return;
                 }
                 const selected = await vscode.window.showQuickPick(
-                    busyAgents.map(e => ({ label: e.name, description: `${e.roleId || 'agent'} - ${e.coordinatorId}` })),
+                    busyAgents.map(e => ({ label: e.name, description: `${e.roleId || 'agent'} - ${e.workflowId}` })),
                     { placeHolder: 'Select agent to view' }
                 );
                 if (selected) {
@@ -840,6 +939,11 @@ Let's get started!`;
             
             HistoryViewPanel.show(sessionId, context.extensionUri, vsCodeClient);
         }),
+        
+        // Completed sessions view - shows all completed sessions
+        vscode.commands.registerCommand('agenticPlanning.openCompletedSessionsView', async () => {
+            CompletedSessionsPanel.show(context.extensionUri, daemonStateProxy);
+        }),
 
         // Refresh commands for tree views
         vscode.commands.registerCommand('agenticPlanning.refreshPlanningSessions', () => {
@@ -905,35 +1009,6 @@ Let's get started!`;
             }
         }),
         
-        vscode.commands.registerCommand('agenticPlanning.resumePlanningSession', async (item?: { session?: { id: string } }) => {
-            if (!vsCodeClient?.isConnected()) {
-                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
-                return;
-            }
-            
-            const sessionId = item?.session?.id;
-            if (!sessionId) {
-                vscode.window.showWarningMessage('No session selected');
-                return;
-            }
-            
-            const confirm = await vscode.window.showWarningMessage(
-                `Resume planning session ${sessionId}? This will restart the planning process.`,
-                { modal: true },
-                'Resume'
-            );
-            
-            if (confirm === 'Resume') {
-                const result = await vsCodeClient.resumeSession(sessionId);
-                if (result.success) {
-                    vscode.window.showInformationMessage(`Session ${sessionId} resuming...`);
-                    sidebarProvider.refresh();
-                } else {
-                    vscode.window.showErrorMessage(result.error || 'Failed to resume session');
-                }
-            }
-        }),
-        
         // Revise plan - opens AI chat for revision
         vscode.commands.registerCommand('agenticPlanning.revisePlan', async (item?: { session?: { id: string } }) => {
             if (!vsCodeClient?.isConnected()) {
@@ -974,13 +1049,77 @@ When revision requirements are clear, SUMMARIZE this conversation and run:
 This will trigger the multi-agent debate to revise the plan.
 
 IMPORTANT - Status Polling Timing:
-After running "apc plan revise", the revision process takes about 80 seconds to complete.
-- Wait 80 seconds before checking status the first time
-- Then poll every 30 seconds: sleep 30 && apc plan status ${sessionId}
-- Do NOT poll more frequently - the multi-agent debate takes time!`;
+After running "apc plan revise", the revision process takes 3-5 minutes to complete.
+- Wait at least 3 minutes (180 seconds) before checking status the first time
+- Then poll every 90 seconds: sleep 90 && apc plan status ${sessionId}
+- Do NOT poll more frequently - the multi-agent review takes time!`;
 
             // Copy to clipboard and open agent chat
             await vscode.env.clipboard.writeText(revisionPrompt);
+            await openAgentChat();
+        }),
+        
+        // Add Task to Plan - opens AI chat to discuss and add specific tasks
+        vscode.commands.registerCommand('agenticPlanning.addTaskToPlan', async (item?: { session?: { id: string } }) => {
+            if (!vsCodeClient?.isConnected()) {
+                vscode.window.showErrorMessage('Not connected to daemon. Please wait for connection...');
+                return;
+            }
+            
+            const sessionId = item?.session?.id;
+            if (!sessionId) {
+                vscode.window.showWarningMessage('No session selected');
+                return;
+            }
+            
+            let session;
+            try {
+                const response = await vsCodeClient.getPlanStatus(sessionId);
+                session = response;
+            } catch {
+                vscode.window.showErrorMessage(`Session ${sessionId} not found`);
+                return;
+            }
+            
+            // Pre-filled prompt for adding tasks (uses revision workflow)
+            const addTaskPrompt = `I want to add specific task(s) to the plan for session ${sessionId}.
+
+Current plan: ${session.currentPlanPath || 'N/A'}
+Original requirement: ${(session.requirement || '').substring(0, 200)}...
+
+Please help me define the new task(s) I want to add to this plan.
+
+For each task, I need to specify:
+- **Task ID**: A unique identifier (e.g., T5, T6) - check the plan to avoid conflicts
+- **Description**: What the task should accomplish  
+- **Dependencies**: Which existing tasks must complete first (comma-separated, e.g., T3,T4)
+- **Engineer**: Optional - which agent role should handle this (default: implementation)
+- **Unity Pipeline**: Optional - none, prep, prep_editmode, prep_playmode, prep_playtest, full
+
+IMPORTANT: This uses the REVISION WORKFLOW.
+- Multi-agent Planner will add the task and validate dependencies
+- Analysts will review the updated plan
+- After revision (~80 seconds), plan goes to "reviewing" status
+- Tasks go to TaskManager only AFTER plan approval
+
+When task details are clear, run this command for EACH task:
+  apc plan add-task --session ${sessionId} --task <TASK_ID> --desc "<DESCRIPTION>" --deps <DEPS>
+
+Optional parameters:
+  --engineer <ROLE>     Specify which agent role handles this task
+  --unity <PIPELINE>    Unity pipeline: none, prep, prep_editmode, prep_playmode, prep_playtest, full
+
+Example:
+  apc plan add-task --session ${sessionId} --task T5 --desc "Implement user authentication" --deps T2,T3
+
+IMPORTANT - Status Polling Timing:
+After running "apc plan add-task", the revision process takes 3-5 minutes to complete.
+- Wait at least 3 minutes (180 seconds) before checking status the first time
+- Then poll every 90 seconds: sleep 90 && apc plan status ${sessionId}
+- Do NOT poll more frequently - the multi-agent review takes time!`;
+
+            // Copy to clipboard and open agent chat
+            await vscode.env.clipboard.writeText(addTaskPrompt);
             await openAgentChat();
         }),
         
@@ -1045,6 +1184,31 @@ After running "apc plan revise", the revision process takes about 80 seconds to 
                 sidebarProvider.refresh();
             } else {
                 vscode.window.showErrorMessage(`Failed to restart planning: ${result.error}`);
+            }
+        }),
+        
+        // Manually complete a session (mark as done)
+        vscode.commands.registerCommand('agenticPlanning.completeSession', async (item?: { session?: { id: string } }) => {
+            const sessionId = item?.session?.id;
+            if (!sessionId) {
+                vscode.window.showWarningMessage('No session selected');
+                return;
+            }
+            
+            const confirm = await vscode.window.showInformationMessage(
+                `Mark session ${sessionId} as complete?`,
+                { modal: true },
+                'Complete'
+            );
+            
+            if (confirm === 'Complete') {
+                const result = await daemonStateProxy.completeSession(sessionId);
+                if (result.success) {
+                    vscode.window.showInformationMessage(`Session ${sessionId} marked as complete`);
+                    sidebarProvider.refresh();
+                } else {
+                    vscode.window.showErrorMessage(`Failed to complete session: ${result.error}`);
+                }
             }
         }),
         
@@ -1157,7 +1321,7 @@ After running "apc plan revise", the revision process takes about 80 seconds to 
             }
             
             const action = await vscode.window.showWarningMessage(
-                'Stop the daemon? This will pause all running workflows and disconnect all clients. The daemon will auto-restart when needed.',
+                'Stop the daemon? This will cancel all running workflows and disconnect all clients. The daemon will auto-restart when needed.',
                 { modal: true },
                 'Stop Daemon',
                 'Cancel'
@@ -1613,6 +1777,9 @@ export async function deactivate() {
             log.error('Error disconnecting VsCodeClient:', e);
         }
     }
+    
+    // Clear the global singleton to prevent stale connection issues on extension restart
+    globalVsCodeClient = null;
     
     // Dispose daemon manager (health checks, etc.)
     if (daemonManager) {

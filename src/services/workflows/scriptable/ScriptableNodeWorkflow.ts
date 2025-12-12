@@ -231,7 +231,7 @@ export class ScriptableNodeWorkflow extends BaseWorkflow {
         this.executionContext.setAgentTaskHandler(async (
             agentName: string,
             prompt: string,
-            options?: { model?: string; timeoutMs?: number }
+            options?: { model?: 'low' | 'mid' | 'high'; timeoutMs?: number }
         ) => {
             return this.runAgentWithPrompt(agentName, prompt, options);
         });
@@ -253,11 +253,11 @@ export class ScriptableNodeWorkflow extends BaseWorkflow {
     private async runAgentWithPrompt(
         agentName: string,
         prompt: string,
-        options?: { model?: string; timeoutMs?: number; stage?: 'implementation' | 'review' | 'analysis' | 'context' | 'planning' | 'finalization' }
+        options?: { model?: 'low' | 'mid' | 'high'; timeoutMs?: number; stage?: 'implementation' | 'review' | 'analysis' | 'context' | 'planning' | 'finalization' }
     ): Promise<{ success: boolean; output: string; fromCallback?: boolean }> {
         const stage = options?.stage || 'implementation';
         const timeoutMs = options?.timeoutMs || 600000;
-        const model = options?.model || 'claude-sonnet-4-20250514';
+        const model = options?.model || 'mid';
         
         try {
             // Use CLI callback for structured completion
@@ -274,17 +274,12 @@ export class ScriptableNodeWorkflow extends BaseWorkflow {
                 }
             );
             
-            if (result.fromCallback && this.isAgentSuccess(result)) {
+            if (this.isAgentSuccess(result)) {
                 return {
                     success: true,
                     output: result.payload?.message || '',
                     fromCallback: true
                 };
-            } else if (!result.fromCallback) {
-                throw new Error(
-                    'Agent did not use CLI callback (`apc agent complete`). ' +
-                    'All agents must report results via CLI callback.'
-                );
             } else {
                 return {
                     success: false,
@@ -302,39 +297,8 @@ export class ScriptableNodeWorkflow extends BaseWorkflow {
         }
     }
     
-    /**
-     * Emit a workflow event
-     */
-    private emitWorkflowEvent(eventType: string, payload?: any): void {
-        this.log(`Emitting event: ${eventType}`);
-        // Events are handled by the coordinator/daemon
-        this.onProgress.fire({
-            ...this.getProgress(),
-            message: `Event: ${eventType}`
-        });
-    }
-    
-    /**
-     * Wait for a workflow event
-     */
-    private async waitForWorkflowEvent(eventType: string, timeoutMs?: number): Promise<any> {
-        this.log(`Waiting for event: ${eventType}`);
-        
-        // Simple implementation - wait for timeout or event
-        // In practice, this would be wired to the event system
-        const timeout = timeoutMs || 60000;
-        
-        return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                reject(new Error(`Timeout waiting for event: ${eventType}`));
-            }, timeout);
-            
-            // For now, resolve immediately - proper implementation would
-            // subscribe to event system
-            clearTimeout(timer);
-            resolve({});
-        });
-    }
+    // Note: Uses inherited emitWorkflowEvent and waitForWorkflowEvent from BaseWorkflow
+    // which properly handle workflow events through the coordinator
     
     /**
      * Phase 2: Execute the node graph
@@ -420,32 +384,6 @@ export class ScriptableNodeWorkflow extends BaseWorkflow {
     // ========================================================================
     // Lifecycle Overrides
     // ========================================================================
-    
-    /**
-     * Override pause to pause the engine
-     */
-    async pause(options?: { force?: boolean }): Promise<void> {
-        if (this.engine) {
-            this.engine.pause();
-        }
-        if (this.executionContext) {
-            this.executionContext.stop();
-        }
-        await super.pause(options);
-    }
-    
-    /**
-     * Override resume to resume the engine
-     */
-    async resume(): Promise<void> {
-        if (this.engine) {
-            this.engine.resume();
-        }
-        if (this.executionContext) {
-            this.executionContext.resume();
-        }
-        await super.resume();
-    }
     
     /**
      * Override cancel to cancel the engine

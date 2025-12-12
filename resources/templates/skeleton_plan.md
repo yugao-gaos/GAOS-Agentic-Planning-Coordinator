@@ -2,7 +2,7 @@
 
 **Session ID:** {{SESSION_ID}}
 **Created:** {{CREATED_DATE}}
-**Status:** 🔄 Planning
+**Complexity:** {{COMPLEXITY}} ({{COMPLEXITY_RANGE}} tasks expected)
 
 ---
 
@@ -60,20 +60,28 @@
 
 <!-- 
 IMPORTANT: Tasks MUST use GLOBAL task ID format for tracking
-Format: - [ ] **{SESSION_ID}_T{N}**: {Task Name} | Deps: {dependencies} | Engineer: {name}
-Example: - [ ] **ps_000001_T1**: Setup project | Deps: None | Engineer: TBD
+Format: - [ ] **{SESSION_ID}_T{N}**: {Task Name} | Deps: {dependencies} | Engineer: {name} | Unity: {config}
+Example: - [ ] **ps_000001_T1**: Setup project | Deps: None | Engineer: TBD | Unity: none
+
+Unity pipeline options:
+- none: Documentation, non-Unity changes (skip pipeline)
+- prep: Code/asset changes (compile only)
+- prep_editmode: Code with EditMode tests (compile + run EditMode tests)
+- prep_playmode: Code with PlayMode tests (compile + run PlayMode tests)
+- prep_playtest: Data/balance changes (compile + manual play test)
+- full: Milestone tasks (compile + all tests + manual playtest)
 -->
 
 ### Phase 1: Foundation
-- [ ] **{{SESSION_ID}}_T1**: {{TASK_1_NAME}} | Deps: None | Engineer: TBD
-- [ ] **{{SESSION_ID}}_T2**: {{TASK_2_NAME}} | Deps: {{SESSION_ID}}_T1 | Engineer: TBD
+- [ ] **{{SESSION_ID}}_T1**: {{TASK_1_NAME}} | Deps: None | Engineer: TBD | Unity: none
+- [ ] **{{SESSION_ID}}_T2**: {{TASK_2_NAME}} | Deps: {{SESSION_ID}}_T1 | Engineer: TBD | Unity: none
 
 ### Phase 2: Core Implementation
-- [ ] **{{SESSION_ID}}_T3**: {{TASK_3_NAME}} | Deps: {{SESSION_ID}}_T1 | Engineer: TBD
-- [ ] **{{SESSION_ID}}_T4**: {{TASK_4_NAME}} | Deps: {{SESSION_ID}}_T2, {{SESSION_ID}}_T3 | Engineer: TBD
+- [ ] **{{SESSION_ID}}_T3**: {{TASK_3_NAME}} | Deps: {{SESSION_ID}}_T1 | Engineer: TBD | Unity: none
+- [ ] **{{SESSION_ID}}_T4**: {{TASK_4_NAME}} | Deps: {{SESSION_ID}}_T2, {{SESSION_ID}}_T3 | Engineer: TBD | Unity: none
 
 ### Phase 3: Integration & Testing
-- [ ] **{{SESSION_ID}}_T5**: {{TASK_5_NAME}} | Deps: {{SESSION_ID}}_T4 | Engineer: TBD
+- [ ] **{{SESSION_ID}}_T5**: {{TASK_5_NAME}} | Deps: {{SESSION_ID}}_T4 | Engineer: TBD | Unity: none
 
 ---
 
@@ -107,8 +115,9 @@ Example: - [ ] **ps_000001_T1**: Setup project | Deps: None | Engineer: TBD
 <!-- PLAN_METADATA
 session_id: {{SESSION_ID}}
 created: {{CREATED_DATE}}
-status: planning
 revision: v1
+complexity: {{COMPLEXITY}}
+expected_tasks: {{COMPLEXITY_RANGE}}
 analysts: opus,codex,gemini
 engineer_count: {{ENGINEER_COUNT}}
 -->

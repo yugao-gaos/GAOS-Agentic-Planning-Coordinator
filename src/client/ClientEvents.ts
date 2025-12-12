@@ -18,6 +18,7 @@ export interface SessionCreatedEventData {
     sessionId: string;
     requirement: string;
     createdAt: string;
+    complexity?: string;  // User-confirmed complexity level
 }
 
 /**
@@ -26,9 +27,11 @@ export interface SessionCreatedEventData {
 export interface SessionUpdatedEventData {
     sessionId: string;
     status: string;
-    previousStatus: string;
+    previousStatus?: string;
     changes: string[];
     updatedAt: string;
+    /** Task ID if the update involves a specific task (e.g., task_added) */
+    taskId?: string;
 }
 
 /**
@@ -126,6 +129,17 @@ export interface WorkflowCompletedEventData {
 }
 
 /**
+ * Generic workflow event data (for custom events like implementation review requests)
+ */
+export interface WorkflowEventData {
+    workflowId: string;
+    sessionId: string;
+    eventType: string;
+    payload?: Record<string, unknown>;
+    timestamp: string;
+}
+
+/**
  * Agent assigned event data
  */
 export interface AgentAssignedEventData {
@@ -139,14 +153,28 @@ export interface AgentAssignedEventData {
 }
 
 /**
- * Agent allocated event data (for terminal creation)
+ * Agent allocated event data (for pool tracking)
+ * Note: logFile is NOT included here because it's only known when work starts
  */
 export interface AgentAllocatedEventData {
     agentName: string;
     sessionId: string;
     roleId: string;
     workflowId: string;
-    logFile?: string;
+}
+
+/**
+ * Agent work started event data (for terminal streaming)
+ * This is fired when an agent actually starts working on a task
+ */
+export interface AgentWorkStartedEventData {
+    agentName: string;
+    sessionId: string;
+    roleId: string;
+    workflowId: string;
+    taskId: string;
+    workCount: number;
+    logFile: string;
 }
 
 /**
@@ -209,7 +237,7 @@ export interface PoolChangedEventData {
     }>;
     busy: Array<{
         name: string;
-        coordinatorId: string;
+        workflowId: string;
         roleId?: string;
     }>;
     resting: string[];
@@ -276,11 +304,18 @@ export interface UnityTaskCompletedEventData {
  */
 export interface UnityStatusChangedEventData {
     status: 'idle' | 'compiling' | 'testing' | 'playing' | 'error';
+    connected: boolean;
     isCompiling: boolean;
     isPlaying: boolean;
     isPaused: boolean;
     hasErrors: boolean;
     errorCount: number;
+    queueLength: number;
+    currentTask?: {
+        id: string;
+        type: string;
+        phase?: string;
+    };
     timestamp: string;
 }
 
@@ -322,6 +357,16 @@ export interface UnityPipelineCompletedEventData {
     tasksInvolved: Array<{ taskId: string; description: string }>;
     duration: number;
     completedAt: string;
+}
+
+/**
+ * Unity player test request event data
+ * Sent when pipeline needs user to manually play test the game
+ */
+export interface UnityPlayerTestRequestEventData {
+    pipelineId: string;
+    stepIndex: number;
+    timestamp: string;
 }
 
 /**
@@ -376,7 +421,7 @@ export interface DaemonErrorEventData {
  */
 export interface ClientConnectedEventData {
     clientId: string;
-    clientType: 'vscode' | 'tui' | 'headless' | 'cli' | 'unknown';
+    clientType: 'vscode' | 'tui' | 'headless' | 'cli' | 'unity' | 'unknown';
     connectedAt: string;
     totalClients: number;
 }
@@ -403,13 +448,28 @@ export interface ErrorEventData {
 
 
 /**
- * Task paused event data
- * Triggered when tasks are paused due to errors or conflicts
+ * Task cancelled event data
+ * Triggered when tasks are cancelled due to errors or conflicts
  */
-export interface TaskPausedEventData {
+export interface TaskCancelledEventData {
     sessionId: string;
     taskIds: string[];
     reason: string;
+    timestamp: string;
+}
+
+/**
+ * User question asked event data
+ * Triggered when coordinator needs user clarification for a task
+ */
+export interface UserQuestionAskedEventData {
+    sessionId: string;
+    taskId: string;
+    questionId: string;
+    taskSummary: string;
+    question: string;
+    /** Pre-built CLI command for the chat agent to call after user answers */
+    respondCommand: string;
     timestamp: string;
 }
 
@@ -447,8 +507,6 @@ export interface ApcEventMap {
     
     // Execution events
     'exec.started': ExecStartedEventData;
-    'exec.paused': { sessionId: string; pausedAt: string };
-    'exec.resumed': { sessionId: string; resumedAt: string };
     'exec.stopped': { sessionId: string; stoppedAt: string };
     'exec.completed': ExecCompletedEventData;
     
@@ -457,7 +515,7 @@ export interface ApcEventMap {
     'workflow.progress': WorkflowProgressEventData;
     'workflow.completed': WorkflowCompletedEventData;
     'workflow.failed': WorkflowCompletedEventData;
-    'workflow.paused': { workflowId: string; sessionId: string; pausedAt: string };
+    'workflow.event': WorkflowEventData;  // Generic workflow events (e.g., review requests)
     
     // Workflow cleanup events
     'workflows.cleaned': { sessionId: string; cleanedCount: number; timestamp: string };
@@ -465,6 +523,7 @@ export interface ApcEventMap {
     // Agent events
     'agent.assigned': AgentAssignedEventData;
     'agent.allocated': AgentAllocatedEventData;
+    'agent.workStarted': AgentWorkStartedEventData;
     'agent.released': AgentReleasedEventData;
     'agent.progress': AgentProgressEventData;
     'agent.completed': AgentReleasedEventData;
@@ -483,6 +542,7 @@ export interface ApcEventMap {
     'unity.pipelineStarted': UnityPipelineStartedEventData;
     'unity.pipelineProgress': UnityPipelineProgressEventData;
     'unity.pipelineCompleted': UnityPipelineCompletedEventData;
+    'unity.playerTestRequest': UnityPlayerTestRequestEventData;
     
     // System events
     'daemon.starting': DaemonStartingEventData;
@@ -495,7 +555,10 @@ export interface ApcEventMap {
     'error': ErrorEventData;
     
     // Task attention events (require user intervention)
-    'task.paused': TaskPausedEventData;
+    'task.cancelled': TaskCancelledEventData;
+    
+    // User interaction events (coordinator asking user for input)
+    'user.questionAsked': UserQuestionAskedEventData;
     
     // Coordinator events
     'coordinator.statusChanged': CoordinatorStatusChangedEventData;

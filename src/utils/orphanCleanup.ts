@@ -21,33 +21,59 @@ import { execSync } from 'child_process';
 export function countCursorAgentProcesses(): number {
     try {
         if (process.platform === 'win32') {
-            // Windows: Use WMIC or PowerShell
-            let result: string;
+            let totalCount = 0;
+            
+            // Count Windows-native cursor-agent processes (including WSL wrappers)
             try {
-                // Try WMIC first (available on most Windows versions)
-                result = execSync(
-                    'wmic process where "commandline like \'%cursor%agent%\'" get processid /format:csv',
-                    { encoding: 'utf-8', timeout: 10000, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }
-                ).trim();
+                let result: string;
+                try {
+                    result = execSync(
+                        'wmic process where "commandline like \'%cursor%agent%\'" get processid /format:csv',
+                        { encoding: 'utf-8', timeout: 10000, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }
+                    ).trim();
+                } catch {
+                    result = execSync(
+                        'powershell -Command "(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like \'*cursor*agent*\' }).Count"',
+                        { encoding: 'utf-8', timeout: 10000, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }
+                    ).trim();
+                    const count = parseInt(result, 10);
+                    return isNaN(count) ? 0 : count;
+                }
+                
+                if (result) {
+                    const lines = result.split('\n').filter((line: string) => {
+                        const trimmed = line.trim();
+                        return trimmed && !trimmed.includes('ProcessId') && !trimmed.includes('Node') && /\d+/.test(trimmed);
+                    });
+                    totalCount = lines.length;
+                }
             } catch {
-                // Fall back to PowerShell if WMIC is not available (Windows 11+)
-                result = execSync(
-                    'powershell -Command "(Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like \'*cursor*agent*\' }).Count"',
-                    { encoding: 'utf-8', timeout: 10000, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }
-                ).trim();
-                // PowerShell returns the count directly
-                const count = parseInt(result, 10);
-                return isNaN(count) ? 0 : count;
+                // Ignore Windows count errors
             }
             
-            if (!result) return 0;
+            // Also count cursor-agent processes running inside WSL
+            // Skip WSL if environment variable is set (avoids hangs on misconfigured WSL)
+            if (!process.env.APC_SKIP_WSL_CHECK) {
+                try {
+                    // Use ps + grep instead of pgrep (more reliable in WSL, avoids self-matching issues)
+                    // Exclude worker-server (Cursor IDE's built-in background process)
+                    // Note: timeout is reduced to 3s to avoid blocking startup on slow/misconfigured WSL
+                    const wslResult = execSync(
+                        'wsl -d Ubuntu -- bash -c "ps aux 2>/dev/null | grep cursor-agent | grep -v grep | grep -v worker-server | wc -l || echo 0"',
+                        { encoding: 'utf-8', timeout: 3000, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }
+                    ).trim();
+                    
+                    const wslCount = parseInt(wslResult, 10);
+                    if (!isNaN(wslCount) && wslCount > 0) {
+                        // Use WSL count as the authoritative count since that's where cursor-agent actually runs
+                        return wslCount;
+                    }
+                } catch {
+                    // WSL not available or timed out - use Windows count
+                }
+            }
             
-            // Count non-header lines in CSV output
-            const lines = result.split('\n').filter((line: string) => {
-                const trimmed = line.trim();
-                return trimmed && !trimmed.includes('ProcessId') && !trimmed.includes('Node') && /\d+/.test(trimmed);
-            });
-            return lines.length;
+            return totalCount;
         } else {
             // Unix (macOS/Linux): Use ps + grep
             const result = execSync(
@@ -78,40 +104,39 @@ export async function killOrphanCursorAgents(
     let killedCount = 0;
 
     if (process.platform === 'win32') {
-        // Windows implementation using WMIC or PowerShell
+        // Windows implementation - handles both native Windows and WSL processes
+        
+        // Step 1: Try to kill Windows-native cursor-agent processes
         try {
-            // Use WMIC to find cursor-agent processes
-            // WMIC returns: Handle  Name  CommandLine
             let result: string;
             try {
-                // Try WMIC first (available on most Windows versions)
                 result = execSync(
                     'wmic process where "commandline like \'%cursor%agent%\'" get processid,commandline /format:csv',
                     { encoding: 'utf-8', timeout: 10000, windowsHide: true }
                 ).trim();
             } catch {
-                // Fall back to PowerShell if WMIC is not available (Windows 11+)
                 result = execSync(
                     'powershell -Command "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like \'*cursor*agent*\' } | Select-Object ProcessId | ConvertTo-Csv -NoTypeInformation"',
                     { encoding: 'utf-8', timeout: 10000, windowsHide: true }
                 ).trim();
             }
             
-            if (!result) return 0;
-            
-            // Parse CSV output to extract PIDs
-            const lines = result.split('\n').filter((line: string) => line.trim());
-            for (const line of lines) {
-                // Skip header lines
-                if (line.includes('ProcessId') || line.includes('Node')) continue;
+            if (result) {
+                const lines = result.split('\n').filter((line: string) => line.trim());
                 
-                // Extract PID from CSV (last number in line for WMIC, quoted for PowerShell)
-                const pidMatch = line.match(/(\d+)\s*$/);
-                if (pidMatch) {
-                    const pidNum = parseInt(pidMatch[1], 10);
-                    if (!isNaN(pidNum) && !excludePids.has(pidNum) && pidNum !== process.pid) {
+                for (const line of lines) {
+                    // Skip header lines and WMIC's own process
+                    if (line.includes('ProcessId') || line.toLowerCase().includes('wmic.exe')) continue;
+                    
+                    // Extract PID from the END of the line (after last comma)
+                    const lastCommaIdx = line.lastIndexOf(',');
+                    if (lastCommaIdx === -1) continue;
+                    
+                    const pidStr = line.substring(lastCommaIdx + 1).replace(/\r/g, '').trim();
+                    const pidNum = parseInt(pidStr, 10);
+                    
+                    if (!isNaN(pidNum) && pidNum > 0 && !excludePids.has(pidNum) && pidNum !== process.pid) {
                         try {
-                            // Use taskkill to terminate the process tree
                             execSync(`taskkill /PID ${pidNum} /T /F`, { 
                                 timeout: 5000,
                                 windowsHide: true,
@@ -120,13 +145,58 @@ export async function killOrphanCursorAgents(
                             console.log(`${logPrefix} 🗑️ Killed orphan cursor-agent process ${pidNum} (Windows)`);
                             killedCount++;
                         } catch {
-                            // Process might already be dead or access denied
+                            // Process might already be dead, running in WSL, or access denied
+                            // Will be handled by WSL cleanup below
                         }
                     }
                 }
             }
         } catch (e) {
             console.log(`${logPrefix} Error finding orphan processes on Windows: ${e}`);
+        }
+        
+        // Step 2: Kill cursor-agent processes running inside WSL
+        // This handles cases where cursor-agent is invoked via WSL
+        // Skip WSL if environment variable is set (avoids hangs on misconfigured WSL)
+        if (!process.env.APC_SKIP_WSL_CHECK) {
+            try {
+                // Check if WSL is available and has cursor-agent processes
+                // Use ps + grep + awk instead of pgrep (more reliable in WSL, avoids self-matching issues)
+                // Exclude worker-server (Cursor IDE's built-in background process - should not be killed)
+                // Note: timeout reduced to 5s to avoid blocking startup on slow/misconfigured WSL
+                const wslCheck = execSync(
+                    'wsl -d Ubuntu -- bash -c "ps aux 2>/dev/null | grep cursor-agent | grep -v grep | grep -v worker-server | awk \'{print \\$2}\' || true"',
+                    { encoding: 'utf-8', timeout: 5000, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }
+                ).trim();
+                
+                if (wslCheck) {
+                    const wslPids = wslCheck.split('\n').filter((p: string) => p.trim() && /^\d+$/.test(p.trim()));
+                    if (wslPids.length > 0) {
+                        console.log(`${logPrefix} Found ${wslPids.length} cursor-agent processes in WSL (PIDs: ${wslPids.join(', ')}), killing...`);
+                        
+                        // Kill each process by PID individually for more reliable cleanup
+                        let wslKilled = 0;
+                        for (const pid of wslPids) {
+                            try {
+                                execSync(
+                                    `wsl -d Ubuntu -- bash -c "kill -9 ${pid} 2>/dev/null; exit 0"`,
+                                    { encoding: 'utf-8', timeout: 3000, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }
+                                );
+                                wslKilled++;
+                            } catch {
+                                // Process might already be dead or WSL timed out
+                            }
+                        }
+                        
+                        if (wslKilled > 0) {
+                            console.log(`${logPrefix} 🗑️ Sent SIGKILL to ${wslKilled} cursor-agent processes in WSL`);
+                            killedCount += wslKilled;
+                        }
+                    }
+                }
+            } catch {
+                // WSL not available, timed out, or not configured - that's fine, skip WSL cleanup
+            }
         }
     } else {
         // Unix (macOS/Linux) implementation

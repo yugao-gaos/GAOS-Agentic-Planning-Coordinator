@@ -74,10 +74,21 @@ export const DEFAULT_WORKFLOW_METADATA: Record<WorkflowType, WorkflowMetadata> =
         requiresUnity: false,
         requiresCompleteDependencies: false, // Context gathering is preparatory, doesn't need deps complete
         coordinatorPrompt: `- 'context_gathering' - Gather and analyze context from folders/files
-   Use when: Run in parallel when building plans to get general understanding of the project, before starting work on unfamiliar task, after repeated errors. If you foresee tasks that need to build assets like prefab, scene, GUIs, run context gathering before the implementation workflow to help you understand what assets are available and how to choose them based on requirement.
-   Input: targets (folders/files), focusAreas (optional), depth ('shallow'|'deep'), taskId (optional - to associate context with a specific task)
+   Use when: Task has needsContext=true and contextWorkflowStatus !== 'succeeded'
+   Input: targets (folders/files), focusAreas (optional), depth ('shallow'|'deep'), taskId (required)
    Output: Context summary written to _AiDevLog/Context/
-   Note: This workflow does NOT require dependencies to be complete - it's a preparation step`
+   
+   **IMPORTANT**: Run this workflow BEFORE task_implementation for tasks with needsContext=true.
+   Check contextWorkflowStatus field - if 'none', run context_gathering first.`
+    },
+    implementation_review: {
+        type: 'implementation_review',
+        name: 'Implementation Review',
+        requiresUnity: false,
+        requiresCompleteDependencies: false, // Review is manually triggered, no deps needed
+        coordinatorPrompt: `- 'implementation_review' - Review completed task implementations (MANUAL ONLY)
+   Note: This workflow is triggered MANUALLY by user from Dependency Map UI.
+   Do NOT dispatch this workflow automatically - it requires user interaction.`
     }
 };
 
@@ -89,7 +100,8 @@ export const WORKFLOW_DESCRIPTIONS: Record<WorkflowType, string> = {
     planning_revision: 'Quickly revises an existing plan based on user feedback or discovered issues. Lighter weight than full planning.',
     task_implementation: 'Implements a single task from the plan. Runs Engineer → Code Review → Approval → Delta Context → Unity Pipeline.',
     error_resolution: 'Fixes compilation or test errors. Single AI session analyzes and fixes, then requests recompile (fire and forget). Coordinator handles retry with context.',
-    context_gathering: 'Gathers and analyzes project context from folders/files. Supports different presets for code, Unity assets, and custom patterns.'
+    context_gathering: 'Gathers and analyzes project context from folders/files. Supports different presets for code, Unity assets, and custom patterns.',
+    implementation_review: 'Reviews completed task implementations using 3 analysts. Manually triggered from Dependency Map UI after tasks complete.'
 };
 
 // ============================================================================

@@ -26,7 +26,7 @@ export class AgentRoleRegistry {
     
     /**
      * Set whether Unity features are enabled
-     * When enabled, role prompts/tools/rules include Unity-specific additions
+     * When enabled, role prompts and tools include Unity-specific additions
      */
     setUnityEnabled(enabled: boolean): void {
         this._unityEnabled = enabled;
@@ -333,10 +333,6 @@ export class AgentRoleRegistry {
             errors.push('Allowed CLI commands must be an array or null');
         }
 
-        if (data.rules !== undefined && !Array.isArray(data.rules)) {
-            errors.push('Rules must be an array');
-        }
-
         if (data.documents !== undefined && !Array.isArray(data.documents)) {
             errors.push('Documents must be an array');
         }
@@ -401,28 +397,6 @@ export class AgentRoleRegistry {
     }
     
     /**
-     * Get the effective rules for a role, with Unity rules if enabled
-     * @param roleId The role ID
-     * @returns Array of rules (base + Unity rules if enabled)
-     */
-    getEffectiveRules(roleId: string): string[] {
-        const role = this.roles.get(roleId);
-        if (!role) {
-            return [];
-        }
-        
-        // Start with base rules
-        const rules = [...role.rules];
-        
-        // Add Unity rules if enabled
-        if (this._unityEnabled && role.unityRules && role.unityRules.length > 0) {
-            rules.push(...role.unityRules);
-        }
-        
-        return rules;
-    }
-    
-    /**
      * Get a role with all effective fields resolved (Unity additions applied if enabled)
      * This creates a new AgentRole object with merged values - does NOT modify the stored role
      * @param roleId The role ID
@@ -438,8 +412,7 @@ export class AgentRoleRegistry {
         return new AgentRole({
             ...role,
             promptTemplate: this.getEffectivePrompt(roleId),
-            allowedMcpTools: this.getEffectiveMcpTools(roleId),
-            rules: this.getEffectiveRules(roleId)
+            allowedMcpTools: this.getEffectiveMcpTools(roleId)
         });
     }
 
@@ -536,64 +509,6 @@ export class AgentRoleRegistry {
             return defaults?.promptTemplate || '';
         }
         return config.promptTemplate;
-    }
-
-    // ========================================================================
-    // Unity Polling Agent Prompt Methods
-    // ========================================================================
-    
-    private static readonly POLLING_PROMPT_ID = 'unity_polling';
-    
-    /**
-     * Get the Unity polling agent prompt
-     * Returns both the current (possibly customized) prompt and the default
-     */
-    getPollingPrompt(): { currentPrompt: string; defaultPrompt: string } {
-        const defaultConfig = DefaultSystemPrompts[AgentRoleRegistry.POLLING_PROMPT_ID];
-        const defaultPrompt = defaultConfig?.promptTemplate || '';
-        
-        const currentConfig = this.systemPrompts.get(AgentRoleRegistry.POLLING_PROMPT_ID);
-        const currentPrompt = currentConfig?.promptTemplate || defaultPrompt;
-        
-        return { currentPrompt, defaultPrompt };
-    }
-    
-    /**
-     * Update the Unity polling agent prompt
-     */
-    updatePollingPrompt(prompt: string): void {
-        let config = this.systemPrompts.get(AgentRoleRegistry.POLLING_PROMPT_ID);
-        if (!config) {
-            // Create from defaults if not exists
-            const defaults = DefaultSystemPrompts[AgentRoleRegistry.POLLING_PROMPT_ID];
-            config = new SystemPromptConfig(defaults || { 
-                id: AgentRoleRegistry.POLLING_PROMPT_ID, 
-                name: 'Unity Polling Agent' 
-            });
-        }
-        
-        // Update the prompt template
-        config.promptTemplate = prompt;
-        this.systemPrompts.set(AgentRoleRegistry.POLLING_PROMPT_ID, config);
-        this.stateManager.saveSystemPromptConfig(AgentRoleRegistry.POLLING_PROMPT_ID, config.toJSON());
-        this.notifySystemPromptsChanged();
-        
-        log.info('Updated Unity polling agent prompt');
-    }
-    
-    /**
-     * Reset the Unity polling agent prompt to default
-     */
-    resetPollingPromptToDefault(): { currentPrompt: string; defaultPrompt: string } {
-        const defaults = DefaultSystemPrompts[AgentRoleRegistry.POLLING_PROMPT_ID];
-        if (defaults) {
-            const config = new SystemPromptConfig(defaults);
-            this.systemPrompts.set(AgentRoleRegistry.POLLING_PROMPT_ID, config);
-            this.stateManager.clearSystemPromptConfig(AgentRoleRegistry.POLLING_PROMPT_ID);
-            this.notifySystemPromptsChanged();
-            log.info('Reset Unity polling agent prompt to default');
-        }
-        return this.getPollingPrompt();
     }
 
     // ========================================================================

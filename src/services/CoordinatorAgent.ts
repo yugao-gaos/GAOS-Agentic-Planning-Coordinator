@@ -232,20 +232,8 @@ export class CoordinatorAgent {
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const logFile = path.join(logDir, `${timestamp}_${evalId}_stream.log`);
         
-        // Write prompt to log file FIRST (before agent runs)
-        // This helps debug what context the coordinator received
-        const promptHeader = `${'═'.repeat(80)}
-COORDINATOR PROMPT (sent to AI)
-${'═'.repeat(80)}
-
-${prompt}
-
-${'═'.repeat(80)}
-END OF PROMPT - AI OUTPUT BELOW
-${'═'.repeat(80)}
-
-`;
-        fs.writeFileSync(logFile, promptHeader, 'utf-8');
+        // Note: Prompt is written to log file by CursorAgentRunner.run()
+        // This centralizes prompt logging for all agents
         
         // Run the AI agent - it will call run_terminal_cmd directly
         // Use simpleMode (no streaming JSON) for coordinator - cleaner output
@@ -535,25 +523,22 @@ History file: ${historyPath}
             result += '\n\n';
         }
         
-        // Show paused tasks that can be resumed
-        const paused = byStatus['paused'] || [];
-        if (paused.length > 0) {
-            result += `⏸️ PAUSED - CAN RESUME (${paused.length}):\n`;
-            result += paused.map(t => 
-                `  - ${t.id}: ${t.description} | Use \`apc workflow resume\` to continue`
-            ).join('\n');
-            result += '\n\n';
-        }
-        
-        // Show ready tasks (created with all deps complete)
+        // Show ready tasks (created with all deps complete) - these should have workflows started!
         const readyTasks = tasks.filter(t => 
             (t.status === 'created' || t.status === 'pending') && t.dependencyStatus === 'all_complete'
         );
         if (readyTasks.length > 0) {
-            result += `READY TO DISPATCH (${readyTasks.length}):\n`;
-            result += readyTasks.map(t => 
-                `  - ${t.id}: ${t.description} | Type: ${t.type} | Priority: ${t.priority}`
-            ).join('\n');
+            result += `🚀 READY TO DISPATCH - START WORKFLOWS NOW (${readyTasks.length}):\n`;
+            result += `   ⚡ These tasks already exist. Use \`apc task start\` to begin workflows.\n`;
+            result += readyTasks.map(t => {
+                // Show context status only if task needs context
+                let contextInfo = '';
+                if (t.needsContext) {
+                    const ctxStatus = t.contextWorkflowStatus || 'none';
+                    contextInfo = ctxStatus === 'succeeded' ? ' | CTX ✓' : ` | CTX: ${ctxStatus} ⚠️`;
+                }
+                return `  - ${t.id}: ${t.description} | Type: ${t.type} | Priority: ${t.priority}${contextInfo}`;
+            }).join('\n');
             result += '\n\n';
         }
 
@@ -567,24 +552,31 @@ History file: ${historyPath}
             result += '\n\n';
         }
 
-        // Show blocked tasks (waiting on dependencies)
+        // Show blocked tasks (waiting on dependencies) with context status
         const blocked = byStatus['blocked'] || [];
         if (blocked.length > 0) {
             result += `BLOCKED (${blocked.length}):\n`;
-            result += blocked.map(t => 
-                `  - ${t.id}: ${t.description} | Status: ${t.status} | Deps: ${t.dependencies.join(', ') || 'none'}`
-            ).join('\n');
+            result += blocked.map(t => {
+                const deps = t.dependencies.join(', ') || 'none';
+                // Show context status only if task needs context
+                let contextInfo = '';
+                if (t.needsContext) {
+                    const ctxStatus = t.contextWorkflowStatus || 'none';
+                    contextInfo = ` | CTX: ${ctxStatus}`;
+                }
+                return `  - ${t.id}: ${t.description} | Deps: ${deps}${contextInfo}`;
+            }).join('\n');
             result += '\n\n';
         }
 
         // Summary of other states
-        const completed = byStatus['completed'] || [];
-        const failed = byStatus['failed'] || [];
+        const succeeded = byStatus['succeeded'] || [];
+        // NOTE: No 'failed' tasks - tasks stay in awaiting_decision until retried
         const pendingBlocked = tasks.filter(t => 
             (t.status === 'created' || t.status === 'pending') && t.dependencyStatus !== 'all_complete'
         );
         
-        result += `Summary: ${completed.length} completed, ${failed.length} failed, ${pendingBlocked.length} waiting on deps`;
+        result += `Summary: ${succeeded.length} succeeded, ${pendingBlocked.length} waiting on deps`;
 
         return result;
     }
@@ -707,7 +699,41 @@ History file: ${historyPath}
             return result;
         }
         
-        // Single event
+        // Single event - format execution_started specially to highlight missing tasks
+        if (input.event.type === 'execution_started') {
+            const execPayload = input.event.payload as ExecutionStartedPayload;
+            const missing = execPayload.totalTasksInPlan - execPayload.tasksCreated;
+            
+            let result = `Event Type: ${input.event.type}
+Session ID: ${input.sessionId}
+Timestamp: ${input.event.timestamp}
+
+📋 TASK CREATION STATUS:
+- Auto-created: ${execPayload.tasksCreated}/${execPayload.totalTasksInPlan} tasks
+- Already exist: ${execPayload.taskCount} tasks in TaskManager`;
+            
+            if (missing > 0) {
+                result += `
+⚠️ MISSING TASKS: ${missing} tasks need to be created by coordinator`;
+                if (execPayload.failedToCreate.length > 0) {
+                    result += `
+   Failed IDs: ${execPayload.failedToCreate.slice(0, 10).join(', ')}${execPayload.failedToCreate.length > 10 ? '...' : ''}`;
+                }
+                result += `
+
+**ACTION REQUIRED**: Read the plan file and create the missing ${missing} tasks.
+Create tasks in dependency order (5 at a time max), starting with tasks that have no dependencies.`;
+            } else if (execPayload.tasksCreated === execPayload.totalTasksInPlan) {
+                result += `
+✅ All tasks auto-created successfully. Start workflows for ready tasks.`;
+            }
+            
+            result += `
+
+Plan File: ${execPayload.planPath}`;
+            return result;
+        }
+        
         return `Event Type: ${input.event.type}
 Session ID: ${input.sessionId}
 Timestamp: ${input.event.timestamp}
@@ -952,8 +978,6 @@ ${JSON.stringify(input.event.payload, null, 2)}`;
             'workflow_completed',
             'user_responded',
             'agent_available',
-            'task_paused',
-            'task_resumed',
             'manual_evaluation',
             'execution_started',
             'workflow_blocked'
@@ -986,7 +1010,7 @@ ${JSON.stringify(input.event.payload, null, 2)}`;
     /**
      * Create a history entry from an event and decision
      * NOTE: AI executes commands directly via run_terminal_cmd,
-     * so dispatch/pause/resume counts are not tracked in decision anymore.
+     * so dispatch counts are not tracked in decision anymore.
      */
     createHistoryEntry(event: CoordinatorEvent, decision: CoordinatorDecision): CoordinatorHistoryEntry {
         return {
@@ -998,9 +1022,7 @@ ${JSON.stringify(input.event.payload, null, 2)}`;
             decision: {
                 dispatchCount: 0,  // AI dispatches directly via CLI
                 dispatchedTasks: [],
-                askedUser: false,
-                pausedCount: 0,
-                resumedCount: 0,
+                cancelledCount: 0,
                 reasoning: decision.reasoning
             }
         };

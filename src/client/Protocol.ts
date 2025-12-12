@@ -119,21 +119,38 @@ export interface SessionStatusParams {
 
 export interface SessionStatusResponse {
     sessionId: string;
-    status: string;
+    status: string;  // Check status === 'revising' for revision state
     requirement: string;
     currentPlanPath?: string;
-    isRevising: boolean;
     workflows: WorkflowSummaryData[];
     pendingWorkflows: number;
     completedWorkflows: number;
 }
 
-export interface SessionPauseParams {
+/**
+ * Info about a completed session (lightweight, for listing)
+ */
+export interface CompletedSessionInfo {
     id: string;
+    requirement: string;
+    completedAt: string;
+    createdAt: string;
+    currentPlanPath?: string;
+    /** Task progress at completion time */
+    taskProgress?: {
+        completed: number;
+        total: number;
+        percentage: number;
+    };
 }
 
-export interface SessionResumeParams {
-    id: string;
+/**
+ * Response for listing completed sessions
+ */
+export interface CompletedSessionListResponse {
+    sessions: CompletedSessionInfo[];
+    /** Total count of completed sessions (may be more than returned if limit applied) */
+    total: number;
 }
 
 // ============================================================================
@@ -200,14 +217,6 @@ export interface ExecStartResponse {
     message: string;
 }
 
-export interface ExecPauseParams {
-    sessionId: string;
-}
-
-export interface ExecResumeParams {
-    sessionId: string;
-}
-
 export interface ExecStopParams {
     sessionId: string;
 }
@@ -218,7 +227,7 @@ export interface ExecStatusParams {
 
 export interface ExecStatusResponse {
     sessionId: string;
-    isRevising: boolean;
+    // Note: Check session status for 'revising' state
     workflows: WorkflowSummaryData[];
     activeWorkflows: number;
     completedWorkflows: number;
@@ -280,7 +289,7 @@ export interface PoolStatusResponse {
     busy: Array<{
         name: string;
         roleId?: string;
-        coordinatorId: string;
+        workflowId: string;
         sessionId: string;
         task?: string;
     }>;
@@ -314,7 +323,7 @@ export interface AgentPoolResponse {
     busy: Array<{
         name: string;
         roleId?: string;
-        coordinatorId: string;
+        workflowId: string;
         task?: string;
     }>;
     restingCount: number;
@@ -405,6 +414,45 @@ export interface UnityWaitResponse {
 }
 
 // ============================================================================
+// Unity Direct WebSocket Types (for Unity package communication)
+// ============================================================================
+
+/**
+ * Unity state response from direct WebSocket connection
+ */
+export interface UnityDirectStateResponse {
+    isCompiling: boolean;
+    isPlaying: boolean;
+    isPaused: boolean;
+    isBusy: boolean;
+    currentOperation: string | null;
+    editorReady: boolean;
+    projectPath: string;
+    unityVersion: string;
+}
+
+/**
+ * Unity registration parameters
+ */
+export interface UnityRegisterParams {
+    projectPath: string;
+    unityVersion: string;
+}
+
+/**
+ * Unity direct command types
+ */
+export type UnityDirectCommand =
+    | 'unity.direct.getState'
+    | 'unity.direct.enterPlayMode'
+    | 'unity.direct.exitPlayMode'
+    | 'unity.direct.loadScene'
+    | 'unity.direct.createScene'
+    | 'unity.direct.runTests'
+    | 'unity.direct.compile'
+    | 'unity.direct.focusEditor';
+
+// ============================================================================
 // Event Types (Server -> Client)
 // ============================================================================
 
@@ -426,8 +474,6 @@ export type ApcEventType =
     
     // Execution events
     | 'exec.started'
-    | 'exec.paused'
-    | 'exec.resumed'
     | 'exec.stopped'
     | 'exec.completed'
     
@@ -436,7 +482,7 @@ export type ApcEventType =
     | 'workflow.progress'
     | 'workflow.completed'
     | 'workflow.failed'
-    | 'workflow.paused'
+    | 'workflow.event'  // Generic workflow events (e.g., review requests)
     
     // Agent events
     | 'agent.assigned'
@@ -463,7 +509,10 @@ export type ApcEventType =
     | 'daemon.shutdown'
     | 'client.connected'
     | 'client.disconnected'
-    | 'error';
+    | 'error'
+    
+    // User interaction events
+    | 'user.questionAsked';
 
 // ============================================================================
 // Event Payloads
@@ -497,9 +546,19 @@ export interface AgentProgressEvent {
 
 export interface UnityStatusChangedEvent {
     status: string;
+    connected: boolean;
     isCompiling: boolean;
     isPlaying: boolean;
+    isPaused: boolean;
+    hasErrors: boolean;
     errorCount: number;
+    queueLength: number;
+    currentTask?: {
+        id: string;
+        type: string;
+        phase?: string;
+    };
+    timestamp: string;
 }
 
 export interface PoolChangedEvent {

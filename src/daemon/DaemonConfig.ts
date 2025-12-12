@@ -11,6 +11,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { Logger } from '../utils/Logger';
+import { AgentBackendType } from '../types';
 
 const log = Logger.create('Daemon', 'DaemonConfig');
 
@@ -29,11 +30,8 @@ export interface CoreConfig {
     /** Total number of agents in the pool */
     agentPoolSize: number;
     
-    /** Default AI backend */
-    defaultBackend: 'cursor';
-    
-    /** State update interval in milliseconds */
-    stateUpdateInterval: number;
+    /** Default AI backend: 'cursor' | 'claude' | 'codex' */
+    defaultBackend: AgentBackendType;
     
     /** Whether Unity features are enabled */
     enableUnityFeatures: boolean;
@@ -54,7 +52,6 @@ export interface CoreConfig {
 export const DEFAULT_CONFIG: Omit<CoreConfig, 'workspaceRoot'> = {
     agentPoolSize: 10,
     defaultBackend: 'cursor',
-    stateUpdateInterval: 5000,
     enableUnityFeatures: true,  // Unity enabled by default
     port: 19840,
     logLevel: 'info',
@@ -214,12 +211,9 @@ export class ConfigLoader {
             sanitized.agentPoolSize = raw.agentPoolSize;
         }
         
-        if (raw.defaultBackend === 'cursor') {
+        const validBackends: AgentBackendType[] = ['cursor', 'claude', 'codex'];
+        if (validBackends.includes(raw.defaultBackend)) {
             sanitized.defaultBackend = raw.defaultBackend;
-        }
-        
-        if (typeof raw.stateUpdateInterval === 'number' && raw.stateUpdateInterval >= 1000) {
-            sanitized.stateUpdateInterval = raw.stateUpdateInterval;
         }
         
         if (typeof raw.enableUnityFeatures === 'boolean') {

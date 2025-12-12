@@ -237,6 +237,12 @@ export function getStyles(): string {
             flex: 1;
             overflow-y: auto;
             padding: 10px;
+            scrollbar-width: none; /* Firefox */
+            -ms-overflow-style: none; /* IE/Edge */
+        }
+        
+        .palette-content::-webkit-scrollbar {
+            display: none; /* Chrome/Safari */
         }
         
         .palette-category {
@@ -334,6 +340,7 @@ export function getStyles(): string {
             pointer-events: none;
             overflow: visible;
             transform-origin: 0 0;
+            z-index: 1; /* Above loop containers (z-index: 0), below regular nodes (z-index: 2) */
         }
         
         .nodes-layer {
@@ -364,6 +371,7 @@ export function getStyles(): string {
             box-shadow: 0 2px 8px rgba(0,0,0,0.2);
             cursor: move;
             transition: box-shadow 0.15s ease;
+            z-index: 2; /* Regular nodes above connections (z-index: 1) and loop containers (z-index: 0) */
         }
         
         .node:hover {
@@ -389,6 +397,43 @@ export function getStyles(): string {
             display: flex;
             align-items: center;
             gap: 6px;
+        }
+        
+        .node-header-icon {
+            flex-shrink: 0;
+        }
+        
+        .node-header-title {
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        
+        .node-lock-btn {
+            flex-shrink: 0;
+            cursor: pointer;
+            opacity: 0.4;
+            transition: opacity 0.15s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2px;
+            border-radius: 3px;
+        }
+        
+        .node-lock-btn:hover {
+            opacity: 0.8;
+            background: rgba(255,255,255,0.1);
+        }
+        
+        .node-lock-btn.locked {
+            opacity: 1;
+            color: var(--vscode-inputValidation-warningBorder, #f0ad4e);
+        }
+        
+        .node.locked {
+            cursor: default;
         }
         
         .node-body {
@@ -480,14 +525,14 @@ export function getStyles(): string {
             filter: drop-shadow(0 0 6px rgba(16, 185, 129, 0.8));
         }
         
-        /* Data ports - Circle style with colored borders */
-        .port-dot[data-type="string"] { border-color: #4CAF50; }
-        .port-dot[data-type="number"] { border-color: #3b82f6; }
-        .port-dot[data-type="boolean"] { border-color: #a855f7; }
-        .port-dot[data-type="object"] { border-color: #78909C; }
-        .port-dot[data-type="array"] { border-color: #06b6d4; }
-        .port-dot[data-type="any"] { border-color: #9CA3AF; }
-        .port-dot[data-type="agent"] { border-color: #ec4899; }
+        /* Data ports - Circle style with colored fill matching connection line colors */
+        .port-dot[data-type="string"] { border-color: #4CAF50; background: #4CAF50; }
+        .port-dot[data-type="number"] { border-color: #3b82f6; background: #3b82f6; }
+        .port-dot[data-type="boolean"] { border-color: #a855f7; background: #a855f7; }
+        .port-dot[data-type="object"] { border-color: #78909C; background: #78909C; }
+        .port-dot[data-type="array"] { border-color: #06b6d4; background: #06b6d4; }
+        .port-dot[data-type="any"] { border-color: #9CA3AF; background: #9CA3AF; }
+        .port-dot[data-type="agent"] { border-color: #ec4899; background: #ec4899; }
         
         /* ================================================================
          * Comment Nodes (sticky note style)
@@ -513,6 +558,153 @@ export function getStyles(): string {
         
         .node-group.selected {
             box-shadow: 0 0 0 2px var(--vscode-focusBorder) !important;
+        }
+        
+        /* ================================================================
+         * Loop Container Nodes
+         * ================================================================ */
+        .node-loop {
+            min-width: 250px;
+            min-height: 150px;
+            background: var(--vscode-editor-background);
+            border: 2px solid var(--vscode-panel-border);
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            overflow: visible;
+            z-index: 0 !important; /* Render behind regular nodes (which are z-index: 1) */
+        }
+        
+        .node-loop.selected {
+            border-color: var(--vscode-focusBorder);
+            box-shadow: 0 0 0 2px var(--vscode-focusBorder);
+        }
+        
+        .node-loop.locked {
+            cursor: default;
+        }
+        
+        /* Title bar */
+        .loop-title-bar {
+            padding: 8px 12px;
+            font-weight: 600;
+            font-size: 12px;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            border-radius: 6px 6px 0 0;
+            cursor: move;
+        }
+        
+        .loop-title {
+            flex: 1;
+        }
+        
+        .loop-title-bar .node-header-icon svg {
+            width: 14px;
+            height: 14px;
+            fill: currentColor;
+        }
+        
+        /* External ports bar - between title and container */
+        .loop-ports-bar {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            padding: 8px 4px;
+            background: var(--vscode-editor-background);
+            border-bottom: 1px solid;
+            border-color: inherit;
+        }
+        
+        .loop-external-inputs {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        
+        .loop-external-outputs {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            align-items: flex-end;
+        }
+        
+        .loop-ports-bar .node-port {
+            font-size: 10px;
+            padding: 2px 4px;
+        }
+        
+        /* Container area - where loop body nodes go */
+        .loop-container-area {
+            flex: 1;
+            margin: 8px;
+            border: 2px dashed;
+            border-radius: 6px;
+            position: relative;
+            background: transparent;
+            min-height: 80px;
+            pointer-events: none; /* Allow clicking through to nodes behind */
+        }
+        
+        /* But internal ports should be clickable */
+        .loop-internal-ports {
+            pointer-events: auto;
+        }
+        
+        /* Internal ports - positioned inside the container */
+        .loop-internal-ports {
+            position: absolute;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            top: 50%;
+            transform: translateY(-50%);
+        }
+        
+        .loop-internal-left {
+            left: 8px;
+        }
+        
+        .loop-internal-right {
+            right: 8px;
+        }
+        
+        .loop-internal-ports .node-port {
+            background: rgba(0, 150, 136, 0.2);
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 10px;
+            border: 1px solid rgba(0, 150, 136, 0.4);
+        }
+        
+        .loop-internal-ports .node-port:hover {
+            background: rgba(0, 150, 136, 0.35);
+        }
+        
+        /* Resize handle */
+        .loop-resize-handle {
+            position: absolute;
+            bottom: 2px;
+            right: 2px;
+            width: 16px;
+            height: 16px;
+            cursor: nwse-resize;
+            color: var(--vscode-descriptionForeground);
+            opacity: 0.5;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            pointer-events: auto;
+        }
+        
+        .loop-resize-handle:hover {
+            opacity: 1;
+        }
+        
+        .node-loop:hover .loop-resize-handle {
+            opacity: 0.7;
         }
         
         /* ================================================================
@@ -665,7 +857,7 @@ export function getStyles(): string {
         }
         
         /* Reroute point colors matching connection types */
-        .reroute-point[data-type="trigger"] { fill: #ec4899; }
+        .reroute-point[data-type="trigger"] { fill: #10b981; }
         .reroute-point[data-type="agent"] { fill: #ec4899; }
         .reroute-point[data-type="string"] { fill: #4CAF50; }
         .reroute-point[data-type="number"] { fill: #3b82f6; }

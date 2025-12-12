@@ -12,7 +12,7 @@ const log = Logger.create('Client', 'RoleSettings');
  * Provides a tabbed interface for:
  * - Agent Roles: Built-in (engineer, reviewer, context) + custom roles
  * 
- * Note: System prompts (coordinator, unity_polling) are managed in SystemSettingsPanel.
+ * Note: System prompts (coordinator, etc.) are managed in SystemSettingsPanel.
  * 
  * Uses VsCodeClient to communicate with daemon for role management.
  */
@@ -770,13 +770,13 @@ ${getSettingsCommonStyles()}
                         </div>
                         
                         <div class="form-group">
-                            <label for="defaultModel">Default Model</label>
+                            <label for="defaultModel">Model Tier</label>
                             <select id="defaultModel" name="defaultModel">
-                                <option value="sonnet-4.5" \${role.defaultModel === 'sonnet-4.5' ? 'selected' : ''}>Claude Sonnet 4.5</option>
-                                <option value="opus-4.5" \${role.defaultModel === 'opus-4.5' ? 'selected' : ''}>Claude Opus 4.5</option>
-                                <option value="gemini-3-pro" \${role.defaultModel === 'gemini-3-pro' ? 'selected' : ''}>Gemini 3 Pro</option>
-                                <option value="gpt-5.1-codex-high" \${role.defaultModel === 'gpt-5.1-codex-high' ? 'selected' : ''}>GPT-5.1 Codex High</option>
+                                <option value="low" \${role.defaultModel === 'low' ? 'selected' : ''}>Low (Fast/Cheap)</option>
+                                <option value="mid" \${role.defaultModel === 'mid' ? 'selected' : ''}>Mid (Balanced)</option>
+                                <option value="high" \${role.defaultModel === 'high' ? 'selected' : ''}>High (Most Capable)</option>
                             </select>
+                            <div class="hint">Model tier is mapped to specific models per backend</div>
                         </div>
                         
                         <div class="form-group">
@@ -807,12 +807,6 @@ ${getSettingsCommonStyles()}
                     <div class="section">
                         <div class="section-header">
                             <div class="section-title">Context</div>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="rules">Rules</label>
-                            <textarea id="rules" name="rules" placeholder="One rule per line">\${role.rules.join('\\n')}</textarea>
-                            <div class="hint">Rules and best practices to include in agent prompts</div>
                         </div>
                         
                         <div class="form-group">
@@ -877,13 +871,13 @@ ${getSettingsCommonStyles()}
                         </div>
                         
                         <div class="form-group">
-                            <label for="defaultModel">Default Model</label>
+                            <label for="defaultModel">Model Tier</label>
                             <select id="defaultModel" name="defaultModel">
-                                <option value="sonnet-4.5">Claude Sonnet 4.5</option>
-                                <option value="opus-4.5">Claude Opus 4.5</option>
-                                <option value="gemini-3-pro">Gemini 3 Pro</option>
-                                <option value="gpt-5.1-codex-high">GPT-5.1 Codex High</option>
+                                <option value="low">Low (Fast/Cheap)</option>
+                                <option value="mid" selected>Mid (Balanced)</option>
+                                <option value="high">High (Most Capable)</option>
                             </select>
+                            <div class="hint">Model tier is mapped to specific models per backend</div>
                         </div>
                         
                         <div class="form-group">
@@ -914,11 +908,6 @@ ${getSettingsCommonStyles()}
                     <div class="section">
                         <div class="section-header">
                             <div class="section-title">Context</div>
-                        </div>
-                        
-                        <div class="form-group">
-                            <label for="rules">Rules</label>
-                            <textarea id="rules" name="rules" placeholder="One rule per line"></textarea>
                         </div>
                         
                         <div class="form-group">
@@ -985,7 +974,6 @@ ${getSettingsCommonStyles()}
                 promptTemplate: formData.get('promptTemplate') || '',
                 allowedMcpTools: parseArrayField(formData.get('allowedMcpTools')),
                 allowedCliCommands: parseArrayField(formData.get('allowedCliCommands')),
-                rules: parseArrayField(formData.get('rules')) || [],
                 documents: parseArrayField(formData.get('documents')) || []
             };
         }

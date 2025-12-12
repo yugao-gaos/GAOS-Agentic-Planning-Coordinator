@@ -26,7 +26,7 @@ const SESSION_COLORS = [
  */
 interface TaskNode {
     id: string;
-    shortId: string;      // Just the task part (e.g., "T1")
+    shortId: string;      // Global task ID (e.g., "PS_000001_T1") - kept for compatibility
     sessionId: string;    // Which session this task belongs to
     description: string;
     status: string;
@@ -209,6 +209,60 @@ export class DependencyMapPanel {
                     : `Task Dependencies - ${this.sessionId}`;
                 this.updateWebviewContent();
                 break;
+            case 'reviewAllTasks':
+                // Start implementation review for all completed tasks in session
+                await this.startImplementationReview(message.completedTaskIds || [], true);
+                break;
+            case 'reviewTask':
+                // Start implementation review for a single task
+                if (message.taskId) {
+                    await this.startImplementationReview([message.taskId], false);
+                }
+                break;
+        }
+    }
+    
+    /**
+     * Start an implementation review workflow
+     */
+    private async startImplementationReview(taskIds: string[], isSessionReview: boolean): Promise<void> {
+        if (taskIds.length === 0) {
+            vscode.window.showWarningMessage('No completed tasks to review');
+            return;
+        }
+        
+        if (!this.vsCodeClient) {
+            vscode.window.showErrorMessage('Cannot start review: not connected to daemon');
+            return;
+        }
+        
+        const label = isSessionReview ? `all ${taskIds.length} completed tasks` : `task ${taskIds[0]}`;
+        log.info(`Starting implementation review for ${label}`);
+        
+        try {
+            // Request daemon to dispatch implementation_review workflow
+            const result = await this.vsCodeClient.send<{ workflowId?: string; error?: string }>(
+                'workflow.dispatch',
+                {
+                    type: 'implementation_review',
+                    sessionId: this.sessionId,
+                    input: {
+                        taskIds,
+                        sessionId: this.sessionId,
+                        planPath: '', // Will be resolved by workflow
+                        isSessionReview
+                    }
+                }
+            );
+            
+            if (result?.workflowId) {
+                vscode.window.showInformationMessage(`Implementation review started for ${label}`);
+            } else {
+                vscode.window.showErrorMessage(`Failed to start review: ${result?.error || 'Unknown error'}`);
+            }
+        } catch (error) {
+            log.error('Failed to start implementation review:', error);
+            vscode.window.showErrorMessage(`Failed to start review: ${error instanceof Error ? error.message : String(error)}`);
         }
     }
 
@@ -292,13 +346,9 @@ export class DependencyMapPanel {
                     workflowsByIdMap.set(wf.id, wf);
                     // Also index by taskId for matching tasks that don't have activeWorkflow set
                     if (wf.taskId) {
-                        // Store with full task ID format (sessionId_taskId) - UPPERCASE for consistency
-                        const fullTaskId = wf.taskId.includes('_') 
-                            ? wf.taskId.toUpperCase() 
-                            : `${this.sessionId.toUpperCase()}_${wf.taskId.toUpperCase()}`;
-                        workflowsByTaskIdMap.set(fullTaskId, wf);
-                        // Also store with short taskId (uppercase)
-                        workflowsByTaskIdMap.set(wf.taskId.toUpperCase(), wf);
+                        // Store with global task ID (UPPERCASE)
+                        const globalTaskId = wf.taskId.toUpperCase();
+                        workflowsByTaskIdMap.set(globalTaskId, wf);
                     }
                 }
             }
@@ -349,12 +399,14 @@ export class DependencyMapPanel {
         
         // Convert to TaskNode format
         const taskNodes: TaskNode[] = tasksFromFile.map(t => {
-            // Extract short ID - use uppercase normalization to handle case mismatches
+            // Normalize to global ID format (UPPERCASE)
             const normalizedId = t.id.toUpperCase();
             const normalizedPrefix = `${t.sessionId.toUpperCase()}_`;
-            const shortId = normalizedId.startsWith(normalizedPrefix) 
-                ? normalizedId.slice(normalizedPrefix.length)
-                : normalizedId;
+            
+            // Build normalized global ID
+            const globalId = normalizedId.startsWith(normalizedPrefix) 
+                ? normalizedId 
+                : `${normalizedPrefix}${normalizedId}`;
             
             // Try to find active workflow for this task
             let workflowType: string | undefined;
@@ -373,32 +425,17 @@ export class DependencyMapPanel {
             }
             
             // Third try: match by taskId (workflow may not have activeWorkflow set)
-            // Map keys are UPPERCASE, so normalize lookups
             if (!workflowType) {
-                // Build global task ID if not already present
-                const globalId = normalizedId.startsWith(normalizedPrefix) 
-                    ? normalizedId 
-                    : `${normalizedPrefix}${normalizedId}`;
-                    
-                // Try global task ID first (e.g., "PS_000001_T1")
-                let wf = workflowsByTaskIdMap.get(globalId);
-                // Try short task ID (e.g., "T1")
-                if (!wf) {
-                    wf = workflowsByTaskIdMap.get(shortId);
-                }
+                // Use global task ID only - no fallback to short ID
+                const wf = workflowsByTaskIdMap.get(globalId);
                 if (wf) {
                     workflowType = wf.type;
                 }
             }
             
-            // Build normalized global ID for tasks stored in short form
-            const globalId = normalizedId.startsWith(normalizedPrefix) 
-                ? normalizedId 
-                : `${normalizedPrefix}${normalizedId}`;
-            
             return {
                 id: globalId,  // Always use normalized global ID
-                shortId: shortId,
+                shortId: globalId,  // Use global ID everywhere - no simple ID
                 sessionId: t.sessionId.toUpperCase(),
                 description: t.description,
                 status: t.status,
@@ -418,10 +455,9 @@ export class DependencyMapPanel {
         
         // Add ghost nodes for foreign dependencies
         for (const [depId, foreignTask] of foreignTaskMap) {
-            const shortId = foreignTask.id.replace(`${foreignTask.sessionId}_`, '');
             taskNodes.push({
                 id: depId,
-                shortId: `${foreignTask.sessionId.slice(-3)}:${shortId}`,  // e.g., "001:T5"
+                shortId: foreignTask.id,  // Use global ID
                 sessionId: foreignTask.sessionId,
                 description: foreignTask.description,
                 status: foreignTask.status,
@@ -512,12 +548,9 @@ export class DependencyMapPanel {
                     for (const wf of workflows) {
                         byId.set(wf.id, wf);
                         if (wf.taskId) {
-                            // Normalize to UPPERCASE for consistent lookup
-                            const fullTaskId = wf.taskId.includes('_') 
-                                ? wf.taskId.toUpperCase() 
-                                : `${sessionId.toUpperCase()}_${wf.taskId.toUpperCase()}`;
-                            byTaskId.set(fullTaskId, wf);
-                            byTaskId.set(wf.taskId.toUpperCase(), wf);
+                            // Store with global task ID (UPPERCASE) - no prefix adding
+                            const globalTaskId = wf.taskId.toUpperCase();
+                            byTaskId.set(globalTaskId, wf);
                         }
                     }
                     activeWorkflowsBySession.set(sessionId, { byId, byTaskId });
@@ -529,12 +562,16 @@ export class DependencyMapPanel {
         
         // Convert to TaskNode format
         const taskNodes: TaskNode[] = allTasks.map(t => {
-            // Extract short ID - use uppercase normalization to handle case mismatches
+            // Normalize to global ID format (UPPERCASE)
             const normalizedId = t.id.toUpperCase();
             const normalizedPrefix = `${t.sessionId.toUpperCase()}_`;
-            const shortId = normalizedId.startsWith(normalizedPrefix) 
-                ? normalizedId.slice(normalizedPrefix.length)
-                : normalizedId;
+            
+            // Build normalized global ID
+            const globalId = normalizedId.startsWith(normalizedPrefix)
+                ? normalizedId
+                : `${normalizedPrefix}${normalizedId}`;
+            
+            const normalizedSessionId = t.sessionId.toUpperCase();
             
             // Check if task has an active workflow
             let workflowType: string | undefined;
@@ -545,9 +582,7 @@ export class DependencyMapPanel {
             }
             
             // Second try: match from session workflows
-            // Map keys are UPPERCASE, so use normalizedSessionId
             if (!workflowType) {
-                const normalizedSessionId = t.sessionId.toUpperCase();
                 const sessionWorkflows = activeWorkflowsBySession.get(t.sessionId) || 
                                         activeWorkflowsBySession.get(normalizedSessionId);
                 if (sessionWorkflows) {
@@ -558,16 +593,9 @@ export class DependencyMapPanel {
                             workflowType = wf.type;
                         }
                     }
-                    // Try by task ID - use normalized IDs
+                    // Try by global task ID only - no fallback to short ID
                     if (!workflowType) {
-                        // Build global ID if task stored in short form
-                        const globalId = normalizedId.startsWith(normalizedPrefix)
-                            ? normalizedId
-                            : `${normalizedPrefix}${normalizedId}`;
-                        let wf = sessionWorkflows.byTaskId.get(globalId);
-                        if (!wf) {
-                            wf = sessionWorkflows.byTaskId.get(shortId);
-                        }
+                        const wf = sessionWorkflows.byTaskId.get(globalId);
                         if (wf) {
                             workflowType = wf.type;
                         }
@@ -575,16 +603,9 @@ export class DependencyMapPanel {
                 }
             }
             
-            // Build normalized global ID for tasks stored in short form
-            const globalId = normalizedId.startsWith(normalizedPrefix)
-                ? normalizedId
-                : `${normalizedPrefix}${normalizedId}`;
-            
-            const normalizedSessionId = t.sessionId.toUpperCase();
-            
             return {
                 id: globalId,  // Always use normalized global ID
-                shortId: `${normalizedSessionId.slice(-3)}:${shortId}`,  // e.g., "001:T1"
+                shortId: globalId,  // Use global ID everywhere - no simple ID
                 sessionId: normalizedSessionId,
                 description: t.description,
                 status: t.status,
@@ -611,13 +632,12 @@ export class DependencyMapPanel {
      * Handles both same-session and cross-plan dependencies
      */
     private calculateLayout(tasks: TaskNode[]): TaskNode[] {
-        // Create maps for both full ID and shortId lookups
+        // Create map for task lookups by global ID
         const taskMapById = new Map(tasks.map(t => [t.id, t]));
-        const taskMapByShortId = new Map(tasks.map(t => [t.shortId, t]));
         
-        // Helper to find a task by dependency ID (could be full or short)
+        // Helper to find a task by dependency ID (global ID only)
         const findTask = (depId: string): TaskNode | undefined => {
-            return taskMapById.get(depId) || taskMapByShortId.get(depId);
+            return taskMapById.get(depId);
         };
         
         // Calculate levels (topological sort)
@@ -628,7 +648,7 @@ export class DependencyMapPanel {
             if (visited.has(taskId)) return 0; // Circular dependency
             
             visited.add(taskId);
-            const task = taskMapById.get(taskId) || taskMapByShortId.get(taskId);
+            const task = taskMapById.get(taskId);
             if (!task || task.dependencies.length === 0) {
                 levels.set(taskId, 0);
                 return 0;
@@ -667,9 +687,9 @@ export class DependencyMapPanel {
         }
         
         // Calculate positions
-        const boxWidth = 90;  // Slightly wider for session prefix
+        const boxWidth = 110;  // Wide enough for task IDs like PS_000001_CTX6
         const boxHeight = 50;
-        const horizontalGap = 40;
+        const horizontalGap = 50;
         const verticalGap = 60;
         const startX = 60;
         const startY = 60;
@@ -731,8 +751,13 @@ export class DependencyMapPanel {
         const currentSessionId = this.sessionId;
         const showToggle = !this.openedFromGlobal;  // Hide toggle when opened from global
         
+        // Calculate completed tasks for review button (non-foreign only)
+        const completedTasks = tasks.filter(t => t.status === 'succeeded' && !t.isForeign);
+        const completedTaskIds = completedTasks.map(t => t.id);
+        const hasCompletedTasks = completedTasks.length > 0;
+        
         // Calculate canvas size
-        const maxX = Math.max(...tasks.map(t => (t.x || 0) + 120), 400);
+        const maxX = Math.max(...tasks.map(t => (t.x || 0) + 150), 400);
         const maxY = Math.max(...tasks.map(t => (t.y || 0) + 80), 300);
         
         // Build session legend for global view (shows session badges)
@@ -873,6 +898,32 @@ export class DependencyMapPanel {
             height: 16px;
         }
         
+        /* Review All Button */
+        .review-btn {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            padding: 4px 10px;
+            font-size: 0.75em;
+            font-weight: 500;
+            background: rgba(16, 185, 129, 0.15);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            border-radius: 4px;
+            cursor: pointer;
+            color: #34d399;
+            transition: all 0.15s ease;
+        }
+        
+        .review-btn:hover {
+            background: rgba(16, 185, 129, 0.25);
+            border-color: rgba(16, 185, 129, 0.5);
+        }
+        
+        .review-btn.disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+        
         /* Legend Toggle Button */
         .legend-toggle {
             padding: 4px 8px;
@@ -898,6 +949,44 @@ export class DependencyMapPanel {
             opacity: 1;
             background: rgba(255,255,255,0.1);
             border-color: rgba(255,255,255,0.2);
+        }
+        
+        /* Context Menu */
+        .context-menu {
+            position: fixed;
+            background: var(--vscode-editorWidget-background, #252526);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 4px 0;
+            z-index: 1000;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+            min-width: 150px;
+            display: none;
+        }
+        
+        .context-menu.visible {
+            display: block;
+        }
+        
+        .context-menu-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 12px;
+            font-size: 0.85em;
+            cursor: pointer;
+            color: var(--fg-color);
+            transition: background 0.1s ease;
+        }
+        
+        .context-menu-item:hover {
+            background: var(--hover-bg);
+        }
+        
+        .context-menu-item svg {
+            width: 14px;
+            height: 14px;
+            opacity: 0.8;
         }
         
         /* Floating Legend Panel */
@@ -967,21 +1056,24 @@ export class DependencyMapPanel {
         .legend-box.in_progress { background: #3b82f6; }
         .legend-box.created { background: #6b7280; }
         .legend-box.blocked { background: #f59e0b; }
-        .legend-box.paused { background: #8b5cf6; }
         .legend-box.failed { background: #ef4444; }
         
-        /* Workflow type legend borders */
-        .legend-border {
-            width: 16px;
-            height: 14px;
-            border-radius: 3px;
-            border: 2px solid;
-            background: transparent;
+        /* Workflow type legend badges */
+        .legend-wf-badge {
+            font-size: 8px;
+            padding: 2px 6px;
+            border-radius: 6px;
+            color: white;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
         }
         
-        .legend-border.implementation { border-color: #3b82f6; }
-        .legend-border.context { border-color: #a855f7; }
-        .legend-border.error { border-color: #ef4444; }
+        .legend-wf-badge.implementation { background: #3b82f6; }
+        .legend-wf-badge.context { background: #a855f7; }
+        .legend-wf-badge.error { background: #ef4444; }
+        .legend-wf-badge.planning { background: #10b981; }
+        .legend-wf-badge.revision { background: #f59e0b; }
         
         /* Session legend (for global view) */
         .session-legend {
@@ -1029,7 +1121,7 @@ export class DependencyMapPanel {
         
         .task-node {
             position: absolute;
-            width: 80px;
+            width: 110px;
             height: 50px;
             border-radius: 6px;
             display: flex;
@@ -1058,33 +1150,6 @@ export class DependencyMapPanel {
             border-color: #60a5fa;
         }
         
-        /* Colored border for tasks with active workflows (matches legend) */
-        .task-node[data-workflow]:not([data-workflow=""]) {
-            border-width: 3px;
-            border-style: solid;
-        }
-        
-        /* Workflow-specific border colors */
-        .task-node[data-workflow="task_implementation"] {
-            border-color: #3b82f6;  /* Blue for implementation */
-        }
-        
-        .task-node[data-workflow="context_gathering"] {
-            border-color: #a855f7;  /* Purple for context */
-        }
-        
-        .task-node[data-workflow="error_resolution"] {
-            border-color: #ef4444;  /* Red for error fixing */
-        }
-        
-        .task-node[data-workflow="planning_new"] {
-            border-color: #10b981;  /* Green for planning */
-        }
-        
-        .task-node[data-workflow="planning_revision"] {
-            border-color: #f59e0b;  /* Orange for revision */
-        }
-        
         .task-node.created {
             background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%);
             border-color: #9ca3af;
@@ -1093,11 +1158,6 @@ export class DependencyMapPanel {
         .task-node.blocked {
             background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
             border-color: #fbbf24;
-        }
-        
-        .task-node.paused {
-            background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%);
-            border-color: #a78bfa;
         }
         
         .task-node.failed {
@@ -1147,6 +1207,29 @@ export class DependencyMapPanel {
         .session-badge-4 { background: #8b5cf6; }  /* Purple */
         .session-badge-5 { background: #06b6d4; }  /* Cyan */
         
+        /* Workflow badge at bottom of task node */
+        .workflow-badge {
+            position: absolute;
+            bottom: -10px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 8px;
+            padding: 2px 6px;
+            border-radius: 6px;
+            color: white;
+            font-weight: 600;
+            white-space: nowrap;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+        }
+        
+        /* Workflow badge colors */
+        .workflow-badge.implementation { background: #3b82f6; }  /* Blue */
+        .workflow-badge.context { background: #a855f7; }  /* Purple */
+        .workflow-badge.error { background: #ef4444; }  /* Red */
+        .workflow-badge.planning { background: #10b981; }  /* Green */
+        .workflow-badge.revision { background: #f59e0b; }  /* Orange */
         
         .task-id {
             font-size: 1.1em;
@@ -1201,7 +1284,6 @@ export class DependencyMapPanel {
         .tooltip-status.in_progress { background: rgba(59, 130, 246, 0.2); color: #60a5fa; }
         .tooltip-status.created { background: rgba(107, 114, 128, 0.2); color: #9ca3af; }
         .tooltip-status.blocked { background: rgba(245, 158, 11, 0.2); color: #fbbf24; }
-        .tooltip-status.paused { background: rgba(139, 92, 246, 0.2); color: #a78bfa; }
         .tooltip-status.failed { background: rgba(239, 68, 68, 0.2); color: #f87171; }
         
         .tooltip-desc {
@@ -1249,6 +1331,19 @@ export class DependencyMapPanel {
         </div>
         
         <div class="toolbar-right">
+            ${viewMode === 'session' && hasCompletedTasks ? `
+            <button class="review-btn${hasCompletedTasks ? '' : ' disabled'}" 
+                    id="reviewAllBtn" 
+                    onclick="reviewAllTasks()"
+                    title="Review all ${completedTasks.length} completed task(s)"
+                    ${hasCompletedTasks ? '' : 'disabled'}>
+                <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
+                    <path d="M10.5 8a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0z"/>
+                    <path d="M0 8s3-5.5 8-5.5S16 8 16 8s-3 5.5-8 5.5S0 8 0 8zm8 3.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z"/>
+                </svg>
+                Review (${completedTasks.length})
+            </button>
+            ` : ''}
             <button class="legend-toggle" id="legendToggle" onclick="toggleLegend()">Legend</button>
             <button class="icon-btn" onclick="refresh()" title="Refresh">
                 <svg viewBox="0 0 16 16" fill="currentColor">
@@ -1270,7 +1365,6 @@ export class DependencyMapPanel {
                 </div>
                 <div class="legend-row">
                     <div class="legend-item"><div class="legend-box blocked"></div> Blocked</div>
-                    <div class="legend-item"><div class="legend-box paused"></div> Paused</div>
                     <div class="legend-item"><div class="legend-box failed"></div> Failed</div>
                 </div>
             </div>
@@ -1280,9 +1374,13 @@ export class DependencyMapPanel {
             <div class="legend-section-title">Active Workflow</div>
             <div class="legend">
                 <div class="legend-row">
-                    <div class="legend-item"><div class="legend-border implementation"></div> Implement</div>
-                    <div class="legend-item"><div class="legend-border context"></div> Context</div>
-                    <div class="legend-item"><div class="legend-border error"></div> Error Fix</div>
+                    <div class="legend-item"><span class="legend-wf-badge implementation">IMPL</span> Implement</div>
+                    <div class="legend-item"><span class="legend-wf-badge context">CTX</span> Context</div>
+                    <div class="legend-item"><span class="legend-wf-badge error">ERR</span> Error Fix</div>
+                </div>
+                <div class="legend-row">
+                    <div class="legend-item"><span class="legend-wf-badge planning">PLAN</span> Planning</div>
+                    <div class="legend-item"><span class="legend-wf-badge revision">REV</span> Revision</div>
                 </div>
             </div>
         </div>
@@ -1325,6 +1423,17 @@ export class DependencyMapPanel {
         <div class="tooltip-deps" id="tooltip-deps"></div>
     </div>
     
+    <!-- Context Menu for completed tasks -->
+    <div class="context-menu" id="contextMenu">
+        <div class="context-menu-item" onclick="reviewSelectedTask()">
+            <svg viewBox="0 0 16 16" fill="currentColor">
+                <path d="M10.5 8a2.5 2.5 0 1 1-5 0 2.5 2.5 0 0 1 5 0z"/>
+                <path d="M0 8s3-5.5 8-5.5S16 8 16 8s-3 5.5-8 5.5S0 8 0 8zm8 3.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z"/>
+            </svg>
+            Review Implementation
+        </div>
+    </div>
+    
     <script>
         const vscode = acquireVsCodeApi();
         const tasks = ${tasksJson};
@@ -1333,12 +1442,11 @@ export class DependencyMapPanel {
         const currentSession = '${currentSessionId}';
         
         const statusIcons = {
-            'completed': '✓',
+            'succeeded': '✓',
             'in_progress': '⟳',
             'created': '○',
             'blocked': '⏸',
-            'paused': '⏯',
-            'failed': '✗'
+            'awaiting_decision': '⚡'  // Needs coordinator attention
         };
         
         // Toggle between session and global view
@@ -1362,7 +1470,53 @@ export class DependencyMapPanel {
                 panel.classList.remove('visible');
                 btn.classList.remove('active');
             }
+            // Also close context menu when clicking outside
+            const contextMenu = document.getElementById('contextMenu');
+            if (contextMenu && !contextMenu.contains(e.target)) {
+                contextMenu.classList.remove('visible');
+            }
         });
+        
+        // Completed task IDs for review
+        const completedTaskIds = ${JSON.stringify(completedTaskIds)};
+        let selectedTaskForReview = null;
+        
+        // Review all completed tasks
+        function reviewAllTasks() {
+            if (completedTaskIds.length === 0) return;
+            vscode.postMessage({ 
+                command: 'reviewAllTasks',
+                completedTaskIds: completedTaskIds
+            });
+        }
+        
+        // Review a single selected task
+        function reviewSelectedTask() {
+            if (!selectedTaskForReview) return;
+            vscode.postMessage({ 
+                command: 'reviewTask',
+                taskId: selectedTaskForReview
+            });
+            // Hide context menu
+            document.getElementById('contextMenu').classList.remove('visible');
+            selectedTaskForReview = null;
+        }
+        
+        // Show context menu for completed task
+        function showContextMenu(e, taskId, status) {
+            e.preventDefault();
+            
+            // Only show for completed tasks
+            if (status !== 'succeeded') return;
+            
+            selectedTaskForReview = taskId;
+            const menu = document.getElementById('contextMenu');
+            
+            // Position menu at click location
+            menu.style.left = e.clientX + 'px';
+            menu.style.top = e.clientY + 'px';
+            menu.classList.add('visible');
+        }
         
         function renderTasks() {
             const canvas = document.getElementById('canvas');
@@ -1378,12 +1532,18 @@ export class DependencyMapPanel {
                 return;
             }
             
-            // Create task maps for lookups (both full ID and short ID)
+            // Create task map for lookups by global ID
             const taskMapById = new Map(tasks.map(t => [t.id, t]));
-            const taskMapByShortId = new Map(tasks.map(t => [t.shortId, t]));
             
-            // Helper to find task by dependency ID
-            const findTask = (depId) => taskMapById.get(depId) || taskMapByShortId.get(depId);
+            // Helper to find task by dependency ID (global ID only)
+            const findTask = (depId) => taskMapById.get(depId);
+            
+            // Helper to extract short display ID (e.g., "T1" from "PS_000001_T1")
+            const getDisplayId = (fullId) => {
+                const parts = fullId.split('_');
+                // Format: PS_XXXXXX_TASKPART - extract everything after second underscore
+                return parts.length >= 3 ? parts.slice(2).join('_') : fullId;
+            };
             
             // Render task nodes
             let nodesHtml = '';
@@ -1412,9 +1572,27 @@ export class DependencyMapPanel {
                     ? '<div style="font-size: 8px; opacity: 0.7;">From ' + (task.sessionId || '').slice(-6) + '</div>'
                     : '';
                 
+                // Workflow badge at bottom of task box
+                let workflowBadge = '';
+                if (workflowType && !task.isForeign) {
+                    const wfClass = workflowType
+                        .replace('task_implementation', 'implementation')
+                        .replace('context_gathering', 'context')
+                        .replace('error_resolution', 'error')
+                        .replace('planning_new', 'planning')
+                        .replace('planning_revision', 'revision');
+                    const wfLabel = workflowType
+                        .replace('task_implementation', 'IMPL')
+                        .replace('context_gathering', 'CTX')
+                        .replace('error_resolution', 'ERR')
+                        .replace('planning_new', 'PLAN')
+                        .replace('planning_revision', 'REV');
+                    workflowBadge = '<span class="workflow-badge ' + wfClass + '">' + wfLabel + '</span>';
+                }
+                
                 nodesHtml += \`
                     <div class="\${classes}" 
-                         style="left: \${x}px; top: \${y}px; width: 90px;"
+                         style="left: \${x}px; top: \${y}px; width: 110px;"
                          data-task-id="\${task.shortId}"
                          data-full-id="\${task.id}"
                          data-session="\${task.sessionId || ''}"
@@ -1425,11 +1603,13 @@ export class DependencyMapPanel {
                          data-foreign="\${task.isForeign || false}"
                          onmouseenter="showTooltip(event, this)"
                          onmousemove="moveTooltip(event)"
-                         onmouseleave="hideTooltip()">
+                         onmouseleave="hideTooltip()"
+                         oncontextmenu="showContextMenu(event, '\${task.id}', '\${task.status}')"
                         \${sessionBadge}
-                        <span class="task-id">\${task.shortId}</span>
+                        <span class="task-id">\${getDisplayId(task.shortId)}</span>
                         <span class="task-status-icon">\${icon}</span>
                         \${foreignLabel}
+                        \${workflowBadge}
                     </div>
                 \`;
             }
@@ -1452,9 +1632,9 @@ export class DependencyMapPanel {
                     const isCrossPlan = depTask.isForeign || (task.sessionId !== depTask.sessionId);
                     
                     // Draw arrow from dependency to task
-                    const startX = (depTask.x || 0) + 45; // Center of box
+                    const startX = (depTask.x || 0) + 55; // Center of box (110px / 2)
                     const startY = (depTask.y || 0) + 50; // Bottom of box
-                    const endX = (task.x || 0) + 45;      // Center of box
+                    const endX = (task.x || 0) + 55;      // Center of box (110px / 2)
                     const endY = (task.y || 0);           // Top of box
                     
                     // Bezier curve for smoother lines

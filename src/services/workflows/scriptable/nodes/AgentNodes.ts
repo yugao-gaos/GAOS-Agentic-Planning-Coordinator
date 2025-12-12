@@ -17,10 +17,10 @@ import { nodeRegistry } from '../NodeRegistry';
 export const AgentRequestNodeDefinition: INodeDefinition = {
     type: 'agent_request',
     name: 'Agent Request',
-    description: 'Request an agent from the pool. Waits until an agent is available or times out.',
+    description: 'Request an agent from the pool and allocate to a bench seat.',
     category: 'agent',
     icon: 'person-add',
-    color: '#2196F3',
+    color: '#ec4899',
     defaultInputs: [
         {
             id: 'trigger',
@@ -31,13 +31,6 @@ export const AgentRequestNodeDefinition: INodeDefinition = {
     ],
     defaultOutputs: [
         {
-            id: 'agent',
-            name: 'Agent',
-            dataType: 'agent',
-            description: 'Allocated agent reference',
-            allowMultiple: false
-        },
-        {
             id: 'done',
             name: 'Done',
             dataType: 'trigger',
@@ -46,6 +39,16 @@ export const AgentRequestNodeDefinition: INodeDefinition = {
     ],
     configSchema: {
         fields: [
+            {
+                name: 'benchSeat',
+                type: 'number',
+                label: 'Allocate to Bench Seat',
+                description: 'Which bench seat to allocate agent to (1-10)',
+                required: true,
+                defaultValue: 1,
+                min: 1,
+                max: 10
+            },
             {
                 name: 'role',
                 type: 'select',
@@ -73,6 +76,7 @@ export const AgentRequestNodeExecutor: NodeExecutor = async (
     inputs: Record<string, any>,
     context: IExecutionContextAPI
 ): Promise<Record<string, any>> => {
+    const benchSeat = node.config.benchSeat ?? 1;
     const role = node.config.role;
     const timeoutSeconds = node.config.timeoutSeconds ?? 300;
     const timeoutMs = timeoutSeconds > 0 ? timeoutSeconds * 1000 : undefined;
@@ -81,15 +85,17 @@ export const AgentRequestNodeExecutor: NodeExecutor = async (
         throw new Error('Agent role is required');
     }
     
-    context.log(`Requesting agent with role: ${role} (timeout: ${timeoutSeconds}s)`, 'info');
+    context.log(`Requesting agent with role: ${role} for bench seat ${benchSeat} (timeout: ${timeoutSeconds}s)`, 'info');
     
     // Request agent with timeout - always waits for availability
     const agentName = await context.requestAgent(role, { timeoutMs });
     
-    context.log(`Agent allocated: ${agentName}`, 'info');
+    // Place agent on bench seat
+    context.setAgentOnBench(benchSeat - 1, agentName); // 0-indexed internally
+    
+    context.log(`Agent allocated: ${agentName} -> bench seat ${benchSeat}`, 'info');
     
     return {
-        agent: agentName,
         done: true
     };
 };
@@ -101,19 +107,11 @@ export const AgentRequestNodeExecutor: NodeExecutor = async (
 export const AgenticWorkNodeDefinition: INodeDefinition = {
     type: 'agentic_work',
     name: 'Agentic Work',
-    description: 'Execute work with an agent using a custom prompt.',
+    description: 'Execute work with an agent from the bench using a custom prompt.',
     category: 'agent',
     icon: 'hubot',
-    color: '#9C27B0',
+    color: '#ec4899',
     defaultInputs: [
-        {
-            id: 'agent',
-            name: 'Agent',
-            dataType: 'agent',
-            description: 'Agent reference (from Agent Request node)',
-            required: true,
-            allowMultiple: false
-        },
         {
             id: 'trigger',
             name: 'Trigger',
@@ -128,13 +126,6 @@ export const AgenticWorkNodeDefinition: INodeDefinition = {
         }
     ],
     defaultOutputs: [
-        {
-            id: 'agent_out',
-            name: 'Agent',
-            dataType: 'agent',
-            description: 'Agent reference (pass to bench, release, or next work node)',
-            allowMultiple: false
-        },
         {
             id: 'result',
             name: 'Result',
@@ -156,6 +147,16 @@ export const AgenticWorkNodeDefinition: INodeDefinition = {
     ],
     configSchema: {
         fields: [
+            {
+                name: 'benchSeat',
+                type: 'number',
+                label: 'Bench Seat',
+                description: 'Which bench seat to use for agent (1-10)',
+                required: true,
+                defaultValue: 1,
+                min: 1,
+                max: 10
+            },
             {
                 name: 'promptTemplate',
                 type: 'template',
@@ -214,7 +215,8 @@ export const AgenticWorkNodeExecutor: NodeExecutor = async (
     inputs: Record<string, any>,
     context: IExecutionContextAPI
 ): Promise<Record<string, any>> => {
-    const agentName = inputs.agent;
+    const benchSeat = node.config.benchSeat ?? 1;
+    const agentName = context.getAgentFromBench(benchSeat - 1); // 0-indexed internally
     const promptTemplate = node.config.promptTemplate;
     const model = node.config.model;
     const releaseAfter = node.config.releaseAfter;
@@ -222,7 +224,7 @@ export const AgenticWorkNodeExecutor: NodeExecutor = async (
     const stage = node.config.stage || 'implementation';
     
     if (!agentName) {
-        throw new Error('Agent reference is required');
+        throw new Error(`No agent found in bench seat ${benchSeat}`);
     }
     
     if (!promptTemplate) {
@@ -260,25 +262,33 @@ export const AgenticWorkNodeExecutor: NodeExecutor = async (
         // Release agent if configured
         if (releaseAfter) {
             context.releaseAgent(agentName);
+            context.removeAgentFromBench(benchSeat - 1);
             context.log(`Released agent: ${agentName}`, 'debug');
         }
         
         return {
-            agent_out: releaseAfter ? undefined : agentName, // Pass agent through (unless released)
             result: output,
             success: result.success,
             done: true
         };
     } catch (error) {
         const errorMsg = error instanceof Error ? error.message : String(error);
+        
+        // Classify error for better diagnostics
+        const { ErrorClassifier } = await import('../../ErrorClassifier');
+        const { ServiceLocator } = await import('../../../ServiceLocator');
+        const classifier = ServiceLocator.resolve(ErrorClassifier);
+        const classification = classifier.classify(errorMsg);
+        
         context.log(`Agent task failed: ${errorMsg}`, 'error');
+        context.log(`  Error type: ${classification.type} (${classification.category}), Action: ${classification.suggestedAction}`, 'error');
         
         if (releaseAfter) {
             context.releaseAgent(agentName);
+            context.removeAgentFromBench(benchSeat - 1);
         }
         
         return {
-            agent_out: releaseAfter ? undefined : agentName, // Pass agent through even on failure (unless released)
             result: errorMsg,
             success: false,
             done: true
@@ -293,23 +303,16 @@ export const AgenticWorkNodeExecutor: NodeExecutor = async (
 export const AgentReleaseNodeDefinition: INodeDefinition = {
     type: 'agent_release',
     name: 'Agent Release',
-    description: 'Release an agent back to the pool after use.',
+    description: 'Release an agent from a bench seat back to the pool.',
     category: 'agent',
     icon: 'person-remove',
-    color: '#F44336',
+    color: '#ec4899',
     defaultInputs: [
         {
             id: 'trigger',
             name: 'Trigger',
             dataType: 'trigger',
             description: 'Execution flow trigger'
-        },
-        {
-            id: 'agent',
-            name: 'Agent',
-            dataType: 'agent',
-            description: 'Agent reference to release',
-            allowMultiple: false
         }
     ],
     defaultOutputs: [
@@ -321,7 +324,18 @@ export const AgentReleaseNodeDefinition: INodeDefinition = {
         }
     ],
     configSchema: {
-        fields: []
+        fields: [
+            {
+                name: 'benchSeat',
+                type: 'number',
+                label: 'Release from Bench Seat',
+                description: 'Which bench seat to release agent from (1-10)',
+                required: true,
+                defaultValue: 1,
+                min: 1,
+                max: 10
+            }
+        ]
     }
 };
 
@@ -330,14 +344,16 @@ export const AgentReleaseNodeExecutor: NodeExecutor = async (
     inputs: Record<string, any>,
     context: IExecutionContextAPI
 ): Promise<Record<string, any>> => {
-    const agentName = inputs.agent;
+    const benchSeat = node.config.benchSeat ?? 1;
+    const agentName = context.getAgentFromBench(benchSeat - 1); // 0-indexed internally
     
     if (!agentName) {
-        throw new Error('Agent reference is required');
+        throw new Error(`No agent found in bench seat ${benchSeat}`);
     }
     
-    context.log(`Releasing agent: ${agentName}`, 'info');
+    context.log(`Releasing agent from bench seat ${benchSeat}: ${agentName}`, 'info');
     context.releaseAgent(agentName);
+    context.removeAgentFromBench(benchSeat - 1);
     
     return {
         done: true
@@ -351,28 +367,20 @@ export const AgentReleaseNodeExecutor: NodeExecutor = async (
 export const AgentBenchNodeDefinition: INodeDefinition = {
     type: 'agent_bench',
     name: 'Agent Bench',
-    description: 'Holds agents ready for use. Each seat provides an agent in/out port pair.',
+    description: 'Visual display of agents currently allocated to bench seats. Agents are assigned via Agent Request and released via Agent Release nodes.',
     category: 'agent',
     icon: 'people',
-    color: '#00897B',
-    defaultInputs: [
-        { id: 'agent_in_0', name: 'Seat 1 In', dataType: 'agent', description: 'Agent input for seat 1', allowMultiple: true },
-        { id: 'agent_in_1', name: 'Seat 2 In', dataType: 'agent', description: 'Agent input for seat 2', allowMultiple: true },
-        { id: 'agent_in_2', name: 'Seat 3 In', dataType: 'agent', description: 'Agent input for seat 3', allowMultiple: true }
-    ],
-    defaultOutputs: [
-        { id: 'agent_out_0', name: 'Seat 1 Out', dataType: 'agent', description: 'Agent output for seat 1', allowMultiple: true },
-        { id: 'agent_out_1', name: 'Seat 2 Out', dataType: 'agent', description: 'Agent output for seat 2', allowMultiple: true },
-        { id: 'agent_out_2', name: 'Seat 3 Out', dataType: 'agent', description: 'Agent output for seat 3', allowMultiple: true }
-    ],
-    allowDynamicPorts: true,
+    color: '#ec4899',
+    defaultInputs: [],
+    defaultOutputs: [],
+    allowDynamicPorts: false,
     configSchema: {
         fields: [
             {
                 name: 'seatCount',
                 type: 'number',
                 label: 'Number of Seats',
-                description: 'Number of agent seats (each seat has an in/out port pair)',
+                description: 'Number of agent seats to display',
                 required: true,
                 defaultValue: 3,
                 min: 1,
@@ -387,19 +395,10 @@ export const AgentBenchNodeExecutor: NodeExecutor = async (
     inputs: Record<string, any>,
     context: IExecutionContextAPI
 ): Promise<Record<string, any>> => {
-    // Agent Bench is a passthrough node - agents flow in and out
-    // It serves as a visual organizer for agent references
-    const outputs: Record<string, any> = {};
-    
-    // Pass through each agent from input to corresponding output
-    for (const [key, value] of Object.entries(inputs)) {
-        if (key.startsWith('agent_in_')) {
-            const seatIndex = key.replace('agent_in_', '');
-            outputs[`agent_out_${seatIndex}`] = value;
-        }
-    }
-    
-    return outputs;
+    // Agent Bench is a visual-only node
+    // It displays which agents are currently on the bench
+    // No execution logic needed - agents are managed via context.setAgentOnBench/getAgentFromBench
+    return {};
 };
 
 // ============================================================================

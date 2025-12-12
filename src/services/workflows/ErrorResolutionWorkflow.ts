@@ -22,7 +22,7 @@ import { PipelineTaskContext } from '../../types/unity';
  * 3. Completes immediately
  * 
  * When Unity recompile finishes:
- * - If success: Coordinator resumes paused tasks
+ * - If success: Coordinator proceeds with ready tasks
  * - If errors remain: Coordinator creates new error task with attempt context
  */
 export class ErrorResolutionWorkflow extends BaseWorkflow {
@@ -116,7 +116,7 @@ export class ErrorResolutionWorkflow extends BaseWorkflow {
         const role = this.getRole('engineer');
         const prompt = this.buildFixPrompt(role);
         
-        this.log(`Running fixer (${role?.defaultModel || 'sonnet-4.5'})...`);
+        this.log(`Running fixer (tier: ${role?.defaultModel || 'mid'})...`);
         
         // Use CLI callback for structured completion - pass pre-allocated agent
         const result = await this.runAgentTaskWithCallback(
@@ -136,18 +136,11 @@ export class ErrorResolutionWorkflow extends BaseWorkflow {
             // CLI callback - use result directly
             if (this.isAgentSuccess(result)) {
                 this.fixApplied = true;
-                this.log(`✓ Fix applied via CLI callback`);
+                this.log(`✓ Fix applied`);
             } else {
-                this.log(`❌ Fix failed via CLI callback`);
+                this.log(`❌ Fix failed`);
                 throw new Error('Error fix failed');
             }
-        } else {
-            // No callback received - agent must use CLI callback
-            throw new Error(
-                'Fixer did not use CLI callback (`apc agent complete`). ' +
-                'All agents must report results via CLI callback for structured data. ' +
-                'Legacy output parsing is no longer supported.'
-            );
         }
         
         // Release fixer
@@ -213,7 +206,7 @@ ${this.previousFixSummary ? `\nPrevious fix tried:\n${this.previousFixSummary}\n
 `;
         }
         
-        return `${basePrompt}
+        const prompt = `${basePrompt}
 
 ## Errors to Fix
 ${errorList}
@@ -229,6 +222,8 @@ ${previousAttemptsSection}
 - Keep changes minimal - don't refactor unrelated code
 - Fix all related errors together
 ${this.previousAttempts > 0 ? '- Previous fix did not work - try something different!' : ''}`;
+        
+        return this.appendExtraInstruction(prompt);
     }
     
 }

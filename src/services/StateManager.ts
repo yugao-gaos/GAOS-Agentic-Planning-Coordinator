@@ -7,7 +7,8 @@ import {
     AgentPoolState,
     PlanningSession,
     PlanInfo,
-    GlobalSettings
+    GlobalSettings,
+    AgentBackendType
 } from '../types';
 import { getMemoryMonitor } from './MemoryMonitor';
 import { FolderStructureManager, getFolderStructureManager } from './FolderStructureManager';
@@ -28,7 +29,7 @@ export interface StateManagerConfig {
     /** Agent pool size (default: 10) */
     agentPoolSize?: number;
     /** Default AI backend (default: 'cursor') */
-    defaultBackend?: 'cursor' | 'claude-code' | 'codex';
+    defaultBackend?: AgentBackendType;
 }
 
 /**

@@ -20,6 +20,7 @@ export { PlanningRevisionWorkflow } from './PlanningRevisionWorkflow';
 export { TaskImplementationWorkflow } from './TaskImplementationWorkflow';
 export { ErrorResolutionWorkflow } from './ErrorResolutionWorkflow';
 export { ContextGatheringWorkflow } from './ContextGatheringWorkflow';
+export { ImplementationReviewWorkflow } from './ImplementationReviewWorkflow';
 
 // Re-export workflow types
 export * from '../../types/workflow';
@@ -34,6 +35,7 @@ const log = Logger.create('Daemon', 'Workflows');
 import { TaskImplementationWorkflow } from './TaskImplementationWorkflow';
 import { ErrorResolutionWorkflow } from './ErrorResolutionWorkflow';
 import { ContextGatheringWorkflow } from './ContextGatheringWorkflow';
+import { ImplementationReviewWorkflow } from './ImplementationReviewWorkflow';
 import { DEFAULT_WORKFLOW_METADATA } from '../WorkflowSettingsManager';
 
 /**
@@ -74,6 +76,13 @@ export function registerBuiltinWorkflows(registry: WorkflowRegistry): void {
         'context_gathering',
         (config, services) => new ContextGatheringWorkflow(config, services),
         DEFAULT_WORKFLOW_METADATA.context_gathering
+    );
+    
+    // Review workflows
+    registry.register(
+        'implementation_review',
+        (config, services) => new ImplementationReviewWorkflow(config, services),
+        DEFAULT_WORKFLOW_METADATA.implementation_review
     );
     
     log.info(`Registered ${registry.size} built-in workflow types`);

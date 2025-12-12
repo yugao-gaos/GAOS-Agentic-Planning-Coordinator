@@ -425,10 +425,30 @@ async function handlePlan(args) {
             case 'new':
             case 'n':
             case 'create': {
-                const prompt = args.slice(1).join(' ').replace(/--docs.*$/, '').trim();
+                // Parse prompt - remove flag sections
+                const prompt = args.slice(1).join(' ')
+                    .replace(/--docs.*?(--complexity|$)/, '')
+                    .replace(/--complexity\s+\w+/, '')
+                    .trim();
                 if (!prompt) {
-                    printError('Usage: apc plan new "<requirement>" [--docs <path1> <path2>]');
+                    printError('Usage: apc plan new "<requirement>" --complexity <level> [--docs <paths>]');
+                    printError('Complexity levels: tiny, small, medium, large, huge');
                     process.exit(1);
+                }
+                
+                // Parse --complexity flag (required for proper task estimation)
+                let complexity = null;
+                const complexityIndex = args.indexOf('--complexity');
+                if (complexityIndex !== -1 && args[complexityIndex + 1]) {
+                    const level = args[complexityIndex + 1].toLowerCase();
+                    const validLevels = ['tiny', 'small', 'medium', 'large', 'huge'];
+                    if (validLevels.includes(level)) {
+                        complexity = level;
+                    } else {
+                        printError(`Invalid complexity level: ${level}`);
+                        printError('Valid levels: tiny (1-3 tasks), small (4-12), medium (13-25), large (26-50), huge (51+)');
+                        process.exit(1);
+                    }
                 }
                 
                 // Parse --docs flag
@@ -438,8 +458,16 @@ async function handlePlan(args) {
                     docs = args.slice(docsIndex + 1).filter(d => !d.startsWith('--'));
                 }
                 
+                // Show complexity info
+                if (complexity) {
+                    const ranges = { tiny: '1-3', small: '4-12', medium: '13-25', large: '26-50', huge: '51+' };
+                    print(`Complexity: ${complexity.toUpperCase()} (${ranges[complexity]} tasks expected)`, COLORS.cyan);
+                } else {
+                    print('Note: No --complexity specified. Planner will estimate scope.', COLORS.yellow);
+                }
+                
                 printHeader('Starting Planning Session...');
-                const response = await sendCommand('plan.create', { prompt, docs });
+                const response = await sendCommand('plan.create', { prompt, docs, complexity });
                 displayResponse(response);
                 break;
             }
@@ -462,8 +490,24 @@ async function handlePlan(args) {
                 const feedback = args.slice(2).join(' ');
                 if (!id || !feedback) {
                     printError('Usage: apc plan revise <session_id> "<feedback>"');
+                    printError('');
+                    printError('To change complexity, include in feedback:');
+                    printError('  apc plan revise ps_001 "change complexity to medium, add more detail to T3"');
+                    printError('  apc plan revise ps_001 "complexity: large - expand scope to include X"');
                     process.exit(1);
                 }
+                
+                // Check if feedback mentions complexity change
+                const complexityMatch = feedback.match(/complexity[:\s]+(\w+)/i);
+                if (complexityMatch) {
+                    const level = complexityMatch[1].toLowerCase();
+                    const validLevels = ['tiny', 'small', 'medium', 'large', 'huge'];
+                    if (validLevels.includes(level)) {
+                        const ranges = { tiny: '1-3', small: '4-12', medium: '13-25', large: '26-50', huge: '51+' };
+                        print(`Complexity change detected: ${level.toUpperCase()} (${ranges[level]} tasks)`, COLORS.cyan);
+                    }
+                }
+                
                 const response = await sendCommand('plan.revise', { id, feedback });
                 displayResponse(response);
                 break;
@@ -705,15 +749,26 @@ async function handleTask(args) {
             
             case 'start':
             case 's': {
-                const params = parseNamedParams(args.slice(1), ['session', 'id', 'workflow']);
+                const params = parseNamedParams(args.slice(1), ['session', 'id', 'workflow', 'input']);
                 if (!params.session || !params.id) {
-                    printError('Usage: apc task start --session <id> --id <taskId> [--workflow task_implementation]');
+                    printError('Usage: apc task start --session <id> --id <taskId> [--workflow task_implementation] [--input JSON]');
                     process.exit(1);
+                }
+                // Parse input JSON if provided (for context_gathering workflows)
+                let parsedInput = undefined;
+                if (params.input) {
+                    try {
+                        parsedInput = JSON.parse(params.input);
+                    } catch (e) {
+                        printError(`Invalid JSON in --input: ${e.message}`);
+                        process.exit(1);
+                    }
                 }
                 const response = await sendCommand('task.start', {
                     session: params.session,
                     id: params.id,
-                    workflow: params.workflow || 'task_implementation'
+                    workflow: params.workflow || 'task_implementation',
+                    input: parsedInput
                 });
                 displayResponse(response);
                 break;
@@ -757,14 +812,135 @@ async function handleTask(args) {
                 break;
             }
             
+            case 'fail':
+            case 'f': {
+                const params = parseNamedParams(args.slice(1), ['session', 'id', 'reason']);
+                if (!params.session || !params.id || !params.reason) {
+                    printError('Usage: apc task fail --session <id> --id <taskId> --reason "why it failed"');
+                    process.exit(1);
+                }
+                const response = await sendCommand('task.fail', {
+                    session: params.session,
+                    task: params.id,
+                    reason: params.reason
+                });
+                displayResponse(response);
+                break;
+            }
+            
+            case 'update':
+            case 'u': {
+                const params = parseNamedParams(args.slice(1), ['session', 'id', 'desc', 'deps']);
+                if (!params.session || !params.id) {
+                    printError('Usage: apc task update --session <id> --id <taskId> [--desc "new description"] [--deps T1,T2]');
+                    process.exit(1);
+                }
+                if (!params.desc && !params.deps) {
+                    printError('At least one of --desc or --deps must be provided');
+                    process.exit(1);
+                }
+                const response = await sendCommand('task.update', {
+                    session: params.session,
+                    id: params.id,
+                    desc: params.desc,
+                    deps: params.deps
+                });
+                displayResponse(response);
+                break;
+            }
+            
+            case 'remove':
+            case 'rm': {
+                const params = parseNamedParams(args.slice(1), ['session', 'id', 'reason']);
+                if (!params.session || !params.id) {
+                    printError('Usage: apc task remove --session <id> --id <taskId> [--reason "why removed"]');
+                    process.exit(1);
+                }
+                const response = await sendCommand('task.remove', {
+                    session: params.session,
+                    id: params.id,
+                    reason: params.reason
+                });
+                displayResponse(response);
+                break;
+            }
+            
+            case 'add-dep': {
+                const params = parseNamedParams(args.slice(1), ['session', 'task', 'depends-on']);
+                if (!params.session || !params.task || !params['depends-on']) {
+                    printError('Usage: apc task add-dep --session <id> --task <taskId> --depends-on <depId>');
+                    process.exit(1);
+                }
+                const response = await sendCommand('task.addDep', {
+                    session: params.session,
+                    task: params.task,
+                    dependsOn: params['depends-on']
+                });
+                displayResponse(response);
+                break;
+            }
+            
             default:
-                print('Usage: apc task [list|create|start|complete|status]', COLORS.yellow);
+                print('Usage: apc task [list|create|start|complete|fail|update|remove|add-dep|status]', COLORS.yellow);
                 console.log('');
                 console.log('  list [session]              List all tasks (optionally for a session)');
                 console.log('  create --session <id> --id <taskId> --desc "..."');
                 console.log('  start --session <id> --id <taskId>');
                 console.log('  complete --session <id> --id <taskId> [--summary "..."]');
+                console.log('  fail --session <id> --id <taskId> --reason "..."');
+                console.log('  update --session <id> --id <taskId> [--desc "..."] [--deps T1,T2]');
+                console.log('  remove --session <id> --id <taskId> [--reason "..."]');
+                console.log('  add-dep --session <id> --task <taskId> --depends-on <depId>');
                 console.log('  status <session_id> <task_id>');
+        }
+    } catch (err) {
+        printError(err.message);
+        process.exit(1);
+    }
+}
+
+/**
+ * Handle task-agent commands
+ */
+async function handleTaskAgent(args) {
+    const subCmd = args[0] || 'status';
+    
+    try {
+        switch (subCmd) {
+            case 'evaluate':
+            case 'eval': {
+                const params = parseNamedParams(args.slice(1), ['session', 'reason']);
+                if (!params.session) {
+                    printError('Usage: apc task-agent evaluate --session <id> [--reason "why evaluation needed"]');
+                    process.exit(1);
+                }
+                const response = await sendCommand('taskAgent.evaluate', {
+                    session: params.session,
+                    reason: params.reason
+                });
+                displayResponse(response);
+                break;
+            }
+            
+            case 'status':
+            case 'st': {
+                const params = parseNamedParams(args.slice(1), ['session']);
+                if (!params.session) {
+                    printError('Usage: apc task-agent status --session <id>');
+                    process.exit(1);
+                }
+                const response = await sendCommand('taskAgent.status', {
+                    session: params.session
+                });
+                displayResponse(response);
+                break;
+            }
+            
+            default:
+                print('Usage: apc task-agent [evaluate|status]', COLORS.yellow);
+                console.log('');
+                console.log('  evaluate --session <id> [--reason "..."]  Trigger TaskAgent to verify/sync tasks');
+                console.log('  status --session <id>                     Check TaskAgent status for session');
         }
     } catch (err) {
         printError(err.message);
@@ -873,6 +1049,61 @@ async function handleAgent(args) {
             
             default:
                 print('Usage: apc agent [pool|roles|release|complete]', COLORS.yellow);
+        }
+    } catch (err) {
+        printError(err.message);
+        process.exit(1);
+    }
+}
+
+/**
+ * Handle user interaction commands (ask/respond for clarifications)
+ */
+async function handleUser(args) {
+    const subCmd = args[0] || 'help';
+    
+    try {
+        switch (subCmd) {
+            case 'ask': {
+                const params = parseNamedParams(args.slice(1), ['session', 'task', 'question', 'context']);
+                if (!params.session || !params.task || !params.question) {
+                    printError('Usage: apc user ask --session <id> --task <id> --question "..." [--context "..."]');
+                    process.exit(1);
+                }
+                const response = await sendCommand('user.ask', {
+                    session: params.session,
+                    task: params.task,
+                    question: params.question,
+                    context: params.context
+                });
+                displayResponse(response);
+                break;
+            }
+            
+            case 'respond': {
+                const params = parseNamedParams(args.slice(1), ['session', 'task', 'id', 'response']);
+                if (!params.session || !params.task || !params.response) {
+                    printError('Usage: apc user respond --session <id> --task <id> [--id <questionId>] --response "..."');
+                    process.exit(1);
+                }
+                const response = await sendCommand('user.respond', {
+                    session: params.session,
+                    task: params.task,
+                    questionId: params.id,
+                    response: params.response
+                });
+                displayResponse(response);
+                break;
+            }
+            
+            default:
+                print('Usage: apc user [ask|respond]', COLORS.yellow);
+                print('', COLORS.reset);
+                print('Commands:', COLORS.cyan);
+                print('  ask      --session <s> --task <t> --question "..."', COLORS.reset);
+                print('           Ask user for clarification about a task', COLORS.reset);
+                print('  respond  --session <s> --task <t> --response "..."', COLORS.reset);
+                print('           Provide answer to pending question', COLORS.reset);
         }
     } catch (err) {
         printError(err.message);
@@ -1437,6 +1668,11 @@ async function main() {
             await handleTask(subArgs);
             break;
             
+        case 'task-agent':
+        case 'ta':
+            await handleTaskAgent(subArgs);
+            break;
+            
         case 'pool':
             await handlePool(subArgs);
             break;
@@ -1449,6 +1685,10 @@ async function main() {
         case 'unity':
         case 'u':
             await handleUnity(subArgs);
+            break;
+            
+        case 'user':
+            await handleUser(subArgs);
             break;
             
         case 'session':

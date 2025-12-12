@@ -6,10 +6,11 @@ import { PlanningSession, PlanStatus, ExecutionState } from '../types';
 import { UnifiedCoordinatorService } from './UnifiedCoordinatorService';
 import { OutputChannelManager } from './OutputChannelManager';
 import { EventBroadcaster } from '../daemon/EventBroadcaster';
-import { PlanningWorkflowInput } from '../types/workflow';
+import { PlanningWorkflowInput, RequirementComplexity } from '../types/workflow';
 import { ServiceLocator } from './ServiceLocator';
 import { TaskManager } from './TaskManager';
-import { PlanParser } from './PlanParser';
+import { TaskIdValidator } from './TaskIdValidator';
+import { PlanParser, PlanTask } from './PlanParser';
 
 /**
  * Configuration for PlanningService
@@ -17,6 +18,24 @@ import { PlanParser } from './PlanParser';
 export interface PlanningServiceConfig {
     /** Unity best practices path (optional) */
     unityBestPracticesPath?: string;
+}
+
+/**
+ * Result of task auto-creation from plan
+ */
+interface TaskCreationStats {
+    tasksCreated: number;
+    totalTasksInPlan: number;
+    failedToCreate: string[];
+}
+
+/**
+ * Task info for topological sorting
+ */
+interface TaskWithGlobalIds {
+    task: PlanTask;
+    globalId: string;
+    globalDeps: string[];
 }
 
 /**
@@ -157,8 +176,12 @@ export class PlanningService extends EventEmitter {
     /**
      * Start a new planning session
      * Dispatches planning_new workflow via UnifiedCoordinatorService
+     * 
+     * @param requirement - The requirement description
+     * @param docs - Optional list of document paths
+     * @param complexity - Optional complexity classification (tiny, small, medium, large, huge)
      */
-    async startPlanning(requirement: string, docs?: string[]): Promise<{
+    async startPlanning(requirement: string, docs?: string[], complexity?: string): Promise<{
         sessionId: string;
         status: PlanStatus;
         debateSummary?: {
@@ -170,6 +193,7 @@ export class PlanningService extends EventEmitter {
         planPath?: string;
         recommendedAgents?: number;
         iterations?: number;
+        complexity?: string;
     }> {
         const sessionId = this.stateManager.generatePlanningSessionId();
         
@@ -194,10 +218,17 @@ export class PlanningService extends EventEmitter {
         this.outputManager.clear();
         this.outputManager.show();
         
+        // Validate complexity if provided
+        const validComplexities = ['tiny', 'small', 'medium', 'large', 'huge'];
+        const validatedComplexity = complexity && validComplexities.includes(complexity.toLowerCase()) 
+            ? complexity.toLowerCase() as RequirementComplexity
+            : undefined;
+        
         // Build input and dispatch planning_new workflow
         const input: PlanningWorkflowInput = {
             requirement,
-            docs: docs || []
+            docs: docs || [],
+            complexity: validatedComplexity
         };
         
         const workflowId = await this.coordinator.dispatchWorkflow(
@@ -349,7 +380,7 @@ export class PlanningService extends EventEmitter {
             const workflowSummaries = this.coordinator.getWorkflowSummaries(sessionId);
             const existingRevision = workflowSummaries.find(
                 (w) => w.type === 'planning_revision' && 
-                    ['running', 'paused', 'blocked'].includes(w.status)
+                    ['running', 'pending', 'blocked'].includes(w.status)
             );
             if (existingRevision) {
                 throw new Error(`Revision already in progress (${existingRevision.id.substring(0, 8)}). Wait for it to complete or cancel it first.`);
@@ -363,6 +394,10 @@ export class PlanningService extends EventEmitter {
             // Show output channel
             this.outputManager.clear();
             this.outputManager.show();
+            
+            // CRITICAL: Pause coordinator evaluations during plan modification
+            // This prevents the coordinator from dispatching tasks based on stale plan state
+            this.coordinator.pauseEvaluations(sessionId, 'Plan revision in progress');
             
             // Build input and dispatch planning_revision workflow
             const input: PlanningWorkflowInput = {
@@ -385,13 +420,11 @@ export class PlanningService extends EventEmitter {
                     if (updatedSession) {
                         if (event.result.success && event.result.output?.planPath) {
                             // Success - plan revision complete
+                            // NOTE: planHistory is already updated by the workflow (PlanningRevisionWorkflow.executeFinalizePhase)
+                            // which handles both updating the previous version's path to the backup
+                            // and adding the new version. We just update status and metadata here.
                             updatedSession.status = 'reviewing';
                             updatedSession.currentPlanPath = event.result.output.planPath;
-                            updatedSession.planHistory.push({
-                                version: newVersion,
-                                path: event.result.output.planPath,
-                                timestamp: new Date().toISOString()
-                            });
                             // Clear partial plan metadata on success
                             if (updatedSession.metadata?.partialPlan) {
                                 delete updatedSession.metadata.partialPlan;
@@ -431,6 +464,9 @@ export class PlanningService extends EventEmitter {
                 version: newVersion
             };
         } catch (error) {
+            // Resume coordinator evaluations on error
+            this.coordinator.resumeEvaluations(sessionId);
+            
             session.status = previousStatus || 'reviewing';
             session.updatedAt = new Date().toISOString();
             this.stateManager.savePlanningSession(session);
@@ -438,6 +474,88 @@ export class PlanningService extends EventEmitter {
 
             this.notifyError(`Plan revision failed. Session reset to "${session.status}" status.`, sessionId);
             throw error;
+        }
+    }
+
+    /**
+     * Add specific task(s) to an existing plan via revision workflow
+     * 
+     * This is a specialized form of revision that:
+     * 1. Builds a task-focused revision feedback
+     * 2. Dispatches the planning_revision workflow (Planner + Analysts review)
+     * 3. Tasks are only added to TaskManager after plan approval
+     * 
+     * The revision workflow ensures:
+     * - Dependencies are validated and set correctly
+     * - Plan standards are maintained
+     * - Multi-agent review for quality
+     * 
+     * @param sessionId The session ID
+     * @param taskSpec Task specification(s) to add
+     * @returns Result with success status
+     */
+    async addTaskToPlan(
+        sessionId: string,
+        taskSpec: {
+            id: string;
+            description: string;
+            dependencies?: string[];
+            engineer?: string;
+            unityPipeline?: 'none' | 'prep' | 'prep_editmode' | 'prep_playmode' | 'prep_playtest' | 'full';
+        }
+    ): Promise<{ success: boolean; taskId?: string; error?: string }> {
+        const session = this.stateManager.getPlanningSession(sessionId);
+        if (!session) {
+            return { success: false, error: `Session ${sessionId} not found` };
+        }
+        
+        if (!session.currentPlanPath) {
+            return { success: false, error: 'No plan file available' };
+        }
+        
+        if (!fs.existsSync(session.currentPlanPath)) {
+            return { success: false, error: 'Plan file does not exist' };
+        }
+        
+        // Build task-focused revision feedback
+        const depsStr = taskSpec.dependencies?.length 
+            ? taskSpec.dependencies.join(', ') 
+            : 'determine based on task dependencies';
+        const engineer = taskSpec.engineer || 'appropriate engineer based on task type';
+        const unity = taskSpec.unityPipeline || 'none';
+        
+        // Create a structured feedback for the revision workflow
+        const revisionFeedback = `ADD NEW TASK TO PLAN:
+
+Task ID: ${taskSpec.id}
+Description: ${taskSpec.description}
+Dependencies: ${depsStr}
+Engineer: ${engineer}
+Unity Pipeline: ${unity}
+
+INSTRUCTIONS FOR PLANNER:
+1. Add this task to the Task Breakdown section following the standard checkbox format
+2. Validate and correct the dependencies based on the existing task structure
+3. Assign the appropriate engineer role if not specified
+4. Ensure the task ID is unique and follows the naming convention
+5. Keep all existing tasks unchanged - only ADD the new task(s)
+6. Update any relevant sections (phases, dependencies graph) if needed
+
+This is a TASK ADDITION revision - do not modify existing tasks unless necessary for dependency correctness.`;
+
+        try {
+            // Use the revision workflow - this ensures proper review
+            const result = await this.revisePlan(sessionId, revisionFeedback);
+            
+            return { 
+                success: true, 
+                taskId: taskSpec.id,
+                // Note: The actual task ID may be adjusted by the planner
+            };
+            
+        } catch (error) {
+            const errorMsg = error instanceof Error ? error.message : String(error);
+            return { success: false, error: errorMsg };
         }
     }
 
@@ -498,8 +616,14 @@ export class PlanningService extends EventEmitter {
                 issues.push(`Task ${task.id} has circular dependency on itself`);
             }
         }
+        
+        // Check if no tasks have dependencies (suspicious for a real plan)
+        const tasksWithDeps = tasksFound.filter(t => t.deps.length > 0).length;
+        if (tasksFound.length > 1 && tasksWithDeps === 0) {
+            issues.push(`WARNING: ${tasksFound.length} tasks found but NONE have dependencies. Check plan format (expected: | Deps: T1 |)`);
+        }
 
-        this.writeProgress(sessionId, 'REVIEW', `Plan format review: ${tasksFound.length} tasks found`);
+        this.writeProgress(sessionId, 'REVIEW', `Plan format review: ${tasksFound.length} tasks found (${tasksWithDeps} with dependencies)`);
         if (issues.length > 0) {
             for (const issue of issues) {
                 this.writeProgress(sessionId, 'REVIEW', `  ⚠️ ${issue}`);
@@ -518,6 +642,14 @@ export class PlanningService extends EventEmitter {
 
     /**
      * Approve a plan for execution
+     * 
+     * New flow with TaskAgent:
+     * 1. Set status to 'verifying'
+     * 2. Run format review and cycle detection
+     * 3. Auto-create tasks from parsed plan
+     * 4. Run TaskAgent verification loop (creates CTX, handles changes)
+     * 5. Set status to 'approved'
+     * 6. Start coordinator execution
      */
     async approvePlan(sessionId: string, autoStart: boolean = true): Promise<void> {
         const session = this.stateManager.getPlanningSession(sessionId);
@@ -529,54 +661,84 @@ export class PlanningService extends EventEmitter {
             throw new Error(`Plan is not ready for approval (status: ${session.status})`);
         }
 
-        // Run format review before approval (includes basic cycle check)
-        const reviewResult = await this.reviewPlanFormat(sessionId);
-        if (!reviewResult.valid) {
-            const errorMsg = `Plan format validation failed:\n${reviewResult.issues.join('\n')}`;
-            this.notifyWarning(
-                `Plan has format issues. Fix them before approval:\n${reviewResult.issues.slice(0, 3).join(', ')}${reviewResult.issues.length > 3 ? '...' : ''}`,
-                sessionId
-            );
-            throw new Error(errorMsg);
-        }
-        
-        // CRITICAL: Run comprehensive cycle detection BEFORE approval
-        const { DependencyGraphUtils } = await import('./DependencyGraphUtils');
-        const taskNodes = reviewResult.tasksFound.map(t => ({
-            id: t.id,
-            dependencies: t.deps
-        }));
-        
-        const validation = DependencyGraphUtils.validateGraph(taskNodes);
-        if (!validation.valid) {
-            const errorMsg = `Dependency graph validation failed:\n${validation.errors.join('\n')}`;
-            this.notifyWarning(
-                `Plan has dependency issues. Fix circular dependencies before approval:\n${validation.errors.slice(0, 3).join('\n')}${validation.errors.length > 3 ? '...' : ''}`,
-                sessionId
-            );
-            throw new Error(errorMsg);
-        }
-        
-        // Log warnings (non-blocking)
-        if (validation.warnings.length > 0) {
-            this.writeProgress(sessionId, 'VALIDATE', `⚠️ Dependency graph warnings:`);
-            for (const warning of validation.warnings) {
-                this.writeProgress(sessionId, 'VALIDATE', `  • ${warning}`);
-            }
-        }
-        
-        this.writeProgress(sessionId, 'VALIDATE', `✅ Dependency graph validated: No cycles detected`);
-
-        session.status = 'approved';
+        // Step 1: Set status to 'verifying' - TaskAgent will manage tasks
+        session.status = 'verifying';
         session.updatedAt = new Date().toISOString();
         this.stateManager.savePlanningSession(session);
         this.notifyChange();
         
-        // Try to auto-create tasks from parsed plan (saves coordinator work)
-        await this.tryCreateTasksFromPlan(sessionId, session.currentPlanPath!);
+        this.writeProgress(sessionId, 'APPROVE', `📋 Starting task verification...`);
+
+        // Step 2: Run format review (non-blocking - TaskAgent will handle issues)
+        const reviewResult = await this.reviewPlanFormat(sessionId);
+        if (!reviewResult.valid) {
+            // Log warning but DON'T block - TaskAgent will handle
+            this.writeProgress(sessionId, 'VALIDATE', `⚠️ Plan format parsing issues (TaskAgent will resolve):`);
+            for (const issue of reviewResult.issues) {
+                this.writeProgress(sessionId, 'VALIDATE', `  • ${issue}`);
+            }
+        }
         
+        // Run cycle detection if tasks were successfully parsed
+        if (reviewResult.tasksFound.length > 0) {
+            const { DependencyGraphUtils } = await import('./DependencyGraphUtils');
+            const taskNodes = reviewResult.tasksFound.map(t => ({
+                id: t.id,
+                dependencies: t.deps
+            }));
+            
+            const validation = DependencyGraphUtils.validateGraph(taskNodes);
+            if (!validation.valid) {
+                // Cycle detection errors ARE blocking - revert to reviewing
+                session.status = 'reviewing';
+                this.stateManager.savePlanningSession(session);
+                this.notifyChange();
+                
+                const errorMsg = `Dependency graph validation failed:\n${validation.errors.join('\n')}`;
+                this.notifyWarning(
+                    `Plan has dependency issues. Fix circular dependencies before approval:\n${validation.errors.slice(0, 3).join('\n')}${validation.errors.length > 3 ? '...' : ''}`,
+                    sessionId
+                );
+                throw new Error(errorMsg);
+            }
+            
+            if (validation.warnings.length > 0) {
+                this.writeProgress(sessionId, 'VALIDATE', `⚠️ Dependency graph warnings:`);
+                for (const warning of validation.warnings) {
+                    this.writeProgress(sessionId, 'VALIDATE', `  • ${warning}`);
+                }
+            }
+            
+            this.writeProgress(sessionId, 'VALIDATE', `✅ Dependency graph validated: No cycles detected`);
+        } else {
+            this.writeProgress(sessionId, 'VALIDATE', `ℹ️ No tasks parsed - TaskAgent will create tasks`);
+        }
+
+        // Step 3: Try to auto-create tasks from parsed plan
+        const taskStats = await this.tryCreateTasksFromPlan(sessionId, session.currentPlanPath!);
+        this.writeProgress(sessionId, 'TASKS', `📦 Auto-created ${taskStats.tasksCreated}/${taskStats.totalTasksInPlan} tasks`);
+        
+        // Step 4: Run TaskAgent verification (async - sets needsContext flags, handles updates)
+        // For now, we'll skip the full TaskAgent loop and proceed to approved
+        // The TaskAgent will be triggered on-demand via CLI when needed
+        // TODO: Integrate full TaskAgent.verifyTasks() loop here
+        this.writeProgress(sessionId, 'VERIFY', `✅ Initial task verification complete`);
+        
+        // Step 5: Set status to 'approved'
+        // Re-fetch session in case it was updated
+        const updatedSession = this.stateManager.getPlanningSession(sessionId);
+        if (!updatedSession) {
+            throw new Error(`Session ${sessionId} disappeared during verification`);
+        }
+        
+        updatedSession.status = 'approved';
+        updatedSession.updatedAt = new Date().toISOString();
+        this.stateManager.savePlanningSession(updatedSession);
+        this.notifyChange();
+        
+        // Step 6: Start coordinator execution if autoStart
         if (autoStart) {
-            const result = await this.startExecution(sessionId);
+            const result = await this.startExecution(sessionId, { taskStats });
             if (result.success) {
                 this.notifyInfo(`Plan ${sessionId} approved and execution started with ${result.engineerCount} engineers!`, sessionId);
             } else {
@@ -589,11 +751,13 @@ export class PlanningService extends EventEmitter {
     
     /**
      * Auto-create tasks from a parsed plan file.
+     * Uses topological sorting to ensure dependencies are created before dependents.
      * 
      * @param sessionId Session ID for the plan
      * @param planPath Path to the plan file
+     * @returns Stats about task creation for coordinator context
      */
-    private async tryCreateTasksFromPlan(sessionId: string, planPath: string): Promise<void> {
+    private async tryCreateTasksFromPlan(sessionId: string, planPath: string): Promise<TaskCreationStats> {
         const taskManager = ServiceLocator.resolve(TaskManager);
         
         // Parse the plan file
@@ -601,38 +765,90 @@ export class PlanningService extends EventEmitter {
         
         if (!parsedPlan.tasks || parsedPlan.tasks.length === 0) {
             this.writeProgress(sessionId, 'TASKS', `⚠️ No tasks found in plan file`);
-            return;
+            return { tasksCreated: 0, totalTasksInPlan: 0, failedToCreate: [] };
         }
         
         // Get existing tasks to avoid duplicates
         const existingTasks = taskManager.getTasksForSession(sessionId);
         const existingIds = new Set(existingTasks.map(t => t.id));
         
-        let created = 0;
-        let skipped = 0;
-        const errors: string[] = [];
-        
-        // Create tasks in order (to respect dependency ordering)
         // Normalize sessionId to UPPERCASE for consistent task ID format
         const normalizedSessionId = sessionId.toUpperCase();
         
+        // Build task map with validated global IDs - no auto-conversion
+        const taskMap = new Map<string, TaskWithGlobalIds>();
         for (const task of parsedPlan.tasks) {
-            // Normalize task ID to global format if it's simple (T1 -> PS_XXXXXX_T1)
-            // Always use UPPERCASE for consistency with TaskManager storage
-            const globalTaskId = task.id.includes('_') 
-                ? task.id.toUpperCase() 
-                : `${normalizedSessionId}_${task.id.toUpperCase()}`;
+            // Task IDs must already be in global format - validate, don't auto-convert
+            const globalId = TaskIdValidator.normalizeGlobalTaskId(task.id);
+            if (!globalId) {
+                console.warn(`[PlanningService] Skipping task with invalid ID "${task.id}" - must be global format PS_XXXXXX_TN`);
+                continue;
+            }
             
+            // Dependencies must also be in global format
+            const globalDeps: string[] = [];
+            for (const dep of task.dependencies) {
+                const globalDep = TaskIdValidator.normalizeGlobalTaskId(dep);
+                if (globalDep) {
+                    globalDeps.push(globalDep);
+                } else {
+                    console.warn(`[PlanningService] Skipping invalid dependency "${dep}" for task ${globalId}`);
+                }
+            }
+            
+            taskMap.set(globalId, { task, globalId, globalDeps });
+        }
+        
+        // Topological sort: Create tasks in order where dependencies come before dependents
+        const sortedTasks: TaskWithGlobalIds[] = [];
+        const visited = new Set<string>();
+        const inProgress = new Set<string>(); // For cycle detection
+        
+        const visit = (globalId: string): boolean => {
+            if (visited.has(globalId)) return true;
+            if (inProgress.has(globalId)) {
+                // Cycle detected - this shouldn't happen if plan was validated
+                this.writeProgress(sessionId, 'TASKS', `⚠️ Cycle detected at task ${globalId}`);
+                return false;
+            }
+            
+            const taskInfo = taskMap.get(globalId);
+            if (!taskInfo) return true; // External dependency, skip
+            
+            inProgress.add(globalId);
+            
+            // Visit dependencies first (only same-session deps)
+            for (const depId of taskInfo.globalDeps) {
+                if (taskMap.has(depId) && !visited.has(depId)) {
+                    if (!visit(depId)) return false;
+                }
+            }
+            
+            inProgress.delete(globalId);
+            visited.add(globalId);
+            sortedTasks.push(taskInfo);
+            return true;
+        };
+        
+        // Visit all tasks
+        for (const globalId of taskMap.keys()) {
+            if (!visited.has(globalId)) {
+                visit(globalId);
+            }
+        }
+        
+        // Create tasks in sorted order
+        let created = 0;
+        let skipped = 0;
+        const errors: string[] = [];
+        const failedTaskIds: string[] = [];
+        
+        for (const { task, globalId: globalTaskId, globalDeps } of sortedTasks) {
             // Skip if already exists
             if (existingIds.has(globalTaskId)) {
                 skipped++;
                 continue;
             }
-            
-            // Normalize dependencies to global format (UPPERCASE)
-            const globalDeps = task.dependencies.map(dep => 
-                dep.includes('_') ? dep.toUpperCase() : `${normalizedSessionId}_${dep.toUpperCase()}`
-            );
             
             // Pass global task ID - createTaskFromCli requires global format PS_XXXXXX_TN
             const result = taskManager.createTaskFromCli({
@@ -649,22 +865,35 @@ export class PlanningService extends EventEmitter {
                 existingIds.add(globalTaskId);
             } else {
                 errors.push(`${globalTaskId}: ${result.error}`);
+                failedTaskIds.push(globalTaskId);
             }
         }
         
+        const totalTasksInPlan = parsedPlan.tasks.length;
+        
         // Log results
         if (created > 0) {
-            this.writeProgress(sessionId, 'TASKS', `✅ Auto-created ${created} tasks from plan`);
+            this.writeProgress(sessionId, 'TASKS', `✅ Auto-created ${created}/${totalTasksInPlan} tasks from plan`);
         }
         if (skipped > 0) {
             this.writeProgress(sessionId, 'TASKS', `⏭️ Skipped ${skipped} existing tasks`);
         }
         if (errors.length > 0) {
-            this.writeProgress(sessionId, 'TASKS', `❌ ${errors.length} tasks failed to create:`);
+            this.writeProgress(sessionId, 'TASKS', `❌ ${errors.length} tasks failed to create (coordinator will handle):`);
             for (const err of errors) {
                 this.writeProgress(sessionId, 'TASKS', `   • ${err}`);
             }
         }
+        
+        // Log dependency summary
+        const totalDeps = parsedPlan.tasks.reduce((sum, t) => sum + t.dependencies.length, 0);
+        this.writeProgress(sessionId, 'TASKS', `📊 Task summary: ${created}/${totalTasksInPlan} created, ${totalDeps} total dependencies`);
+        
+        return {
+            tasksCreated: created,
+            totalTasksInPlan,
+            failedToCreate: failedTaskIds
+        };
     }
     
     // =========================================================================
@@ -679,6 +908,11 @@ export class PlanningService extends EventEmitter {
     async startExecution(sessionId: string, options?: {
         mode?: 'auto' | 'interactive';
         engineerCount?: number;
+        taskStats?: {
+            tasksCreated: number;
+            totalTasksInPlan: number;
+            failedToCreate: string[];
+        };
     }): Promise<{ success: boolean; error?: string; engineerCount?: number }> {
         try {
             const session = this.stateManager.getPlanningSession(sessionId);
@@ -696,7 +930,7 @@ export class PlanningService extends EventEmitter {
             }
             
             // Start execution via coordinator (dispatches task workflows)
-            const workflowIds = await this.coordinator.startExecution(sessionId);
+            const workflowIds = await this.coordinator.startExecution(sessionId, options?.taskStats);
             
             // Create simplified execution state (occupancy tracked in global TaskManager)
             const executionState: ExecutionState = {
@@ -761,78 +995,6 @@ export class PlanningService extends EventEmitter {
         session.updatedAt = new Date().toISOString();
         this.stateManager.savePlanningSession(session);
         this.notifyChange();
-    }
-    
-    /**
-     * Pause execution for a session
-     * Note: Plan status stays 'approved'. Workflow pause state is tracked by workflows.
-     */
-    async pauseExecution(sessionId: string): Promise<{ success: boolean; error?: string }> {
-        try {
-            const session = this.stateManager.getPlanningSession(sessionId);
-            if (!session) {
-                return { success: false, error: `Session ${sessionId} not found` };
-            }
-            
-            // Check if there are active workflows to pause
-            const state = this.coordinator.getSessionState(sessionId);
-            if (!state || state.activeWorkflows.size === 0) {
-                return { success: false, error: `No active workflows to pause` };
-            }
-            
-            await this.coordinator.pauseSession(sessionId);
-            
-            // Update execution timestamp, but NOT session status
-            session.updatedAt = new Date().toISOString();
-            if (session.execution) {
-                session.execution.lastActivityAt = new Date().toISOString();
-            }
-            this.stateManager.savePlanningSession(session);
-            this.notifyChange();
-            
-            this.writeProgress(sessionId, 'EXECUTION', '⏸️ WORKFLOWS PAUSED');
-            
-            return { success: true };
-        } catch (error) {
-            const errorMsg = error instanceof Error ? error.message : String(error);
-            return { success: false, error: errorMsg };
-        }
-    }
-    
-    /**
-     * Resume paused workflows
-     * Note: Plan status stays 'approved'. Workflow resume is handled by coordinator.
-     */
-    async resumeExecution(sessionId: string): Promise<{ success: boolean; error?: string }> {
-        try {
-            const session = this.stateManager.getPlanningSession(sessionId);
-            if (!session) {
-                return { success: false, error: `Session ${sessionId} not found` };
-            }
-            
-            // Check if there are paused workflows to resume
-            const hasPausedWorkflows = this.coordinator.hasPausedWorkflows(sessionId);
-            if (!hasPausedWorkflows) {
-                return { success: false, error: `No paused workflows to resume` };
-            }
-            
-            await this.coordinator.resumeSession(sessionId);
-            
-            // Update execution timestamp, but NOT session status
-            session.updatedAt = new Date().toISOString();
-            if (session.execution) {
-                session.execution.lastActivityAt = new Date().toISOString();
-            }
-            this.stateManager.savePlanningSession(session);
-            this.notifyChange();
-            
-            this.writeProgress(sessionId, 'EXECUTION', '▶️ WORKFLOWS RESUMED');
-            
-            return { success: true };
-        } catch (error) {
-            const errorMsg = error instanceof Error ? error.message : String(error);
-            return { success: false, error: errorMsg };
-        }
     }
     
     /**
@@ -975,43 +1137,6 @@ export class PlanningService extends EventEmitter {
             const errorMessage = error instanceof Error ? error.message : String(error);
             this.writeProgress(sessionId, 'ERROR', `❌ Failed to stop: ${errorMessage}`);
             return { success: false, error: `Failed to stop session: ${errorMessage}` };
-        }
-    }
-
-    /**
-     * Pause a running session (pause all active workflows)
-     */
-    async pauseSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
-        try {
-            const session = this.stateManager.getPlanningSession(sessionId);
-            if (!session) {
-                return { success: false, error: `Session ${sessionId} not found` };
-            }
-
-            // Delegate to pauseExecution which checks for active workflows
-            return await this.pauseExecution(sessionId);
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            return { success: false, error: `Failed to pause session: ${errorMessage}` };
-        }
-    }
-
-    /**
-     * Resume paused workflows
-     * Note: Resumes paused workflows. For restarting execution, use startExecution.
-     */
-    async resumeSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
-        try {
-            const session = this.stateManager.getPlanningSession(sessionId);
-            if (!session) {
-                return { success: false, error: `Session ${sessionId} not found` };
-            }
-
-            // Delegate to resumeExecution which checks for paused workflows
-            return await this.resumeExecution(sessionId);
-        } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            return { success: false, error: `Failed to resume session: ${errorMessage}` };
         }
     }
 

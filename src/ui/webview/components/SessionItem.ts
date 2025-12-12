@@ -1,7 +1,7 @@
 /**
  * Session item component - renders a single planning session with its sub-items.
  */
-import { SessionInfo, WorkflowInfo, AgentInfo } from '../types';
+import { SessionInfo, WorkflowInfo, AgentInfo, CompletedSessionSummary } from '../types';
 import { ICONS } from '../icons';
 import { escapeHtml } from '../helpers';
 import { Logger } from '../../../utils/Logger';
@@ -47,9 +47,9 @@ const WORKFLOW_TYPE_INFO: Record<string, { icon: string; class: string; label: s
 /**
  * Get plan action buttons based on session status.
  * Note: Revise/Approve buttons are now in the Plan Viewer panel.
- * Sidebar only shows Open button + status-specific actions (Stop, Restart).
+ * Sidebar only shows Open button + status-specific actions (Stop, Restart, Complete).
  */
-function getPlanButtons(status: string, hasPartialPlan?: boolean): string {
+function getPlanButtons(status: string, hasPartialPlan?: boolean, readyForCompletion?: boolean): string {
     // Planning in progress - show stop button
     if (status === 'planning') {
         return `
@@ -74,8 +74,14 @@ function getPlanButtons(status: string, hasPartialPlan?: boolean): string {
         }
         return `<button class="sub-item-btn primary" data-action="openPlan" title="Open Plan Viewer">Open</button>`;
     }
-    // Approved - show Open button (Revise is in Plan Viewer)
+    // Approved - show Open button + Complete if all tasks done
     if (status === 'approved') {
+        if (readyForCompletion) {
+            return `
+                <button class="sub-item-btn" data-action="openPlan" title="Open Plan Viewer">Open</button>
+                <button class="sub-item-btn primary" data-action="completeSession" title="Mark session as complete">Complete</button>
+            `;
+        }
         return `<button class="sub-item-btn" data-action="openPlan" title="Open Plan Viewer">Open</button>`;
     }
     // Completed
@@ -95,7 +101,7 @@ function getPlanButtons(status: string, hasPartialPlan?: boolean): string {
 
 /**
  * Get execution status and buttons based on session status.
- * Note: Workflow states (running/paused) are now shown on individual workflows, not here.
+ * Note: Workflow states (running/blocked/completed/failed) are shown on individual workflows, not here.
  */
 function getExecutionInfo(status: string, hasExecution: boolean): { buttons: string; status: string; badgeClass: string } {
     switch (status) {
@@ -141,6 +147,7 @@ function getExecutionInfo(status: string, hasExecution: boolean): { buttons: str
  */
 function getPlanBadgeClass(planStatus?: string): string {
     switch (planStatus) {
+        case 'Completed': return 'completed';
         case 'Approved': return 'approved';
         case 'Pending Review': return 'pending';
         case 'Planning...': return 'running';
@@ -200,12 +207,8 @@ function renderWorkflowItem(wf: WorkflowInfo, agents: AgentInfo[]): string {
     
     // Build workflow control buttons based on status
     const workflowActions = (() => {
-        if (wf.status === 'running') {
-            return `<button class="workflow-action-btn" data-action="pauseWorkflow" data-workflow-id="${escapeHtml(wf.id)}" title="Pause workflow">⏸</button>`;
-        } else if (wf.status === 'paused') {
-            return `<button class="workflow-action-btn" data-action="resumeWorkflow" data-workflow-id="${escapeHtml(wf.id)}" title="Resume workflow">▶</button>`;
-        } else if (wf.status === 'pending' || wf.status === 'blocked') {
-            return `<button class="workflow-action-btn danger" data-action="cancelWorkflow" data-workflow-id="${escapeHtml(wf.id)}" title="Cancel workflow">✕</button>`;
+        if (wf.status === 'running' || wf.status === 'pending' || wf.status === 'blocked') {
+            return `<button class="workflow-action-btn danger" data-action="cancelWorkflow" data-workflow-id="${escapeHtml(wf.id)}" title="Cancel workflow">${ICONS.stop}</button>`;
         }
         return '';
     })();
@@ -249,7 +252,7 @@ function renderHistoryItem(wf: WorkflowInfo): string {
         ? `${wf.taskId} ${typeInfo.shortLabel}`
         : typeInfo.label;
     
-    const statusIcon = wf.status === 'completed' 
+    const statusIcon = wf.status === 'succeeded' 
         ? '<span style="color: #10b981;">✓</span>' 
         : '<span style="color: #f14c4c;">✗</span>';
     
@@ -312,14 +315,14 @@ export function renderSessionItem(session: SessionInfo, isExpanded: boolean): st
         ? session.requirement.substring(0, 40) + '...' 
         : session.requirement;
     
-    const planButtons = getPlanButtons(session.status, session.hasPartialPlan);
+    const planButtons = getPlanButtons(session.status, session.hasPartialPlan, session.readyForCompletion);
     const hasExecution = !!(session.executionStatus || (session.activeWorkflows && session.activeWorkflows.length > 0));
     const execInfo = getExecutionInfo(session.status, hasExecution);
     const planBadgeClass = getPlanBadgeClass(session.planStatus);
     
     // Determine if session is active (has running workflows)
     const hasRunningWorkflow = session.activeWorkflows?.some(w => w.status === 'running' || w.status === 'pending') || false;
-    const isRevising = session.status === 'revising' || session.isRevising;
+    const isRevising = session.status === 'revising';  // Use session status only
     const activityClass = isRevising ? 'revising' : (hasRunningWorkflow ? 'active' : '');
     
     return `
@@ -430,5 +433,92 @@ export function renderSessionsSection(sessions: SessionInfo[], expandedSessionId
     return sessions
         .map(s => renderSessionItem(s, expandedSessionIds.has(s.id)))
         .join('');
+}
+
+/**
+ * Render a single completed session item (compact view for the collapsed list).
+ */
+function renderCompletedSessionItem(session: CompletedSessionSummary): string {
+    const truncatedReq = session.requirement.length > 35 
+        ? session.requirement.substring(0, 35) + '...' 
+        : session.requirement;
+    
+    // Format completion date
+    const completedDate = new Date(session.completedAt);
+    const dateStr = completedDate.toLocaleDateString(undefined, { 
+        month: 'short', 
+        day: 'numeric' 
+    });
+    
+    // Task progress display
+    const progressStr = session.taskProgress 
+        ? `${session.taskProgress.completed}/${session.taskProgress.total}`
+        : '';
+    
+    return `
+        <div class="completed-session-item" 
+             data-session-id="${session.id}"
+             data-plan-path="${session.planPath || ''}"
+             title="${escapeHtml(session.requirement)}">
+            <div class="completed-session-info">
+                <span class="completed-session-title">${escapeHtml(truncatedReq)}</span>
+                <span class="completed-session-meta">
+                    <span class="completed-session-date">${dateStr}</span>
+                    ${progressStr ? `<span class="completed-session-progress">${progressStr}</span>` : ''}
+                </span>
+            </div>
+            <div class="completed-session-actions">
+                <button class="completed-session-btn" data-action="openCompletedPlan" data-session-id="${session.id}" title="Open Plan">
+                    ${ICONS.document}
+                </button>
+                <button class="completed-session-btn primary" data-action="reopenSession" data-session-id="${session.id}" title="Reopen for Review">
+                    ${ICONS.refresh}
+                </button>
+            </div>
+        </div>
+    `;
+}
+
+/**
+ * Render the completed sessions section (collapsible).
+ */
+export function renderCompletedSessionsSection(
+    completedSessions: CompletedSessionSummary[], 
+    total: number,
+    isExpanded: boolean
+): string {
+    if (total === 0) {
+        return ''; // Don't show section if no completed sessions
+    }
+    
+    const sessionsHtml = completedSessions
+        .map(s => renderCompletedSessionItem(s))
+        .join('');
+    
+    const moreCount = total - completedSessions.length;
+    
+    return `
+        <div class="completed-sessions-section ${isExpanded ? 'expanded' : ''}">
+            <div class="completed-sessions-header" data-action="toggleCompletedSessions">
+                <div class="completed-sessions-expand ${isExpanded ? 'expanded' : ''}">
+                    ${ICONS.chevronRight}
+                </div>
+                <span class="completed-sessions-title">Completed</span>
+                <span class="completed-sessions-count">${total}</span>
+            </div>
+            <div class="completed-sessions-body ${isExpanded ? 'expanded' : ''}">
+                ${sessionsHtml}
+                ${moreCount > 0 ? `
+                    <button class="completed-sessions-view-all" data-action="viewAllCompletedSessions">
+                        View All (${moreCount} more)
+                    </button>
+                ` : total > 0 ? `
+                    <button class="completed-sessions-view-all" data-action="viewAllCompletedSessions">
+                        View All Details
+                    </button>
+                ` : ''}
+            </div>
+        </div>
+    `;
 }
 

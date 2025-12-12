@@ -30,7 +30,6 @@ interface ConfigData {
     workingDirectory: string;
     agentPoolSize: number;
     defaultBackend: string;
-    stateUpdateInterval: number;
     enableUnityFeatures: boolean;
     port: number;
     logLevel: string;
@@ -179,18 +178,12 @@ export class SystemSettingsPanel {
     
     /**
      * Load all system prompts from daemon or defaults
-     * Note: unity_polling is excluded - it's configured in Unity settings page
      */
     private async loadSystemPrompts(): Promise<void> {
         this.systemPrompts = [];
         
-        // Prompts to exclude from System Prompts section (they have their own UI elsewhere)
-        const excludedPrompts = ['unity_polling'];
-        
         // Build list from DefaultSystemPrompts
         for (const [id, defaults] of Object.entries(DefaultSystemPrompts)) {
-            // Skip excluded prompts
-            if (excludedPrompts.includes(id)) continue;
             
             try {
                 // Try to get customized version from daemon
@@ -203,7 +196,7 @@ export class SystemSettingsPanel {
                         name: prompt.name,
                         description: prompt.description || defaults.description || '',
                         category: prompt.category || defaults.category || 'utility',
-                        defaultModel: prompt.defaultModel || defaults.defaultModel || 'sonnet-4.5',
+                        defaultModel: prompt.defaultModel || defaults.defaultModel || 'mid',
                         promptTemplate: prompt.promptTemplate || defaults.promptTemplate || '',
                         roleIntro: prompt.roleIntro || defaults.roleIntro,
                         decisionInstructions: prompt.decisionInstructions || defaults.decisionInstructions,
@@ -216,7 +209,7 @@ export class SystemSettingsPanel {
                         name: defaults.name,
                         description: defaults.description || '',
                         category: defaults.category || 'utility',
-                        defaultModel: defaults.defaultModel || 'sonnet-4.5',
+                        defaultModel: defaults.defaultModel || 'mid',
                         promptTemplate: defaults.promptTemplate || '',
                         roleIntro: defaults.roleIntro,
                         decisionInstructions: defaults.decisionInstructions,
@@ -230,7 +223,7 @@ export class SystemSettingsPanel {
                     name: defaults.name,
                     description: defaults.description || '',
                     category: defaults.category || 'utility',
-                    defaultModel: defaults.defaultModel || 'sonnet-4.5',
+                    defaultModel: defaults.defaultModel || 'mid',
                     promptTemplate: defaults.promptTemplate || '',
                     roleIntro: defaults.roleIntro,
                     decisionInstructions: defaults.decisionInstructions,
@@ -290,7 +283,6 @@ export class SystemSettingsPanel {
             workingDirectory: '_AiDevLog',
             agentPoolSize: 10,
             defaultBackend: 'cursor',
-            stateUpdateInterval: 3000,
             enableUnityFeatures: true,
             port: 19840,
             logLevel: 'info',
@@ -442,15 +434,6 @@ export class SystemSettingsPanel {
             case 'checkCursorCliStatus':
                 await this.checkCursorCliStatus();
                 break;
-            case 'getPollingPrompt':
-                await this.getPollingPrompt();
-                break;
-            case 'savePollingPrompt':
-                await this.savePollingPrompt(message.prompt);
-                break;
-            case 'resetPollingPrompt':
-                await this.resetPollingPrompt();
-                break;
             case 'saveSystemPrompt':
                 await this.saveSystemPrompt(message.promptId, message.config);
                 break;
@@ -522,7 +505,7 @@ export class SystemSettingsPanel {
         try {
             // Convert value to proper type
             let typedValue: unknown = value;
-            if (key === 'agentPoolSize' || key === 'stateUpdateInterval' || key === 'port') {
+            if (key === 'agentPoolSize' || key === 'port') {
                 typedValue = parseInt(value as string, 10);
             } else if (key === 'enableUnityFeatures' || key === 'autoOpenTerminals') {
                 typedValue = value === 'true' || value === true;
@@ -1542,60 +1525,6 @@ export class SystemSettingsPanel {
     }
     
     // ========================================================================
-    // Unity Polling Agent Prompt Methods
-    // ========================================================================
-    
-    /**
-     * Get the Unity polling agent prompt
-     */
-    private async getPollingPrompt(): Promise<void> {
-        try {
-            const response = await this.vsCodeClient.send('prompts.getPolling', {}) as { currentPrompt?: string; defaultPrompt?: string } | undefined;
-            this.panel.webview.postMessage({
-                type: 'pollingPrompt',
-                data: {
-                    currentPrompt: response?.currentPrompt || response?.defaultPrompt || '',
-                    defaultPrompt: response?.defaultPrompt || ''
-                }
-            });
-        } catch (err) {
-            log.warn('Failed to get polling prompt:', err);
-            // Send empty data on error
-            this.panel.webview.postMessage({
-                type: 'pollingPrompt',
-                data: {
-                    currentPrompt: '',
-                    defaultPrompt: ''
-                }
-            });
-        }
-    }
-    
-    /**
-     * Save the Unity polling agent prompt
-     */
-    private async savePollingPrompt(prompt: string): Promise<void> {
-        try {
-            await this.vsCodeClient.send('prompts.updatePolling', { prompt });
-            vscode.window.showInformationMessage('Polling agent prompt saved');
-        } catch (err) {
-            vscode.window.showErrorMessage(`Failed to save polling prompt: ${err}`);
-        }
-    }
-    
-    /**
-     * Reset the Unity polling agent prompt to default
-     */
-    private async resetPollingPrompt(): Promise<void> {
-        try {
-            await this.vsCodeClient.send('prompts.resetPolling', {});
-            await this.getPollingPrompt(); // Refresh the UI
-            vscode.window.showInformationMessage('Polling agent prompt reset to default');
-        } catch (err) {
-            vscode.window.showErrorMessage(`Failed to reset polling prompt: ${err}`);
-        }
-    }
-
     /**
      * Generate the webview HTML content
      */
@@ -1605,7 +1534,6 @@ export class SystemSettingsPanel {
             workingDirectory: '_AiDevLog',
             agentPoolSize: 10,
             defaultBackend: 'cursor',
-            stateUpdateInterval: 5000,
             enableUnityFeatures: true,
             port: 19840,
             logLevel: 'info',
@@ -1636,7 +1564,7 @@ export class SystemSettingsPanel {
                 name: p.name,
                 description: p.description || '',
                 category: p.category || 'utility',
-                defaultModel: p.defaultModel || 'sonnet-4.5',
+                defaultModel: p.defaultModel || 'mid',
                 promptTemplate: p.promptTemplate || '',
                 roleIntro: p.roleIntro,
                 decisionInstructions: p.decisionInstructions
@@ -1926,27 +1854,6 @@ ${getSettingsCommonStyles()}
             <div id="general" class="tab-content active">
                 <div class="section">
                     <div class="section-header">
-                        <div class="section-title">Performance</div>
-                    </div>
-                    
-                    <div class="form-group">
-                        <label>
-                            State Update Interval (ms)
-                            <span id="stateUpdateInterval-badge" class="badge default">Default</span>
-                        </label>
-                        <input 
-                            type="number" 
-                            id="stateUpdateInterval" 
-                            min="1000"
-                            step="1000"
-                            onchange="setConfig('stateUpdateInterval', this.value)"
-                        />
-                        <div class="hint">How often the daemon updates state files (minimum 1000ms).</div>
-                    </div>
-                </div>
-                
-                <div class="section">
-                    <div class="section-header">
                         <div class="section-title">Daemon Configuration</div>
                     </div>
                     
@@ -1985,9 +1892,11 @@ ${getSettingsCommonStyles()}
                             <span id="defaultBackend-badge" class="badge default">Default</span>
                         </label>
                         <select id="defaultBackend" onchange="setConfig('defaultBackend', this.value)">
-                            <option value="cursor">Cursor (Recommended)</option>
+                            <option value="cursor">Cursor</option>
+                            <option value="claude">Claude</option>
+                            <option value="codex">Codex</option>
                         </select>
-                        <div class="hint">AI backend for agent sessions. Only Cursor is currently supported.</div>
+                        <div class="hint">AI backend for agent sessions. Each backend requires its CLI to be installed.</div>
                     </div>
                 </div>
                 
@@ -2207,29 +2116,6 @@ ${getSettingsCommonStyles()}
                     </div>
                 </div>
                 
-                <div class="section">
-                    <div class="section-header">
-                        <div class="section-title">Unity Polling Agent</div>
-                        <button class="secondary" onclick="resetPollingPrompt()" style="font-size: 0.85em;">Reset</button>
-                    </div>
-                    
-                    <p style="opacity: 0.8; margin: 0 0 12px 0; font-size: 0.9em;">
-                        Monitors Unity Editor state (compilation, play mode, errors).
-                    </p>
-                    
-                    <div class="form-group">
-                        <label for="pollingAgentPrompt">System Prompt</label>
-                        <textarea 
-                            id="pollingAgentPrompt" 
-                            rows="8"
-                            style="font-family: monospace; font-size: 0.85em;"
-                            onchange="savePollingPrompt()"
-                        ></textarea>
-                        <div class="hint">
-                            The polling agent continuously checks Unity state via MCP tools and reports status.
-                        </div>
-                    </div>
-                </div>
             </div>
             
             <!-- Folders Tab -->
@@ -2317,14 +2203,12 @@ ${getSettingsCommonStyles()}
         // Initialize UI
         function init() {
             // Set form values
-            document.getElementById('stateUpdateInterval').value = config.stateUpdateInterval ?? defaults.stateUpdateInterval;
             document.getElementById('enableUnityFeatures').checked = config.enableUnityFeatures ?? defaults.enableUnityFeatures;
             document.getElementById('port').value = config.port ?? defaults.port;
             document.getElementById('logLevel').value = config.logLevel ?? defaults.logLevel;
             document.getElementById('defaultBackend').value = config.defaultBackend ?? defaults.defaultBackend;
             
             // Update badges
-            updateBadge('stateUpdateInterval', config.stateUpdateInterval, defaults.stateUpdateInterval);
             updateBadge('enableUnityFeatures', config.enableUnityFeatures, defaults.enableUnityFeatures);
             updateBadge('port', config.port, defaults.port);
             updateBadge('logLevel', config.logLevel, defaults.logLevel);
@@ -2361,7 +2245,9 @@ ${getSettingsCommonStyles()}
             const icons = {
                 coordinator: '🎯',
                 new_plan: '📝',
-                revise_plan: '✏️'
+                revise_plan: '✏️',
+                add_task: '➕',
+                task_agent: '📋'
             };
             return icons[prompt.id] || '💬';
         }
@@ -2443,13 +2329,11 @@ ${getSettingsCommonStyles()}
                         </div>
                         
                         <div class="form-group">
-                            <label for="promptModel-\${prompt.id}">Default Model</label>
+                            <label for="promptModel-\${prompt.id}">Model Tier</label>
                             <select id="promptModel-\${prompt.id}" name="defaultModel">
-                                <option value="sonnet-4.5" \${prompt.defaultModel === 'sonnet-4.5' ? 'selected' : ''}>Claude Sonnet 4.5</option>
-                                <option value="opus-4.5" \${prompt.defaultModel === 'opus-4.5' ? 'selected' : ''}>Claude Opus 4.5</option>
-                                <option value="gemini-3-pro" \${prompt.defaultModel === 'gemini-3-pro' ? 'selected' : ''}>Gemini 3 Pro</option>
-                                <option value="haiku-3.5" \${prompt.defaultModel === 'haiku-3.5' ? 'selected' : ''}>Claude Haiku 3.5</option>
-                                <option value="gpt-5.1-codex-high" \${prompt.defaultModel === 'gpt-5.1-codex-high' ? 'selected' : ''}>GPT-5.1 Codex High</option>
+                                <option value="low" \${prompt.defaultModel === 'low' ? 'selected' : ''}>Low (Fast, cheaper - simple tasks)</option>
+                                <option value="mid" \${prompt.defaultModel === 'mid' ? 'selected' : ''}>Mid (Balanced - most tasks)</option>
+                                <option value="high" \${prompt.defaultModel === 'high' ? 'selected' : ''}>High (Most capable - complex tasks)</option>
                             </select>
                         </div>
                     </div>
@@ -2960,24 +2844,6 @@ ${getSettingsCommonStyles()}
             }
         }
         
-        // Unity Polling Agent functions
-        let pollingPromptDefault = '';
-        
-        function savePollingPrompt() {
-            const prompt = document.getElementById('pollingAgentPrompt').value;
-            vscode.postMessage({ command: 'savePollingPrompt', prompt });
-        }
-        
-        function resetPollingPrompt() {
-            document.getElementById('pollingAgentPrompt').value = pollingPromptDefault;
-            vscode.postMessage({ command: 'resetPollingPrompt' });
-        }
-        
-        function updatePollingPrompt(data) {
-            pollingPromptDefault = data.defaultPrompt || '';
-            document.getElementById('pollingAgentPrompt').value = data.currentPrompt || data.defaultPrompt || '';
-        }
-        
         // Cursor CLI functions
         function installCursorCli() {
             vscode.postMessage({ command: 'installCursorCli' });
@@ -3020,8 +2886,6 @@ ${getSettingsCommonStyles()}
                 updateCursorCliStatus(message.status);
             } else if (message.type === 'cursorAgentStatus') {
                 updateCursorAgentStatus(message.status);
-            } else if (message.type === 'pollingPrompt') {
-                updatePollingPrompt(message.data);
             } else if (message.type === 'daemon-connected') {
                 // Refresh MCP status when daemon connects
                 refreshMcpStatus();
@@ -3042,9 +2906,6 @@ ${getSettingsCommonStyles()}
         
         // Request cursor-agent status on load
         refreshCursorAgentStatus();
-        
-        // Request polling prompt on load
-        vscode.postMessage({ command: 'getPollingPrompt' });
     </script>
 </body>
 </html>`;

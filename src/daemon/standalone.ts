@@ -42,9 +42,12 @@ const log = Logger.create('Daemon', 'Standalone');
 
 /**
  * Initialize all services for standalone daemon mode
+ * @param config The core configuration
  * @param daemon The daemon instance (so we can signal when services are ready)
+ * @param skipOrphanCleanup Skip orphan cleanup (already done by caller, e.g., vscode mode)
+ * @param configLoader Optional ConfigLoader for live config updates
  */
-async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promise<ApiServices> {
+async function initializeServices(config: CoreConfig, daemon?: ApcDaemon, skipOrphanCleanup = false, configLoader?: ConfigLoader): Promise<ApiServices> {
     log.info('Initializing services...');
     log.info(`Workspace: ${config.workspaceRoot}`);
     log.info(`Working directory: _AiDevLog (standard)`);
@@ -72,18 +75,40 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
     broadcastProgress('Bootstrapping services');
     bootstrapDaemonServices();
     
-    // Kill orphan agent processes using backend abstraction
-    // Check if AgentRunner is registered (it should be after bootstrapDaemonServices)
-    if (ServiceLocator.isRegistered(AgentRunner)) {
-        log.info('Cleaning up orphan agent processes...');
-        broadcastProgress('Cleaning up orphan processes');
-        const agentRunner = ServiceLocator.resolve(AgentRunner);
-        const killedCount = await agentRunner.killOrphanAgents();
-        if (killedCount > 0) {
-            log.info(`Killed ${killedCount} orphan processes`);
-        } else {
-            log.info('No orphan processes found');
+    // Kill orphan cursor-agent processes on startup for a clean slate
+    // This ensures no stale processes from previous daemon runs interfere
+    // Skip if already done by caller (e.g., vscode mode does cleanup in start.ts)
+    if (!skipOrphanCleanup) {
+        broadcastProgress('Killing orphan cursor-agent processes');
+        try {
+            const { killOrphanCursorAgents, countCursorAgentProcesses } = await import('../utils/orphanCleanup');
+            
+            // Count processes before cleanup (excludes Cursor IDE's worker-server)
+            const beforeCount = countCursorAgentProcesses();
+            if (beforeCount > 0) {
+                log.info(`Found ${beforeCount} orphan cursor-agent processes - cleaning up...`);
+                
+                // Kill orphan processes (excludes Cursor IDE's worker-server)
+                const killedCount = await killOrphanCursorAgents(new Set(), '[DaemonStartup]');
+                
+                // Wait for processes to fully terminate
+                await new Promise(resolve => setTimeout(resolve, 300));
+                
+                // Verify cleanup
+                const afterCount = countCursorAgentProcesses();
+                if (afterCount === 0) {
+                    log.info(`✅ Cleaned up ${killedCount} orphan processes`);
+                } else {
+                    log.debug(`${afterCount} cursor-agent processes remain (likely just spawned or Cursor IDE)`);
+                }
+            } else {
+                log.info('No orphan cursor-agent processes found');
+            }
+        } catch (err) {
+            log.warn(`Orphan cleanup skipped: ${err}`);
         }
+    } else {
+        log.debug('Orphan cleanup skipped (already done by caller)');
     }
     
     // Initialize output channel manager (file-only mode for standalone)
@@ -131,6 +156,47 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
     ServiceLocator.register(AgentPoolService, () => agentPoolService);
     log.info(`AgentPoolService initialized with ${agentPoolService.getPoolStatus().total} agents`);
     
+    // Set up live config change listener for runtime config updates
+    // Track current values to detect changes
+    let currentPoolSize = agentPoolService.getPoolStatus().total;
+    let currentBackend = config.defaultBackend;
+    let currentUnityEnabled = config.enableUnityFeatures;
+    
+    if (configLoader) {
+        configLoader.onChange((newConfig) => {
+            // Handle pool size changes
+            if (newConfig.agentPoolSize !== currentPoolSize) {
+                log.info(`Pool size changed: ${currentPoolSize} -> ${newConfig.agentPoolSize}`);
+                const result = agentPoolService.resizePool(newConfig.agentPoolSize);
+                if (result.added.length > 0) {
+                    log.info(`Added agents: ${result.added.join(', ')}`);
+                }
+                if (result.removed.length > 0) {
+                    log.info(`Removed agents: ${result.removed.join(', ')}`);
+                }
+                currentPoolSize = newConfig.agentPoolSize;
+            }
+            
+            // Handle backend changes
+            if (newConfig.defaultBackend !== currentBackend) {
+                log.info(`Default backend changed: ${currentBackend} -> ${newConfig.defaultBackend}`);
+                const agentRunner = ServiceLocator.resolve(AgentRunner);
+                agentRunner.setBackend(newConfig.defaultBackend);
+                currentBackend = newConfig.defaultBackend;
+            }
+            
+            // Handle Unity features toggle
+            if (newConfig.enableUnityFeatures !== currentUnityEnabled) {
+                log.info(`Unity features ${newConfig.enableUnityFeatures ? 'enabled' : 'disabled'}`);
+                roleRegistry.setUnityEnabled(newConfig.enableUnityFeatures);
+                // Also update DependencyService
+                const dependencyService = ServiceLocator.resolve(DependencyService);
+                dependencyService.setUnityEnabled(newConfig.enableUnityFeatures);
+                currentUnityEnabled = newConfig.enableUnityFeatures;
+            }
+        });
+    }
+    
     // Initialize HeadlessTerminalManager (no-op for standalone)
     // Register with ServiceLocator so it can be cleaned up during shutdown
     const terminalManager = new HeadlessTerminalManager();
@@ -149,8 +215,43 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
         unityManager = ServiceLocator.resolve(UnityControlManager);
         unityManager.setAgentRoleRegistry(roleRegistry);
         await unityManager.initialize(config.workspaceRoot);
+        
+        // Set up direct Unity WebSocket communication callbacks
+        // These will be connected to the daemon's Unity client when it connects
+        if (daemon) {
+            daemon.setUnityClientCallbacks(
+                (clientId: string) => unityManager?.onUnityClientConnected(),
+                () => unityManager?.onUnityClientDisconnected()
+            );
+            
+            // Set up Unity event callback - routes events from Unity Bridge to UnityControlManager
+            daemon.setUnityEventCallback((eventName: string, data: any) => {
+                unityManager?.receiveUnityEvent(eventName, data);
+            });
+            
+            // Set up send/query callbacks for direct communication
+            unityManager.setUnityDirectCallbacks(
+                async (cmd: string, params?: Record<string, unknown>) => {
+                    return daemon.sendRequestToUnity(cmd, params);
+                },
+                async () => {
+                    const response = await daemon.sendRequestToUnity('unity.direct.getState');
+                    if (!response?.success) return null;
+                    return response.data as { isCompiling: boolean; isPlaying: boolean; isBusy: boolean; editorReady: boolean };
+                }
+            );
+        }
+        
         log.info('UnityControlManager initialized');
     }
+    
+    // Initialize TaskAgent with workspace root and role registry
+    broadcastProgress('Initializing TaskAgent');
+    const { TaskAgent } = await import('../services/TaskAgent');
+    const taskAgent = ServiceLocator.resolve(TaskAgent);
+    taskAgent.setWorkspaceRoot(config.workspaceRoot);
+    taskAgent.setRoleRegistry(roleRegistry);
+    log.info('TaskAgent initialized');
     
     // Register and initialize UnifiedCoordinatorService
     broadcastProgress('Initializing UnifiedCoordinatorService');
@@ -167,20 +268,20 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
     }
     
     // ==========================================================================
-    // WORKFLOW RECOVERY: Restore paused workflows from previous daemon session
+    // SESSION INITIALIZATION: Initialize active sessions and cleanup orphan agents
     // ==========================================================================
-    broadcastProgress('Recovering paused workflows');
+    broadcastProgress('Initializing sessions');
     
-    // Get all non-completed sessions and restore their paused workflows
+    // Get all non-completed sessions
     const allSessions = stateManager.getAllPlanningSessions();
     const activeSessions = allSessions.filter(s => s.status !== 'completed');
     
-    // Initialize each active session (this triggers workflow restoration)
+    // Initialize each active session
     for (const session of activeSessions) {
-        coordinator.getSessionState(session.id); // Auto-initializes and restores workflows
+        coordinator.getSessionState(session.id); // Auto-initializes session state
     }
     
-    // Collect all valid workflow IDs from restored workflows
+    // Collect all valid workflow IDs from active workflows
     const validWorkflowIds = new Set<string>();
     for (const session of activeSessions) {
         const sessionState = coordinator.getSessionState(session.id);
@@ -191,13 +292,13 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
         }
     }
     
-    // Release any agents allocated to workflows that couldn't be restored
+    // Release any agents allocated to workflows that no longer exist
     const releasedOrphans = agentPoolService.releaseOrphanAllocatedAgents(validWorkflowIds);
     if (releasedOrphans.length > 0) {
         log.info(`Released ${releasedOrphans.length} orphan agent(s) from dead workflows`);
     }
     
-    log.info(`Workflow recovery complete: ${validWorkflowIds.size} workflows active across ${activeSessions.length} sessions`);
+    log.info(`Session initialization complete: ${validWorkflowIds.size} workflows active across ${activeSessions.length} sessions`);
     // ==========================================================================
     
     // Subscribe to agent allocation events and broadcast to clients
@@ -206,17 +307,14 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
         log.debug(`onAgentAllocated: agent=${agentName}, session=${sessionId}, role=${roleId}, workflow=${workflowId}`);
         
         try {
-            // Get log file path - include workflow ID and agent name for unique temp files
-            // Guard against empty sessionId
-            const logDir = sessionId ? stateManager.getPlanFolder(sessionId) : undefined;
-            const logFile = logDir ? `${logDir}/logs/agents/${workflowId}_${agentName}.log` : undefined;
-            
+            // Note: logFile is NOT included here because it's only known when work starts.
+            // Each work assignment gets a unique log file: {workflowId}_{workCount}_{agentName}.log
+            // The agent.workStarted event (fired from workflow) includes the actual logFile.
             broadcaster.broadcast('agent.allocated', {
                 agentName,
                 sessionId,
                 roleId,
-                workflowId,
-                logFile
+                workflowId
             });
             
             // Also broadcast pool change so UI shows agent as busy
@@ -229,7 +327,7 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
                 poolStatus.total,
                 poolStatus.available,
                 allocatedAgents.map(a => ({ name: a.name, workflowId: a.workflowId, roleId: a.roleId })),
-                busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId })),
+                busyAgents.map(b => ({ name: b.name, workflowId: b.workflowId || '', roleId: b.roleId })),
                 restingAgents
             );
         } catch (e) {
@@ -245,13 +343,20 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
                     poolStatus.total,
                     poolStatus.available,
                     allocatedAgents.map(a => ({ name: a.name, workflowId: a.workflowId, roleId: a.roleId })),
-                    busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId })),
+                    busyAgents.map(b => ({ name: b.name, workflowId: b.workflowId || '', roleId: b.roleId })),
                     restingAgents
                 );
             } catch (e2) {
                 log.error(`Failed to broadcast pool.changed:`, e2);
             }
         }
+    });
+    
+    // Subscribe to agent work started events and broadcast to clients
+    // This event has the correct log file path (with work count) for terminal streaming
+    coordinator.onAgentWorkStarted((data) => {
+        log.debug(`onAgentWorkStarted: agent=${data.agentName}, task=${data.taskId}, workCount=${data.workCount}`);
+        broadcaster.broadcast('agent.workStarted', data);
     });
     
     // Subscribe to session state changes and broadcast to clients
@@ -277,7 +382,7 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             poolStatus2.total,
             poolStatus2.available,
             allocatedAgents2.map(a => ({ name: a.name, workflowId: a.workflowId, roleId: a.roleId })),
-            busyAgents2.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId })),
+            busyAgents2.map(b => ({ name: b.name, workflowId: b.workflowId || '', roleId: b.roleId })),
             restingAgents2
         );
     });
@@ -307,8 +412,8 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
     ServiceLocator.register(ScriptableWorkflowRegistry, () => scriptableRegistry);
     log.info(`ScriptableWorkflowRegistry initialized with ${scriptableRegistry.getCustomWorkflowTypes().length} custom workflows`);
     
-    // Note: Session recovery is now handled automatically by initSession() 
-    // which calls restorePausedWorkflows() for each active session
+    // Note: Session state is initialized above, no workflow recovery needed
+    // Workflows that were running when daemon shut down were cancelled
     
     // Initialize PlanningService
     const planningService = new PlanningService(stateManager, coordinator, {});
@@ -353,9 +458,21 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
     const platform = process.platform;
     const relevantDeps = depStatuses.filter(d => d.platform === platform || d.platform === 'all');
     const missingDeps = relevantDeps.filter(d => d.required && !d.installed);
-    const criticalMissing = missingDeps.filter(d => 
-        d.name.includes('Python') || d.name.includes('APC CLI')
-    );
+    
+    // Check if Unity features are enabled - MCP for Unity becomes critical
+    const unityEnabled = dependencyService.isUnityEnabled();
+    
+    const criticalMissing = missingDeps.filter(d => {
+        // Always critical: Python, APC CLI
+        if (d.name.includes('Python') || d.name.includes('APC CLI')) {
+            return true;
+        }
+        // Critical when Unity enabled: MCP for Unity
+        if (unityEnabled && (d.name === 'MCP for Unity' || d.name.includes('Unity MCP'))) {
+            return true;
+        }
+        return false;
+    });
     
     if (missingDeps.length > 0) {
         log.warn(`⚠️  Missing dependencies (${missingDeps.length}):`);
@@ -413,7 +530,10 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             getSessionTasksFilePath: (sessionId: string) => stateManager.getSessionTasksFilePath(sessionId),
             getWorkspaceRoot: () => stateManager.getWorkspaceRoot(),
             getWorkingDir: () => stateManager.getWorkingDir(),
-            getPlansDirectory: () => stateManager.getPlansDirectory()
+            getPlansDirectory: () => stateManager.getPlansDirectory(),
+            getCompletedSessionIds: () => stateManager.getCompletedSessionIds(),
+            loadSessionFromDisk: (sessionId: string) => stateManager.loadSessionFromDisk(sessionId),
+            savePlanningSession: (session: any) => stateManager.savePlanningSession(session)
         },
         agentPoolService: {
             getPoolStatus: () => agentPoolService.getPoolStatus(),
@@ -422,7 +542,7 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             getBusyAgents: () => agentPoolService.getBusyAgents().map(b => ({
                 name: b.name,
                 roleId: b.roleId,
-                coordinatorId: b.workflowId || '',
+                workflowId: b.workflowId || '',
                 sessionId: b.sessionId,
                 task: b.task
             })),
@@ -439,10 +559,6 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             getWorkflowStatus: (sessionId: string, workflowId: string) => coordinator.getWorkflowStatus(sessionId, workflowId),
             dispatchWorkflow: (sessionId: string, type: string, input: any) => coordinator.dispatchWorkflow(sessionId, type as any, input),
             cancelWorkflow: (sessionId: string, workflowId: string) => coordinator.cancelWorkflow(sessionId, workflowId),
-            pauseWorkflow: (sessionId: string, workflowId: string) => coordinator.pauseWorkflow(sessionId, workflowId),
-            resumeWorkflow: (sessionId: string, workflowId: string) => coordinator.resumeWorkflow(sessionId, workflowId),
-            pauseSession: (sessionId: string) => coordinator.pauseSession(sessionId),
-            resumeSession: (sessionId: string) => coordinator.resumeSession(sessionId),
             cancelSession: (sessionId: string) => coordinator.cancelSession(sessionId),
             startExecution: (sessionId: string) => coordinator.startExecution(sessionId),
             signalAgentCompletion: (signal: any) => coordinator.signalAgentCompletion(signal),
@@ -450,24 +566,31 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
                 coordinator.triggerCoordinatorEvaluation(sessionId, eventType as any, payload),
             updateWorkflowHistorySummary: (sessionId: string, workflowId: string, summary: string) =>
                 coordinator.updateWorkflowHistorySummary(sessionId, workflowId, summary),
-            startTaskWorkflow: (sessionId: string, taskId: string, workflowType: string) =>
-                coordinator.startTaskWorkflow(sessionId, taskId, workflowType),
+            startTaskWorkflow: (sessionId: string, taskId: string, workflowType: string, workflowInput?: Record<string, any>) =>
+                coordinator.startTaskWorkflow(sessionId, taskId, workflowType, workflowInput),
             // Stale workflow cleanup
             forceCleanupStaleWorkflows: (sessionId: string) => coordinator.forceCleanupStaleWorkflows(sessionId),
             forceCleanupAllStaleWorkflows: () => coordinator.forceCleanupAllStaleWorkflows(),
+            // Workflow event response handling
+            handleWorkflowEventResponse: (workflowId: string, eventType: string, payload: any) => 
+                coordinator.handleWorkflowEventResponse(workflowId, eventType, payload),
             // Graceful shutdown
-            gracefulShutdown: () => coordinator.gracefulShutdown()
+            gracefulShutdown: () => coordinator.gracefulShutdown(),
+            // Manual session completion
+            completeSession: (sessionId: string) => coordinator.completeSession(sessionId),
+            isSessionReadyForCompletion: (sessionId: string) => coordinator.isSessionReadyForCompletion(sessionId)
         },
         planningService: {
             listPlanningSessions: () => planningService.listPlanningSessions(),
             getPlanningStatus: (id: string) => planningService.getPlanningStatus(id),
-            startPlanning: async (prompt: string, docs?: string[]) => {
-                const result = await planningService.startPlanning(prompt, docs);
+            startPlanning: async (prompt: string, docs?: string[], complexity?: string) => {
+                const result = await planningService.startPlanning(prompt, docs, complexity);
                 // Transform to match API interface
                 return {
                     sessionId: result.sessionId,
                     status: result.status as string,
                     planPath: result.planPath,
+                    complexity: result.complexity,
                     recommendedAgents: result.recommendedAgents 
                         ? { count: result.recommendedAgents, justification: 'Auto-determined' }
                         : undefined,
@@ -478,7 +601,14 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             approvePlan: (id: string, autoStart?: boolean) => planningService.approvePlan(id, autoStart),
             cancelPlan: (id: string) => planningService.cancelPlan(id),
             restartPlanning: (id: string) => planningService.restartPlanning(id),
-            removeSession: (id: string) => planningService.removeSession(id)
+            removeSession: (id: string) => planningService.removeSession(id),
+            addTaskToPlan: (sessionId: string, taskSpec: {
+                id: string;
+                description: string;
+                dependencies?: string[];
+                engineer?: string;
+                unityPipeline?: 'none' | 'prep' | 'prep_editmode' | 'prep_playmode' | 'prep_playtest' | 'full';
+            }) => planningService.addTaskToPlan(sessionId, taskSpec)
         },
         processManager: {
             killOrphanCursorAgents: async () => {
@@ -491,34 +621,27 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
         taskManager: {
             getProgressForSession: (sessionId: string) => {
                 const tm = ServiceLocator.resolve(TaskManager);
-                const progress = tm.getProgressForSession(sessionId);
-                // Map 'paused' to 'failed' for API compatibility
-                return {
-                    completed: progress.completed,
-                    pending: progress.pending,
-                    inProgress: progress.inProgress,
-                    failed: progress.paused, // TaskManager uses 'paused', API expects 'failed'
-                    ready: progress.ready,
-                    total: progress.total
-                };
+                return tm.getProgressForSession(sessionId);
             },
             getTasksForSession: (sessionId: string) => ServiceLocator.resolve(TaskManager).getTasksForSession(sessionId),
             getTask: (globalTaskId: string) => ServiceLocator.resolve(TaskManager).getTask(globalTaskId),
             getAllTasks: () => ServiceLocator.resolve(TaskManager).getAllTasks(),
-            createTaskFromCli: (params: { sessionId: string; rawTaskId: string; description: string; dependencies?: string[]; taskType?: 'implementation' | 'error_fix'; priority?: number; errorText?: string }) => 
-                ServiceLocator.resolve(TaskManager).createTaskFromCli({
-                    ...params,
-                    taskId: params.rawTaskId
-                }),
+            createTaskFromCli: (params: { sessionId: string; taskId: string; description: string; dependencies?: string[]; taskType?: 'implementation' | 'error_fix'; priority?: number; errorText?: string; unityPipeline?: 'none' | 'prep' | 'prep_editmode' | 'prep_playmode' | 'prep_playtest' | 'full'; needsContext?: boolean }) => 
+                ServiceLocator.resolve(TaskManager).createTaskFromCli(params),
             completeTask: (globalTaskId: string, summary?: string) => ServiceLocator.resolve(TaskManager).markTaskCompletedViaCli(globalTaskId, summary),
             updateTaskStage: (globalTaskId: string, stage: string) => ServiceLocator.resolve(TaskManager).updateTaskStage(globalTaskId, stage),
-            markTaskFailed: (globalTaskId: string, reason?: string) => ServiceLocator.resolve(TaskManager).markTaskFailed(globalTaskId, reason),
+            // NOTE: markTaskFailed was removed - tasks should never be permanently abandoned
             deleteTask: (globalTaskId: string, reason?: string) => ServiceLocator.resolve(TaskManager).deleteTask(globalTaskId, reason),
             validateTaskFormat: (task: any) => ServiceLocator.resolve(TaskManager).validateTaskFormat(task),
             reloadPersistedTasks: () => ServiceLocator.resolve(TaskManager).reloadPersistedTasks(),
             getAgentAssignmentsForUI: () => ServiceLocator.resolve(TaskManager).getAgentAssignmentsForUI?.() || [],
             addDependency: (taskId: string, dependsOnId: string) => ServiceLocator.resolve(TaskManager).addDependency(taskId, dependsOnId),
-            removeDependency: (taskId: string, depId: string) => ServiceLocator.resolve(TaskManager).removeDependency(taskId, depId)
+            removeDependency: (taskId: string, depId: string) => ServiceLocator.resolve(TaskManager).removeDependency(taskId, depId),
+            updateTaskFromCli: (params) => ServiceLocator.resolve(TaskManager).updateTaskFromCli(params),
+            removeTaskFromCli: (sessionId, taskId, reason) => ServiceLocator.resolve(TaskManager).removeTaskFromCli(sessionId, taskId, reason),
+            addQuestionToTask: (taskId, question) => ServiceLocator.resolve(TaskManager).addQuestionToTask(taskId, question),
+            answerTaskQuestion: (taskId, questionId, answer) => ServiceLocator.resolve(TaskManager).answerTaskQuestion(taskId, questionId, answer),
+            getPendingQuestion: (taskId) => ServiceLocator.resolve(TaskManager).getPendingQuestion(taskId)
         },
         roleRegistry: {
             getRole: (roleId: string) => roleRegistry.getRole(roleId),
@@ -541,18 +664,18 @@ async function initializeServices(config: CoreConfig, daemon?: ApcDaemon): Promi
             getAllSystemPrompts: () => roleRegistry.getAllSystemPrompts(),
             getSystemPrompt: (id: string) => roleRegistry.getSystemPrompt(id),
             updateSystemPrompt: (config: any) => roleRegistry.updateSystemPrompt(config),
-            resetSystemPromptToDefault: (promptId: string) => roleRegistry.resetSystemPromptToDefault(promptId),
-            // Polling prompt methods
-            getPollingPrompt: () => roleRegistry.getPollingPrompt(),
-            updatePollingPrompt: (prompt: string) => roleRegistry.updatePollingPrompt(prompt),
-            resetPollingPromptToDefault: () => roleRegistry.resetPollingPromptToDefault()
+            resetSystemPromptToDefault: (promptId: string) => roleRegistry.resetSystemPromptToDefault(promptId)
         },
         // Unity manager - included when Unity features are enabled
         unityManager: unityManager ? {
             getState: () => unityManager!.getState(),
-            queueTask: (type: string, requester: any, options?: any) => 
-                unityManager!.queueTask(type as any, requester, options)
-        } : undefined
+            getUnityStatus: () => unityManager!.getUnityStatus(),
+            queuePipeline: (coordinatorId: string, operations: any[], tasksInvolved: any[], mergeEnabled: boolean) =>
+                unityManager!.queuePipeline(coordinatorId, operations, tasksInvolved, mergeEnabled)
+        } : undefined,
+        // Internal reference to daemon for Unity client management
+        // This is used by ApiHandler to access Unity client registration
+        _daemon: daemon
     };
 }
 
@@ -595,8 +718,8 @@ async function main(): Promise<void> {
         await daemon.start();
         log.info(`Daemon WebSocket server started on port ${config.port}`);
         
-        // Now initialize all services (passing daemon so it can be marked ready)
-        const services = await initializeServices(config, daemon);
+        // Now initialize all services (passing daemon and its configLoader so it can be marked ready)
+        const services = await initializeServices(config, daemon, false, daemon.getConfigLoader());
         
         // Register services with daemon
         daemon.setServices(services);

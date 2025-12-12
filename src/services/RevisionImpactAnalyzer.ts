@@ -267,21 +267,19 @@ export class RevisionImpactAnalyzer {
      * Convert ManagedTask to PlanTask format for compatibility with existing analysis logic
      */
     private static convertToPlanTask(task: any): PlanTask {
-        // Extract local task ID (remove session prefix if present)
-        const localId = task.id.includes('_') ? task.id.split('_').pop() || task.id : task.id;
+        // Use global task ID - no conversion to local/simple ID
+        const globalId = task.id.toUpperCase();
         
-        // Convert dependencies to local IDs
-        const localDeps = (task.dependencies || []).map((depId: string) => 
-            depId.includes('_') ? depId.split('_').pop() || depId : depId
-        );
+        // Keep dependencies as global IDs
+        const globalDeps = (task.dependencies || []).map((depId: string) => depId.toUpperCase());
         
         return {
-            id: localId,
+            id: globalId,
             description: task.description,
-            completed: task.status === 'completed',
-            approved: task.status === 'completed', // Completed tasks are implicitly approved
+            completed: task.status === 'succeeded',
+            approved: task.status === 'succeeded', // Succeeded tasks are implicitly approved
             engineer: task.actualAgent || 'Unassigned',
-            dependencies: localDeps
+            dependencies: globalDeps
         };
     }
     

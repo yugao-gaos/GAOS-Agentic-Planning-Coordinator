@@ -28,17 +28,20 @@ import { EventBroadcaster } from '../daemon/EventBroadcaster';
 import { PlanCache } from './PlanCache';
 import { ErrorClassifier } from './workflows/ErrorClassifier';
 import { DependencyService } from './DependencyService';
+import { TaskIdValidator } from './TaskIdValidator';
 
 // Level 1 - Depends on Level 0
 import { ProcessManager } from './ProcessManager';
 import { TaskManager } from './TaskManager';
 
 // Level 2 - Depends on Level 1
-import { CursorAgentRunner } from './CursorAgentRunner';
+// Note: Individual backend runners (CursorAgentRunner, ClaudeAgentRunner, CodexAgentRunner)
+// are registered via AgentRunner.bootstrapBackends() to keep abstraction clean
 
 // Level 3 - Depends on Level 2
 import { AgentRunner } from './AgentBackend';
 import { UnityControlManager } from './UnityControlManager';
+import { TaskAgent } from './TaskAgent';
 
 /**
  * Bootstrap all DAEMON services with the ServiceLocator
@@ -71,6 +74,7 @@ export function bootstrapDaemonServices(): void {
     ServiceLocator.register(PlanCache, () => new PlanCache());
     ServiceLocator.register(ErrorClassifier, () => new ErrorClassifier());
     ServiceLocator.register(DependencyService, () => new DependencyService());
+    ServiceLocator.register(TaskIdValidator, () => new TaskIdValidator());
 
     // ========================================================================
     // Level 1 - Depends on Level 0
@@ -80,17 +84,18 @@ export function bootstrapDaemonServices(): void {
     ServiceLocator.register(TaskManager, () => new TaskManager());
 
     // ========================================================================
-    // Level 2 - Depends on Level 1
+    // Level 2 & 3 - Agent Backend Services
     // ========================================================================
+    // All backend runners are registered via AgentRunner.bootstrapBackends()
+    // This keeps the abstraction clean - DaemonBootstrap only knows about AgentRunner
+    AgentRunner.bootstrapBackends();
     
-    ServiceLocator.register(CursorAgentRunner, () => new CursorAgentRunner());
-
     // ========================================================================
     // Level 3 - Depends on Level 2
     // ========================================================================
     
-    ServiceLocator.register(AgentRunner, () => new AgentRunner());
     ServiceLocator.register(UnityControlManager, () => new UnityControlManager());
+    ServiceLocator.register(TaskAgent, () => new TaskAgent());
 
     // ========================================================================
     // Level 4 - UnifiedCoordinatorService

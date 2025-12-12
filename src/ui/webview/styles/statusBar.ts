@@ -103,6 +103,123 @@ export const statusBarStyles = `
     font-size: 12px;
 }
 
+/* Unity status dot - matches coordinator style */
+.unity-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+}
+
+.unity-dot.idle {
+    background: var(--vscode-descriptionForeground, #6b7280);
+}
+
+.unity-dot.offline {
+    background: var(--vscode-testing-iconFailed, #f14c4c);
+}
+
+.unity-dot.compiling {
+    background: var(--vscode-charts-blue, #4d9de0);
+    animation: unity-pulse-compiling 1s infinite;
+    box-shadow: 0 0 6px rgba(77, 157, 224, 0.6);
+}
+
+.unity-dot.testing {
+    background: var(--vscode-list-warningForeground, #cca700);
+    animation: unity-pulse-testing 1.5s infinite;
+    box-shadow: 0 0 4px rgba(204, 167, 0, 0.4);
+}
+
+.unity-dot.playing {
+    background: var(--vscode-testing-iconPassed, #73c991);
+    animation: unity-pulse-playing 2s infinite;
+    box-shadow: 0 0 4px rgba(115, 201, 145, 0.4);
+}
+
+.unity-dot.running {
+    background: var(--vscode-charts-purple, #a855f7);
+    animation: unity-pulse-running 1s infinite;
+    box-shadow: 0 0 6px rgba(168, 85, 247, 0.6);
+}
+
+.unity-text {
+    font-weight: 500;
+    font-size: 12px;
+}
+
+/* Unity actions container */
+.unity-actions {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+    padding-left: 8px;
+}
+
+/* Unity pulse animations */
+@keyframes unity-pulse-compiling {
+    0%, 100% {
+        opacity: 1;
+        transform: scale(1);
+        box-shadow: 0 0 6px rgba(77, 157, 224, 0.6);
+    }
+    50% {
+        opacity: 0.8;
+        transform: scale(1.15);
+        box-shadow: 0 0 12px rgba(77, 157, 224, 0.8);
+    }
+}
+
+@keyframes unity-pulse-testing {
+    0%, 100% {
+        opacity: 1;
+        transform: scale(1);
+        box-shadow: 0 0 4px rgba(204, 167, 0, 0.4);
+    }
+    50% {
+        opacity: 0.7;
+        transform: scale(1.1);
+        box-shadow: 0 0 8px rgba(204, 167, 0, 0.6);
+    }
+}
+
+@keyframes unity-pulse-playing {
+    0%, 100% {
+        opacity: 1;
+        transform: scale(1);
+        box-shadow: 0 0 4px rgba(115, 201, 145, 0.4);
+    }
+    50% {
+        opacity: 0.8;
+        transform: scale(1.05);
+        box-shadow: 0 0 6px rgba(115, 201, 145, 0.5);
+    }
+}
+
+@keyframes unity-pulse-running {
+    0%, 100% {
+        opacity: 1;
+        transform: scale(1);
+        box-shadow: 0 0 6px rgba(168, 85, 247, 0.6);
+    }
+    50% {
+        opacity: 0.8;
+        transform: scale(1.15);
+        box-shadow: 0 0 12px rgba(168, 85, 247, 0.8);
+    }
+}
+
+/* Disabled state for coord-icon-btn */
+.coord-icon-btn.disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.coord-icon-btn.disabled:hover {
+    background: transparent;
+    border-color: var(--vscode-widget-border);
+    opacity: 0.4;
+}
+
 /* Coordinator pulse animations */
 @keyframes coordinator-pulse-subtle {
     0%, 100% {

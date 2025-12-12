@@ -11,6 +11,7 @@ import { AgentRoleRegistry } from './AgentRoleRegistry';
 import { UnityControlManager } from './UnityControlManager';
 import { OutputChannelManager } from './OutputChannelManager';
 import { ServiceLocator } from './ServiceLocator';
+import { TaskIdValidator } from './TaskIdValidator';
 import { Logger } from '../utils/Logger';
 
 const log = Logger.create('Daemon', 'Coordinator');
@@ -35,6 +36,7 @@ import {
     WorkflowSummary,
     CompletedWorkflowSummary,
     TaskImplementationInput,
+    ContextGatheringInput,
     RevisionState,
     AgentCompletionSignal
 } from '../types/workflow';
@@ -44,7 +46,6 @@ import { EventBroadcaster } from '../daemon/EventBroadcaster';
 import { CoordinatorAgent, CoordinatorStatus } from './CoordinatorAgent';
 import { CoordinatorContext } from './CoordinatorContext';
 import { getMemoryMonitor } from './MemoryMonitor';
-import { WorkflowHistoryService } from './WorkflowHistoryService';
 import {
     CoordinatorEvent,
     CoordinatorEventType,
@@ -64,7 +65,7 @@ import {
 interface ArchivedWorkflow {
     id: string;
     type: WorkflowType;
-    status: 'completed' | 'failed' | 'cancelled';
+    status: 'succeeded' | 'failed' | 'cancelled';
     taskId?: string;
     startedAt: string;
     completedAt: string;
@@ -91,9 +92,8 @@ interface SessionState {
     workflowDisposables: Map<string, Array<{ dispose: () => void }>>;
     
     // === Revision State Tracking ===
-    // Used when planning_revision workflow pauses other workflows
-    isRevising: boolean;
-    pausedForRevision: string[];  // Workflow IDs paused during revision
+    // Note: Revision status is tracked via session.status === 'revising'
+    // and pausedSessions map - no separate isRevising flag needed
     revisionState?: RevisionState;
     
     // === Workflow-Task Mapping ===
@@ -130,7 +130,7 @@ export interface DispatchOptions {
  * - Session initialization and workflow tracking
  * - Workflow dispatch with dependency checking
  * - Agent allocation queue (priority-based)
- * - Revision handling (pause task dispatch, run revision, resume)
+ * - Revision handling (cancel conflicting workflows, run revision)
  * - Event routing to UI
  * 
  * Obtain via ServiceLocator:
@@ -151,7 +151,6 @@ export class UnifiedCoordinatorService {
     /** Unity Control Manager - only available when Unity features are enabled */
     private unityManager: UnityControlManager | undefined;
     private outputManager: OutputChannelManager;
-    private historyService: WorkflowHistoryService;
     
     /** Whether Unity features are enabled */
     private unityEnabled: boolean = true;
@@ -165,6 +164,10 @@ export class UnifiedCoordinatorService {
     // Lock to prevent duplicate workflow starts (race condition protection)
     // Key: globalTaskId -> Set prevents parallel startTaskWorkflow calls on same task
     private workflowStartLocks: Set<string> = new Set();
+    
+    // Sessions with paused coordinator evaluations
+    // Used during plan modification to prevent stale task dispatch
+    private pausedSessions: Map<string, { reason: string; pausedAt: string }> = new Map();
     
     // Agent CLI completion signals
     // Key: `${workflowId}_${stage}` -> resolve function
@@ -188,6 +191,17 @@ export class UnifiedCoordinatorService {
     private readonly _onAgentAllocated = new TypedEventEmitter<{ agentName: string; sessionId: string; roleId: string; workflowId: string }>();
     readonly onAgentAllocated = this._onAgentAllocated.event;
     
+    private readonly _onAgentWorkStarted = new TypedEventEmitter<{
+        agentName: string;
+        sessionId: string;
+        roleId: string;
+        workflowId: string;
+        taskId: string;
+        workCount: number;
+        logFile: string;
+    }>();
+    readonly onAgentWorkStarted = this._onAgentWorkStarted.event;
+    
     private readonly _onCoordinatorStatusChanged = new TypedEventEmitter<CoordinatorStatus>();
     readonly onCoordinatorStatusChanged = this._onCoordinatorStatusChanged.event;
     
@@ -210,9 +224,6 @@ export class UnifiedCoordinatorService {
         // Unity manager will be set via setUnityEnabled() when Unity features are enabled
         this.unityManager = undefined;
         this.outputManager = ServiceLocator.resolve(OutputChannelManager);
-        
-        // Initialize workflow history service
-        this.historyService = new WorkflowHistoryService(this.stateManager.getWorkspaceRoot());
         
         // Create workflow registry with all built-in types
         this.workflowRegistry = createWorkflowRegistry();
@@ -363,6 +374,63 @@ export class UnifiedCoordinatorService {
         return this.unityEnabled;
     }
     
+    // =========================================================================
+    // COORDINATOR PAUSE/RESUME (for plan modification)
+    // =========================================================================
+    
+    /**
+     * Pause coordinator evaluations for a session.
+     * 
+     * Used during plan modification (revision, adding tasks) to prevent
+     * the coordinator from dispatching workflows based on stale plan state.
+     * 
+     * @param sessionId The session to pause
+     * @param reason Human-readable reason for pausing
+     */
+    pauseEvaluations(sessionId: string, reason: string): void {
+        this.pausedSessions.set(sessionId, {
+            reason,
+            pausedAt: new Date().toISOString()
+        });
+        this.log(`⏸️  Paused coordinator evaluations for ${sessionId}: ${reason}`);
+    }
+    
+    /**
+     * Resume coordinator evaluations for a session.
+     * 
+     * Called after plan modification is complete to allow normal task dispatch.
+     * 
+     * @param sessionId The session to resume
+     */
+    resumeEvaluations(sessionId: string): void {
+        const pauseInfo = this.pausedSessions.get(sessionId);
+        if (pauseInfo) {
+            this.pausedSessions.delete(sessionId);
+            const duration = Date.now() - new Date(pauseInfo.pausedAt).getTime();
+            this.log(`▶️  Resumed coordinator evaluations for ${sessionId} (was paused ${Math.round(duration / 1000)}s for: ${pauseInfo.reason})`);
+        }
+    }
+    
+    /**
+     * Check if coordinator evaluations are paused for a session.
+     * 
+     * @param sessionId The session to check
+     * @returns true if evaluations are paused
+     */
+    isSessionPaused(sessionId: string): boolean {
+        return this.pausedSessions.has(sessionId);
+    }
+    
+    /**
+     * Get pause information for a session.
+     * 
+     * @param sessionId The session to check
+     * @returns Pause info or undefined if not paused
+     */
+    getSessionPauseInfo(sessionId: string): { reason: string; pausedAt: string } | undefined {
+        return this.pausedSessions.get(sessionId);
+    }
+    
     /**
      * Get the current coordinator status for UI display
      */
@@ -411,10 +479,6 @@ export class UnifiedCoordinatorService {
             // Event listener disposables for cleanup
             workflowDisposables: new Map(),
             
-            // Revision state tracking
-            isRevising: false,
-            pausedForRevision: [],
-            
             // Workflow-task mapping
             workflowToTaskMap: new Map(),
             
@@ -429,123 +493,7 @@ export class UnifiedCoordinatorService {
         if (savedWorkflowHistory.length > 0) historyInfo.push(`${savedWorkflowHistory.length} workflow`);
         this.log(`Session initialized: ${sessionId}${historyInfo.length > 0 ? ` (loaded ${historyInfo.join(', ')} history entries)` : ''}`);
         
-        // Restore any paused workflows from disk
-        this.restorePausedWorkflows(sessionId);
-        
         this._onSessionStateChanged.fire(sessionId);
-    }
-    
-    /**
-     * Restore paused workflows from tasks after daemon restart
-     * 
-     * This reads activeWorkflow from tasks (single source of truth) and recreates
-     * workflow objects in memory, putting them in a paused state ready to be resumed.
-     * 
-     * No duplicate/orphan detection needed - tasks own their workflow state.
-     */
-    private restorePausedWorkflows(sessionId: string): void {
-        const taskManager = ServiceLocator.resolve(TaskManager);
-        const tasksWithWorkflows = taskManager.getTasksWithActiveWorkflows(sessionId);
-        
-        if (tasksWithWorkflows.length === 0) {
-            return;
-        }
-        
-        this.log(`Restoring ${tasksWithWorkflows.length} paused workflow(s) for session ${sessionId}`);
-        
-        const state = this.sessions.get(sessionId);
-        if (!state) return;
-        
-        let restored = 0;
-        let failed = 0;
-        let orphansCleared = 0;
-        
-        for (const task of tasksWithWorkflows) {
-            const activeWorkflow = task.activeWorkflow!;
-            // Use task's own sessionId for reliable prefix stripping (handles case differences)
-            const taskId = task.id.replace(`${task.sessionId}_`, '');
-            
-            // Skip if task is completed/failed (shouldn't have activeWorkflow, but clean up if so)
-            if (task.status === 'completed' || task.status === 'failed') {
-                this.log(`  🗑️ Clearing orphan activeWorkflow for ${task.status} task ${taskId}`);
-                taskManager.clearActiveWorkflow(task.id);
-                
-                // Release any allocated agents
-                if (activeWorkflow.allocatedAgents?.length > 0) {
-                    this.agentPoolService.releaseAgents(activeWorkflow.allocatedAgents);
-                    this.log(`    Released ${activeWorkflow.allocatedAgents.length} orphan agent(s)`);
-                }
-                
-                orphansCleared++;
-                continue;
-            }
-            
-            try {
-                // Recreate the workflow using the saved input and type
-                const workflowType = activeWorkflow.type as WorkflowType;
-                
-                // Create workflow config with the original ID
-                const config: WorkflowConfig = {
-                    id: activeWorkflow.id,
-                    type: workflowType,
-                    sessionId,
-                    priority: activeWorkflow.priority,
-                    input: activeWorkflow.workflowInput
-                };
-                
-                // Get workflow services
-                const services: WorkflowServices = {
-                    stateManager: this.stateManager,
-                    agentPoolService: this.agentPoolService,
-                    roleRegistry: this.roleRegistry,
-                    unityManager: this.unityManager,
-                    outputManager: this.outputManager,
-                    unityEnabled: this.unityEnabled
-                };
-                
-                // Create the workflow instance
-                const workflow = this.workflowRegistry.create(workflowType, config, services);
-                
-                // Restore its phase position
-                workflow.restoreFromSavedState({
-                    phaseIndex: activeWorkflow.phaseIndex,
-                    phaseName: activeWorkflow.phaseName,
-                    filesModified: activeWorkflow.continuationContext?.filesModified || [],
-                    continuationContext: activeWorkflow.continuationContext ? {
-                        phaseName: activeWorkflow.phaseName,
-                        partialOutput: activeWorkflow.continuationContext.partialOutput || '',
-                        filesModified: activeWorkflow.continuationContext.filesModified || [],
-                        whatWasDone: activeWorkflow.continuationContext.whatWasDone || ''
-                    } : undefined
-                });
-                
-                // Subscribe to workflow events
-                this.subscribeToWorkflow(workflow, sessionId);
-                
-                // Track workflow in session state
-                state.workflows.set(activeWorkflow.id, workflow);
-                state.workflowToTaskMap.set(activeWorkflow.id, taskId);
-                
-                this.log(`  Restored workflow ${activeWorkflow.id.substring(0, 8)} (${workflowType}) for task ${taskId} at phase ${activeWorkflow.phaseIndex} (${activeWorkflow.phaseName})`);
-                this.log(`    Allocated agents: ${activeWorkflow.allocatedAgents?.join(', ') || 'none'}`);
-                
-                restored++;
-                
-            } catch (error) {
-                const errorMsg = error instanceof Error ? error.message : String(error);
-                this.log(`  Failed to restore workflow ${activeWorkflow.id} for task ${taskId}: ${errorMsg}`);
-                
-                // Clear the failed workflow state from task
-                taskManager.clearActiveWorkflow(task.id);
-                failed++;
-            }
-        }
-        
-        if (restored > 0 || failed > 0 || orphansCleared > 0) {
-            this.log(`  Restoration complete: ${restored} restored, ${failed} failed, ${orphansCleared} orphans cleared`);
-        }
-        
-        state.updatedAt = new Date().toISOString();
     }
     
     /**
@@ -569,9 +517,7 @@ export class UnifiedCoordinatorService {
                         activeWorkflows: new Map(),
                         pendingWorkflows: [],
                         completedWorkflows: [],
-                        workflowHistory: savedWorkflowHistory,
-                        isRevising: false,
-                        pausedForRevision: []
+                        workflowHistory: savedWorkflowHistory
                     };
                 }
             }
@@ -583,8 +529,8 @@ export class UnifiedCoordinatorService {
         const activeWorkflows = new Map<string, WorkflowProgress>();
         for (const [id, workflow] of state.workflows) {
             const status = workflow.getStatus();
-            // Only include running/pending/paused workflows - exclude completed/cancelled/failed
-            if (status !== 'completed' && status !== 'cancelled' && status !== 'failed') {
+            // Only include running/pending/blocked workflows - exclude succeeded/cancelled/failed
+            if (status !== 'succeeded' && status !== 'cancelled' && status !== 'failed') {
                 activeWorkflows.set(id, workflow.getProgress());
             }
         }
@@ -595,8 +541,6 @@ export class UnifiedCoordinatorService {
             pendingWorkflows: state.pendingWorkflowIds,
             completedWorkflows: state.completedWorkflowIds,
             workflowHistory: state.workflowHistory,
-            isRevising: state.isRevising,
-            pausedForRevision: state.pausedForRevision,
             revisionState: state.revisionState
         };
     }
@@ -624,20 +568,6 @@ export class UnifiedCoordinatorService {
         return summaries;
     }
     
-    /**
-     * Check if a session has any paused workflows
-     */
-    hasPausedWorkflows(sessionId: string): boolean {
-        const state = this.sessions.get(sessionId);
-        if (!state) return false;
-        
-        for (const workflow of state.workflows.values()) {
-            if (workflow.getStatus() === 'paused') {
-                return true;
-            }
-        }
-        return false;
-    }
     
     /**
      * Check if a session has any active (running/pending) workflows
@@ -665,7 +595,7 @@ export class UnifiedCoordinatorService {
      * Task occupancy/conflict is handled generically:
      * - Workflows declare occupancy via onTaskOccupancyDeclared
      * - Workflows declare conflicts via onTaskConflictDeclared
-     * - Coordinator handles pause/resume based on conflict resolution strategy
+     * - Coordinator cancels conflicting workflows based on resolution strategy
      * 
      * @returns Workflow ID
      */
@@ -715,28 +645,29 @@ export class UnifiedCoordinatorService {
         if (type === 'task_implementation') {
             const taskInput = input as TaskImplementationInput;
             
-            // STRICT: Validate taskId is global format PS_XXXXXX_TN
-            const globalMatch = taskInput.taskId.match(/^(ps_\d{6})_([^_]+)$/i);
-            if (!globalMatch) {
-                throw new Error(
-                    `Invalid taskId "${taskInput.taskId}": Must be global format PS_XXXXXX_TN. ` +
-                    `Simple IDs like "T1" are not accepted.`
-                );
+            // STRICT: Validate taskId is global format PS_XXXXXX_TN (using TaskIdValidator)
+            const taskResult = TaskIdValidator.validateGlobalTaskId(taskInput.taskId);
+            if (!taskResult.valid) {
+                throw new Error(taskResult.error!);
             }
             
-            // Normalize to UPPERCASE
-            const globalTaskId = `${globalMatch[1].toUpperCase()}_${globalMatch[2].toUpperCase()}`;
+            const globalTaskId = taskResult.normalizedId!;
             state.workflowToTaskMap.set(config.id, globalTaskId);  // Store normalized global ID
             
-            // Initialize activeWorkflow in TaskManager (single source of truth for workflow state)
+            // Mark task as in_progress in TaskManager
             const taskManager = ServiceLocator.resolve(TaskManager);
-            taskManager.initializeActiveWorkflow(
-                globalTaskId,
-                config.id,
-                type,
-                input,
-                options.priority ?? 10
-            );
+            taskManager.startWorkflowOnTask(globalTaskId, config.id);
+        } else if (type === 'context_gathering') {
+            // context_gathering workflows can optionally be associated with a task
+            const contextInput = input as ContextGatheringInput;
+            if (contextInput.taskId) {
+                // Validate taskId is global format PS_XXXXXX_TN (using TaskIdValidator)
+                const normalizedTaskId = TaskIdValidator.normalizeGlobalTaskId(contextInput.taskId);
+                if (normalizedTaskId) {
+                    state.workflowToTaskMap.set(config.id, normalizedTaskId);
+                    this.log(`context_gathering workflow associated with task ${normalizedTaskId}`);
+                }
+            }
         }
         
         this.log(`Dispatched workflow: ${type} (${config.id}) for session ${sessionId}`);
@@ -754,22 +685,19 @@ export class UnifiedCoordinatorService {
      * @param sessionId - The planning session
      * @param taskId - The task ID (must be global format PS_XXXXXX_TN)
      * @param workflowType - The workflow type to run
+     * @param workflowInput - Optional additional input (e.g., targets for context_gathering)
      * @returns Workflow ID
      */
-    async startTaskWorkflow(sessionId: string, taskId: string, workflowType: string): Promise<string> {
+    async startTaskWorkflow(sessionId: string, taskId: string, workflowType: string, workflowInput?: Record<string, any>): Promise<string> {
         const taskManager = ServiceLocator.resolve(TaskManager);
         
-        // STRICT: Validate taskId is global format PS_XXXXXX_TN
-        const globalMatch = taskId.match(/^(ps_\d{6})_([^_]+)$/i);
-        if (!globalMatch) {
-            throw new Error(
-                `Invalid taskId "${taskId}": Must be global format PS_XXXXXX_TN ` +
-                `(e.g., "${sessionId.toUpperCase()}_T1"). Simple IDs like "T1" are not accepted.`
-            );
+        // STRICT: Validate taskId is global format PS_XXXXXX_TN (using TaskIdValidator)
+        const taskResult = TaskIdValidator.validateGlobalTaskId(taskId);
+        if (!taskResult.valid) {
+            throw new Error(taskResult.error!);
         }
         
-        // Normalize to UPPERCASE
-        const globalTaskId = `${globalMatch[1].toUpperCase()}_${globalMatch[2].toUpperCase()}`;
+        const globalTaskId = taskResult.normalizedId!;
         
         // LOCK: Prevent concurrent workflow starts on same task (race condition protection)
         if (this.workflowStartLocks.has(globalTaskId)) {
@@ -783,7 +711,7 @@ export class UnifiedCoordinatorService {
         this.workflowStartLocks.add(globalTaskId);
         
         try {
-            return await this._startTaskWorkflowImpl(sessionId, taskId, workflowType, globalTaskId, taskManager);
+            return await this._startTaskWorkflowImpl(sessionId, taskId, workflowType, globalTaskId, taskManager, workflowInput);
         } finally {
             // Always release lock
             this.workflowStartLocks.delete(globalTaskId);
@@ -798,7 +726,8 @@ export class UnifiedCoordinatorService {
         taskId: string, 
         workflowType: string, 
         globalTaskId: string,
-        taskManager: TaskManager
+        taskManager: TaskManager,
+        workflowInput?: Record<string, any>
     ): Promise<string> {
         // VALIDATION: Only start workflows for approved plans
         const session = this.stateManager.getPlanningSession(sessionId);
@@ -816,22 +745,21 @@ export class UnifiedCoordinatorService {
         }
         
         // VALIDATION: Prevent duplicate workflows on same task
-        // A task can only have ONE active workflow at a time (enforced by activeWorkflow field)
-        if (task.activeWorkflow) {
-            // Task has an active workflow - check if it's still in memory
-            const state = this.sessions.get(sessionId);
-            const existingWorkflow = state?.workflows.get(task.activeWorkflow.id);
-            if (existingWorkflow) {
-                const status = existingWorkflow.getStatus();
-                throw new Error(
-                    `Task ${taskId} already has an active workflow (${task.activeWorkflow.id}, status: ${status}). ` +
-                    `Wait for it to complete before starting a new one. ` +
-                    `Use 'apc task status --session ${sessionId} --task ${taskId}' to check current status.`
-                );
-            } else {
-                // Workflow not in memory - might be stale reference, clear it
-                this.log(`Clearing stale activeWorkflow reference for task ${taskId}`);
-                taskManager.clearActiveWorkflow(globalTaskId);
+        // Check if task already has an active workflow in memory
+        const state = this.sessions.get(sessionId);
+        if (state) {
+            for (const [existingWfId, existingWf] of state.workflows) {
+                const existingTaskId = state.workflowToTaskMap.get(existingWfId);
+                if (existingTaskId?.toUpperCase() === globalTaskId.toUpperCase()) {
+                    const status = existingWf.getStatus();
+                    if (status !== 'succeeded' && status !== 'failed' && status !== 'cancelled') {
+                        throw new Error(
+                            `Task ${taskId} already has an active workflow (${existingWfId}, status: ${status}). ` +
+                            `Wait for it to complete before starting a new one. ` +
+                            `Use 'apc task status --session ${sessionId} --task ${taskId}' to check current status.`
+                        );
+                    }
+                }
             }
         }
         
@@ -843,7 +771,7 @@ export class UnifiedCoordinatorService {
             // This workflow requires all dependencies to be complete
             const unmetDeps = task.dependencies.filter(depId => {
                 const depTask = taskManager.getTask(depId);
-                return !depTask || depTask.status !== 'completed';
+                return !depTask || depTask.status !== 'succeeded';
             });
             
             if (unmetDeps.length > 0) {
@@ -876,6 +804,38 @@ export class UnifiedCoordinatorService {
                 previousAttempts: task.previousAttempts || 0,
                 previousFixSummary: task.previousFixSummary
             };
+        } else if (workflowType === 'context_gathering') {
+            // context_gathering requires specific input (targets, focusAreas, depth)
+            // Can be provided via --input parameter OR derived from task.targetFiles
+            if (workflowInput && workflowInput.targets) {
+                // Use provided input, ensure taskId is set
+                input = {
+                    ...workflowInput,
+                    taskId
+                };
+                this.log(`context_gathering using provided input with ${workflowInput.targets.length} target(s)`);
+            } else if (task.targetFiles && task.targetFiles.length > 0) {
+                // Use task.targetFiles as targets (if stored during task creation)
+                input = {
+                    targets: task.targetFiles,
+                    taskId,
+                    depth: 'shallow',
+                    focusAreas: [task.description]
+                };
+                this.log(`context_gathering using task.targetFiles as targets: ${task.targetFiles.join(', ')}`);
+            } else {
+                // No input provided and no targetFiles - error with guidance
+                throw new Error(
+                    `Cannot start 'context_gathering' workflow: No targets specified.\n\n` +
+                    `Option 1: Provide --input with targets:\n` +
+                    `apc task start --session ${sessionId} --id ${taskId} --workflow context_gathering --input '{\n` +
+                    `  "targets": ["path/to/analyze"],\n` +
+                    `  "depth": "shallow"\n` +
+                    `}'\n\n` +
+                    `Option 2: Use workflow dispatch directly:\n` +
+                    `apc workflow dispatch ${sessionId} context_gathering --input '{"targets": [...], "taskId": "${taskId}"}'`
+                );
+            }
         } else {
             input = {
                 taskId,
@@ -888,7 +848,17 @@ export class UnifiedCoordinatorService {
         taskManager.markTaskInProgress(globalTaskId);
         
         // Dispatch the workflow
-        return this.dispatchWorkflow(sessionId, workflowType as WorkflowType, input);
+        const workflowId = await this.dispatchWorkflow(sessionId, workflowType as WorkflowType, input);
+        
+        // Add workflow to task's history (for gating logic)
+        taskManager.addWorkflowToTaskHistory(globalTaskId, {
+            workflowId,
+            workflowType: workflowType as 'context_gathering' | 'task_implementation' | 'error_resolution',
+            status: 'running',
+            startedAt: new Date().toISOString()
+        });
+        
+        return workflowId;
     }
     
     /**
@@ -900,7 +870,11 @@ export class UnifiedCoordinatorService {
      * 3. Decide which workflows to dispatch for which tasks
      * 4. Potentially ask user for clarification if needed
      */
-    async startExecution(sessionId: string): Promise<string[]> {
+    async startExecution(sessionId: string, taskStats?: {
+        tasksCreated: number;
+        totalTasksInPlan: number;
+        failedToCreate: string[];
+    }): Promise<string[]> {
         const taskManager = ServiceLocator.resolve(TaskManager);
         
         // Initialize session state if needed
@@ -922,7 +896,10 @@ export class UnifiedCoordinatorService {
                 {
                     type: 'execution_started',
                     planPath: '',
-                    taskCount: errorTasks.length
+                    taskCount: errorTasks.length,
+                    tasksCreated: errorTasks.length,
+                    totalTasksInPlan: errorTasks.length,
+                    failedToCreate: []
                 } as ExecutionStartedPayload
             );
             
@@ -944,28 +921,35 @@ export class UnifiedCoordinatorService {
         session.updatedAt = new Date().toISOString();
         this.stateManager.savePlanningSession(session);
         
+        // Calculate task stats if not provided
+        const stats = taskStats || { tasksCreated: 0, totalTasksInPlan: 0, failedToCreate: [] };
+        const existingTasks = taskManager.getTasksForSession(sessionId);
+        
         this.log(`Starting execution for session ${sessionId}`);
         this.log(`Plan path: ${session.currentPlanPath}`);
+        this.log(`Task stats: ${stats.tasksCreated}/${stats.totalTasksInPlan} auto-created, ${stats.failedToCreate.length} failed`);
         
         // Trigger AI Coordinator to:
-        // 1. Read and understand the plan (via read_file tool)
-        // 2. Create tasks via CLI: apc task create --session ... --id ... --desc ...
-        // 3. Start workflows via CLI: apc task start --session ... --id ... --workflow ...
+        // 1. Check ready tasks and start workflows
+        // 2. Handle awaiting_decision tasks
+        // Note: Task creation is now handled by TaskAgent during plan approval
         const decision = await this.triggerCoordinatorEvaluation(
             sessionId,
             'execution_started',
             {
                 type: 'execution_started',
                 planPath: session.currentPlanPath,
-                taskCount: 0  // Tasks don't exist yet - coordinator creates them
+                taskCount: existingTasks.length,
+                tasksCreated: stats.tasksCreated,
+                totalTasksInPlan: stats.totalTasksInPlan,
+                failedToCreate: stats.failedToCreate
             } as ExecutionStartedPayload
         );
         
-        // NOTE: The Coordinator AI now executes CLI commands directly via run_terminal_cmd
-        // e.g., run_terminal_cmd("apc task create --session ps_000001 --id ps_000001_T1 --desc ...")
-        // No parsing/execution needed here - AI handles it directly
+        // NOTE: Coordinator dispatches workflows via run_terminal_cmd
+        // Task creation is handled by TaskAgent during plan approval (status: 'verifying')
         
-        // Return empty - tasks are created via CLI by the coordinator
+        // Return empty - workflows are started via CLI by the coordinator
         return [];
     }
     
@@ -973,59 +957,6 @@ export class UnifiedCoordinatorService {
     // =========================================================================
     // WORKFLOW LIFECYCLE
     // =========================================================================
-    
-    /**
-     * Pause all workflows in a session
-     * Note: Session status is NOT changed. Workflow pause state is tracked by workflows.
-     */
-    async pauseSession(sessionId: string): Promise<void> {
-        const state = this.sessions.get(sessionId);
-        if (!state) return;
-        
-        this.log(`Pausing session: ${sessionId}`);
-        
-        for (const workflow of state.workflows.values()) {
-            const status = workflow.getStatus();
-            if (status === 'running' || status === 'pending') {
-                await workflow.pause();
-            }
-        }
-        
-        // Update timestamp only (status stays unchanged - workflow states tracked separately)
-        const session = this.stateManager.getPlanningSession(sessionId);
-        if (session) {
-            session.updatedAt = new Date().toISOString();
-            this.stateManager.savePlanningSession(session);
-        }
-        
-        this._onSessionStateChanged.fire(sessionId);
-    }
-    
-    /**
-     * Resume all paused workflows in a session
-     * Note: Session status is NOT changed. Workflow resume is handled by individual workflows.
-     */
-    async resumeSession(sessionId: string): Promise<void> {
-        const state = this.sessions.get(sessionId);
-        if (!state) return;
-        
-        this.log(`Resuming session: ${sessionId}`);
-        
-        for (const workflow of state.workflows.values()) {
-            if (workflow.getStatus() === 'paused') {
-                await workflow.resume();
-            }
-        }
-        
-        // Update timestamp only (status stays unchanged - workflow states tracked separately)
-        const session = this.stateManager.getPlanningSession(sessionId);
-        if (session) {
-            session.updatedAt = new Date().toISOString();
-            this.stateManager.savePlanningSession(session);
-        }
-        
-        this._onSessionStateChanged.fire(sessionId);
-    }
     
     /**
      * Cancel all workflows in a session
@@ -1054,7 +985,7 @@ export class UnifiedCoordinatorService {
         if (state) {
             for (const workflow of state.workflows.values()) {
                 const status = workflow.getStatus();
-                if (status !== 'completed' && status !== 'cancelled' && status !== 'failed') {
+                if (status !== 'succeeded' && status !== 'cancelled' && status !== 'failed') {
                     await workflow.cancel();
                 }
             }
@@ -1080,7 +1011,7 @@ export class UnifiedCoordinatorService {
                         poolStatus.total,
                         poolStatus.available,
                         allocatedAgents.map(a => ({ name: a.name, workflowId: a.workflowId, roleId: a.roleId })),
-                        busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId })),
+                        busyAgents.map(b => ({ name: b.name, workflowId: b.workflowId || '', roleId: b.roleId })),
                         restingAgents
                     );
                 } catch (e) {
@@ -1127,33 +1058,71 @@ export class UnifiedCoordinatorService {
         const workflow = state.workflows.get(workflowId);
         if (workflow) {
             await workflow.cancel();
+            
+            // Update workflow status in task's history
+            const taskId = state.workflowToTaskMap.get(workflowId);
+            if (taskId) {
+                const taskManager = ServiceLocator.resolve(TaskManager);
+                taskManager.updateWorkflowInTaskHistory(taskId, workflowId, 'cancelled');
+            }
         }
     }
     
     /**
-     * Pause a specific workflow
+     * Cancel all active workflows for a specific task and move them to history.
+     * Called when a task becomes completed to ensure no orphaned workflows remain.
+     * 
+     * @param sessionId The session ID
+     * @param taskId The global task ID (e.g., PS_000001_T2)
+     * @returns Number of workflows cancelled
      */
-    async pauseWorkflow(sessionId: string, workflowId: string): Promise<void> {
+    async cancelWorkflowsForTask(sessionId: string, taskId: string): Promise<number> {
         const state = this.sessions.get(sessionId);
-        if (!state) return;
+        if (!state) return 0;
         
-        const workflow = state.workflows.get(workflowId);
-        if (workflow) {
-            await workflow.pause();
+        // Validate and normalize using TaskIdValidator (single source of truth)
+        const normalizedTaskId = TaskIdValidator.normalizeGlobalTaskId(taskId);
+        if (!normalizedTaskId) {
+            this.log(`cancelWorkflowsForTask: Invalid taskId "${taskId}"`);
+            return 0;
         }
-    }
-    
-    /**
-     * Resume a paused workflow
-     */
-    async resumeWorkflow(sessionId: string, workflowId: string): Promise<void> {
-        const state = this.sessions.get(sessionId);
-        if (!state) return;
         
-        const workflow = state.workflows.get(workflowId);
-        if (workflow) {
-            await workflow.resume();
+        let cancelledCount = 0;
+        
+        // Find all workflows for this task
+        const workflowsToCancel: string[] = [];
+        for (const [workflowId, mappedTaskId] of state.workflowToTaskMap.entries()) {
+            // mappedTaskId should already be normalized, but compare safely
+            if (mappedTaskId === normalizedTaskId) {
+                workflowsToCancel.push(workflowId);
+            }
         }
+        
+        if (workflowsToCancel.length === 0) {
+            return 0;
+        }
+        
+        this.log(`Cancelling ${workflowsToCancel.length} workflow(s) for completed task ${normalizedTaskId}`);
+        
+        // Cancel each workflow
+        for (const workflowId of workflowsToCancel) {
+            const workflow = state.workflows.get(workflowId);
+            if (workflow) {
+                const status = workflow.getStatus();
+                // Only cancel if not already finished
+                if (status !== 'succeeded' && status !== 'cancelled' && status !== 'failed') {
+                    this.log(`  ⏹️ Cancelling workflow ${workflowId.substring(0, 8)} (status: ${status})`);
+                    await workflow.cancel();
+                    cancelledCount++;
+                }
+            }
+        }
+        
+        if (cancelledCount > 0) {
+            this._onSessionStateChanged.fire(sessionId);
+        }
+        
+        return cancelledCount;
     }
     
     /**
@@ -1238,7 +1207,7 @@ export class UnifiedCoordinatorService {
                 poolStatus.total,
                 poolStatus.available,
                 allocatedAgents.map(a => ({ name: a.name, workflowId: a.workflowId, roleId: a.roleId })),
-                busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId })),
+                busyAgents.map(b => ({ name: b.name, workflowId: b.workflowId || '', roleId: b.roleId })),
                 restingAgents
             );
             log.debug(`pool.changed broadcast complete`);
@@ -1294,7 +1263,7 @@ export class UnifiedCoordinatorService {
                 poolStatus.total,
                 poolStatus.available,
                 allocatedAgents.map(a => ({ name: a.name, workflowId: a.workflowId, roleId: a.roleId })),
-                busyAgents.map(b => ({ name: b.name, coordinatorId: b.workflowId || '', roleId: b.roleId })),
+                busyAgents.map(b => ({ name: b.name, workflowId: b.workflowId || '', roleId: b.roleId })),
                 restingAgents
             );
         } catch (e) {
@@ -1303,6 +1272,55 @@ export class UnifiedCoordinatorService {
         
         // Note: We don't trigger coordinator evaluation here because the agent is still
         // allocated to the session and may be needed again soon (e.g., for plan revision loop)
+    }
+    
+    /**
+     * Handle workflow events (for UI interaction like review requests)
+     * Broadcasts the event to connected clients
+     */
+    private handleWorkflowEvent(
+        sessionId: string, 
+        workflowId: string, 
+        eventType: string, 
+        payload?: any
+    ): void {
+        this.log(`Workflow ${workflowId} emitted event: ${eventType}`);
+        
+        try {
+            const broadcaster = ServiceLocator.resolve(EventBroadcaster);
+            broadcaster.broadcast('workflow.event', {
+                workflowId,
+                sessionId,
+                eventType,
+                payload,
+                timestamp: new Date().toISOString()
+            });
+        } catch (e) {
+            log.error(`Failed to broadcast workflow.event:`, e);
+        }
+    }
+    
+    /**
+     * Handle workflow event response from a client
+     * Routes the response to the appropriate workflow
+     */
+    public handleWorkflowEventResponse(
+        workflowId: string, 
+        eventType: string, 
+        payload: any
+    ): void {
+        this.log(`Received workflow event response: ${eventType} for workflow ${workflowId}`);
+        
+        // Find the workflow
+        for (const state of this.sessions.values()) {
+            const workflow = state.workflows.get(workflowId);
+            if (workflow) {
+                (workflow as any).handleWorkflowEventResponse?.(eventType, payload);
+                return;
+            }
+        }
+        
+        log.warn(`Workflow ${workflowId} not found for event response: ${eventType}`);
     }
     
     /**
@@ -1453,37 +1471,38 @@ export class UnifiedCoordinatorService {
         this.log(`   🔒 Occupied: ${occupiedTasks.map(o => `${o.taskId}→${o.occupyingWorkflowId.substring(0,8)}`).join(', ')}`);
         
         switch (resolution) {
-            case 'pause_others': {
-                const workflowsToPause = [...new Set(occupiedTasks.map(o => o.occupyingWorkflowId))];
-                for (const otherWorkflowId of workflowsToPause) {
+            case 'cancel_others': {
+                const workflowsToCancel = [...new Set(occupiedTasks.map(o => o.occupyingWorkflowId))];
+                for (const otherWorkflowId of workflowsToCancel) {
                     const workflow = state.workflows.get(otherWorkflowId);
                     const status = workflow?.getStatus();
                     if (workflow && (status === 'running' || status === 'blocked' || status === 'pending')) {
-                        await workflow.pause({ force: true });
-                        state.pausedForRevision.push(otherWorkflowId);
-                        this.log(`   ⏸️  Force-paused ${otherWorkflowId.substring(0, 8)}`);
+                        await workflow.cancel();
+                        this.log(`   ❌ Cancelled ${otherWorkflowId.substring(0, 8)}`);
                         
                         const taskId = state.workflowToTaskMap.get(otherWorkflowId);
                         if (taskId) {
-                            // Normalize to UPPERCASE for consistency with TaskManager storage
-                            taskManager.updateTaskStage(`${sessionId.toUpperCase()}_${taskId.toUpperCase()}`, 'deferred', 'Paused due to conflict');
+                            // Reset task to pending so coordinator can re-dispatch later
+                            taskManager.updateTaskStage(taskId.toUpperCase(), 'pending', 'Cancelled due to conflict');
                         }
                     }
                 }
-                state.isRevising = true;
+                // Note: Session status is already 'revising' (set by PlanningService)
+                // and pauseEvaluations() was called - no separate flag needed
                 break;
             }
             
             case 'wait_for_others': {
+                // Register waiting and cancel the current workflow - coordinator will re-dispatch later
                 taskManager.registerWaitingForConflicts(
                     workflowId,
                     taskIds,
                     [...new Set(occupiedTasks.map(o => o.occupyingWorkflowId))]
                 );
                 const workflow = state.workflows.get(workflowId);
-                const status = workflow?.getStatus();
-                if (workflow && (status === 'running' || status === 'pending')) {
-                    await workflow.pause();
+                if (workflow) {
+                    await workflow.cancel();
+                    this.log(`   ❌ Cancelled ${workflowId.substring(0, 8)} (waiting for others)`);
                 }
                 break;
             }
@@ -1501,30 +1520,6 @@ export class UnifiedCoordinatorService {
         state.updatedAt = new Date().toISOString();
         this._onSessionStateChanged.fire(sessionId);
     }
-    
-    /**
-     * Resume workflows waiting for released tasks
-     */
-    private async resumeWaitingWorkflows(sessionId: string, releasedTaskIds: string[]): Promise<void> {
-        const state = this.sessions.get(sessionId);
-        if (!state) return;
-        
-        const taskManager = ServiceLocator.resolve(TaskManager);
-        const waitingWorkflows = taskManager.getWaitingWorkflows();
-        const canProceed = taskManager.checkWaitingWorkflows(releasedTaskIds);
-        
-        for (const workflowId of canProceed) {
-            const workflow = state.workflows.get(workflowId);
-            const waitInfo = waitingWorkflows.get(workflowId);
-            
-            if (workflow?.getStatus() === 'paused' && waitInfo) {
-                workflow.onConflictsResolved?.(waitInfo.conflictingTaskIds);
-                await workflow.resume();
-                this.log(`   ▶️  Resumed ${workflowId.substring(0, 8)}`);
-            }
-        }
-    }
-    
     
     // =========================================================================
     // INTERNAL HELPERS
@@ -1567,17 +1562,27 @@ export class UnifiedCoordinatorService {
             this.handleAgentDemotedToBench(agentName);
         }));
         
+        // Workflow events (for UI interaction like review requests)
+        disposables.push(workflow.onWorkflowEvent.event((data) => {
+            this.handleWorkflowEvent(sessionId, workflow.id, data.eventType, data.payload);
+        }));
+        
+        // Agent work started - forward to subscribers (for terminal streaming with correct log file)
+        disposables.push(workflow.onAgentWorkStarted.event((data) => {
+            this._onAgentWorkStarted.fire(data);
+        }));
+        
         // Task occupancy declared - inline delegation to TaskManager
         disposables.push(workflow.onTaskOccupancyDeclared.event((occupancy) => {
             const taskManager = ServiceLocator.resolve(TaskManager);
             taskManager.declareTaskOccupancy(workflow.id, occupancy.taskIds, occupancy.type, occupancy.reason);
         }));
         
-        // Task occupancy released - inline delegation + resume waiting workflows
+        // Task occupancy released - inline delegation
         disposables.push(workflow.onTaskOccupancyReleased.event((taskIds) => {
             const taskManager = ServiceLocator.resolve(TaskManager);
             taskManager.releaseTaskOccupancy(workflow.id, taskIds);
-            this.resumeWaitingWorkflows(sessionId, taskIds);
+            // Coordinator will re-evaluate and dispatch workflows for freed tasks
         }));
         
         // Task conflicts declared - complex handling
@@ -1704,7 +1709,7 @@ export class UnifiedCoordinatorService {
         const historySummary: CompletedWorkflowSummary = {
             id: workflowId,
             type: workflow?.type || 'unknown',
-            status: result.success ? 'completed' : 'failed',
+            status: result.success ? 'succeeded' : 'failed',
             taskId,
             startedAt: workflow?.getProgress().startedAt || state.createdAt,
             completedAt: new Date().toISOString(),
@@ -1733,18 +1738,39 @@ export class UnifiedCoordinatorService {
         this.log(`Workflow ${workflowId.substring(0,8)} completed: ${result.success ? 'SUCCESS' : 'FAILED'}`);
         
         // Get task manager and global task ID (normalized to UPPERCASE)
+        // NOTE: taskId from workflowToTaskMap is ALREADY the full global ID (e.g., PS_000001_T2)
+        // Do NOT prefix with sessionId again - that would create invalid IDs like PS_000001_PS_000001_T2
         const taskManager = ServiceLocator.resolve(TaskManager);
-        const globalTaskId = taskId ? `${sessionId.toUpperCase()}_${taskId.toUpperCase()}` : undefined;
+        const globalTaskId = taskId?.toUpperCase();
         
-        // Clear the task's active workflow and set to awaiting_decision
+        // Mark task as awaiting_decision
         // The coordinator will decide what to do next (another workflow, mark complete, etc.)
         if (globalTaskId) {
-            taskManager.clearActiveWorkflow(globalTaskId);
-            taskManager.markTaskAwaitingDecision(globalTaskId);
-            
-            if (!result.success) {
-                // Record failure attempt on the task
-                taskManager.recordTaskFailure(globalTaskId, result.error || 'Unknown error');
+            // Check if task was marked as orphaned (removed from plan during revision)
+            // If so, delete it now that the workflow has completed
+            if (taskManager.isTaskOrphaned(globalTaskId)) {
+                this.log(`🗑️  Cleaning up orphaned task ${globalTaskId} (workflow completed)`);
+                taskManager.deleteTask(globalTaskId, 'Orphaned task - workflow completed after plan revision');
+            } else {
+                taskManager.markTaskAwaitingDecision(globalTaskId);
+                
+                // Update workflow status in task's history
+                taskManager.updateWorkflowInTaskHistory(
+                    globalTaskId, 
+                    workflowId, 
+                    result.success ? 'succeeded' : 'failed',
+                    result.error
+                );
+                
+                if (!result.success) {
+                    // Record failure attempt on the task
+                    taskManager.recordTaskFailure(globalTaskId, result.error || 'Unknown error');
+                }
+                
+                // If context_gathering completed successfully, save the context path to the task
+                if (workflow?.type === 'context_gathering' && result.success && result.output?.contextPath) {
+                    taskManager.setTaskContextPath(globalTaskId, result.output.contextPath);
+                }
             }
         }
         
@@ -1777,38 +1803,17 @@ export class UnifiedCoordinatorService {
             log.warn(`Failed to broadcast workflow.completed:`, e);
         }
         
-        // Save workflow to persistent history
-        try {
-            await this.historyService.saveWorkflow({
-                id: workflowId,
-                sessionId,
-                type: workflow?.type || 'unknown',
-                status: result.success ? 'completed' : 'failed',
-                taskId,
-                startedAt: workflow?.getProgress().startedAt || state.createdAt,
-                completedAt: new Date().toISOString(),
-                duration: result.duration || 0,
-                success: result.success,
-                output: result.output,
-                error: result.error
-            });
-        } catch (e) {
-            this.log(`Failed to save workflow history: ${e}`);
-        }
-        
-        // Handle revision workflow completion (cleanup legacy state)
+        // Handle revision workflow completion
         // Note: workflow variable already declared above
         if (workflow?.type === 'planning_revision') {
-            state.isRevising = false;
             state.revisionState = undefined;
-            this.log(`Revision complete, resuming paused workflows`);
-            
-            // Resume any workflows that were paused for revision
-            this.resumePendingWorkflows(sessionId);
+            this.log(`Revision complete, coordinator will dispatch new workflows for remaining tasks`);
+            // Session status will be updated to 'reviewing' by the workflow
+            // resumeEvaluations() is called by the workflow in finalize phase
         }
         
-        // Check if all workflows are complete
-        this.checkSessionCompletion(sessionId);
+        // NOTE: Sessions are NOT auto-completed when workflows finish.
+        // Users must manually complete sessions via the UI.
         
         // Clean up old completed workflows to prevent memory growth
         this.cleanupCompletedWorkflows(sessionId);
@@ -1866,101 +1871,20 @@ export class UnifiedCoordinatorService {
     }
     
     /**
-     * Resume pending workflows after revision
-     * 
-     * Workflows that were paused because their tasks were affected will resume.
-     * Workflows for tasks that were REMOVED by the revision will be cancelled.
+     * Check if all workflows and tasks in a session are complete.
+     * NOTE: This does NOT auto-complete sessions. It only checks readiness.
+     * Users must manually complete sessions via the UI.
+     * @returns true if all workflows and tasks are complete
      */
-    private async resumePendingWorkflows(sessionId: string): Promise<void> {
+    isSessionReadyForCompletion(sessionId: string): boolean {
         const state = this.sessions.get(sessionId);
-        if (!state) return;
+        if (!state) return false;
         
-        // Get current task IDs from TaskManager (not legacy plan parsing)
-        // In the new architecture, tasks are created via CLI by the coordinator
-        const taskManager = ServiceLocator.resolve(TaskManager);
-        const currentTasks = taskManager.getTasksForSession(sessionId);
-        const currentTaskIds = new Set<string>(
-            // Use task's own sessionId for reliable prefix stripping (handles case differences)
-            currentTasks.map(t => t.id.replace(`${t.sessionId}_`, ''))
-        );
-        
-        this.log(`\n📋 Resuming workflows after revision (${state.pausedForRevision.length} paused, ${currentTaskIds.size} tasks in TaskManager)`);
-        
-        // Resume or cancel paused workflows based on whether their tasks still exist
-        for (const workflowId of state.pausedForRevision) {
-            const workflow = state.workflows.get(workflowId);
-            if (!workflow || workflow.getStatus() !== 'paused') continue;
-            
-            const taskId = state.workflowToTaskMap.get(workflowId);
-            
-            if (taskId && currentTaskIds.has(taskId)) {
-                // Task still exists - resume the workflow
-                await workflow.resume();
-                this.log(`   ▶️  Resumed workflow for task ${taskId}`);
-                
-                // Sync task stage with global TaskManager - back to implementing
-                // Normalize to UPPERCASE for consistency with TaskManager storage
-                const taskManager = ServiceLocator.resolve(TaskManager);
-                taskManager.updateTaskStage(`${sessionId.toUpperCase()}_${taskId.toUpperCase()}`, 'implementing', 'Resumed after revision');
-            } else if (taskId) {
-                // Task was removed by revision - cancel the workflow
-                await workflow.cancel();
-                this.log(`   ❌ Cancelled workflow for removed task ${taskId}`);
-                
-                // Task was removed, no need to update stage
-            } else {
-                // Unknown task - resume to be safe
-                await workflow.resume();
-                this.log(`   ▶️  Resumed workflow ${workflowId} (unknown task)`);
-            }
-        }
-        
-        state.pausedForRevision = [];
-        
-        // Clear revision state
-        state.revisionState = undefined;
-        
-        // Re-dispatch any pending workflows for tasks that still exist
-        const pendingToDispatch = [...state.pendingWorkflowIds];
-        state.pendingWorkflowIds = [];
-        
-        this.log(`   📤 Re-dispatching ${pendingToDispatch.length} pending workflows`);
-        
-        for (const pendingId of pendingToDispatch) {
-            const taskId = state.workflowToTaskMap.get(pendingId);
-            
-            if (taskId && !currentTaskIds.has(taskId)) {
-                // Task was removed - don't dispatch
-                this.log(`   ⏭️  Skipping removed task ${taskId}`);
-                continue;
-            }
-            
-            // Re-dispatch happens via AI Coordinator's next evaluation cycle
-            // when it detects ready tasks without active workflows
-            this.log(`   📋 Task ${taskId || pendingId} ready for next dispatch cycle`);
-        }
-        
-        this._onSessionStateChanged.fire(sessionId);
-    }
-    
-    /**
-     * Check if all workflows in a session are complete
-     */
-    private checkSessionCompletion(sessionId: string): void {
-        const state = this.sessions.get(sessionId);
-        if (!state) return;
-        
-        // Don't auto-complete sessions that are still in planning/review states
-        // Only 'approved' sessions (execution started) can become 'completed'
         const session = this.stateManager.getPlanningSession(sessionId);
-        if (!session) return;
+        if (!session) return false;
         
-        const planningStates: string[] = ['no_plan', 'planning', 'reviewing', 'revising'];
-        if (planningStates.includes(session.status)) {
-            // Session is still in planning phase - don't auto-complete
-            // The session needs to go through approval -> execution flow
-            return;
-        }
+        // Only approved sessions can be completed
+        if (session.status !== 'approved') return false;
         
         const taskManager = ServiceLocator.resolve(TaskManager);
         
@@ -1968,7 +1892,7 @@ export class UnifiedCoordinatorService {
         let allWorkflowsComplete = true;
         for (const workflow of state.workflows.values()) {
             const status = workflow.getStatus();
-            if (status !== 'completed' && status !== 'cancelled' && status !== 'failed') {
+            if (status !== 'succeeded' && status !== 'cancelled' && status !== 'failed') {
                 allWorkflowsComplete = false;
                 break;
             }
@@ -1982,28 +1906,46 @@ export class UnifiedCoordinatorService {
             taskProgress.ready === 0
         );
         
-        // Only mark complete if:
-        // 1. Session is approved (execution was started)
-        // 2. All workflows are done
-        // 3. All tasks are done (and there were tasks to begin with)
-        const isSessionComplete = (
-            session.status === 'approved' &&
-            allWorkflowsComplete && 
-            allTasksComplete && 
-            taskProgress.total > 0
-        );
-        
-        if (isSessionComplete) {
-            session.status = 'completed';
-            session.updatedAt = new Date().toISOString();
-            this.stateManager.savePlanningSession(session);
-            this.log(`Session ${sessionId} completed (workflows: ${state.workflows.size} done, tasks: ${taskProgress.completed}/${taskProgress.total} complete)`);
-            
-            // Clean up TaskManager (but don't unregister ERROR_RESOLUTION - it lives forever)
-            if (sessionId !== ERROR_RESOLUTION_SESSION_ID) {
-                taskManager.unregisterSession(sessionId);
-            }
+        // Ready for completion if all workflows and tasks are done
+        return allWorkflowsComplete && allTasksComplete && taskProgress.total > 0;
+    }
+    
+    /**
+     * Manually complete a session.
+     * Called by user from the UI when all tasks are done.
+     */
+    completeSession(sessionId: string): { success: boolean; error?: string } {
+        const state = this.sessions.get(sessionId);
+        if (!state) {
+            return { success: false, error: `Session ${sessionId} not found` };
         }
+        
+        const session = this.stateManager.getPlanningSession(sessionId);
+        if (!session) {
+            return { success: false, error: `Session ${sessionId} not found in state manager` };
+        }
+        
+        // Must be in approved state
+        if (session.status !== 'approved') {
+            return { success: false, error: `Session must be approved to complete (current: ${session.status})` };
+        }
+        
+        const taskManager = ServiceLocator.resolve(TaskManager);
+        const taskProgress = taskManager.getProgressForSession(sessionId);
+        
+        // Mark session as completed
+        session.status = 'completed';
+        session.updatedAt = new Date().toISOString();
+        this.stateManager.savePlanningSession(session);
+        this.log(`Session ${sessionId} manually completed (workflows: ${state.workflows.size}, tasks: ${taskProgress.completed}/${taskProgress.total})`);
+        
+        // Clean up TaskManager (but don't unregister ERROR_RESOLUTION - it lives forever)
+        if (sessionId !== ERROR_RESOLUTION_SESSION_ID) {
+            taskManager.unregisterSession(sessionId);
+        }
+        
+        this._onSessionStateChanged.fire(sessionId);
+        return { success: true };
     }
     
     /**
@@ -2023,7 +1965,7 @@ export class UnifiedCoordinatorService {
         
         for (const [workflowId, workflow] of state.workflows) {
             const status = workflow.getStatus();
-            if (status === 'completed' || status === 'cancelled' || status === 'failed') {
+            if (status === 'succeeded' || status === 'cancelled' || status === 'failed') {
                 // Check age - only cleanup if completed more than 5 minutes ago
                 // This keeps recent completions available for inspection
                 const progress = workflow.getProgress();
@@ -2034,7 +1976,7 @@ export class UnifiedCoordinatorService {
                     const archived: ArchivedWorkflow = {
                         id: workflowId,
                         type: workflow.type,
-                        status: workflow.getStatus() as 'completed' | 'failed' | 'cancelled',
+                        status: workflow.getStatus() as 'succeeded' | 'failed' | 'cancelled',
                         taskId: workflow.getProgress().taskId,
                         startedAt: workflow.getProgress().startedAt,
                         completedAt: workflow.getProgress().updatedAt,
@@ -2089,12 +2031,20 @@ export class UnifiedCoordinatorService {
      * and evaluation. Decisions are executed asynchronously via callback.
      * 
      * IMPORTANT: Only triggers for approved sessions to prevent executing unapproved plans.
+     * Skips evaluation if session is paused (during plan modification).
      */
     async triggerCoordinatorEvaluation(
         sessionId: string,
         eventType: CoordinatorEventType,
         payload: any
     ): Promise<CoordinatorDecision | null> {
+        // Check if session is paused (plan modification in progress)
+        const pauseInfo = this.pausedSessions.get(sessionId);
+        if (pauseInfo) {
+            this.log(`Skipping coordinator evaluation: session ${sessionId} is paused (${pauseInfo.reason})`);
+            return null;
+        }
+        
         // Verify session is approved before triggering coordinator
         const session = this.stateManager.getPlanningSession(sessionId);
         if (!session) {
@@ -2182,9 +2132,7 @@ export class UnifiedCoordinatorService {
             decision: {
                 dispatchCount: 0,  // AI dispatches directly
                 dispatchedTasks: [],
-                askedUser: false,
-                pausedCount: 0,
-                resumedCount: 0,
+                cancelledCount: 0,
                 reasoning: truncatedReasoning
             }
         };
@@ -2330,7 +2278,7 @@ export class UnifiedCoordinatorService {
     /**
      * Cancel a pending completion signal wait
      * 
-     * Called when a workflow is cancelled or paused before receiving signal.
+     * Called when a workflow is cancelled before receiving signal.
      * 
      * @param workflowId The workflow ID
      * @param stage The stage (optional - cancels all if not specified)
@@ -2449,61 +2397,53 @@ export class UnifiedCoordinatorService {
     // =========================================================================
     
     /**
-     * Graceful shutdown - pauses all workflows (saving state) and releases agents
+     * Graceful shutdown - cancels all active workflows and releases agents
      * 
-     * Call this before stopping the daemon to ensure workflows can be resumed on restart.
-     * Unlike dispose(), this preserves workflow state for recovery.
+     * Call this before stopping the daemon. Active workflows will need to be restarted
+     * manually on next daemon start.
      * 
-     * @returns Number of workflows paused and agents released
+     * @returns Number of workflows cancelled and agents released
      */
-    async gracefulShutdown(): Promise<{ workflowsPaused: number; agentsReleased: number }> {
+    async gracefulShutdown(): Promise<{ workflowsCancelled: number; agentsReleased: number }> {
         this.log('Initiating graceful shutdown...');
         
-        let workflowsPaused = 0;
+        let workflowsCancelled = 0;
         let agentsReleased = 0;
         
-        // Pause all active workflows in all sessions
-        // Each workflow persists its own state via BaseWorkflow.persistState()
+        // Cancel all active workflows in all sessions
         for (const [sessionId, state] of this.sessions) {
             this.log(`  Shutting down session ${sessionId}...`);
             
             for (const [workflowId, workflow] of state.workflows) {
                 const status = workflow.getStatus();
                 
-                // Only pause running or pending workflows (paused are already saved)
+                // Cancel all non-terminal workflows
                 if (status === 'running' || status === 'pending' || status === 'blocked') {
                     try {
                         const progress = workflow.getProgress();
                         
-                        // Pause with daemon_shutdown reason - this persists state
-                        await workflow.pause({ 
-                            force: true,  // Force-kill any running agent
-                            reason: 'daemon_shutdown' 
-                        });
+                        await workflow.cancel();
                         
-                        workflowsPaused++;
-                        this.log(`    ⏸️  Paused workflow ${workflowId.substring(0, 12)} (${progress.type}) at phase ${progress.phaseIndex}`);
+                        workflowsCancelled++;
+                        this.log(`    ❌ Cancelled workflow ${workflowId.substring(0, 12)} (${progress.type}) at phase ${progress.phaseIndex}`);
                         
                     } catch (e) {
-                        this.log(`    ⚠️  Failed to pause workflow ${workflowId}: ${e}`);
+                        this.log(`    ⚠️  Failed to cancel workflow ${workflowId}: ${e}`);
                     }
                 }
             }
         }
         
-        // Note: We do NOT release agents here - they remain allocated to their workflows
-        // On daemon restart, workflows are restored and agents stay allocated
-        // If a workflow fails to restore, orphan cleanup will release its agents
-        
-        // Count agents that will remain allocated
+        // Release all allocated agents
         const allocatedAgents = this.agentPoolService.getAllocatedAgents();
         const busyAgents = this.agentPoolService.getBusyAgents();
-        agentsReleased = 0; // We don't release agents anymore - they stay with their workflows
+        agentsReleased = allocatedAgents.length + busyAgents.length;
         
-        this.log(`Graceful shutdown complete: ${workflowsPaused} workflows paused`);
-        this.log(`  Agents preserved: ${allocatedAgents.length} allocated, ${busyAgents.length} busy (will be validated on restart)`);
+        this.agentPoolService.releaseAgents([...allocatedAgents.map(a => a.name), ...busyAgents.map(a => a.name)]);
         
-        return { workflowsPaused, agentsReleased };
+        this.log(`Graceful shutdown complete: ${workflowsCancelled} workflows cancelled, ${agentsReleased} agents released`);
+        
+        return { workflowsCancelled, agentsReleased };
     }
     
     /**

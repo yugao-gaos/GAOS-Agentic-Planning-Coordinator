@@ -4,6 +4,7 @@ import { DaemonStateProxy } from '../services/DaemonStateProxy';
 import { ROLE_WORKFLOW_MAP } from '../types/constants';
 import { ServiceLocator } from '../services/ServiceLocator';
 import { Logger } from '../utils/Logger';
+import { focusUnityEditor } from '../utils/windowFocus';
 import { PlanViewerPanel } from './PlanViewerPanel';
 
 const log = Logger.create('Client', 'SidebarView');
@@ -13,6 +14,7 @@ import {
     getSidebarHtml,
     buildClientState,
     renderSessionsSection,
+    renderCompletedSessionsSection,
     renderAgentGrid,
     SidebarState,
     SessionInfo,
@@ -21,6 +23,7 @@ import {
     WorkflowInfo,
     CoordinatorStatusInfo,
     ConnectionHealthInfo,
+    CompletedSessionSummary,
 } from './webview';
 
 export class SidebarViewProvider implements vscode.WebviewViewProvider {
@@ -39,6 +42,9 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
     
     /** Track active workflow IDs to prevent stale queries */
     private trackedWorkflows: Set<string> = new Set();
+    
+    /** Track if completed sessions section is expanded */
+    private completedSessionsExpanded: boolean = false;
     
     /** Track initialization progress */
     private initializationStep: string = 'Starting...';
@@ -356,14 +362,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 case 'startExecution':
                     vscode.commands.executeCommand('agenticPlanning.startExecution', { session: { id: data.sessionId } });
                     break;
-                case 'pauseExecution':
-                    vscode.commands.executeCommand('agenticPlanning.pauseExecution', { session: { id: data.sessionId } });
-                    break;
                 case 'stopExecution':
                     vscode.commands.executeCommand('agenticPlanning.stopExecution', { session: { id: data.sessionId } });
-                    break;
-                case 'resumeExecution':
-                    vscode.commands.executeCommand('agenticPlanning.resumeExecution', { session: { id: data.sessionId } });
                     break;
                 case 'approvePlan':
                     vscode.commands.executeCommand('agenticPlanning.approvePlan', { session: { id: data.sessionId } });
@@ -377,29 +377,14 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 case 'restartPlanning':
                     vscode.commands.executeCommand('agenticPlanning.restartPlanning', { session: { id: data.sessionId } });
                     break;
+                case 'completeSession':
+                    vscode.commands.executeCommand('agenticPlanning.completeSession', { session: { id: data.sessionId } });
+                    break;
                 case 'removeSession':
                     vscode.commands.executeCommand('agenticPlanning.removePlanningSession', { session: { id: data.sessionId } });
                     break;
                 case 'releaseAgent':
                     vscode.commands.executeCommand('agenticPlanning.releaseAgent', { label: data.agentName });
-                    break;
-                case 'pauseWorkflow':
-                    if (data.sessionId && data.workflowId && this.stateProxy) {
-                        const result = await this.stateProxy.pauseWorkflow(data.sessionId, data.workflowId);
-                        if (!result.success) {
-                            vscode.window.showErrorMessage(result.error || 'Failed to pause workflow');
-                        }
-                        this.refresh();
-                    }
-                    break;
-                case 'resumeWorkflow':
-                    if (data.sessionId && data.workflowId && this.stateProxy) {
-                        const result = await this.stateProxy.resumeWorkflow(data.sessionId, data.workflowId);
-                        if (!result.success) {
-                            vscode.window.showErrorMessage(result.error || 'Failed to resume workflow');
-                        }
-                        this.refresh();
-                    }
                     break;
                 case 'cancelWorkflow':
                     if (data.sessionId && data.workflowId && this.stateProxy) {
@@ -499,6 +484,58 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                         this.refresh();
                     }
                     break;
+                case 'triggerUnityEditModeTest':
+                    // Trigger Unity prep + EditMode test pipeline
+                    if (this.stateProxy) {
+                        const result = await this.stateProxy.triggerUnityEditModeTest();
+                        if (result.success) {
+                            vscode.window.showInformationMessage('Unity EditMode test pipeline queued');
+                        } else {
+                            vscode.window.showErrorMessage(`Failed to trigger EditMode test: ${result.error}`);
+                        }
+                        this.refresh();
+                    }
+                    break;
+                case 'triggerUnityPlayModeTest':
+                    // Trigger Unity prep + PlayMode test pipeline
+                    if (this.stateProxy) {
+                        const result = await this.stateProxy.triggerUnityPlayModeTest();
+                        if (result.success) {
+                            vscode.window.showInformationMessage('Unity PlayMode test pipeline queued');
+                        } else {
+                            vscode.window.showErrorMessage(`Failed to trigger PlayMode test: ${result.error}`);
+                        }
+                        this.refresh();
+                    }
+                    break;
+                case 'triggerUnityPlayerTest':
+                    // Trigger Unity prep + Player manual test pipeline
+                    if (this.stateProxy) {
+                        const result = await this.stateProxy.triggerUnityPlayerTest();
+                        if (result.success) {
+                            vscode.window.showInformationMessage('Unity Player test pipeline queued');
+                        } else {
+                            vscode.window.showErrorMessage(`Failed to trigger Player test: ${result.error}`);
+                        }
+                        this.refresh();
+                    }
+                    break;
+                case 'reopenSession':
+                    // Reopen a completed session for review
+                    if (data.sessionId && this.stateProxy) {
+                        const success = await this.stateProxy.reopenSession(data.sessionId);
+                        if (success) {
+                            vscode.window.showInformationMessage(`Session ${data.sessionId} reopened for review`);
+                        } else {
+                            vscode.window.showErrorMessage(`Failed to reopen session ${data.sessionId}`);
+                        }
+                        this.refresh();
+                    }
+                    break;
+                case 'viewAllCompletedSessions':
+                    // Open completed sessions view panel
+                    vscode.commands.executeCommand('agenticPlanning.openCompletedSessionsView');
+                    break;
             }
         });
 
@@ -560,16 +597,24 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             for (const session of state.sessions) {
                 for (const workflow of [...(session.activeWorkflows || []), ...(session.workflowHistory || [])]) {
                     const status = workflow.status;
-                    if (status === 'running' || status === 'paused' || status === 'pending') {
+                    if (status === 'running' || status === 'pending') {
                         this.trackedWorkflows.add(workflow.id);
                     }
                 }
             }
             
             // Pre-render session and agent HTML for efficient updates
+            // Combine active sessions and completed sessions into one HTML block
+            const activeSessionsHtml = renderSessionsSection(state.sessions, this.expandedSessions);
+            const completedSessionsHtml = renderCompletedSessionsSection(
+                state.completedSessions, 
+                state.completedSessionsTotal,
+                this.completedSessionsExpanded
+            );
+            
             const extendedState = {
                 ...clientState,
-                sessionsHtml: renderSessionsSection(state.sessions, this.expandedSessions),
+                sessionsHtml: activeSessionsHtml + completedSessionsHtml,
                 agentsHtml: renderAgentGrid(state.agents),
             };
             
@@ -592,6 +637,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             missingDependencies: [],
             connectionRetries: 0,
             sessions: [],
+            completedSessions: [],
+            completedSessionsTotal: 0,
             agents: [],
             unity: {
                 connected: false,
@@ -599,7 +646,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 isCompiling: false,
                 hasErrors: false,
                 errorCount: 0,
-                queueLength: 0
+                queueLength: 0,
+                status: 'idle'
             },
             unityEnabled: this.unityEnabled,
             coordinatorStatus: {
@@ -616,9 +664,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
         
         // Build client state and send to webview
         const clientState = buildClientState(checkingState);
+        const activeSessionsHtml = renderSessionsSection([], this.expandedSessions);
+        const completedSessionsHtml = renderCompletedSessionsSection([], 0, this.completedSessionsExpanded);
         const extendedState = {
             ...clientState,
-            sessionsHtml: renderSessionsSection([], this.expandedSessions),
+            sessionsHtml: activeSessionsHtml + completedSessionsHtml,
             agentsHtml: renderAgentGrid([]),
         };
         
@@ -679,6 +729,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 missingDependencies: [],
                 connectionRetries: 0,
                 sessions: [],
+                completedSessions: [],
+                completedSessionsTotal: 0,
                 agents: [],
                 unity: {
                     connected: false,
@@ -686,7 +738,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     isCompiling: false,
                     hasErrors: false,
                     errorCount: 0,
-                    queueLength: 0
+                    queueLength: 0,
+                    status: 'idle'
                 },
                 unityEnabled: this.unityEnabled,
                 coordinatorStatus: {
@@ -709,6 +762,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 missingDependencies: [],
                 connectionRetries: connectionHealth.consecutiveFailures,
                 sessions: [],
+                completedSessions: [],
+                completedSessionsTotal: 0,
                 agents: [],
                 unity: {
                     connected: false,
@@ -716,7 +771,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     isCompiling: false,
                     hasErrors: false,
                     errorCount: 0,
-                    queueLength: 0
+                    queueLength: 0,
+                    status: 'idle'
                 },
                 unityEnabled: this.unityEnabled,
                 coordinatorStatus: {
@@ -741,6 +797,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 missingDependencies: [],
                 connectionRetries: connectionHealth.consecutiveFailures,
                 sessions: [],
+                completedSessions: [],
+                completedSessionsTotal: 0,
                 agents: [],
                 unity: {
                     connected: false,
@@ -748,7 +806,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     isCompiling: false,
                     hasErrors: false,
                     errorCount: 0,
-                    queueLength: 0
+                    queueLength: 0,
+                    status: 'idle'
                 },
                 unityEnabled: this.unityEnabled,
                 coordinatorStatus: {
@@ -770,6 +829,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 missingDependencies: [],
                 connectionRetries: 0,
                 sessions: [],
+                completedSessions: [],
+                completedSessionsTotal: 0,
                 agents: [],
                 unity: {
                     connected: false,
@@ -777,7 +838,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     isCompiling: false,
                     hasErrors: false,
                     errorCount: 0,
-                    queueLength: 0
+                    queueLength: 0,
+                    status: 'idle'
                 },
                 unityEnabled: this.unityEnabled,
                 coordinatorStatus: {
@@ -834,6 +896,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 connectionRetries: connectionHealth.consecutiveFailures,
                 initializationStep: this.initializationStep, // Include progress message
                 sessions: [], // No sessions until ready
+                completedSessions: [], // No completed sessions until ready
+                completedSessionsTotal: 0,
                 agents: [], // No agents until ready
                 unity: {
                     connected: false,
@@ -841,7 +905,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                     isCompiling: false,
                     hasErrors: false,
                     errorCount: 0,
-                    queueLength: 0
+                    queueLength: 0,
+                    status: 'idle'
                 },
                 unityEnabled: this.unityEnabled,
                 coordinatorStatus: {
@@ -863,7 +928,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             // Get active workflows for this session from proxy or coordinator
             let activeWorkflows: WorkflowInfo[] = [];
             let workflowHistory: WorkflowInfo[] = [];
-            let isRevising = false;
+            const isRevising = s.status === 'revising';  // Use session status directly
             let taskCount = 0;
             let completedTasks = 0;
             let agentCount = 0;
@@ -875,7 +940,6 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 
             if (sessionState) {
                 try {
-                    isRevising = sessionState.isRevising;
                     
                     // Build workflow history from completed workflows (newest first)
                     for (const hist of sessionState.workflowHistory || []) {
@@ -883,10 +947,10 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                             id: hist.id,
                             type: hist.type,
                             status: hist.status,
-                            phase: hist.status === 'completed' ? 'Done' : 'Failed',
+                            phase: hist.status === 'succeeded' ? 'Done' : 'Failed',
                             phaseIndex: 0,
                             totalPhases: 1,
-                            percentage: hist.status === 'completed' ? 100 : 0,
+                            percentage: hist.status === 'succeeded' ? 100 : 0,
                             startedAt: hist.startedAt,
                             taskId: hist.taskId,
                             logPath: hist.logPath,
@@ -927,7 +991,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                         // Count task workflows
                         if (progress.type === 'task_implementation') {
                             taskCount++;
-                            if (progress.status === 'completed') {
+                            if (progress.status === 'succeeded') {
                                 completedTasks++;
                             }
                         }
@@ -954,14 +1018,13 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             // Determine execution status from workflows or session status
             let executionStatus = 'Not started';
             const activeRunningWorkflows = activeWorkflows.filter(w => w.status === 'running' || w.status === 'pending');
-            const pausedWorkflows = activeWorkflows.filter(w => w.status === 'paused');
             
             if (activeRunningWorkflows.length > 0) {
                 executionStatus = `Running (${activeRunningWorkflows.length} workflows)`;
-            } else if (pausedWorkflows.length > 0) {
-                executionStatus = 'Paused';
             } else if (s.status === 'completed') {
                 executionStatus = 'Completed';
+            } else if (s.status === 'verifying') {
+                executionStatus = 'Verifying Tasks';
             } else if (s.status === 'approved') {
                 executionStatus = 'Ready';
             } else if (isRevising) {
@@ -971,8 +1034,12 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             // Determine plan status
             let planStatus = 'Draft';
             const hasPartialPlan = !!(s as any).metadata?.partialPlan;
-            if (s.status === 'approved' || s.status === 'completed') {
+            if (s.status === 'completed') {
+                planStatus = 'Completed';
+            } else if (s.status === 'approved') {
                 planStatus = 'Approved';
+            } else if (s.status === 'verifying') {
+                planStatus = 'Verifying...';
             } else if (s.status === 'reviewing') {
                 // If plan is partial/incomplete, show warning indicator
                 planStatus = hasPartialPlan ? '⚠️ Incomplete' : 'Pending Review';
@@ -996,7 +1063,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 name: b.name,
                 roleId: b.roleId,
                 sessionId: b.sessionId,
-                workflowId: b.coordinatorId, // Map coordinatorId back to workflowId
+                workflowId: b.workflowId,
                 task: b.task
             }));
             for (const agent of busyAgents) {
@@ -1094,6 +1161,14 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 }
             }
             
+            // Determine if session is ready for manual completion
+            // Ready if: approved, no active workflows, all tasks complete
+            const hasActiveWorkflows = activeWorkflows.some(
+                w => w.status !== 'succeeded' && w.status !== 'cancelled' && w.status !== 'failed'
+            );
+            const allTasksComplete = taskCount > 0 && completedTasks >= taskCount;
+            const readyForCompletion = s.status === 'approved' && !hasActiveWorkflows && allTasksComplete;
+            
             sessions.push({
                 id: s.id,
                 requirement: s.requirement,
@@ -1108,10 +1183,11 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 executionStatus,
                 activeWorkflows,
                 workflowHistory,
-                isRevising,
+                // Note: isRevising is determined by status === 'revising' in the UI
                 sessionAgents,
                 hasPartialPlan: !!(s as any).metadata?.partialPlan,
-                interruptReason: (s as any).metadata?.interruptReason
+                interruptReason: (s as any).metadata?.interruptReason,
+                readyForCompletion
             });
         }
 
@@ -1127,7 +1203,7 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             name: b.name,
             roleId: b.roleId,
             sessionId: b.sessionId,
-            workflowId: b.coordinatorId, // Map coordinatorId back to workflowId
+            workflowId: b.workflowId,
             task: b.task
         }));
         
@@ -1268,7 +1344,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             isCompiling: false,
             hasErrors: false,
             errorCount: 0,
-            queueLength: 0
+            queueLength: 0,
+            status: 'idle'
         };
         
         if (this.unityEnabled) {
@@ -1299,6 +1376,27 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                 log.warn('Failed to get coordinator status:', e);
             }
         }
+        
+        // Get completed sessions (most recent 5 for sidebar display)
+        let completedSessions: CompletedSessionSummary[] = [];
+        let completedSessionsTotal = 0;
+        
+        if (this.stateProxy) {
+            try {
+                const completedResult = await this.stateProxy.getCompletedSessions(5);
+                completedSessionsTotal = completedResult.total;
+                completedSessions = completedResult.sessions.map(s => ({
+                    id: s.id,
+                    requirement: s.requirement,
+                    completedAt: s.completedAt,
+                    createdAt: s.createdAt,
+                    planPath: s.currentPlanPath,
+                    taskProgress: s.taskProgress
+                }));
+            } catch (e) {
+                log.warn('Failed to get completed sessions:', e);
+            }
+        }
 
         return {
             systemStatus,
@@ -1306,6 +1404,8 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
             missingDependencies,
             connectionRetries: 0,
             sessions,
+            completedSessions,
+            completedSessionsTotal,
             agents,
             unity,
             unityEnabled: this.unityEnabled,
@@ -1502,6 +1602,42 @@ export class SidebarViewProvider implements vscode.WebviewViewProvider {
                         const errorMsg = error instanceof Error ? error.message : String(error);
                         log.error('Unity MCP installation failed:', errorMsg);
                         vscode.window.showErrorMessage(`Failed to install Unity MCP: ${errorMsg}`);
+                    }
+                    break;
+                }
+                case 'unity-bridge': {
+                    // Install APC Unity Bridge package to Unity project
+                    log.info('Installing APC Unity Bridge package...');
+                    
+                    try {
+                        if (this.stateProxy) {
+                            const response = await this.stateProxy.installUnityBridge();
+                            if (response?.success) {
+                                // Focus Unity Editor so user can see the newly installed package
+                                log.info('Focusing Unity Editor after package installation');
+                                focusUnityEditor().catch(err => {
+                                    log.warn('Failed to focus Unity Editor:', err);
+                                });
+                                
+                                vscode.window.showInformationMessage(
+                                    'APC Unity Bridge installed! Refresh Unity to load the package.',
+                                    'Refresh Dependencies'
+                                ).then(async selection => {
+                                    if (selection === 'Refresh Dependencies') {
+                                        await vscode.commands.executeCommand('agenticPlanning.refreshDependencies');
+                                    }
+                                });
+                            } else {
+                                const errorMsg = response?.message || 'Unknown error';
+                                vscode.window.showErrorMessage(`Failed to install Unity Bridge: ${errorMsg}`);
+                            }
+                        } else {
+                            vscode.window.showErrorMessage('Cannot install: daemon not connected');
+                        }
+                    } catch (error) {
+                        const errorMsg = error instanceof Error ? error.message : String(error);
+                        log.error('Unity Bridge installation failed:', errorMsg);
+                        vscode.window.showErrorMessage(`Failed to install Unity Bridge: ${errorMsg}`);
                     }
                     break;
                 }

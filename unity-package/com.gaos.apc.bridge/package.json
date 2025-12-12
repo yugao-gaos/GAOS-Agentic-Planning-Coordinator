@@ -1,0 +1,26 @@
+{
+    "name": "com.gaos.apc.bridge",
+    "version": "0.2.0",
+    "displayName": "APC Unity Bridge",
+    "description": "Direct WebSocket connection between Unity Editor and APC Daemon for real-time Unity control operations.",
+    "unity": "2021.3",
+    "unityRelease": "0f1",
+    "documentationUrl": "https://github.com/YourRepo/GAOS-Agentic-Planning-Coordinator",
+    "changelogUrl": "https://github.com/YourRepo/GAOS-Agentic-Planning-Coordinator/blob/main/CHANGELOG.md",
+    "licensesUrl": "https://github.com/YourRepo/GAOS-Agentic-Planning-Coordinator/blob/main/LICENSE",
+    "keywords": [
+        "apc",
+        "agentic",
+        "planning",
+        "coordinator",
+        "websocket",
+        "daemon"
+    ],
+    "author": {
+        "name": "APC Team",
+        "url": "https://github.com/YourRepo"
+    },
+    "type": "tool",
+    "samples": []
+}
+

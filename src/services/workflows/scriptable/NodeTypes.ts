@@ -74,8 +74,11 @@ export interface INodeConnection {
 
 /**
  * Error handling strategy for a node
+ * 
+ * Note: 'retry' was removed to avoid agent leaks and state issues.
+ * If a node fails, the workflow should fail and let coordinator handle retry.
  */
-export type ErrorStrategy = 'retry' | 'skip' | 'abort' | 'goto';
+export type ErrorStrategy = 'skip' | 'abort' | 'goto';
 
 /**
  * Per-node error handling configuration
@@ -84,17 +87,19 @@ export interface INodeErrorConfig {
     /** Strategy when this node fails */
     strategy: ErrorStrategy;
     
-    /** Max retries if strategy is 'retry' */
-    maxRetries?: number;
-    
-    /** Delay between retries in ms */
-    retryDelayMs?: number;
-    
     /** Target node ID if strategy is 'goto' */
     gotoNodeId?: string;
     
     /** Default value to use if strategy is 'skip' */
     skipDefaultValue?: any;
+}
+
+/**
+ * Node instance position and display options
+ */
+export interface INodeDisplayOptions {
+    /** Whether the node position is locked (cannot be dragged) */
+    locked?: boolean;
 }
 
 /**
@@ -138,6 +143,9 @@ export interface INodeInstance {
     
     /** Custom label override */
     label?: string;
+    
+    /** Whether the node position is locked (cannot be dragged) */
+    locked?: boolean;
 }
 
 /**
@@ -190,6 +198,12 @@ export interface INodeDefinition {
     
     /** Maximum instances of this node in a graph (e.g., 1 for start) */
     maxInstances?: number;
+    
+    /** Internal ports for container nodes (rendered inside the container area) */
+    internalPorts?: {
+        inputs?: Omit<INodePort, 'direction'>[];
+        outputs?: Omit<INodePort, 'direction'>[];
+    };
 }
 
 /**
@@ -321,7 +335,7 @@ export interface INodeGraph {
 export type NodeExecutionStatus = 
     | 'pending'
     | 'running'
-    | 'completed'
+    | 'succeeded'
     | 'failed'
     | 'skipped'
     | 'waiting';  // For sync nodes waiting on branches
@@ -439,6 +453,15 @@ export interface IExecutionContextAPI {
     /** Release an agent back to the pool */
     releaseAgent(agentName: string): void;
     
+    /** Set an agent on a bench seat (0-indexed) */
+    setAgentOnBench(seatIndex: number, agentName: string): void;
+    
+    /** Get an agent from a bench seat (0-indexed) */
+    getAgentFromBench(seatIndex: number): string | undefined;
+    
+    /** Remove an agent from a bench seat (0-indexed) */
+    removeAgentFromBench(seatIndex: number): void;
+    
     /** Run an agent task with CLI callback requirement */
     runAgentTask(agentName: string, prompt: string, options?: {
         model?: string;
@@ -465,7 +488,7 @@ export interface IExecutionContextAPI {
     /** Get the workflow services */
     getWorkflowServices(): any;
     
-    /** Check if workflow is paused/cancelled */
+    /** Check if workflow is cancelled */
     shouldStop(): boolean;
     
     /** Sleep for specified milliseconds */

@@ -74,16 +74,6 @@ export const workflowStyles = `
     border-left-color: rgba(0, 122, 204, 0.7);
 }
 
-.workflow-item.paused {
-    border-left-color: rgba(249, 115, 22, 0.6);
-}
-
-.workflow-item.paused .workflow-progress-bg {
-    background: linear-gradient(90deg, 
-        rgba(249, 115, 22, 0.12) 0%, 
-        rgba(249, 115, 22, 0.05) 100%);
-}
-
 .workflow-item.completed {
     border-left-color: rgba(115, 201, 145, 0.6);
 }
@@ -202,7 +192,7 @@ export const workflowStyles = `
     align-items: center;
 }
 
-/* Workflow control buttons (pause/resume/cancel) */
+/* Workflow control buttons (cancel) */
 .workflow-action-btn {
     padding: 2px 8px;
     border: 1px solid var(--vscode-widget-border);

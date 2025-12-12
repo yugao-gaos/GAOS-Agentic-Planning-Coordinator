@@ -19,7 +19,7 @@ export const IfConditionNodeDefinition: INodeDefinition = {
     name: 'If Condition',
     description: 'Branch execution based on a condition',
     category: 'flow',
-    icon: 'split-branch',
+    icon: 'if-else',
     color: '#FF5722',
     defaultInputs: [
         {
@@ -105,7 +105,7 @@ export const SwitchCaseNodeDefinition: INodeDefinition = {
     name: 'Switch Case',
     description: 'Multi-way branch based on value matching',
     category: 'flow',
-    icon: 'switch',
+    icon: 'signpost',
     color: '#FF5722',
     defaultInputs: [
         {
@@ -205,28 +205,23 @@ export const SwitchCaseNodeExecutor: NodeExecutor = async (
 };
 
 // ============================================================================
-// For Loop Node
+// For Loop Node (Container style)
 // ============================================================================
 
 export const ForLoopNodeDefinition: INodeDefinition = {
     type: 'for_loop',
     name: 'For Loop',
-    description: 'Iterate over an array or range',
+    description: 'Container loop node - drag nodes inside to form the loop body',
     category: 'flow',
     icon: 'loop',
     color: '#009688',
+    // External ports (on the outer frame)
     defaultInputs: [
         {
             id: 'trigger',
             name: 'Trigger',
             dataType: 'trigger',
             description: 'Starts the loop'
-        },
-        {
-            id: 'loop_back',
-            name: 'Loop Back',
-            dataType: 'trigger',
-            description: 'Connect from loop body to continue to next iteration'
         },
         {
             id: 'items',
@@ -236,24 +231,6 @@ export const ForLoopNodeDefinition: INodeDefinition = {
         }
     ],
     defaultOutputs: [
-        {
-            id: 'item',
-            name: 'Current Item',
-            dataType: 'any',
-            description: 'Current iteration item'
-        },
-        {
-            id: 'index',
-            name: 'Index',
-            dataType: 'number',
-            description: 'Current iteration index'
-        },
-        {
-            id: 'loop',
-            name: 'Loop Body',
-            dataType: 'trigger',
-            description: 'Triggers for each iteration'
-        },
         {
             id: 'complete',
             name: 'Complete',
@@ -267,6 +244,8 @@ export const ForLoopNodeDefinition: INodeDefinition = {
             description: 'Collected results from all iterations'
         }
     ],
+    // Mark as container node
+    allowDynamicPorts: false,
     configSchema: {
         fields: [
             {
@@ -301,6 +280,62 @@ export const ForLoopNodeDefinition: INodeDefinition = {
                 label: 'Count',
                 description: 'Number of iterations for count mode',
                 defaultValue: 5
+            },
+            {
+                name: 'width',
+                type: 'number',
+                label: 'Width (px)',
+                description: 'Width of the loop container',
+                defaultValue: 400,
+                min: 250,
+                max: 1200
+            },
+            {
+                name: 'height',
+                type: 'number',
+                label: 'Height (px)',
+                description: 'Height of the loop container',
+                defaultValue: 250,
+                min: 150,
+                max: 800
+            },
+            {
+                name: 'containedNodeIds',
+                type: 'string',
+                label: 'Contained Nodes',
+                description: 'Comma-separated list of node IDs in loop body (auto-managed)',
+                defaultValue: ''
+            }
+        ]
+    },
+    // Internal ports (rendered inside the container) - stored separately
+    internalPorts: {
+        outputs: [
+            {
+                id: 'loop_body',
+                name: 'Loop Body',
+                dataType: 'trigger',
+                description: 'Triggers for each iteration - connect to nodes inside the loop'
+            },
+            {
+                id: 'item',
+                name: 'Current Item',
+                dataType: 'any',
+                description: 'Current iteration item'
+            },
+            {
+                id: 'index',
+                name: 'Index',
+                dataType: 'number',
+                description: 'Current iteration index'
+            }
+        ],
+        inputs: [
+            {
+                id: 'loop_back',
+                name: 'Loop Back',
+                dataType: 'trigger',
+                description: 'Connect from loop body end to continue to next iteration'
             }
         ]
     }
@@ -340,115 +375,13 @@ export const ForLoopNodeExecutor: NodeExecutor = async (
             items,
             currentIndex: 0
         },
+        // Internal outputs (inside loop container)
+        loop_body: items.length > 0,
         item: items[0],
         index: 0,
-        loop: items.length > 0,
+        // External outputs (outside loop container)
         complete: items.length === 0,
         results: []
-    };
-};
-
-// ============================================================================
-// While Loop Node
-// ============================================================================
-
-export const WhileLoopNodeDefinition: INodeDefinition = {
-    type: 'while_loop',
-    name: 'While Loop',
-    description: 'Loop while a condition is true',
-    category: 'flow',
-    icon: 'repeat',
-    color: '#009688',
-    defaultInputs: [
-        {
-            id: 'trigger',
-            name: 'Trigger',
-            dataType: 'trigger',
-            description: 'Starts the loop'
-        },
-        {
-            id: 'loop_back',
-            name: 'Loop Back',
-            dataType: 'trigger',
-            description: 'Connect from loop body to continue to next iteration'
-        }
-    ],
-    defaultOutputs: [
-        {
-            id: 'iteration',
-            name: 'Iteration',
-            dataType: 'number',
-            description: 'Current iteration count'
-        },
-        {
-            id: 'loop',
-            name: 'Loop Body',
-            dataType: 'trigger',
-            description: 'Triggers while condition is true'
-        },
-        {
-            id: 'complete',
-            name: 'Complete',
-            dataType: 'trigger',
-            description: 'Triggers when condition becomes false'
-        }
-    ],
-    configSchema: {
-        fields: [
-            {
-                name: 'condition',
-                type: 'expression',
-                label: 'Condition',
-                description: 'Loop continues while this expression is true',
-                required: true
-            },
-            {
-                name: 'maxIterations',
-                type: 'number',
-                label: 'Max Iterations',
-                description: 'Safety limit for maximum iterations',
-                defaultValue: 100,
-                min: 1,
-                max: 10000
-            }
-        ]
-    }
-};
-
-export const WhileLoopNodeExecutor: NodeExecutor = async (
-    node: INodeInstance,
-    inputs: Record<string, any>,
-    context: IExecutionContextAPI
-): Promise<Record<string, any>> => {
-    const condition = node.config.condition;
-    const maxIterations = node.config.maxIterations || 100;
-    
-    if (!condition) {
-        throw new Error('Condition is required');
-    }
-    
-    // Evaluate initial condition
-    let result: boolean;
-    try {
-        result = Boolean(context.evaluate(condition));
-    } catch (error) {
-        const errorMsg = error instanceof Error ? error.message : String(error);
-        throw new Error(`Condition evaluation failed: ${errorMsg}`);
-    }
-    
-    context.log(`While loop: condition = ${result}`, 'debug');
-    
-    // Return loop metadata - actual iteration is handled by the execution engine
-    return {
-        __loop__: {
-            type: 'while',
-            condition,
-            maxIterations,
-            currentIteration: 0
-        },
-        iteration: 0,
-        loop: result,
-        complete: !result
     };
 };
 
@@ -460,6 +393,5 @@ export function registerControlFlowNodes(): void {
     nodeRegistry.register(IfConditionNodeDefinition, IfConditionNodeExecutor);
     nodeRegistry.register(SwitchCaseNodeDefinition, SwitchCaseNodeExecutor);
     nodeRegistry.register(ForLoopNodeDefinition, ForLoopNodeExecutor);
-    nodeRegistry.register(WhileLoopNodeDefinition, WhileLoopNodeExecutor);
 }
 

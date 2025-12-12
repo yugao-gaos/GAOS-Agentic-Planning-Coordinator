@@ -129,8 +129,7 @@ export class IdlePlanMonitor {
             const sessionState = this.coordinator.getSessionState(session.id);
             const hasActiveWorkflows = sessionState?.activeWorkflows && sessionState.activeWorkflows.size > 0;
             
-            // Check if any workflows are actually running (not just paused)
-            // If all workflows are paused, we should still trigger evaluation so coordinator can resume them
+            // Check if any workflows are actively running
             let hasRunningWorkflows = false;
             if (sessionState?.activeWorkflows) {
                 for (const progress of sessionState.activeWorkflows.values()) {
@@ -144,11 +143,6 @@ export class IdlePlanMonitor {
             if (hasActiveWorkflows && hasRunningWorkflows) {
                 this.log(`Startup: Skipping ${session.id} - has running workflows`);
                 continue;
-            }
-            
-            // Log if we're triggering for paused workflows
-            if (hasActiveWorkflows && !hasRunningWorkflows) {
-                this.log(`Startup: Session ${session.id} has paused workflows - triggering coordinator to decide on resume`);
             }
             
             // Trigger coordinator
@@ -227,47 +221,56 @@ export class IdlePlanMonitor {
                 const activeWorkflowCount = sessionState?.activeWorkflows?.size || 0;
                 const hasActiveWorkflows = activeWorkflowCount > 0;
                 
-                // Check if any workflows are actually running vs all paused
+                // Count running workflows
                 let runningWorkflowCount = 0;
-                let pausedWorkflowCount = 0;
                 if (sessionState?.activeWorkflows) {
                     for (const progress of sessionState.activeWorkflows.values()) {
                         if (progress.status === 'running' || progress.status === 'pending') {
                             runningWorkflowCount++;
-                        } else if (progress.status === 'paused') {
-                            pausedWorkflowCount++;
                         }
                     }
                 }
-                const hasOnlyPausedWorkflows = hasActiveWorkflows && runningWorkflowCount === 0 && pausedWorkflowCount > 0;
                 
                 // Check if there are ready tasks (tasks with all dependencies met)
                 let readyTasks: any[] = [];
                 let hasReadyTasks = false;
                 
+                // Check if there are tasks awaiting coordinator decision
+                // These are tasks where workflows finished (success or failure) - MUST be handled!
+                let awaitingDecisionTasks: any[] = [];
+                let hasAwaitingDecision = false;
+                
                 if (taskManager) {
                     try {
                         readyTasks = taskManager.getReadyTasksForSession(session.id) || [];
                         hasReadyTasks = readyTasks.length > 0;
+                        
+                        // CRITICAL: Also check for awaiting_decision tasks
+                        // These are tasks that had workflows complete/fail and need coordinator attention
+                        // They should NEVER be forgotten!
+                        awaitingDecisionTasks = taskManager.getAwaitingDecisionTasksForSession?.(session.id) || [];
+                        hasAwaitingDecision = awaitingDecisionTasks.length > 0;
                     } catch (err) {
                         this.log(`Error checking ready tasks for ${session.id}: ${err}`);
                     }
                 }
                 
                 // Determine if we should track this plan for coordination
-                // Track if: (1) No workflows (idle), OR (2) Has ready tasks, OR (3) Has only paused workflows (coordinator decides to resume)
-                const shouldTrack = !hasActiveWorkflows || hasReadyTasks || hasOnlyPausedWorkflows;
+                // Track if: (1) No workflows (idle), OR (2) Has ready tasks, OR (3) Has awaiting_decision tasks
+                const needsAttention = hasReadyTasks || hasAwaitingDecision;
+                const shouldTrack = !hasActiveWorkflows || needsAttention;
                 
                 if (!shouldTrack) {
-                    // Has running workflows but no ready tasks - nothing for coordinator to do
+                    // Has running workflows but no tasks needing attention - nothing for coordinator to do
                     this.idlePlans.delete(session.id);
                     continue;
                 }
                 
                 // Determine appropriate threshold based on situation
                 // - Fully idle (no workflows): 60s threshold (less urgent, avoid spam)
-                // - Has workflows + ready tasks OR has paused workflows: 0s threshold (immediate)
-                const needsImmediateTrigger = (hasActiveWorkflows && hasReadyTasks) || hasOnlyPausedWorkflows;
+                // - Has workflows + ready/awaiting tasks: 0s threshold (immediate)
+                // - Has awaiting_decision tasks (especially with failed attempts): IMMEDIATE
+                const needsImmediateTrigger = hasActiveWorkflows && needsAttention;
                 const threshold = needsImmediateTrigger ? 0 : IdlePlanMonitor.IDLE_THRESHOLD_MS;
                 
                 // Get or create tracking state for this plan
@@ -282,15 +285,19 @@ export class IdlePlanMonitor {
                     };
                     this.idlePlans.set(session.id, planState);
                     
-                    let reason: string;
-                    if (hasOnlyPausedWorkflows) {
-                        reason = `has ${pausedWorkflowCount} paused workflow(s) - coordinator will decide on resume`;
-                    } else if (hasActiveWorkflows) {
-                        reason = `has ${activeWorkflowCount} workflows + ${readyTasks.length} ready tasks`;
+                    // Build descriptive reason for tracking
+                    let trackReason: string;
+                    if (hasActiveWorkflows) {
+                        const parts: string[] = [`${activeWorkflowCount} workflows`];
+                        if (readyTasks.length > 0) parts.push(`${readyTasks.length} ready`);
+                        if (awaitingDecisionTasks.length > 0) parts.push(`${awaitingDecisionTasks.length} awaiting decision`);
+                        trackReason = `has ${parts.join(' + ')}`;
                     } else {
-                        reason = 'idle (no workflows)';
+                        trackReason = hasAwaitingDecision 
+                            ? `idle with ${awaitingDecisionTasks.length} awaiting decision` 
+                            : 'idle (no workflows)';
                     }
-                    this.log(`Tracking plan: ${session.id} (${reason})`);
+                    this.log(`Tracking plan: ${session.id} (${trackReason})`);
                     continue;  // Don't trigger on first detection
                 }
                 
@@ -312,13 +319,24 @@ export class IdlePlanMonitor {
                 }
                 
                 // Trigger coordinator evaluation
+                // Build reason that reflects all types of tasks needing attention
                 let reason: string;
-                if (hasOnlyPausedWorkflows) {
-                    reason = `${pausedWorkflowCount} paused workflow(s) awaiting coordinator decision with ${availableAgents.length} available agents`;
-                } else if (hasActiveWorkflows) {
-                    reason = `${readyTasks.length} ready tasks with ${availableAgents.length} available agents (${runningWorkflowCount} workflows running)`;
+                if (hasActiveWorkflows) {
+                    const parts: string[] = [];
+                    if (readyTasks.length > 0) parts.push(`${readyTasks.length} ready`);
+                    if (awaitingDecisionTasks.length > 0) {
+                        const failedCount = awaitingDecisionTasks.filter((t: any) => (t.attempts || 0) > 0).length;
+                        const awaitingDesc = failedCount > 0 
+                            ? `${awaitingDecisionTasks.length} awaiting decision (${failedCount} need retry)`
+                            : `${awaitingDecisionTasks.length} awaiting decision`;
+                        parts.push(awaitingDesc);
+                    }
+                    reason = `${parts.join(', ')} with ${availableAgents.length} available agents (${runningWorkflowCount} workflows running)`;
                 } else {
-                    reason = `idle for ${Math.round(timeSinceTracking / 1000)}s with ${availableAgents.length} available agents`;
+                    const awaitingInfo = hasAwaitingDecision 
+                        ? `, ${awaitingDecisionTasks.length} awaiting decision` 
+                        : '';
+                    reason = `idle for ${Math.round(timeSinceTracking / 1000)}s with ${availableAgents.length} available agents${awaitingInfo}`;
                 }
                 
                 this.log(`Triggering coordinator for ${session.id}: ${reason}`);

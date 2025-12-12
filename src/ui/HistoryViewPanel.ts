@@ -113,7 +113,7 @@ export class HistoryViewPanel {
                         phase: hist.phase || hist.status,
                         phaseIndex: 0,
                         totalPhases: 1,
-                        percentage: hist.status === 'completed' ? 100 : 0,
+                        percentage: hist.status === 'succeeded' ? 100 : 0,
                         startedAt: hist.startedAt || '',
                         taskId: hist.taskId,
                         logPath: hist.logPath,
@@ -396,9 +396,9 @@ export class HistoryViewPanel {
 
     private renderHistoryItem(wf: WorkflowInfo): string {
         const typeInfo = this.getWorkflowTypeInfo(wf.type);
-        // Explicitly check for failed status - treat anything else (completed, cancelled, etc.) as non-error
-        const statusClass = wf.status === 'failed' ? 'failed' : wf.status === 'completed' ? 'completed' : '';
-        const statusText = wf.status === 'failed' ? 'Failed' : wf.status === 'completed' ? 'Completed' : wf.status;
+        // Explicitly check for failed status - treat anything else (succeeded, cancelled, etc.) as non-error
+        const statusClass = wf.status === 'failed' ? 'failed' : wf.status === 'succeeded' ? 'succeeded' : '';
+        const statusText = wf.status === 'failed' ? 'Failed' : wf.status === 'succeeded' ? 'Succeeded' : wf.status;
         
         const label = wf.taskId 
             ? `${wf.taskId} ${typeInfo.label}`
@@ -414,7 +414,7 @@ export class HistoryViewPanel {
                     </div>
                     <div class="workflow-label">${this.escapeHtml(label)}</div>
                     <div class="workflow-status ${statusClass}">
-                        ${wf.status === 'failed' ? '✗' : wf.status === 'completed' ? '✓' : '◷'} ${statusText}
+                        ${wf.status === 'failed' ? '✗' : wf.status === 'succeeded' ? '✓' : '◷'} ${statusText}
                     </div>
                 </div>
                 <div class="history-details">
@@ -501,22 +501,95 @@ export class HistoryViewPanel {
 
     private formatOutput(output: any): string {
         try {
-            // If output has specific known fields, format them nicely
+            // If output has an explicit summary field, use it
             if (output.summary) {
                 return this.escapeHtml(output.summary);
             }
-            if (output.planPath) {
-                return `Plan: ${this.escapeHtml(output.planPath)}`;
+            
+            // TaskImplementationWorkflow output
+            if (output.taskId !== undefined) {
+                const parts: string[] = [];
+                parts.push(`Task ${this.escapeHtml(output.taskId)}`);
+                if (output.filesModified && Array.isArray(output.filesModified)) {
+                    parts.push(`modified ${output.filesModified.length} file(s)`);
+                }
+                if (output.reviewIterations !== undefined) {
+                    parts.push(`${output.reviewIterations} review iteration(s)`);
+                }
+                if (output.unityEnabled) {
+                    parts.push('Unity verification queued');
+                }
+                return parts.join(', ');
             }
+            
+            // ErrorResolutionWorkflow output
+            if (output.fixApplied !== undefined && output.errors !== undefined) {
+                const errorCount = Array.isArray(output.errors) ? output.errors.length : 0;
+                if (output.fixApplied) {
+                    return `Fixed ${errorCount} error(s) on attempt ${output.attempt || 1}`;
+                } else {
+                    return `Attempted to fix ${errorCount} error(s), no fix applied`;
+                }
+            }
+            
+            // ContextGatheringWorkflow output
+            if (output.contextPath !== undefined && output.detectedTypes !== undefined) {
+                const types = Array.isArray(output.detectedTypes) ? output.detectedTypes.join(', ') : 'various';
+                return `Context gathered: ${types}`;
+            }
+            
+            // PlanningRevisionWorkflow output
+            if (output.reviewVerdict !== undefined) {
+                const parts: string[] = [];
+                parts.push(`Review: ${this.escapeHtml(output.reviewVerdict)}`);
+                if (output.affectedTaskIds && Array.isArray(output.affectedTaskIds) && output.affectedTaskIds.length > 0) {
+                    parts.push(`${output.affectedTaskIds.length} task(s) affected`);
+                }
+                if (output.isGlobalRevision) {
+                    parts.push('global revision');
+                }
+                return parts.join(', ');
+            }
+            
+            // PlanningNewWorkflow output
+            if (output.planPath) {
+                const parts: string[] = [];
+                parts.push(`Plan created`);
+                if (output.iterations !== undefined) {
+                    parts.push(`${output.iterations} iteration(s)`);
+                }
+                if (output.forcedFinalize) {
+                    parts.push('finalized with warnings');
+                }
+                return parts.join(', ');
+            }
+            
+            // Generic files array (fallback)
             if (output.files && Array.isArray(output.files)) {
                 return `Modified ${output.files.length} file(s)`;
             }
-            // Otherwise show compact JSON
-            const json = JSON.stringify(output, null, 2);
-            if (json.length > 200) {
-                return this.escapeHtml(json.substring(0, 200) + '...');
+            
+            // If output is simple/small, don't show raw JSON at all
+            const keys = Object.keys(output);
+            if (keys.length === 0) {
+                return 'Completed';
             }
-            return this.escapeHtml(json);
+            
+            // For unrecognized outputs, show a brief summary instead of raw JSON
+            if (keys.length <= 3) {
+                const summary = keys.map(k => {
+                    const v = output[k];
+                    if (typeof v === 'boolean') return v ? k : `no ${k}`;
+                    if (typeof v === 'number') return `${k}: ${v}`;
+                    if (typeof v === 'string' && v.length < 30) return `${k}: ${v}`;
+                    if (Array.isArray(v)) return `${v.length} ${k}`;
+                    return k;
+                }).join(', ');
+                return this.escapeHtml(summary);
+            }
+            
+            // For complex outputs, show key count only
+            return `Output contains ${keys.length} fields`;
         } catch {
             return this.escapeHtml(String(output));
         }

@@ -9,7 +9,7 @@
  *    - Ready: Coordinator + Unity status
  */
 import { ICONS } from '../icons';
-import { SidebarState, UnityInfo, MissingDependencyInfo, CoordinatorStatusInfo } from '../types';
+import { SidebarState, UnityInfo, MissingDependencyInfo, CoordinatorStatusInfo, formatTaskTypeShort } from '../types';
 
 /**
  * Render the status title bar (always visible).
@@ -233,24 +233,52 @@ function renderSystemReadyBox(
     
     let unityHtml = '';
     if (unityEnabled) {
-        const unityBadge = getUnityBadgeStyle(unity);
-        // Show prep button when Unity is idle and queue is empty
-        const canTriggerPrep = unity.connected && 
-                               !unity.isCompiling && 
-                               !unity.isPlaying && 
-                               !unity.currentTask && 
-                               unity.queueLength === 0;
-        const prepBtnHtml = canTriggerPrep 
-            ? `<button class="coord-icon-btn" id="unityPrepBtn" title="Trigger Unity Prep (compile)">🔄</button>`
-            : '';
+        const unityState = getUnityStateInfo(unity);
+        const unityClass = getUnityStateClass(unity);
+        
+        // Build status text with queue info
+        let statusText = unityState.text;
+        
+        // Show queue count if there are items waiting (not including current task)
+        // queueLength includes current task, so subtract 1 if there's a current task
+        const waitingInQueue = unity.currentTask 
+            ? Math.max(0, unity.queueLength - 1) 
+            : unity.queueLength;
+        
+        if (waitingInQueue > 0) {
+            statusText += ` [+${waitingInQueue} queued]`;
+        }
+        
+        // Action buttons - always show, but disable when not applicable
+        const canTriggerActions = unity.connected && 
+                                  !unity.isCompiling && 
+                                  !unity.isPlaying && 
+                                  !unity.currentTask;
         
         unityHtml = `
             <div class="status-boxes-row" style="margin-top: 6px;">
-                <div class="status-box">
+                <div class="status-box" id="unityInfo">
                     <span class="status-box-label">Unity</span>
-                    <span class="unity-badge" style="background: ${unityBadge.background};">${unityBadge.text}</span>
-                    ${unity.queueLength > 0 ? `<span class="unity-queue">(${unity.queueLength})</span>` : ''}
-                    ${prepBtnHtml}
+                    <div class="unity-dot ${unityClass}" id="unityDot"></div>
+                    <span class="unity-text" id="unityText">${statusText}</span>
+                    <div class="unity-actions">
+                        <button class="coord-icon-btn${!canTriggerActions ? ' disabled' : ''}" 
+                                id="unityPrepBtn" 
+                                title="Prep (compile only)"
+                                ${!canTriggerActions ? 'disabled' : ''}>⚡</button>
+                        <button class="coord-icon-btn${!canTriggerActions ? ' disabled' : ''}" 
+                                id="unityEditModeBtn" 
+                                title="Prep + EditMode Tests"
+                                ${!canTriggerActions ? 'disabled' : ''}>🧪</button>
+                        <button class="coord-icon-btn${!canTriggerActions ? ' disabled' : ''}" 
+                                id="unityPlayModeBtn" 
+                                title="Prep + PlayMode Tests"
+                                ${!canTriggerActions ? 'disabled' : ''}>▶️</button>
+                        <button class="coord-icon-btn${!canTriggerActions ? ' disabled' : ''}" 
+                                id="unityPlayerTestBtn" 
+                                title="Prep + Player Test"
+                                ${!canTriggerActions ? 'disabled' : ''}>🎮</button>
+                    </div>
                 </div>
             </div>
         `;
@@ -272,6 +300,79 @@ function renderSystemReadyBox(
             ${unityHtml}
         </div>
     `;
+}
+
+/**
+ * Get Unity state info for display.
+ * Uses formatTaskTypeShort from types for concise status text.
+ */
+function getUnityStateInfo(unity: UnityInfo): { text: string; state: string } {
+    if (!unity.connected) {
+        return { text: 'Offline', state: 'offline' };
+    }
+    if (unity.isCompiling) {
+        return { text: 'Compiling', state: 'compiling' };
+    }
+    if (unity.currentTask) {
+        const taskType = unity.currentTask.type;
+        const friendlyName = formatTaskTypeShort(taskType);
+        
+        if (taskType === 'test_editmode' || taskType === 'test_framework_editmode') {
+            return { text: `Testing: ${friendlyName}`, state: 'testing' };
+        }
+        if (taskType === 'test_playmode' || taskType === 'test_framework_playmode') {
+            return { text: `Testing: ${friendlyName}`, state: 'testing' };
+        }
+        if (taskType === 'test_player_playmode') {
+            return { text: `Testing: ${friendlyName}`, state: 'playing' };
+        }
+        if (taskType === 'prep_editor' || taskType === 'prep') {
+            return { text: 'Prep', state: 'compiling' };
+        }
+        return { text: `Running: ${friendlyName}`, state: 'running' };
+    }
+    // Show queued state when there are pipelines waiting
+    if (unity.queueLength > 0) {
+        return { text: 'Queued', state: 'running' };
+    }
+    if (unity.isPlaying) {
+        return { text: 'Playing', state: 'playing' };
+    }
+    return { text: 'Idle', state: 'idle' };
+}
+
+/**
+ * Get CSS class for Unity state dot.
+ */
+function getUnityStateClass(unity: UnityInfo): string {
+    if (!unity.connected) {
+        return 'offline';
+    }
+    if (unity.isCompiling) {
+        return 'compiling';
+    }
+    if (unity.currentTask) {
+        const taskType = unity.currentTask.type;
+        if (taskType === 'test_editmode' || taskType === 'test_playmode' || 
+            taskType === 'test_framework_editmode' || taskType === 'test_framework_playmode') {
+            return 'testing';
+        }
+        if (taskType === 'test_player_playmode') {
+            return 'playing';
+        }
+        if (taskType === 'prep_editor' || taskType === 'prep') {
+            return 'compiling';
+        }
+        return 'running';
+    }
+    // Show running animation when pipelines are queued
+    if (unity.queueLength > 0) {
+        return 'running';
+    }
+    if (unity.isPlaying) {
+        return 'playing';
+    }
+    return 'idle';
 }
 
 /**
@@ -310,31 +411,6 @@ function getCoordinatorStateClass(state: string): string {
     }
 }
 
-/**
- * Get Unity badge style based on state.
- */
-function getUnityBadgeStyle(unity: UnityInfo): { text: string; background: string } {
-    if (!unity.connected) {
-        return { text: 'Offline', background: 'rgba(107, 114, 128, 0.3)' };
-    }
-    if (unity.isCompiling) {
-        return { text: 'Compiling', background: 'rgba(0, 122, 204, 0.3)' };
-    }
-    if (unity.currentTask) {
-        const taskType = unity.currentTask.type;
-        if (taskType === 'test_editmode' || taskType === 'test_playmode') {
-            return { text: 'Testing', background: 'rgba(234, 179, 8, 0.3)' };
-        }
-        if (taskType === 'prep_editor') {
-            return { text: 'Compiling', background: 'rgba(0, 122, 204, 0.3)' };
-        }
-        return { text: 'Running', background: 'rgba(115, 201, 145, 0.3)' };
-    }
-    if (unity.isPlaying) {
-        return { text: 'Playing', background: 'rgba(115, 201, 145, 0.3)' };
-    }
-    return { text: 'Idle', background: 'rgba(107, 114, 128, 0.3)' };
-}
 
 /**
  * Escape HTML special characters.

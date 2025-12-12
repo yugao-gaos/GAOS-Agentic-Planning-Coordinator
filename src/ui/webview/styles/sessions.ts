@@ -91,7 +91,6 @@ export const sessionStyles = `
 .session-status-dot.pending { background: #cca700; }
 .session-status-dot.approved { background: #73c991; }
 .session-status-dot.executing { background: #007acc; animation: pulse 1s infinite; }
-.session-status-dot.paused { background: #f97316; }
 .session-status-dot.completed { background: #73c991; }
 .session-status-dot.reviewing { background: #a855f7; }
 .session-status-dot.failed { background: #f14c4c; }
@@ -209,7 +208,6 @@ export const sessionStyles = `
 .sub-item-badge.approved { background: rgba(115, 201, 145, 0.2); color: #73c991; }
 .sub-item-badge.draft { background: rgba(107, 114, 128, 0.2); color: #9ca3af; }
 .sub-item-badge.running { background: rgba(0, 122, 204, 0.2); color: #007acc; }
-.sub-item-badge.paused { background: rgba(249, 115, 22, 0.2); color: #f97316; }
 .sub-item-badge.completed { background: rgba(115, 201, 145, 0.2); color: #73c991; }
 .sub-item-badge.reviewing { background: rgba(168, 85, 247, 0.2); color: #a855f7; }
 .sub-item-badge.revising { 
@@ -563,6 +561,192 @@ export const sessionStyles = `
         flex: 1;
         max-width: 80px;
     }
+}
+
+/* ===== COMPLETED SESSIONS SECTION ===== */
+.completed-sessions-section {
+    margin-top: 12px;
+    border-top: 1px solid var(--vscode-widget-border);
+    padding-top: 8px;
+}
+
+.completed-sessions-header {
+    display: flex;
+    align-items: center;
+    padding: 4px 8px;
+    cursor: pointer;
+    gap: 6px;
+    border-radius: 4px;
+    opacity: 0.8;
+}
+
+.completed-sessions-header:hover {
+    background: var(--vscode-list-hoverBackground);
+    opacity: 1;
+}
+
+.completed-sessions-expand {
+    width: 14px;
+    height: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 0.15s;
+    flex-shrink: 0;
+}
+
+.completed-sessions-expand.expanded {
+    transform: rotate(90deg);
+}
+
+.completed-sessions-expand svg {
+    width: 10px;
+    height: 10px;
+    fill: currentColor;
+    opacity: 0.6;
+}
+
+.completed-sessions-title {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--vscode-foreground);
+    opacity: 0.7;
+}
+
+.completed-sessions-count {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background: rgba(115, 201, 145, 0.15);
+    color: #73c991;
+    margin-left: auto;
+}
+
+.completed-sessions-body {
+    display: none;
+    padding-top: 4px;
+}
+
+.completed-sessions-body.expanded {
+    display: block;
+}
+
+/* Individual completed session item */
+.completed-session-item {
+    display: flex;
+    align-items: center;
+    padding: 6px 8px 6px 24px;
+    border-radius: 3px;
+    margin-bottom: 2px;
+    gap: 8px;
+}
+
+.completed-session-item:hover {
+    background: var(--vscode-list-hoverBackground);
+}
+
+.completed-session-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.completed-session-title {
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--vscode-foreground);
+    opacity: 0.9;
+}
+
+.completed-session-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 10px;
+    opacity: 0.6;
+}
+
+.completed-session-date {
+    color: var(--vscode-descriptionForeground);
+}
+
+.completed-session-progress {
+    color: #73c991;
+}
+
+.completed-session-actions {
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.completed-session-item:hover .completed-session-actions {
+    opacity: 1;
+}
+
+.completed-session-btn {
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--vscode-button-secondaryBackground);
+    border: 1px solid var(--vscode-widget-border);
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--vscode-foreground);
+    padding: 0;
+}
+
+.completed-session-btn:hover {
+    background: var(--vscode-button-secondaryHoverBackground);
+}
+
+.completed-session-btn.primary {
+    background: rgba(115, 201, 145, 0.2);
+    border-color: rgba(115, 201, 145, 0.3);
+    color: #73c991;
+}
+
+.completed-session-btn.primary:hover {
+    background: rgba(115, 201, 145, 0.3);
+    border-color: rgba(115, 201, 145, 0.5);
+}
+
+.completed-session-btn svg {
+    width: 12px;
+    height: 12px;
+    fill: currentColor;
+}
+
+/* View All button */
+.completed-sessions-view-all {
+    display: block;
+    width: calc(100% - 32px);
+    margin: 8px 16px;
+    padding: 6px 12px;
+    font-size: 11px;
+    background: var(--vscode-button-secondaryBackground);
+    color: var(--vscode-button-secondaryForeground);
+    border: 1px solid var(--vscode-widget-border);
+    border-radius: 4px;
+    cursor: pointer;
+    text-align: center;
+    transition: background 0.15s;
+}
+
+.completed-sessions-view-all:hover {
+    background: var(--vscode-button-secondaryHoverBackground);
+}
+
+.completed-sessions-view-all:active {
+    transform: scale(0.98);
 }
 `;
 

@@ -29,7 +29,6 @@ interface NodeState {
     inputs: Record<string, any>;
     outputs: Record<string, any>;
     result?: INodeExecutionResult;
-    retryCount: number;
     startedAt?: string;
     error?: string;  // Error message when status is 'failed' or 'skipped'
 }
@@ -40,7 +39,7 @@ interface NodeState {
 interface BranchState {
     branchId: string;
     nodeIds: string[];
-    status: 'pending' | 'running' | 'completed' | 'failed';
+    status: 'pending' | 'running' | 'succeeded' | 'failed';
     result?: any;
 }
 
@@ -131,8 +130,7 @@ export class NodeExecutionEngine {
             this.nodeStates.set(node.id, {
                 status: 'pending',
                 inputs: {},
-                outputs: {},
-                retryCount: 0
+                outputs: {}
             });
         }
     }
@@ -165,7 +163,7 @@ export class NodeExecutionEngine {
             
             for (const endNode of endNodes) {
                 const state = this.nodeStates.get(endNode.id);
-                if (state?.status === 'completed' && state.outputs['__workflow_output__']) {
+                if (state?.status === 'succeeded' && state.outputs['__workflow_output__']) {
                     output = { ...output, ...state.outputs['__workflow_output__'] };
                 }
             }
@@ -223,7 +221,7 @@ export class NodeExecutionEngine {
         const state = this.nodeStates.get(nodeId)!;
         
         // Skip if already completed
-        if (state.status === 'completed' || state.status === 'skipped') {
+        if (state.status === 'succeeded' || state.status === 'skipped') {
             return;
         }
         
@@ -268,7 +266,7 @@ export class NodeExecutionEngine {
             );
             
             state.outputs = outputs;
-            state.status = 'completed';
+            state.status = 'succeeded';
             
             // Add outputs to context for expression evaluation
             this.context.addNodeOutputs(nodeId, outputs);
@@ -281,7 +279,7 @@ export class NodeExecutionEngine {
             // Build result
             state.result = {
                 nodeId,
-                status: 'completed',
+                status: 'succeeded',
                 outputs,
                 durationMs: Date.now() - startTime,
                 startedAt: state.startedAt,
@@ -336,7 +334,7 @@ export class NodeExecutionEngine {
         for (const conn of incomingConnections) {
             const sourceState = this.nodeStates.get(conn.fromNodeId);
             
-            if (sourceState?.status !== 'completed') {
+            if (sourceState?.status !== 'succeeded') {
                 // Source not ready - this shouldn't happen in normal execution
                 continue;
             }
@@ -420,7 +418,7 @@ export class NodeExecutionEngine {
         // Check if all source nodes have completed
         for (const conn of incomingConnections) {
             const sourceState = this.nodeStates.get(conn.fromNodeId);
-            if (!sourceState || sourceState.status !== 'completed') {
+            if (!sourceState || sourceState.status !== 'succeeded') {
                 return false;
             }
         }
@@ -631,12 +629,15 @@ export class NodeExecutionEngine {
             state.inputs = {};
             state.outputs = {};
             state.result = undefined;
-            state.retryCount = 0;
         }
     }
     
     /**
-     * Handle node error with retry/skip/abort/goto strategies
+     * Handle node error with skip/abort/goto strategies
+     * 
+     * Note: 'retry' strategy was removed to avoid agent leaks and state issues.
+     * If a node fails, the workflow should fail and let coordinator handle retry
+     * with a fresh workflow.
      */
     private async handleNodeError(
         node: INodeInstance,
@@ -648,26 +649,7 @@ export class NodeExecutionEngine {
             return false; // No error handling, propagate error
         }
         
-        const errorMsg = error instanceof Error ? error.message : String(error);
-        
         switch (errorConfig.strategy) {
-            case 'retry':
-                const maxRetries = errorConfig.maxRetries || 3;
-                if (state.retryCount < maxRetries) {
-                    state.retryCount++;
-                    const delayMs = errorConfig.retryDelayMs || 1000;
-                    
-                    log.warn(`Node ${node.id} failed, retrying (${state.retryCount}/${maxRetries}) in ${delayMs}ms`);
-                    
-                    await this.context.sleep(delayMs);
-                    
-                    // Reset state and re-execute
-                    state.status = 'pending';
-                    await this.executeNode(node.id);
-                    return true;
-                }
-                return false;
-                
             case 'skip':
                 // WARNING: 'skip' strategy masks errors with default values
                 // Only use this if you understand the error will be hidden from users
@@ -725,7 +707,7 @@ export class NodeExecutionEngine {
             graphName: this.graph.name,
             timestamp: new Date().toISOString(),
             completedNodes: Array.from(this.nodeStates.entries())
-                .filter(([_, s]) => s.status === 'completed')
+                .filter(([_, s]) => s.status === 'succeeded')
                 .map(([id, _]) => id),
             contextSnapshot: this.context.getAllVariables(),
             nodeResults: Object.fromEntries(
@@ -761,7 +743,7 @@ export class NodeExecutionEngine {
         for (const nodeId of checkpoint.completedNodes) {
             const state = this.nodeStates.get(nodeId);
             if (state) {
-                state.status = 'completed';
+                state.status = 'succeeded';
                 if (checkpoint.nodeResults[nodeId]) {
                     state.result = checkpoint.nodeResults[nodeId];
                     state.outputs = checkpoint.nodeResults[nodeId].outputs;

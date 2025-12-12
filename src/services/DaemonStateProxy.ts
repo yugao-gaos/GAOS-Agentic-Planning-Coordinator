@@ -18,6 +18,7 @@ import {
     AgentRole
 } from '../types';
 import { WorkflowProgress, CompletedWorkflowSummary } from '../types/workflow';
+import { CompletedSessionInfo } from '../client/Protocol';
 import { Logger } from '../utils/Logger';
 
 const log = Logger.create('Client', 'DaemonStateProxy');
@@ -48,14 +49,13 @@ export interface PoolStatus {
 export interface BusyAgentInfo {
     name: string;
     roleId?: string;
-    coordinatorId: string;
+    workflowId: string;
     sessionId: string;
-    workflowId?: string;  // The specific workflow this agent is working on
     task?: string;
 }
 
 export interface SessionState {
-    isRevising: boolean;
+    // Note: Check session.status === 'revising' for revision state
     activeWorkflows: Map<string, WorkflowProgress>;
     workflowHistory: CompletedWorkflowSummary[];
 }
@@ -67,6 +67,12 @@ export interface UnityStatus {
     hasErrors: boolean;
     errorCount: number;
     queueLength: number;
+    status?: 'idle' | 'compiling' | 'testing' | 'playing' | 'error';
+    currentTask?: {
+        id: string;
+        type: string;
+        phase?: string;
+    };
 }
 
 export interface CoordinatorStatusInfo {
@@ -83,6 +89,8 @@ export interface DaemonStateProxyOptions {
     unityEnabled?: boolean;
     /** Workspace root for locating daemon port file (for auto-reconnect) */
     workspaceRoot?: string;
+    /** Extension URI for creating webview panels */
+    extensionUri?: any;
 }
 
 // ============================================================================
@@ -111,6 +119,7 @@ export class DaemonStateProxy {
     private vsCodeClient: VsCodeClient;
     private unityEnabled: boolean;
     private workspaceRoot?: string;
+    private extensionUri?: any;
     
     // Connection health monitoring
     private healthCheckTimer: NodeJS.Timeout | null = null;
@@ -134,6 +143,7 @@ export class DaemonStateProxy {
         this.vsCodeClient = options.vsCodeClient;
         this.unityEnabled = options.unityEnabled ?? true;
         this.workspaceRoot = options.workspaceRoot;
+        this.extensionUri = options.extensionUri;
         
         // Listen to coordinator and Unity status events
         this.setupEventListeners();
@@ -165,25 +175,53 @@ export class DaemonStateProxy {
         // Listen for Unity status changes
         this.vsCodeClient.on('unity.statusChanged', (data: any) => {
             this.lastUnityStatus = {
-                connected: true,  // If we're receiving events, Unity is connected
+                connected: data.connected ?? false,  // Unity Bridge connected to daemon
                 isPlaying: data.isPlaying,
                 isCompiling: data.isCompiling,
                 hasErrors: data.hasErrors,
                 errorCount: data.errorCount,
-                queueLength: 0  // Will be updated by state queries
+                queueLength: data.queueLength ?? 0,
+                status: data.status,
+                currentTask: data.currentTask
             };
         });
         
-        // Listen for Unity pipeline events to update queue
-        this.vsCodeClient.on('unity.pipelineStarted', (data: any) => {
-            if (this.lastUnityStatus) {
-                this.lastUnityStatus.queueLength = (this.lastUnityStatus.queueLength || 0) + 1;
-            }
+        // Listen for player test popup request
+        this.vsCodeClient.on('unity.playerTestRequest', (data: any) => {
+            this.handlePlayerTestRequest(data.pipelineId, data.stepIndex);
         });
+    }
+    
+    // Player test popup handling
+    private playerTestPopup: any = null;
+    private currentPlayerTestPipelineId: string | null = null;
+    
+    /**
+     * Handle player test popup request from daemon
+     */
+    private async handlePlayerTestRequest(pipelineId: string, stepIndex: number): Promise<void> {
+        log.info(`[DaemonStateProxy] Player test requested for pipeline ${pipelineId}`);
         
-        this.vsCodeClient.on('unity.pipelineCompleted', (data: any) => {
-            if (this.lastUnityStatus && this.lastUnityStatus.queueLength > 0) {
-                this.lastUnityStatus.queueLength--;
+        // Dynamically import to avoid circular dependency
+        const { PlayerTestPopup } = await import('../ui/PlayerTestPopup');
+        
+        this.currentPlayerTestPipelineId = pipelineId;
+        
+        const popup = PlayerTestPopup.getInstance();
+        popup.show(this.extensionUri, {
+            onStartTest: () => {
+                log.info('[DaemonStateProxy] User started player test');
+                this.vsCodeClient.sendPlayerTestStart(pipelineId);
+            },
+            onFinishTest: () => {
+                log.info('[DaemonStateProxy] User finished player test');
+                this.vsCodeClient.sendPlayerTestFinish(pipelineId);
+                this.currentPlayerTestPipelineId = null;
+            },
+            onCancel: () => {
+                log.info('[DaemonStateProxy] User cancelled player test');
+                this.vsCodeClient.sendPlayerTestCancel(pipelineId);
+                this.currentPlayerTestPipelineId = null;
             }
         });
     }
@@ -521,6 +559,74 @@ export class DaemonStateProxy {
             return undefined;
         }
     }
+    
+    /**
+     * Get completed sessions from daemon (these are stored on disk, not in memory)
+     */
+    async getCompletedSessions(limit?: number): Promise<{ sessions: CompletedSessionInfo[]; total: number }> {
+        if (!this.vsCodeClient.isConnected()) {
+            return { sessions: [], total: 0 };
+        }
+
+        try {
+            const response = await this.vsCodeClient.listCompletedSessions(limit);
+            return response;
+        } catch (err) {
+            log.warn('Failed to get completed sessions from daemon:', err);
+            return { sessions: [], total: 0 };
+        }
+    }
+    
+    /**
+     * Reopen a completed session for review
+     */
+    async reopenSession(sessionId: string): Promise<boolean> {
+        if (!this.vsCodeClient.isConnected()) {
+            return false;
+        }
+
+        try {
+            await this.vsCodeClient.reopenSession(sessionId);
+            return true;
+        } catch (err) {
+            log.warn('Failed to reopen session:', err);
+            return false;
+        }
+    }
+    
+    /**
+     * Manually complete a session
+     */
+    async completeSession(sessionId: string): Promise<{ success: boolean; error?: string }> {
+        if (!this.vsCodeClient.isConnected()) {
+            return { success: false, error: 'Not connected to daemon' };
+        }
+
+        try {
+            await this.vsCodeClient.send('session.complete', { id: sessionId });
+            return { success: true };
+        } catch (err) {
+            log.warn('Failed to complete session:', err);
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Check if a session is ready for manual completion
+     */
+    async isSessionReadyForCompletion(sessionId: string): Promise<boolean> {
+        if (!this.vsCodeClient.isConnected()) {
+            return false;
+        }
+
+        try {
+            const response: { ready: boolean } = await this.vsCodeClient.send('session.checkReadyForCompletion', { id: sessionId });
+            return response.ready;
+        } catch (err) {
+            log.warn('Failed to check session completion readiness:', err);
+            return false;
+        }
+    }
 
     // NOTE: getProgressLogPath removed - progress.log is no longer generated
     // Use workflow logs in logs/ folder instead
@@ -580,7 +686,7 @@ export class DaemonStateProxy {
             return response.busy.map(b => ({
                 name: b.name,
                 roleId: b.roleId,
-                coordinatorId: b.coordinatorId,
+                workflowId: b.workflowId,
                 sessionId: b.sessionId,
                 task: b.task
             }));
@@ -703,7 +809,6 @@ export class DaemonStateProxy {
         try {
             type SessionStateResponse = { 
                 state?: { 
-                    isRevising: boolean; 
                     activeWorkflows?: Array<WorkflowProgress & { id: string }>;
                     workflowHistory?: CompletedWorkflowSummary[];
                 } 
@@ -718,7 +823,6 @@ export class DaemonStateProxy {
                     }
                 }
                 return {
-                    isRevising: response.state.isRevising,
                     activeWorkflows: workflowsMap,
                     workflowHistory: response.state.workflowHistory || []
                 };
@@ -753,13 +857,15 @@ export class DaemonStateProxy {
 
         try {
             const response = await this.vsCodeClient.getUnityStatus();
-            const status = {
+            const status: UnityStatus = {
                 connected: response.connected,
                 isPlaying: response.isPlaying,
                 isCompiling: response.isCompiling,
                 hasErrors: response.hasErrors,
                 errorCount: response.errorCount,
-                queueLength: response.queueLength
+                queueLength: response.queueLength ?? 0,
+                status: response.status as UnityStatus['status'],
+                currentTask: response.currentTask
             };
             this.lastUnityStatus = status;
             return status;
@@ -786,6 +892,66 @@ export class DaemonStateProxy {
             return await this.vsCodeClient.triggerUnityPrep();
         } catch (err) {
             log.warn('Failed to trigger Unity prep:', err);
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Trigger Unity prep + EditMode test pipeline
+     */
+    async triggerUnityEditModeTest(): Promise<{ success: boolean; pipelineId?: string; error?: string }> {
+        if (!this.unityEnabled) {
+            return { success: false, error: 'Unity features not enabled' };
+        }
+        
+        if (!this.vsCodeClient.isConnected()) {
+            return { success: false, error: 'Daemon not connected' };
+        }
+        
+        try {
+            return await this.vsCodeClient.triggerUnityPipeline(['prep', 'test_editmode']);
+        } catch (err) {
+            log.warn('Failed to trigger Unity EditMode test:', err);
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Trigger Unity prep + PlayMode test pipeline
+     */
+    async triggerUnityPlayModeTest(): Promise<{ success: boolean; pipelineId?: string; error?: string }> {
+        if (!this.unityEnabled) {
+            return { success: false, error: 'Unity features not enabled' };
+        }
+        
+        if (!this.vsCodeClient.isConnected()) {
+            return { success: false, error: 'Daemon not connected' };
+        }
+        
+        try {
+            return await this.vsCodeClient.triggerUnityPipeline(['prep', 'test_playmode']);
+        } catch (err) {
+            log.warn('Failed to trigger Unity PlayMode test:', err);
+            return { success: false, error: err instanceof Error ? err.message : String(err) };
+        }
+    }
+    
+    /**
+     * Trigger Unity prep + Player manual test pipeline
+     */
+    async triggerUnityPlayerTest(): Promise<{ success: boolean; pipelineId?: string; error?: string }> {
+        if (!this.unityEnabled) {
+            return { success: false, error: 'Unity features not enabled' };
+        }
+        
+        if (!this.vsCodeClient.isConnected()) {
+            return { success: false, error: 'Daemon not connected' };
+        }
+        
+        try {
+            return await this.vsCodeClient.triggerUnityPipeline(['prep', 'test_player_playmode']);
+        } catch (err) {
+            log.warn('Failed to trigger Unity Player test:', err);
             return { success: false, error: err instanceof Error ? err.message : String(err) };
         }
     }
@@ -833,26 +999,6 @@ export class DaemonStateProxy {
     // ========================================================================
     // Workflow Control
     // ========================================================================
-    
-    /**
-     * Pause a workflow
-     */
-    async pauseWorkflow(sessionId: string, workflowId: string): Promise<{ success: boolean; error?: string }> {
-        if (!this.vsCodeClient.isConnected()) {
-            return { success: false, error: 'Daemon not connected' };
-        }
-        return this.vsCodeClient.pauseWorkflow(sessionId, workflowId);
-    }
-    
-    /**
-     * Resume a paused workflow
-     */
-    async resumeWorkflow(sessionId: string, workflowId: string): Promise<{ success: boolean; error?: string }> {
-        if (!this.vsCodeClient.isConnected()) {
-            return { success: false, error: 'Daemon not connected' };
-        }
-        return this.vsCodeClient.resumeWorkflow(sessionId, workflowId);
-    }
     
     /**
      * Cancel a workflow
@@ -949,6 +1095,28 @@ export class DaemonStateProxy {
         } catch (err) {
             log.warn('Failed to refresh dependencies on daemon:', err);
             return undefined;
+        }
+    }
+    
+    /**
+     * Install APC Unity Bridge package to Unity project
+     */
+    async installUnityBridge(): Promise<{ success: boolean; message: string } | undefined> {
+        if (!this.vsCodeClient.isConnected()) {
+            return undefined;
+        }
+        
+        try {
+            const response: { success?: boolean; message?: string } = 
+                await this.vsCodeClient.send('system.installUnityBridge');
+            
+            return {
+                success: response.success || false,
+                message: response.message || 'Unknown result'
+            };
+        } catch (err) {
+            log.warn('Failed to install Unity Bridge:', err);
+            return { success: false, message: err instanceof Error ? err.message : String(err) };
         }
     }
 }

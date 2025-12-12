@@ -28,6 +28,7 @@ import { ProcessManager } from '../services/ProcessManager';
 import { HeadlessTerminalManager } from '../services/HeadlessTerminalManager';
 import { WslKeepaliveMonitor } from './WslKeepaliveMonitor';
 import { countCursorAgentProcesses, killOrphanCursorAgents } from '../utils/orphanCleanup';
+import { execSync } from 'child_process';
 
 const log = Logger.create('Daemon', 'ApcDaemon');
 
@@ -41,10 +42,14 @@ const log = Logger.create('Daemon', 'ApcDaemon');
 interface ConnectedClient {
     id: string;
     ws: WebSocket;
-    type: 'vscode' | 'tui' | 'headless' | 'cli' | 'unknown';
+    type: 'vscode' | 'tui' | 'headless' | 'cli' | 'unity' | 'unknown';
     connectedAt: string;
     lastActivity: string;
     subscribedSessions: Set<string>;
+    /** For Unity clients: the project path they registered with */
+    unityProjectPath?: string;
+    /** For Unity clients: whether they've completed registration */
+    isRegistered?: boolean;
 }
 
 /**
@@ -99,6 +104,16 @@ export class ApcDaemon {
     /** Idle shutdown timer - daemon shuts down after 60s with no clients */
     private idleShutdownTimer: NodeJS.Timeout | null = null;
     private static readonly IDLE_SHUTDOWN_MS = 60000;  // 60 seconds
+    
+    /** Track the registered Unity client (only one allowed per daemon) */
+    private unityClientId: string | null = null;
+    
+    /** Callbacks for Unity client lifecycle events */
+    private onUnityClientConnected?: (clientId: string) => void;
+    private onUnityClientDisconnected?: () => void;
+    
+    /** Callback for Unity events (state changes, compile events, etc.) */
+    private onUnityEvent?: (eventName: string, data: any) => void;
     
     constructor(options: DaemonOptions = {}) {
         const workspaceRoot = options.workspaceRoot || findWorkspaceRoot();
@@ -167,6 +182,8 @@ export class ApcDaemon {
                     clearInitializationCache: () => this.clearInitializationCache(),
                     setDependencyCheckComplete: () => this.setDependencyCheckComplete()
                 };
+                // Pass config loader for live config updates
+                this.services.configLoader = this.configLoader;
                 this.apiHandler = new ApiHandler(this.services);
             }
             
@@ -310,6 +327,8 @@ export class ApcDaemon {
             clearInitializationCache: () => this.clearInitializationCache(),
             setDependencyCheckComplete: () => this.setDependencyCheckComplete()
         };
+        // Pass config loader for live config updates
+        this.services.configLoader = this.configLoader;
         this.apiHandler = new ApiHandler(services);
         this.log('info', 'Services registered with daemon');
         
@@ -331,12 +350,12 @@ export class ApcDaemon {
         // Cancel idle shutdown timer if active
         this.cancelIdleShutdownTimer();
         
-        // Gracefully shutdown coordinator (pause workflows, release agents)
-        // This saves workflow state so they can be resumed on restart
+        // Gracefully shutdown coordinator (cancel workflows, release agents)
+        // Active workflows will need to be restarted manually on next daemon start
         if (this.services?.coordinator?.gracefulShutdown) {
             try {
                 const result = await this.services.coordinator.gracefulShutdown();
-                this.log('info', `Graceful shutdown: ${result.workflowsPaused} workflows paused, ${result.agentsReleased} agents released`);
+                this.log('info', `Graceful shutdown: ${result.workflowsCancelled} workflows cancelled, ${result.agentsReleased} agents released`);
             } catch (err) {
                 this.log('warn', `Graceful shutdown error: ${err}`);
             }
@@ -354,15 +373,33 @@ export class ApcDaemon {
         }
         
         // Stop WSL keepalive monitor (if running)
+        let wasWslKeepaliveRunning = false;
         try {
             if (ServiceLocator.isRegistered(WslKeepaliveMonitor)) {
                 const wslKeepalive = ServiceLocator.resolve(WslKeepaliveMonitor);
+                wasWslKeepaliveRunning = wslKeepalive.isRunning();
                 wslKeepalive.stop();
                 this.log('info', 'WslKeepaliveMonitor stopped');
             }
         } catch (err) {
             // WSL keepalive may not be registered (non-Windows or non-cursor backend)
             this.log('debug', `WslKeepaliveMonitor cleanup skipped: ${err}`);
+        }
+        
+        // Shut down WSL if we were keeping it alive (Windows only)
+        // This reclaims the ~2GB memory used by VmmemWSL
+        if (wasWslKeepaliveRunning && process.platform === 'win32') {
+            try {
+                this.log('info', 'Shutting down WSL to reclaim memory...');
+                execSync('wsl --shutdown', { 
+                    stdio: 'ignore',
+                    windowsHide: true,
+                    timeout: 10000  // 10 second timeout
+                });
+                this.log('info', 'WSL shutdown complete');
+            } catch (err) {
+                this.log('warn', `WSL shutdown failed: ${err}`);
+            }
         }
         
         // Broadcast shutdown event
@@ -636,6 +673,8 @@ export class ApcDaemon {
         
         if (message.type === 'request') {
             await this.handleRequest(client, message.payload);
+        } else if (message.type === 'event' && client.type === 'unity') {
+            this.handleUnityEvent(client, message.payload);
         } else {
             this.log('warn', `Unknown message type from ${client.id}: ${message.type}`);
         }
@@ -769,6 +808,17 @@ export class ApcDaemon {
      */
     private handleDisconnect(client: ConnectedClient, code: number, reason: string): void {
         this.log('info', `Client disconnected: ${client.id} (code: ${code}, reason: ${reason})`);
+        
+        // Handle Unity client disconnect
+        if (client.type === 'unity' && this.unityClientId === client.id) {
+            this.log('info', 'Unity client disconnected');
+            this.unityClientId = null;
+            
+            // Notify callback
+            if (this.onUnityClientDisconnected) {
+                this.onUnityClientDisconnected();
+            }
+        }
         
         // Unsubscribe from all sessions
         this.broadcaster.unsubscribeClient(client.id);
@@ -929,7 +979,7 @@ export class ApcDaemon {
         const clientType = req.headers['x-apc-client-type'] as string;
         
         if (clientType) {
-            if (['vscode', 'tui', 'headless', 'cli'].includes(clientType)) {
+            if (['vscode', 'tui', 'headless', 'cli', 'unity'].includes(clientType)) {
                 return clientType as ConnectedClient['type'];
             }
         }
@@ -992,6 +1042,189 @@ export class ApcDaemon {
      */
     getConfigLoader(): ConfigLoader {
         return this.configLoader;
+    }
+    
+    // ========================================================================
+    // Unity Client Management
+    // ========================================================================
+    
+    /**
+     * Set callbacks for Unity client lifecycle events.
+     * Called by UnityControlManager to track when Unity connects/disconnects.
+     */
+    setUnityClientCallbacks(
+        onConnected: (clientId: string) => void,
+        onDisconnected: () => void
+    ): void {
+        this.onUnityClientConnected = onConnected;
+        this.onUnityClientDisconnected = onDisconnected;
+    }
+    
+    /**
+     * Set callback for Unity events (state changes, compile events, test events).
+     * Events are pushed from Unity Bridge when editor state changes.
+     */
+    setUnityEventCallback(callback: (eventName: string, data: any) => void): void {
+        this.onUnityEvent = callback;
+    }
+    
+    /**
+     * Handle incoming event from Unity client.
+     * Routes events to UnityControlManager for processing.
+     * 
+     * Note: We don't broadcast raw Unity Bridge events directly - instead,
+     * UnityControlManager processes them and emits proper typed events
+     * via emitStatusUpdate() which broadcasts unity.statusChanged.
+     */
+    private handleUnityEvent(client: ConnectedClient, event: ApcEvent): void {
+        if (!client.isRegistered) {
+            this.log('warn', `Ignoring event from unregistered Unity client: ${client.id}`);
+            return;
+        }
+        
+        const eventName = event.event;
+        const eventData = event.data;
+        
+        this.log('debug', `Unity event from ${client.id}: ${eventName}`);
+        
+        // Route to UnityControlManager via callback
+        // UnityControlManager will process the event and emit typed status updates
+        if (this.onUnityEvent) {
+            this.onUnityEvent(eventName, eventData);
+        }
+    }
+    
+    /**
+     * Register a Unity client after workspace validation.
+     * Only one Unity client can be registered at a time.
+     * 
+     * @param clientId The client ID to register
+     * @param projectPath The Unity project path to validate
+     * @returns Success/failure with error message if validation fails
+     */
+    registerUnityClient(clientId: string, projectPath: string): { success: boolean; error?: string } {
+        const client = this.clients.get(clientId);
+        if (!client) {
+            return { success: false, error: 'Client not found' };
+        }
+        
+        if (client.type !== 'unity') {
+            return { success: false, error: 'Client is not a Unity client' };
+        }
+        
+        // Validate workspace match
+        const normalizedProjectPath = projectPath.replace(/\\/g, '/').toLowerCase();
+        const normalizedWorkspaceRoot = this.config.workspaceRoot.replace(/\\/g, '/').toLowerCase();
+        
+        if (normalizedProjectPath !== normalizedWorkspaceRoot) {
+            this.log('warn', `Unity client ${clientId} project path mismatch: ${projectPath} vs ${this.config.workspaceRoot}`);
+            return { 
+                success: false, 
+                error: `Project path mismatch. Expected: ${this.config.workspaceRoot}, Got: ${projectPath}` 
+            };
+        }
+        
+        // Check if another Unity client is already registered
+        if (this.unityClientId && this.unityClientId !== clientId) {
+            const existingClient = this.clients.get(this.unityClientId);
+            if (existingClient) {
+                this.log('warn', `Rejecting Unity client ${clientId} - another Unity client already registered: ${this.unityClientId}`);
+                return { success: false, error: 'Another Unity client is already registered' };
+            }
+        }
+        
+        // Register the Unity client
+        client.unityProjectPath = projectPath;
+        client.isRegistered = true;
+        this.unityClientId = clientId;
+        
+        this.log('info', `Unity client registered: ${clientId} (${projectPath})`);
+        
+        // Notify callback
+        if (this.onUnityClientConnected) {
+            this.onUnityClientConnected(clientId);
+        }
+        
+        return { success: true };
+    }
+    
+    /**
+     * Get the registered Unity client ID (if any)
+     */
+    getUnityClientId(): string | null {
+        return this.unityClientId;
+    }
+    
+    /**
+     * Check if a Unity client is registered and connected
+     */
+    isUnityClientConnected(): boolean {
+        if (!this.unityClientId) return false;
+        const client = this.clients.get(this.unityClientId);
+        return client?.isRegistered === true && client.ws.readyState === WebSocket.OPEN;
+    }
+    
+    /**
+     * Send a message directly to the Unity client
+     * @returns true if message was sent, false if Unity not connected
+     */
+    sendToUnityClient(message: ApcMessage): boolean {
+        if (!this.unityClientId) return false;
+        
+        const client = this.clients.get(this.unityClientId);
+        if (!client || !client.isRegistered) return false;
+        
+        return this.sendToClient(client, message);
+    }
+    
+    /**
+     * Send a request to Unity and wait for response
+     */
+    async sendRequestToUnity(cmd: string, params?: Record<string, unknown>, timeoutMs: number = 30000): Promise<ApcResponse | null> {
+        if (!this.isUnityClientConnected()) {
+            return null;
+        }
+        
+        const client = this.clients.get(this.unityClientId!)!;
+        const requestId = `unity_req_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        
+        return new Promise((resolve) => {
+            // Set up timeout
+            const timeout = setTimeout(() => {
+                resolve({ id: requestId, success: false, error: 'Unity request timed out' });
+            }, timeoutMs);
+            
+            // Set up one-time response handler
+            const responseHandler = (data: WebSocket.RawData) => {
+                try {
+                    const message = JSON.parse(data.toString()) as ApcMessage;
+                    if (message.type === 'response') {
+                        const response = message.payload as ApcResponse;
+                        if (response.id === requestId) {
+                            clearTimeout(timeout);
+                            client.ws.off('message', responseHandler);
+                            resolve(response);
+                        }
+                    }
+                } catch {
+                    // Ignore parse errors
+                }
+            };
+            
+            client.ws.on('message', responseHandler);
+            
+            // Send request
+            const request: ApcRequest = {
+                id: requestId,
+                cmd,
+                params
+            };
+            
+            this.sendToClient(client, {
+                type: 'request',
+                payload: request
+            });
+        });
     }
 }
 

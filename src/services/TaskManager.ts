@@ -9,6 +9,7 @@ import { AgentPoolService } from './AgentPoolService';
 import { atomicWriteFileSync } from './StateManager';
 import { getMemoryMonitor } from './MemoryMonitor';
 import { getFolderStructureManager } from './FolderStructureManager';
+import { TaskIdValidator } from './TaskIdValidator';
 
 // ============================================================================
 // Task Manager - Global Singleton for Cross-Plan Task Coordination
@@ -24,14 +25,38 @@ export type TaskStatus =
     | 'in_progress'        // Workflow running on this task
     | 'awaiting_decision'  // Workflow finished, waiting for coordinator to decide next action
     | 'blocked'            // Waiting for dependencies
-    | 'paused'             // Manually paused
-    | 'completed'          // Coordinator marked complete via CLI
-    | 'failed';            // Coordinator marked failed via CLI
+    | 'succeeded';         // Coordinator verified work complete via CLI
+    // NOTE: No 'failed' status - tasks are NEVER abandoned. They stay in 'awaiting_decision'
+    // until coordinator retries or user intervenes.
 
 /**
  * Simple task type for categorization
  */
 export type TaskType = 'implementation' | 'error_fix';
+
+/**
+ * User clarification - Q&A entry for when coordinator asks user for input
+ */
+export interface UserClarification {
+    id: string;
+    question: string;
+    answer?: string;
+    askedAt: string;
+    answeredAt?: string;
+}
+
+/**
+ * Task-level workflow history entry
+ * Tracks workflows run on each task for gating logic (e.g., context must succeed before implementation)
+ */
+export interface TaskWorkflowHistoryEntry {
+    workflowId: string;
+    workflowType: 'context_gathering' | 'task_implementation' | 'error_resolution';
+    status: 'running' | 'succeeded' | 'failed' | 'cancelled';
+    startedAt: string;
+    completedAt?: string;
+    error?: string;
+}
 
 /**
  * Parameters for creating a task via CLI
@@ -56,33 +81,9 @@ export interface TaskCreateParams {
     
     /** Unity pipeline configuration - determines which operations to run after implementation */
     unityPipeline?: UnityPipelineConfig;
-}
-
-/**
- * Active workflow state - embedded in task for persistence
- * This is the single source of truth for active/paused workflow state.
- * Replaces the old paused_workflows/*.json files.
- */
-export interface ActiveWorkflowState {
-    id: string;                    // Workflow ID
-    type: string;                  // Workflow type (task_implementation, etc.)
-    status: 'pending' | 'running' | 'paused' | 'blocked';
-    phaseIndex: number;            // Current phase index
-    phaseName: string;             // Current phase name
-    allocatedAgents: string[];     // Agents allocated to this workflow
-    startedAt: string;             // When workflow started
-    pausedAt?: string;             // When workflow was paused (if paused)
     
-    // Continuation context for resuming paused workflows
-    continuationContext?: {
-        partialOutput: string;     // Partial agent output when paused
-        filesModified: string[];   // Files modified before pause
-        whatWasDone: string;       // Summary of completed work
-    };
-    
-    // Original workflow input (needed to recreate workflow on restore)
-    workflowInput: Record<string, any>;
-    priority: number;
+    /** Whether this task needs context gathering before implementation */
+    needsContext?: boolean;
 }
 
 /**
@@ -105,9 +106,6 @@ export interface ManagedTask {
     targetFiles?: string[];       // Expected files to modify
     notes?: string;               // Additional context
     
-    // Active workflow (at most 1 per task) - replaces currentWorkflow + paused_workflows files
-    activeWorkflow?: ActiveWorkflowState;
-    
     // Timing
     createdAt: string;
     startedAt?: string;           // First workflow started
@@ -115,10 +113,6 @@ export interface ManagedTask {
     
     // Files modified (accumulated across workflows)
     filesModified: string[];
-    
-    // Pause tracking
-    pausedAt?: string;
-    pausedReason?: string;
     
     // Attempt tracking (incremented each time a workflow fails on this task)
     attempts: number;
@@ -130,6 +124,19 @@ export interface ManagedTask {
     
     // Unity pipeline configuration (set by analyst during planning)
     unityPipeline?: UnityPipelineConfig;
+    
+    // Context gathering tracking
+    contextPath?: string;          // Path to gathered context file
+    contextGatheredAt?: string;    // When context was gathered
+    
+    // Context requirement (set by TaskAgent during creation)
+    needsContext?: boolean;        // Whether this task needs context gathering before implementation
+    
+    // Task-level workflow history (for gating logic)
+    workflowHistory?: TaskWorkflowHistoryEntry[];
+    
+    // User clarifications - Q&A history for this task
+    userClarifications?: UserClarification[];
     
     // Legacy fields for compatibility during migration
     // TODO: Remove these after full migration
@@ -215,16 +222,6 @@ interface SessionRegistration {
 }
 
 /**
- * Paused task notification
- */
-export interface PausedTaskNotification {
-    sessionId: string;
-    taskIds: string[];
-    reason: string;
-    pausedAt: string;
-}
-
-/**
  * Special session ID for error resolution
  */
 export const ERROR_RESOLUTION_SESSION_ID = 'ERROR_RESOLUTION';
@@ -295,10 +292,8 @@ export class TaskManager {
     // Callbacks
     private onTaskCompletedCallback?: (task: ManagedTask) => void;
     private onAgentIdleCallback?: (agentName: string) => void;
-    private onTasksPausedCallback?: (notification: PausedTaskNotification) => void;
 
-    // Configuration for task retention
-    private readonly COMPLETED_TASK_RETENTION_HOURS = 48; // Keep completed tasks for 48 hours
+    // Periodic cleanup timer for completed session tasks
     private cleanupTimerId: NodeJS.Timeout | null = null;
     
     constructor() {
@@ -375,42 +370,51 @@ export class TaskManager {
     
     /**
      * Clean up old completed tasks to prevent memory growth
+     * 
+     * IMPORTANT: Only cleans tasks from COMPLETED sessions!
+     * Active sessions must keep all tasks in memory because:
+     * - Coordinator needs completed task status for dependency checking
+     * - getTask() must return completed tasks so dependents can proceed
      */
     private cleanupOldTasks(): void {
-        const now = Date.now();
-        const completedRetentionMs = this.COMPLETED_TASK_RETENTION_HOURS * 60 * 60 * 1000;
+        const stateManager = this.getStateManager();
+        if (!stateManager) return;
         
         let completedCleaned = 0;
         
-        // Clean up old completed tasks
+        // Only clean up tasks from COMPLETED sessions
+        // Active sessions need all their tasks in memory for dependency checking
         for (const [taskId, task] of this.tasks.entries()) {
-            if (task.status === 'completed' && task.completedAt) {
-                const completedAt = new Date(task.completedAt).getTime();
-                if (now - completedAt > completedRetentionMs) {
-                    // Remove from task map
-                    this.tasks.delete(taskId);
-                    
-                    // Remove from file index
-                    for (const file of task.filesModified) {
-                        const normalizedFile = this.normalizeFilename(file);
-                        const taskSet = this.fileToTaskIndex.get(normalizedFile);
-                        if (taskSet) {
-                            taskSet.delete(taskId);
-                            if (taskSet.size === 0) {
-                                this.fileToTaskIndex.delete(normalizedFile);
-                            }
-                        }
+            // Check if the session is completed
+            const session = stateManager.getPlanningSession(task.sessionId);
+            if (session?.status !== 'completed') {
+                // Session is still active - keep ALL its tasks in memory
+                continue;
+            }
+            
+            // Session is completed - safe to remove from memory
+            // (task history is preserved on disk via merge-based persistence)
+            this.tasks.delete(taskId);
+            
+            // Remove from file index
+            for (const file of task.filesModified) {
+                const normalizedFile = this.normalizeFilename(file);
+                const taskSet = this.fileToTaskIndex.get(normalizedFile);
+                if (taskSet) {
+                    taskSet.delete(taskId);
+                    if (taskSet.size === 0) {
+                        this.fileToTaskIndex.delete(normalizedFile);
                     }
-                    
-                    completedCleaned++;
                 }
             }
+            
+            completedCleaned++;
         }
         
         if (completedCleaned > 0) {
-            this.log(`Cleanup: removed ${completedCleaned} completed tasks (>${this.COMPLETED_TASK_RETENTION_HOURS}h old)`);
-            // Persist after cleanup
-            this.persistTasks();
+            this.log(`Cleanup: removed ${completedCleaned} tasks from memory (completed sessions only)`);
+            // NOTE: Do NOT persist here - this is memory-only cleanup.
+            // Task history remains on disk and is preserved via merge-based persistence.
         }
     }
     
@@ -488,17 +492,22 @@ export class TaskManager {
     /**
      * Persist tasks for a specific session
      * Saves to {workingDir}/{plans}/{sessionId}/tasks.json
+     * 
+     * Uses MERGE-BASED persistence to preserve task history:
+     * - Reads existing tasks from disk first
+     * - Merges with in-memory tasks (in-memory wins for conflicts)
+     * - This ensures tasks cleaned from memory are not lost from disk
      */
-    private persistTasksForSession(sessionId: string, tasks?: ManagedTask[]): void {
+    private persistTasksForSession(sessionId: string, inMemoryTasks?: ManagedTask[]): void {
         const stateManager = this.getStateManager();
         if (!stateManager) return;
         
         try {
-            // Get tasks for this session if not provided
+            // Get in-memory tasks for this session if not provided
             // Use case-insensitive matching for robustness
-            if (!tasks) {
+            if (!inMemoryTasks) {
                 const normalizedSessionId = sessionId.toUpperCase();
-                tasks = Array.from(this.tasks.values()).filter(t => t.sessionId.toUpperCase() === normalizedSessionId);
+                inMemoryTasks = Array.from(this.tasks.values()).filter(t => t.sessionId.toUpperCase() === normalizedSessionId);
             }
             
             const sessionFolder = stateManager.getSessionTasksFolder(sessionId);
@@ -508,11 +517,40 @@ export class TaskManager {
             
             const filePath = stateManager.getSessionTasksFilePath(sessionId);
             
+            // MERGE-BASED PERSISTENCE: Read existing tasks from disk first
+            // This preserves tasks that were cleaned from memory but should remain in history
+            const mergedTasks = new Map<string, ManagedTask>();
+            
+            if (fs.existsSync(filePath)) {
+                try {
+                    const existingContent = fs.readFileSync(filePath, 'utf-8');
+                    const existingData = JSON.parse(existingContent);
+                    const existingTasks: ManagedTask[] = existingData.tasks || [];
+                    
+                    // Add all existing tasks to the merged map first
+                    for (const task of existingTasks) {
+                        if (task.id) {
+                            mergedTasks.set(task.id, task);
+                        }
+                    }
+                } catch (readErr) {
+                    // If we can't read existing file, start fresh (file might be corrupted)
+                    this.log(`[WARN] Could not read existing tasks file for merge, starting fresh: ${readErr}`);
+                }
+            }
+            
+            // Now add/update with in-memory tasks (in-memory wins for conflicts)
+            for (const task of inMemoryTasks) {
+                mergedTasks.set(task.id, task);
+            }
+            
+            const finalTasks = Array.from(mergedTasks.values());
+            
             const data = {
                 sessionId,
                 lastUpdated: new Date().toISOString(),
-                taskCount: tasks.length,
-                tasks: tasks
+                taskCount: finalTasks.length,
+                tasks: finalTasks
             };
             
             atomicWriteFileSync(filePath, JSON.stringify(data, null, 2));
@@ -588,68 +626,46 @@ export class TaskManager {
                     }
                     
                     // =========================================================
-                    // MIGRATION: Normalize task IDs to global UPPERCASE format
-                    // Handles multiple legacy formats:
-                    //   - Short form: "T1" → "PS_000001_T1"
-                    //   - Lowercase full: "ps_000001_T1" → "PS_000001_T1"
-                    //   - Correct format: "PS_000001_T1" → no change
+                    // VALIDATE: Task IDs must be global format - no auto-conversion
+                    // Only uppercase normalization is allowed, not adding prefixes
                     // =========================================================
                     const originalId = task.id;
-                    const normalizedSessionId = task.sessionId.toUpperCase();
                     
-                    // Check if task.id already has session prefix
-                    const hasPrefix = task.id.toUpperCase().startsWith(normalizedSessionId + '_');
-                    
-                    // Build normalized global ID
-                    let normalizedId: string;
-                    if (hasPrefix) {
-                        // Already has prefix - just uppercase it
-                        normalizedId = task.id.toUpperCase();
-                    } else {
-                        // Short form - prepend session prefix
-                        normalizedId = `${normalizedSessionId}_${task.id.toUpperCase()}`;
+                    // Validate task ID is in global format
+                    const taskResult = TaskIdValidator.validateGlobalTaskId(task.id);
+                    if (!taskResult.valid) {
+                        this.log(`[ERROR] Skipping task with invalid ID "${task.id}" - must be global format PS_XXXXXX_TN`);
+                        continue;
                     }
                     
-                    // Update task fields to normalized format
-                    task.id = normalizedId;
-                    task.sessionId = normalizedSessionId;
+                    // Normalize to uppercase (no prefix adding)
+                    task.id = taskResult.normalizedId!;
+                    task.sessionId = taskResult.sessionPart!;
                     
-                    // Normalize dependencies to global UPPERCASE format
+                    // Validate and normalize dependencies - skip invalid ones
                     if (task.dependencies && Array.isArray(task.dependencies)) {
-                        task.dependencies = task.dependencies.map((dep: string) => {
-                            const depUpper = dep.toUpperCase();
-                            // Check if dependency already has a session prefix (ps_XXXXXX_)
-                            if (depUpper.match(/^PS_\d{6}_/)) {
-                                return depUpper;
-                            }
-                            // Short form - prepend current session prefix
-                            return `${normalizedSessionId}_${depUpper}`;
-                        });
+                        task.dependencies = task.dependencies
+                            .map((dep: string) => TaskIdValidator.normalizeGlobalTaskId(dep))
+                            .filter((dep: string | null): dep is string => dep !== null);
                     }
                     
-                    // Normalize dependents to global UPPERCASE format
+                    // Validate and normalize dependents - skip invalid ones
                     if (task.dependents && Array.isArray(task.dependents)) {
-                        task.dependents = task.dependents.map((dep: string) => {
-                            const depUpper = dep.toUpperCase();
-                            // Check if dependent already has a session prefix
-                            if (depUpper.match(/^PS_\d{6}_/)) {
-                                return depUpper;
-                            }
-                            // Short form - prepend current session prefix
-                            return `${normalizedSessionId}_${depUpper}`;
-                        });
+                        task.dependents = task.dependents
+                            .map((dep: string) => TaskIdValidator.normalizeGlobalTaskId(dep))
+                            .filter((dep: string | null): dep is string => dep !== null);
                     }
                     
-                    if (originalId !== normalizedId) {
-                        this.log(`[MIGRATE] Task ${originalId} → ${normalizedId}`);
+                    if (originalId !== task.id) {
+                        this.log(`[NORMALIZE] Task ${originalId} → ${task.id}`);
                     }
                     
-                    this.tasks.set(normalizedId, task);
+                    this.tasks.set(task.id, task);
                     sessionLoadedCount++;
                     
                     // Rebuild file index with normalized ID
                     if (task.filesModified && task.filesModified.length > 0) {
-                        this.addFilesToIndex(normalizedId, task.filesModified);
+                        this.addFilesToIndex(task.id, task.filesModified);
                     }
                 }
                 
@@ -671,114 +687,23 @@ export class TaskManager {
                 this.persistTasks();
             }
             
-            // =========================================================================
-            // MIGRATION: Convert old paused_workflows/*.json files to task.activeWorkflow
-            // This is a one-time migration - after running, paused_workflows/ is deleted
-            // =========================================================================
-            let totalMigrated = 0;
+            // Clean up old paused_workflows folders (legacy cleanup)
             for (const sessionId of sessionFolders) {
-                const session = stateManager.getPlanningSession(sessionId);
-                if (session?.status === 'completed') continue;
-                
+                const stateManager = ServiceLocator.resolve(StateManager);
                 const pausedDir = stateManager.getPausedWorkflowsFolder(sessionId);
-                if (!fs.existsSync(pausedDir)) continue;
-                
-                try {
-                    const files = fs.readdirSync(pausedDir).filter(f => f.endsWith('.json'));
-                    if (files.length === 0) {
-                        // Empty folder, just delete it
-                        fs.rmSync(pausedDir, { recursive: true });
-                        continue;
-                    }
-                    
-                    this.log(`[MIGRATION] Found ${files.length} old pause file(s) for session ${sessionId}`);
-                    
-                    let sessionMigrated = 0;
-                    for (const file of files) {
-                        try {
-                            const workflowId = file.replace('.json', '');
-                            const filePath = path.join(pausedDir, file);
-                            const pauseState = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-                            
-                            // Find the corresponding task
-                            const taskId = pauseState.taskId;
-                            if (!taskId) {
-                                this.log(`  [SKIP] ${workflowId}: no taskId in pause file`);
-                                continue;
-                            }
-                            
-                            // Normalize to UPPERCASE for consistent lookup
-                            const globalTaskId = `${sessionId.toUpperCase()}_${taskId.toUpperCase()}`;
-                            const task = this.tasks.get(globalTaskId);
-                            
-                            if (!task) {
-                                this.log(`  [SKIP] ${workflowId}: task ${taskId} not found`);
-                                continue;
-                            }
-                            
-                            // Skip if task is already completed/failed
-                            if (task.status === 'completed' || task.status === 'failed') {
-                                this.log(`  [SKIP] ${workflowId}: task ${taskId} is ${task.status}`);
-                                continue;
-                            }
-                            
-                            // Skip if task already has an activeWorkflow
-                            if (task.activeWorkflow) {
-                                this.log(`  [SKIP] ${workflowId}: task ${taskId} already has activeWorkflow`);
-                                continue;
-                            }
-                            
-                            // Migrate pause state to activeWorkflow
-                            task.activeWorkflow = {
-                                id: workflowId,
-                                type: pauseState.workflowType || 'task_implementation',
-                                status: 'paused',
-                                phaseIndex: pauseState.phaseIndex || 0,
-                                phaseName: pauseState.phaseName || 'unknown',
-                                allocatedAgents: pauseState.allocatedAgents || [],
-                                startedAt: pauseState.pausedAt || new Date().toISOString(),
-                                pausedAt: pauseState.pausedAt || new Date().toISOString(),
-                                workflowInput: pauseState.workflowInput || { taskId },
-                                priority: pauseState.priority || 10,
-                                continuationContext: pauseState.continuationPrompt ? {
-                                    partialOutput: pauseState.agentPartialOutput || '',
-                                    filesModified: pauseState.filesModified || [],
-                                    whatWasDone: pauseState.whatWasDone || ''
-                                } : undefined
-                            };
-                            
-                            this.log(`  [OK] Migrated ${workflowId} → task ${taskId}`);
-                            sessionMigrated++;
-                            
-                        } catch (fileErr) {
-                            this.log(`  [ERROR] Failed to migrate ${file}: ${fileErr}`);
-                        }
-                    }
-                    
-                    // Delete the paused_workflows folder after migration
+                if (fs.existsSync(pausedDir)) {
                     fs.rmSync(pausedDir, { recursive: true });
-                    this.log(`[MIGRATION] Deleted paused_workflows/ for session ${sessionId}`);
-                    
-                    totalMigrated += sessionMigrated;
-                    
-                } catch (err) {
-                    this.log(`[MIGRATION ERROR] Session ${sessionId}: ${err}`);
+                    this.log(`[CLEANUP] Deleted legacy paused_workflows/ for session ${sessionId}`);
                 }
             }
             
-            if (totalMigrated > 0) {
-                this.log(`[MIGRATION] Migrated ${totalMigrated} workflow(s) to tasks.json`);
-                this.persistTasks(); // Save migrated state
-            }
-            // =========================================================================
-            
             // Clean up orphaned in_progress tasks (daemon restart scenario)
+            // Tasks that were in_progress when daemon stopped are reset to pending
             let recoveredCount = 0;
             for (const task of this.tasks.values()) {
-                if (task.status === 'in_progress' && !task.activeWorkflow) {
+                if (task.status === 'in_progress') {
                     this.log(`[RECOVERY] Resetting orphaned task ${task.id} from in_progress → created`);
                     task.status = 'created';
-                    task.activeWorkflow = undefined;
                     recoveredCount++;
                 }
             }
@@ -809,7 +734,7 @@ export class TaskManager {
         }
         
         // Valid status values
-        const validStatuses: TaskStatus[] = ['created', 'in_progress', 'blocked', 'paused', 'completed', 'failed'];
+        const validStatuses: TaskStatus[] = ['created', 'in_progress', 'blocked', 'succeeded', 'awaiting_decision'];
         if (!validStatuses.includes(task.status)) {
             return { valid: false, reason: `invalid status "${task.status}"` };
         }
@@ -891,6 +816,22 @@ export class TaskManager {
     }
     
     /**
+     * Remove specific files from the index for a task
+     */
+    private removeFilesFromIndex(taskId: string, files: string[]): void {
+        for (const file of files) {
+            const basename = this.normalizeFilename(file);
+            const taskIds = this.fileToTaskIndex.get(basename);
+            if (taskIds) {
+                taskIds.delete(taskId);
+                if (taskIds.size === 0) {
+                    this.fileToTaskIndex.delete(basename);
+                }
+            }
+        }
+    }
+    
+    /**
      * Remove a task from the file index entirely
      */
     private removeTaskFromFileIndex(taskId: string): void {
@@ -957,7 +898,10 @@ export class TaskManager {
      * Map a status string to TaskStatus type (for legacy compatibility)
      */
     static mapToStatus(status: string): TaskStatus {
-        const validStatuses: TaskStatus[] = ['created', 'in_progress', 'blocked', 'paused', 'completed', 'failed'];
+        const validStatuses: TaskStatus[] = ['created', 'in_progress', 'blocked', 'succeeded', 'awaiting_decision'];
+        // Map legacy 'completed' to 'succeeded' and 'failed' to 'awaiting_decision'
+        if (status === 'completed') return 'succeeded';
+        if (status === 'failed') return 'awaiting_decision';
         return validStatuses.includes(status as TaskStatus) ? status as TaskStatus : 'created';
     }
 
@@ -1085,7 +1029,8 @@ export class TaskManager {
             notes,
             previousAttempts,
             previousFixSummary,
-            unityPipeline
+            unityPipeline,
+            needsContext
         } = params;
 
         // Validate required fields
@@ -1128,64 +1073,35 @@ export class TaskManager {
         }
 
         // ========================================================================
-        // STAGE 1: ID FORMAT VALIDATION
+        // STAGE 1: ID FORMAT VALIDATION (using TaskIdValidator - single source of truth)
         // ========================================================================
 
-        // Validate sessionId format - must match PS_XXXXXX pattern (case-insensitive)
-        if (!sessionId.match(/^ps_\d{6}$/i)) {
-            return { 
-                success: false, 
-                error: `Invalid sessionId "${sessionId}": Must match format "PS_XXXXXX" (e.g., "PS_000001")` 
-            };
+        // Validate sessionId format - must match PS_XXXXXX pattern
+        const sessionResult = TaskIdValidator.validateSessionId(sessionId);
+        if (!sessionResult.valid) {
+            return { success: false, error: sessionResult.error! };
         }
+        const normalizedSessionId = sessionResult.normalizedId!;
 
-        // ========================================================================
-        // STRICT GLOBAL ID FORMAT - All IDs must be PS_XXXXXX_TN format
-        // No simple IDs (T1, T2) accepted - single source of truth
-        // ========================================================================
-        
         // Validate taskId format - MUST be global format: PS_XXXXXX_TN
-        const globalMatch = taskId.match(/^(ps_\d{6})_([^_]+)$/i);
-        if (!globalMatch) {
-            return { 
-                success: false, 
-                error: `Invalid taskId "${taskId}": Must be global format PS_XXXXXX_TN (e.g., "PS_000001_T1"). Simple IDs like "T1" are not accepted.` 
-            };
+        const taskResult = TaskIdValidator.validateTaskIdForSession(taskId, sessionId);
+        if (!taskResult.valid) {
+            return { success: false, error: taskResult.error! };
         }
-        
-        const [, taskSessionId, taskPart] = globalMatch;
-        
-        // Session prefix must match the passed sessionId (case-insensitive)
-        if (taskSessionId.toUpperCase() !== sessionId.toUpperCase()) {
-            return { 
-                success: false, 
-                error: `Invalid taskId "${taskId}": Session prefix "${taskSessionId}" doesn't match passed sessionId "${sessionId}"` 
-            };
-        }
-        
-        // Normalize to UPPERCASE
-        const normalizedSessionId = sessionId.toUpperCase();
-        const normalizedTaskId = taskPart.toUpperCase();
-        const globalTaskId = `${normalizedSessionId}_${normalizedTaskId}`;
+        const globalTaskId = taskResult.normalizedId!;
 
         // Validate dependency ID formats - ALL must be global format
         for (const dep of dependencies) {
             // Check for double-prefix error (e.g., PS_000001_PS_000001_T1)
-            const depUpper = dep.toUpperCase();
-            if (depUpper.startsWith(`${normalizedSessionId}_${normalizedSessionId}_`)) {
-                return { 
-                    success: false, 
-                    error: `Invalid dependency "${dep}": Contains double session prefix. Use global format "${normalizedSessionId}_T1"` 
-                };
+            const doublePrefixError = TaskIdValidator.checkDoublePrefix(dep, normalizedSessionId);
+            if (doublePrefixError) {
+                return { success: false, error: doublePrefixError };
             }
             
-            // ALL dependencies must be global format PS_XXXXXX_TN (supports cross-session)
-            const depMatch = dep.match(/^(ps_\d{6})_([^_]+)$/i);
-            if (!depMatch) {
-                return { 
-                    success: false, 
-                    error: `Invalid dependency "${dep}": Must be global format PS_XXXXXX_TN (e.g., "PS_000001_T1"). Simple IDs like "T1" are not accepted.` 
-                };
+            // ALL dependencies must be global format PS_XXXXXX_TN
+            const depResult = TaskIdValidator.validateGlobalTaskId(dep);
+            if (!depResult.valid) {
+                return { success: false, error: depResult.error! };
             }
         }
         
@@ -1211,12 +1127,8 @@ export class TaskManager {
             }
             
             if (missingDeps.length > 0) {
-                // Provide helpful error message
-                const depList = missingDeps.map(id => {
-                    // Show both formats for clarity
-                    const shortId = id.includes('_') ? id.split('_').pop() : id;
-                    return `"${shortId}" (${id})`;
-                }).join(', ');
+                // Provide helpful error message with global IDs
+                const depList = missingDeps.map(id => `"${id}"`).join(', ');
                 
                 return { 
                     success: false, 
@@ -1229,7 +1141,7 @@ export class TaskManager {
         const hasDependencies = globalDependencies.length > 0;
         const allDepsComplete = globalDependencies.every(depId => {
             const depTask = this.tasks.get(depId);
-            return depTask && depTask.status === 'completed';
+            return depTask && depTask.status === 'succeeded';
         });
         
         const initialStatus: TaskStatus = hasDependencies && !allDepsComplete ? 'blocked' : 'created';
@@ -1250,9 +1162,6 @@ export class TaskManager {
             targetFiles,
             notes,
             
-            // Active workflow (none initially)
-            activeWorkflow: undefined,
-            
             // Timing
             createdAt: new Date().toISOString(),
             
@@ -1268,6 +1177,9 @@ export class TaskManager {
             
             // Unity pipeline configuration
             unityPipeline,
+            
+            // Context requirement
+            needsContext,
         };
 
         this.tasks.set(globalTaskId, managedTask);
@@ -1372,7 +1284,7 @@ export class TaskManager {
         }
         
         // Update task status if dependency is not complete
-        if (depTask.status !== 'completed') {
+        if (depTask.status !== 'succeeded') {
             task.status = 'blocked';
             this.log(`Task ${taskId} blocked by new dependency ${dependsOnId}`);
         }
@@ -1415,7 +1327,7 @@ export class TaskManager {
         if (task.status === 'blocked') {
             const allDepsComplete = task.dependencies.every(d => {
                 const dep = this.tasks.get(d);
-                return dep && dep.status === 'completed';
+                return dep && dep.status === 'succeeded';
             });
             
             if (allDepsComplete || task.dependencies.length === 0) {
@@ -1430,34 +1342,370 @@ export class TaskManager {
         return { success: true };
     }
     
+    // ========================================================================
+    // Task Update and Removal (CLI callable)
+    // ========================================================================
+    
     /**
-     * Initialize active workflow for a task
-     * Called when starting a workflow on a task
+     * Update a task from CLI command
+     * Supports partial updates - only specified fields are changed.
+     * 
+     * @param params - Update parameters
+     * @returns Success/failure with error message
      */
-    initializeActiveWorkflow(
+    updateTaskFromCli(params: { 
+        sessionId: string; 
+        taskId: string; 
+        description?: string; 
+        dependencies?: string[];
+    }): { success: boolean; error?: string } {
+        const { sessionId, taskId, description, dependencies } = params;
+        
+        // Normalize IDs to uppercase
+        const normalizedSessionId = sessionId.toUpperCase();
+        const normalizedTaskId = taskId.toUpperCase();
+        
+        // Validate task exists
+        const task = this.tasks.get(normalizedTaskId);
+        if (!task) {
+            return { success: false, error: `Task ${normalizedTaskId} not found` };
+        }
+        
+        // Validate session matches
+        if (task.sessionId !== normalizedSessionId) {
+            return { 
+                success: false, 
+                error: `Task ${normalizedTaskId} belongs to session ${task.sessionId}, not ${normalizedSessionId}` 
+            };
+        }
+        
+        // Check if task can be modified (not succeeded or in_progress)
+        if (task.status === 'succeeded') {
+            return { success: false, error: `Cannot update completed task ${normalizedTaskId}` };
+        }
+        
+        if (task.status === 'in_progress') {
+            return { success: false, error: `Cannot update task ${normalizedTaskId} while workflow is running` };
+        }
+        
+        // Track changes for logging
+        const changes: string[] = [];
+        
+        // Update description if provided
+        if (description !== undefined && description !== task.description) {
+            const oldDesc = task.description;
+            task.description = description;
+            changes.push(`description: "${oldDesc.substring(0, 30)}..." → "${description.substring(0, 30)}..."`);
+        }
+        
+        // Update dependencies if provided
+        if (dependencies !== undefined) {
+            // Normalize dependency IDs
+            const normalizedDeps = dependencies.map(d => d.toUpperCase());
+            
+            // Validate all dependencies exist
+            for (const depId of normalizedDeps) {
+                if (!this.tasks.has(depId)) {
+                    return { success: false, error: `Dependency task ${depId} not found` };
+                }
+            }
+            
+            // Remove this task from old dependencies' dependents lists
+            for (const oldDepId of task.dependencies) {
+                const oldDep = this.tasks.get(oldDepId);
+                if (oldDep) {
+                    oldDep.dependents = oldDep.dependents.filter(d => d !== normalizedTaskId);
+                }
+            }
+            
+            // Set new dependencies
+            const oldDeps = task.dependencies;
+            task.dependencies = normalizedDeps;
+            
+            // Add this task to new dependencies' dependents lists
+            for (const newDepId of normalizedDeps) {
+                const newDep = this.tasks.get(newDepId);
+                if (newDep && !newDep.dependents.includes(normalizedTaskId)) {
+                    newDep.dependents.push(normalizedTaskId);
+                }
+            }
+            
+            // Check for cycles
+            const allTasks = this.getAllTasks();
+            const { DependencyGraphUtils } = require('./DependencyGraphUtils');
+            const taskNodes = allTasks.map(t => ({
+                id: t.id,
+                dependencies: t.dependencies
+            }));
+            
+            const cycleCheck = DependencyGraphUtils.detectCycles(taskNodes);
+            if (cycleCheck.hasCycle) {
+                // Rollback
+                for (const newDepId of normalizedDeps) {
+                    const newDep = this.tasks.get(newDepId);
+                    if (newDep) {
+                        newDep.dependents = newDep.dependents.filter(d => d !== normalizedTaskId);
+                    }
+                }
+                task.dependencies = oldDeps;
+                for (const oldDepId of oldDeps) {
+                    const oldDep = this.tasks.get(oldDepId);
+                    if (oldDep && !oldDep.dependents.includes(normalizedTaskId)) {
+                        oldDep.dependents.push(normalizedTaskId);
+                    }
+                }
+                
+                return {
+                    success: false,
+                    error: `Cannot update dependencies: Would create circular dependency.\n${cycleCheck.description}`
+                };
+            }
+            
+            // Update task status based on new dependencies
+            const hasIncompleteDeps = normalizedDeps.some(depId => {
+                const dep = this.tasks.get(depId);
+                return !dep || dep.status !== 'succeeded';
+            });
+            
+            if (task.status === 'created' && hasIncompleteDeps) {
+                task.status = 'blocked';
+            } else if (task.status === 'blocked' && !hasIncompleteDeps) {
+                task.status = 'created';
+            }
+            
+            changes.push(`dependencies: [${oldDeps.join(', ')}] → [${normalizedDeps.join(', ')}]`);
+        }
+        
+        if (changes.length === 0) {
+            return { success: false, error: 'No changes specified' };
+        }
+        
+        this.log(`Updated task ${normalizedTaskId}: ${changes.join('; ')}`);
+        this.persistTasks();
+        
+        return { success: true };
+    }
+    
+    /**
+     * Remove a task from CLI command
+     * Cancels any active workflows and cleans up dependencies.
+     * 
+     * @param sessionId - Session ID
+     * @param taskId - Task ID to remove
+     * @param reason - Optional reason for removal (included in summary)
+     * @returns Success/failure with error message
+     */
+    removeTaskFromCli(
+        sessionId: string, 
         taskId: string, 
-        workflowId: string, 
-        workflowType: string,
-        workflowInput: Record<string, any>,
-        priority: number
-    ): void {
+        reason?: string
+    ): { success: boolean; error?: string; cancelledWorkflows?: number } {
+        // Normalize IDs to uppercase
+        const normalizedSessionId = sessionId.toUpperCase();
+        const normalizedTaskId = taskId.toUpperCase();
+        
+        // Validate task exists
+        const task = this.tasks.get(normalizedTaskId);
+        if (!task) {
+            return { success: false, error: `Task ${normalizedTaskId} not found` };
+        }
+        
+        // Validate session matches
+        if (task.sessionId !== normalizedSessionId) {
+            return { 
+                success: false, 
+                error: `Task ${normalizedTaskId} belongs to session ${task.sessionId}, not ${normalizedSessionId}` 
+            };
+        }
+        
+        // Don't allow removing tasks with dependents unless they're also being removed
+        if (task.dependents.length > 0) {
+            const activeDependents = task.dependents.filter(depId => {
+                const dep = this.tasks.get(depId);
+                return dep && dep.status !== 'succeeded';
+            });
+            
+            if (activeDependents.length > 0) {
+                return {
+                    success: false,
+                    error: `Cannot remove task ${normalizedTaskId}: Tasks depend on it: ${activeDependents.join(', ')}. Remove or update dependents first.`
+                };
+            }
+        }
+        
+        // Cancel any active workflows for this task
+        let cancelledWorkflows = 0;
+        if (task.status === 'in_progress') {
+            // Use dynamic import to avoid circular dependency
+            import('./UnifiedCoordinatorService').then(async ({ UnifiedCoordinatorService }) => {
+                try {
+                    if (ServiceLocator.isRegistered(UnifiedCoordinatorService)) {
+                        const coordinator = ServiceLocator.resolve(UnifiedCoordinatorService);
+                        const count = await coordinator.cancelWorkflowsForTask(task.sessionId, normalizedTaskId);
+                        if (count > 0) {
+                            this.log(`Cancelled ${count} workflow(s) for removed task ${normalizedTaskId}${reason ? ` (${reason})` : ''}`);
+                        }
+                    }
+                } catch (e) {
+                    this.log(`[WARN] Could not cancel workflows for task ${normalizedTaskId}: ${e}`);
+                }
+            }).catch(() => {});
+        }
+        
+        // Remove this task from its dependencies' dependents lists
+        for (const depId of task.dependencies) {
+            const dep = this.tasks.get(depId);
+            if (dep) {
+                dep.dependents = dep.dependents.filter(d => d !== normalizedTaskId);
+            }
+        }
+        
+        // Remove this task from succeeded dependents' dependencies lists
+        // (only for succeeded tasks that no longer need the dependency)
+        for (const dependentId of task.dependents) {
+            const dependent = this.tasks.get(dependentId);
+            if (dependent && dependent.status === 'succeeded') {
+                dependent.dependencies = dependent.dependencies.filter(d => d !== normalizedTaskId);
+            }
+        }
+        
+        // Remove from file index
+        if (task.filesModified) {
+            this.removeFilesFromIndex(normalizedTaskId, task.filesModified);
+        }
+        if (task.targetFiles) {
+            this.removeFilesFromIndex(normalizedTaskId, task.targetFiles);
+        }
+        
+        // Remove occupancy
+        this.taskOccupancy.delete(normalizedTaskId);
+        
+        // Remove the task
+        this.tasks.delete(normalizedTaskId);
+        
+        const reasonText = reason ? ` (${reason})` : '';
+        this.log(`Removed task ${normalizedTaskId}${reasonText}`);
+        this.persistTasks();
+        
+        return { success: true, cancelledWorkflows };
+    }
+    
+    /**
+     * Update task description
+     * Used during plan reconciliation when task description changes
+     * 
+     * @param taskId - Global task ID
+     * @param description - New description
+     */
+    updateTaskDescription(taskId: string, description: string): void {
+        const task = this.tasks.get(taskId);
+        if (!task) {
+            this.log(`Task ${taskId} not found for description update`);
+            return;
+        }
+        
+        const oldDesc = task.description;
+        task.description = description;
+        this.log(`Updated description for ${taskId}: "${oldDesc.substring(0, 30)}..." → "${description.substring(0, 30)}..."`);
+        this.persistTasks();
+    }
+    
+    /**
+     * Update task dependencies (replace all dependencies)
+     * Used during plan reconciliation when dependencies change
+     * 
+     * @param taskId - Global task ID
+     * @param dependencies - New list of dependency task IDs
+     */
+    updateTaskDependencies(taskId: string, dependencies: string[]): void {
+        const task = this.tasks.get(taskId);
+        if (!task) {
+            this.log(`Task ${taskId} not found for dependency update`);
+            return;
+        }
+        
+        // Remove this task from old dependencies' dependents lists
+        for (const oldDepId of task.dependencies) {
+            const oldDep = this.tasks.get(oldDepId);
+            if (oldDep) {
+                oldDep.dependents = oldDep.dependents.filter(d => d !== taskId);
+            }
+        }
+        
+        // Set new dependencies
+        task.dependencies = dependencies;
+        
+        // Add this task to new dependencies' dependents lists
+        for (const newDepId of dependencies) {
+            const newDep = this.tasks.get(newDepId);
+            if (newDep && !newDep.dependents.includes(taskId)) {
+                newDep.dependents.push(taskId);
+            }
+        }
+        
+        // Check if task should be blocked/unblocked
+        const hasIncompleteDeps = dependencies.some(depId => {
+            const dep = this.tasks.get(depId);
+            return !dep || dep.status !== 'succeeded';
+        });
+        
+        if (task.status === 'created' && hasIncompleteDeps) {
+            task.status = 'blocked';
+            this.log(`Task ${taskId} blocked due to incomplete dependencies`);
+        } else if (task.status === 'blocked' && !hasIncompleteDeps) {
+            task.status = 'created';
+            this.log(`Task ${taskId} unblocked - all dependencies complete`);
+        }
+        
+        this.log(`Updated dependencies for ${taskId}: [${dependencies.join(', ')}]`);
+        this.persistTasks();
+    }
+    
+    /**
+     * Mark a task as orphaned (removed from plan but still in progress)
+     * Orphaned tasks will be auto-deleted when their workflow completes
+     * 
+     * @param taskId - Global task ID
+     * @param reason - Reason for marking as orphaned
+     */
+    markTaskOrphaned(taskId: string, reason: string): void {
+        const task = this.tasks.get(taskId);
+        if (!task) {
+            this.log(`Task ${taskId} not found for orphan marking`);
+            return;
+        }
+        
+        // Add orphaned metadata
+        task.notes = task.notes 
+            ? `${task.notes}\n[ORPHANED] ${reason}`
+            : `[ORPHANED] ${reason}`;
+        
+        this.log(`⚠️ Task ${taskId} marked as orphaned: ${reason}`);
+        this.persistTasks();
+    }
+    
+    /**
+     * Check if a task is marked as orphaned
+     * 
+     * @param taskId - Global task ID
+     * @returns true if task is orphaned
+     */
+    isTaskOrphaned(taskId: string): boolean {
+        const task = this.tasks.get(taskId);
+        return task?.notes?.includes('[ORPHANED]') || false;
+    }
+    
+    /**
+     * Start a workflow on a task - marks task as in_progress
+     * Called when dispatching a workflow for a task
+     */
+    startWorkflowOnTask(taskId: string, workflowId: string): void {
         const task = this.tasks.get(taskId);
         if (!task) {
             this.log(`Task ${taskId} not found for workflow assignment`);
             return;
         }
         
-        task.activeWorkflow = {
-            id: workflowId,
-            type: workflowType,
-            status: 'pending',
-            phaseIndex: 0,
-            phaseName: 'initializing',
-            allocatedAgents: [],
-            startedAt: new Date().toISOString(),
-            workflowInput,
-            priority
-        };
         task.status = 'in_progress';
         
         if (!task.startedAt) {
@@ -1466,60 +1714,6 @@ export class TaskManager {
         
         this.log(`Task ${taskId} started workflow ${workflowId}`);
         this.persistTasks();
-    }
-    
-    /**
-     * Save active workflow state (called during pause/checkpoint)
-     * This persists the workflow's execution state into the task
-     */
-    saveActiveWorkflowState(taskId: string, state: Partial<ActiveWorkflowState>): void {
-        const task = this.tasks.get(taskId);
-        if (!task || !task.activeWorkflow) {
-            this.log(`Task ${taskId} has no active workflow to update`);
-            return;
-        }
-        
-        // Update the active workflow state
-        Object.assign(task.activeWorkflow, state);
-        
-        this.log(`Task ${taskId} workflow state updated (phase: ${task.activeWorkflow.phaseIndex})`);
-        this.persistTasks();
-    }
-    
-    /**
-     * Get active workflow state for a task
-     */
-    getActiveWorkflowState(taskId: string): ActiveWorkflowState | undefined {
-        const task = this.tasks.get(taskId);
-        return task?.activeWorkflow;
-    }
-    
-    /**
-     * Clear the active workflow when it completes
-     * Does NOT automatically complete the task - coordinator decides
-     * Always persists changes to ensure stale references are removed from disk
-     */
-    clearActiveWorkflow(taskId: string): void {
-        const task = this.tasks.get(taskId);
-        if (!task) return;
-        
-        task.activeWorkflow = undefined;
-        // Keep status as in_progress - coordinator will decide next step
-        this.log(`Task ${taskId} workflow cleared, awaiting coordinator decision`);
-        this.persistTasks();
-    }
-    
-    /**
-     * Get all tasks that have an active workflow (for restoration on startup)
-     */
-    getTasksWithActiveWorkflows(sessionId: string): ManagedTask[] {
-        const result: ManagedTask[] = [];
-        for (const task of this.tasks.values()) {
-            if (task.sessionId === sessionId && task.activeWorkflow) {
-                result.push(task);
-            }
-        }
-        return result;
     }
     
     /**
@@ -1532,13 +1726,15 @@ export class TaskManager {
             return;
         }
         
-        task.status = 'completed';
+        task.status = 'succeeded';
         task.completedAt = new Date().toISOString();
-        task.activeWorkflow = undefined;
         
         if (summary) {
             task.notes = task.notes ? `${task.notes}\n\nCompletion: ${summary}` : `Completion: ${summary}`;
         }
+        
+        // Cancel any active workflows for this task and move them to history
+        this.cancelWorkflowsForCompletedTask(taskId, task.sessionId);
         
         // Update dependent tasks - they may now be unblocked
         this.updateDependentStatuses(task);
@@ -1566,26 +1762,24 @@ export class TaskManager {
             
             if (!planPath || !fs.existsSync(planPath)) return;
             
-            // Extract local task ID (e.g., "ps_000001_T1" → "T1")
-            const localTaskId = task.id.includes('_') 
-                ? task.id.split('_').pop() || task.id
-                : task.id;
+            // Use global task ID for plan file matching
+            const globalTaskId = task.id.toUpperCase();
             
             // Update checkbox in plan file
             let content = fs.readFileSync(planPath, 'utf-8');
             const checkbox = completed ? '[x]' : '[ ]';
             const oppositeCheckbox = completed ? '[ ]' : '[x]';
             
-            // Pattern: - [ ] **T1**: or - [x] **T1**:
+            // Pattern: - [ ] **PS_000001_T1**: or - [x] **PS_000001_T1**: (case-insensitive)
             const pattern = new RegExp(
-                `(^\\s*-\\s*)\\[${completed ? ' ' : 'x'}\\](\\s*\\*\\*${localTaskId}\\*\\*)`,
-                'gm'
+                `(^\\s*-\\s*)\\[${completed ? ' ' : 'x'}\\](\\s*\\*\\*${globalTaskId}\\*\\*)`,
+                'gmi'
             );
             
             if (pattern.test(content)) {
                 content = content.replace(pattern, `$1${checkbox}$2`);
                 fs.writeFileSync(planPath, content, 'utf-8');
-                this.log(`📋 Synced plan checkbox: ${localTaskId} → ${checkbox}`);
+                this.log(`📋 Synced plan checkbox: ${globalTaskId} → ${checkbox}`);
             }
         } catch (e) {
             // Non-critical - don't fail task completion if checkbox sync fails
@@ -1615,18 +1809,17 @@ export class TaskManager {
             const tasks = this.getTasksForSession(sessionId);
             
             for (const task of tasks) {
-                const localTaskId = task.id.includes('_') 
-                    ? task.id.split('_').pop() || task.id
-                    : task.id;
+                // Use global task ID for plan file matching
+                const globalTaskId = task.id.toUpperCase();
                 
-                const shouldBeChecked = task.status === 'completed';
+                const shouldBeChecked = task.status === 'succeeded';
                 const currentCheckbox = shouldBeChecked ? '[ ]' : '[x]';
                 const newCheckbox = shouldBeChecked ? '[x]' : '[ ]';
                 
-                // Only update if checkbox doesn't match status
+                // Only update if checkbox doesn't match status (case-insensitive)
                 const pattern = new RegExp(
-                    `(^\\s*-\\s*)\\[${shouldBeChecked ? ' ' : 'x'}\\](\\s*\\*\\*${localTaskId}\\*\\*)`,
-                    'gm'
+                    `(^\\s*-\\s*)\\[${shouldBeChecked ? ' ' : 'x'}\\](\\s*\\*\\*${globalTaskId}\\*\\*)`,
+                    'gmi'
                 );
                 
                 if (pattern.test(content)) {
@@ -1658,7 +1851,7 @@ export class TaskManager {
             // Check if all dependencies are now complete
             const allDepsComplete = depTask.dependencies.every(depId => {
                 const dt = this.tasks.get(depId);
-                return dt && dt.status === 'completed';
+                return dt && dt.status === 'succeeded';
             });
             
             if (allDepsComplete) {
@@ -1691,6 +1884,26 @@ export class TaskManager {
         return Array.from(this.tasks.values())
             .filter(t => t.sessionId.toUpperCase() === normalizedSessionId && t.status === 'created')
             .sort((a, b) => a.priority - b.priority);
+    }
+    
+    /**
+     * Get tasks awaiting coordinator decision for a session
+     * These are tasks where a workflow finished (success or failure) and the coordinator
+     * needs to decide what to do next (mark complete, retry, or mark failed).
+     * 
+     * IMPORTANT: These tasks should NEVER be forgotten - the coordinator must act on them.
+     */
+    getAwaitingDecisionTasksForSession(sessionId: string): ManagedTask[] {
+        const normalizedSessionId = sessionId.toUpperCase();
+        return Array.from(this.tasks.values())
+            .filter(t => t.sessionId.toUpperCase() === normalizedSessionId && t.status === 'awaiting_decision')
+            .sort((a, b) => {
+                // Prioritize tasks with failed attempts (they need retry attention)
+                const aFailed = (a.attempts || 0) > 0 ? 1 : 0;
+                const bFailed = (b.attempts || 0) > 0 ? 1 : 0;
+                if (bFailed !== aFailed) return bFailed - aFailed; // Failed attempts first
+                return a.priority - b.priority; // Then by priority
+            });
     }
     
     /**
@@ -1729,7 +1942,7 @@ export class TaskManager {
             if (!task) continue;
             
             // Skip completed tasks
-            if (task.status === 'completed' || task.status === 'failed') continue;
+            if (task.status === 'succeeded') continue;  // Skip succeeded tasks
             
             // Verify actual file overlap (index is based on basename, need full path check)
             const overlap = files.filter(f => 
@@ -1751,123 +1964,6 @@ export class TaskManager {
         
         return affected;
     }
-    
-    /**
-     * Pause tasks and their dependents
-     * Returns a map of sessionId -> paused task IDs for notification
-     */
-    pauseTasksAndDependents(
-        taskIds: string[], 
-        reason: string
-    ): Map<string, string[]> {
-        const pausedBySession = new Map<string, string[]>();
-        const toPause = new Set<string>(taskIds);
-        const processed = new Set<string>();
-        
-        // BFS to find all dependents
-        while (toPause.size > processed.size) {
-            for (const taskId of toPause) {
-                if (processed.has(taskId)) continue;
-                processed.add(taskId);
-                
-                const task = this.tasks.get(taskId);
-                if (!task) continue;
-                
-                // Add dependents to pause list
-                for (const dependentId of task.dependents) {
-                    toPause.add(dependentId);
-                }
-            }
-        }
-        
-        // Pause all tasks
-        const now = new Date().toISOString();
-        for (const taskId of toPause) {
-            const task = this.tasks.get(taskId);
-            if (!task) continue;
-            
-            // Don't pause already completed/failed tasks
-            if (task.status === 'completed' || task.status === 'failed') continue;
-            
-            // Store previous status for resume (using pausedReason to store it)
-            const previousStatus = task.status;
-            task.status = 'paused';
-            task.pausedAt = now;
-            task.pausedReason = `${reason} (was: ${previousStatus})`;
-            
-            // Track by session
-            if (!pausedBySession.has(task.sessionId)) {
-                pausedBySession.set(task.sessionId, []);
-            }
-            pausedBySession.get(task.sessionId)!.push(taskId);
-            
-            this.log(`Paused task ${taskId} (${task.sessionId}): ${reason}`);
-        }
-        
-        // Fire callback for each session
-        for (const [sessionId, pausedTaskIds] of pausedBySession) {
-            this.onTasksPausedCallback?.({
-                sessionId,
-                taskIds: pausedTaskIds,
-                reason,
-                pausedAt: now
-            });
-        }
-        
-        // Persist after pausing
-        if (pausedBySession.size > 0) {
-            this.persistTasks();
-        }
-        
-        return pausedBySession;
-    }
-    
-    /**
-     * Resume paused tasks
-     */
-    resumePausedTasks(taskIds: string[]): void {
-        for (const taskId of taskIds) {
-            const task = this.tasks.get(taskId);
-            if (!task || task.status !== 'paused') continue;
-            
-            // Extract previous status from pausedReason if stored
-            let previousStatus: TaskStatus = 'created';
-            if (task.pausedReason) {
-                const match = task.pausedReason.match(/\(was: (\w+)\)$/);
-                if (match) {
-                    previousStatus = TaskManager.mapToStatus(match[1]);
-                }
-            }
-            
-            task.status = previousStatus;
-            task.pausedAt = undefined;
-            task.pausedReason = undefined;
-            
-            this.log(`Resumed task ${taskId} to status ${previousStatus}`);
-        }
-        
-        // Update dependent statuses for affected sessions
-        const sessions = new Set(taskIds.map(id => this.tasks.get(id)?.sessionId).filter(Boolean));
-        for (const sessionId of sessions) {
-            // Re-evaluate blocked tasks in this session
-            for (const task of this.getTasksForSession(sessionId!)) {
-                if (task.status === 'blocked') {
-                    const allDepsComplete = task.dependencies.every(depId => {
-                        const dt = this.tasks.get(depId);
-                        return dt && dt.status === 'completed';
-                    });
-                    if (allDepsComplete) {
-                        task.status = 'created';
-                    }
-                }
-            }
-        }
-        
-        // Persist after resuming
-        if (taskIds.length > 0) {
-            this.persistTasks();
-        }
-    }
 
     // ========================================================================
     // Error Task Queries
@@ -1887,7 +1983,7 @@ export class TaskManager {
      */
     getPendingErrorFixingTasks(): ManagedTask[] {
         return this.getErrorFixingTasks()
-            .filter(t => t.status !== 'completed' && t.status !== 'failed');
+            .filter(t => t.status !== 'succeeded');  // All non-succeeded error tasks are pending
     }
     
     // ========================================================================
@@ -1989,7 +2085,7 @@ export class TaskManager {
 
             const depsCompleted = task.dependencies.every(depId => {
                 const depTask = this.tasks.get(depId);
-                return depTask && depTask.status === 'completed';
+                return depTask && depTask.status === 'succeeded';
             });
 
             if (depsCompleted) {
@@ -2165,9 +2261,8 @@ export class TaskManager {
         const task = this.tasks.get(taskId);
         if (!task) return;
 
-        task.status = 'completed';
+        task.status = 'succeeded';
         task.completedAt = new Date().toISOString();
-        task.activeWorkflow = undefined;
         
         if (filesModified) {
             const oldFiles = task.filesModified;
@@ -2194,6 +2289,9 @@ export class TaskManager {
             }
         }
 
+        // Cancel any active workflows for this task and move them to history
+        this.cancelWorkflowsForCompletedTask(taskId, task.sessionId);
+
         // Update dependent tasks
         this.updateDependentStatuses(task);
         
@@ -2205,36 +2303,309 @@ export class TaskManager {
         this.syncPlanCheckbox(taskId, true);
     }
 
+    // NOTE: markTaskFailed() was removed - tasks should NEVER be permanently abandoned.
+    // Tasks stay in 'awaiting_decision' until coordinator retries or user intervenes.
+    // The attempts counter and lastError field track failure history.
+    
     /**
-     * Mark task as failed
+     * Reset a completed task back to pending for re-implementation
+     * Used by implementation review workflow when fixes are needed
+     * 
+     * @param taskId Global task ID
+     * @param reviewNotes Notes from the review to attach to the task
      */
-    markTaskFailed(taskId: string, reason?: string): void {
-        const task = this.tasks.get(taskId);
-        if (!task) return;
-
-        task.status = 'failed';
-        task.completedAt = new Date().toISOString();
-        task.activeWorkflow = undefined;
-
-        if (task.actualAgent) {
-            const context = this.agentTaskContext.get(task.actualAgent);
-            if (context) {
-                context.currentTask = undefined;
-                context.currentTaskId = undefined;
-            }
-            
-            // Notify idle callback with agent name
-            const poolService = this.getAgentPoolService();
-            if (poolService?.getAgentStatus(task.actualAgent)) {
-                this.onAgentIdleCallback?.(task.actualAgent);
-            }
+    resetTaskForReview(taskId: string, reviewNotes?: string): boolean {
+        const task = this.tasks.get(taskId) || this.tasks.get(taskId.toUpperCase());
+        if (!task) {
+            this.log(`Cannot reset: task=${taskId} not found`);
+            return false;
         }
-
-        this.log(`Task ${taskId} failed: ${reason || 'unknown'}`);
+        
+        // Only reset completed tasks
+        if (task.status !== 'succeeded') {
+            this.log(`Cannot reset: task=${taskId} is not completed (status: ${task.status})`);
+            return false;
+        }
+        
+        // Reset to 'created' (pending) status
+        task.status = 'created';
+        task.completedAt = undefined;
+        task.startedAt = undefined;
+        task.actualAgent = undefined;
+        
+        // Increment attempts counter
+        task.attempts = (task.attempts || 0) + 1;
+        
+        // Add review notes
+        if (reviewNotes) {
+            const timestamp = new Date().toISOString();
+            const reviewSection = `\n[REVIEW ${timestamp}]\n${reviewNotes}`;
+            task.notes = task.notes ? `${task.notes}${reviewSection}` : reviewSection;
+        }
+        
+        this.log(`Task ${taskId} reset for review (attempt ${task.attempts})`);
         this.persistTasks();
         
-        // Sync plan.md checkbox (unchecked - failed tasks are not complete)
+        // Sync plan.md checkbox (mark unchecked)
         this.syncPlanCheckbox(taskId, false);
+        
+        return true;
+    }
+    
+    /**
+     * Set the context path for a task after context gathering completes
+     * Called by UnifiedCoordinatorService when a context_gathering workflow finishes
+     */
+    setTaskContextPath(taskId: string, contextPath: string): void {
+        const task = this.tasks.get(taskId);
+        if (task) {
+            task.contextPath = contextPath;
+            task.contextGatheredAt = new Date().toISOString();
+            this.log(`Task ${taskId} context gathered: ${contextPath}`);
+            this.persistTasks();
+        }
+    }
+    
+    // ========================================================================
+    // Task Workflow History - Track workflows run on each task
+    // ========================================================================
+    
+    /**
+     * Check if a task has a successful context_gathering workflow in its history
+     * Used by coordinator to gate implementation workflow behind context gathering
+     */
+    hasSuccessfulContextGathering(taskId: string): boolean {
+        const task = this.tasks.get(taskId);
+        if (!task || !task.workflowHistory) {
+            return false;
+        }
+        return task.workflowHistory.some(
+            entry => entry.workflowType === 'context_gathering' && entry.status === 'succeeded'
+        );
+    }
+    
+    /**
+     * Get the current context workflow status for a task
+     * Returns the status of the most recent context_gathering workflow
+     */
+    getContextWorkflowStatus(taskId: string): 'none' | 'running' | 'succeeded' | 'failed' {
+        const task = this.tasks.get(taskId);
+        if (!task || !task.workflowHistory) {
+            return 'none';
+        }
+        
+        // Find the most recent context_gathering workflow
+        const contextWorkflows = task.workflowHistory.filter(
+            entry => entry.workflowType === 'context_gathering'
+        );
+        
+        if (contextWorkflows.length === 0) {
+            return 'none';
+        }
+        
+        // Sort by startedAt descending and get the most recent
+        const mostRecent = contextWorkflows.sort(
+            (a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime()
+        )[0];
+        
+        return mostRecent.status === 'cancelled' ? 'failed' : mostRecent.status;
+    }
+    
+    /**
+     * Add a workflow entry to a task's history
+     * Called when a workflow starts on a task
+     */
+    addWorkflowToTaskHistory(taskId: string, entry: TaskWorkflowHistoryEntry): void {
+        const task = this.tasks.get(taskId);
+        if (!task) {
+            this.log(`Cannot add workflow to history: task ${taskId} not found`);
+            return;
+        }
+        
+        // Initialize workflow history if needed
+        if (!task.workflowHistory) {
+            task.workflowHistory = [];
+        }
+        
+        task.workflowHistory.push(entry);
+        this.log(`Task ${taskId}: added workflow ${entry.workflowId} (${entry.workflowType}) to history`);
+        this.persistTasks();
+    }
+    
+    /**
+     * Update a workflow entry in a task's history
+     * Called when a workflow completes or fails
+     */
+    updateWorkflowInTaskHistory(
+        taskId: string, 
+        workflowId: string, 
+        status: 'succeeded' | 'failed' | 'cancelled',
+        error?: string
+    ): void {
+        const task = this.tasks.get(taskId);
+        if (!task || !task.workflowHistory) {
+            this.log(`Cannot update workflow in history: task ${taskId} not found or no history`);
+            return;
+        }
+        
+        const entry = task.workflowHistory.find(e => e.workflowId === workflowId);
+        if (!entry) {
+            this.log(`Cannot update workflow in history: workflow ${workflowId} not found in task ${taskId}`);
+            return;
+        }
+        
+        entry.status = status;
+        entry.completedAt = new Date().toISOString();
+        if (error) {
+            entry.error = error;
+        }
+        
+        this.log(`Task ${taskId}: updated workflow ${workflowId} to ${status}`);
+        this.persistTasks();
+    }
+    
+    // ========================================================================
+    // User Clarifications - Q&A for tasks needing user input
+    // ========================================================================
+    
+    /**
+     * Add a pending question to a task
+     * Called when coordinator needs user clarification
+     * @returns The question ID for referencing in response
+     */
+    addQuestionToTask(taskId: string, question: string): { success: boolean; questionId?: string; error?: string } {
+        const task = this.tasks.get(taskId);
+        if (!task) {
+            return { success: false, error: `Task ${taskId} not found` };
+        }
+        
+        // Initialize clarifications array if needed
+        if (!task.userClarifications) {
+            task.userClarifications = [];
+        }
+        
+        // Check for pending questions (no answer yet)
+        const pendingQuestion = task.userClarifications.find(c => !c.answer);
+        if (pendingQuestion) {
+            return { 
+                success: false, 
+                error: `Task ${taskId} already has a pending question (${pendingQuestion.id})` 
+            };
+        }
+        
+        // Generate question ID
+        const questionId = `q_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+        
+        task.userClarifications.push({
+            id: questionId,
+            question,
+            askedAt: new Date().toISOString()
+        });
+        
+        this.log(`Task ${taskId}: added question ${questionId}`);
+        this.persistTasks();
+        
+        return { success: true, questionId };
+    }
+    
+    /**
+     * Answer a pending question on a task
+     * Called when user provides clarification via chat
+     * @returns Success and the clarification record
+     */
+    answerTaskQuestion(
+        taskId: string, 
+        questionId: string, 
+        answer: string
+    ): { success: boolean; clarification?: UserClarification; error?: string } {
+        const task = this.tasks.get(taskId);
+        if (!task) {
+            return { success: false, error: `Task ${taskId} not found` };
+        }
+        
+        if (!task.userClarifications) {
+            return { success: false, error: `Task ${taskId} has no pending questions` };
+        }
+        
+        const clarification = task.userClarifications.find(c => c.id === questionId);
+        if (!clarification) {
+            return { success: false, error: `Question ${questionId} not found on task ${taskId}` };
+        }
+        
+        if (clarification.answer) {
+            return { success: false, error: `Question ${questionId} was already answered` };
+        }
+        
+        clarification.answer = answer;
+        clarification.answeredAt = new Date().toISOString();
+        
+        this.log(`Task ${taskId}: question ${questionId} answered`);
+        this.persistTasks();
+        
+        return { success: true, clarification };
+    }
+    
+    /**
+     * Get pending question for a task (if any)
+     */
+    getPendingQuestion(taskId: string): UserClarification | undefined {
+        const task = this.tasks.get(taskId);
+        if (!task?.userClarifications) return undefined;
+        return task.userClarifications.find(c => !c.answer);
+    }
+    
+    /**
+     * Get all clarifications for a task (for building extra instructions)
+     */
+    getTaskClarifications(taskId: string): UserClarification[] {
+        const task = this.tasks.get(taskId);
+        return task?.userClarifications || [];
+    }
+    
+    /**
+     * Build extra instruction string from answered clarifications
+     * Used when starting workflows to inject user answers into prompts
+     */
+    buildClarificationInstruction(taskId: string): string | undefined {
+        const clarifications = this.getTaskClarifications(taskId);
+        const answered = clarifications.filter(c => c.answer);
+        
+        if (answered.length === 0) return undefined;
+        
+        const lines = answered.map(c => 
+            `**User Clarification:**\nQ: ${c.question}\nA: ${c.answer}`
+        );
+        
+        return lines.join('\n\n');
+    }
+    
+    /**
+     * Cancel any active workflows for a completed task and move them to history.
+     * This ensures no orphaned workflows remain running after a task is marked complete.
+     */
+    private cancelWorkflowsForCompletedTask(taskId: string, sessionId: string): void {
+        // Dynamic import to avoid circular dependencies
+        import('./UnifiedCoordinatorService').then(({ UnifiedCoordinatorService }) => {
+            try {
+                if (!ServiceLocator.isRegistered(UnifiedCoordinatorService)) {
+                    return; // Coordinator not registered yet during startup
+                }
+                const coordinator = ServiceLocator.resolve(UnifiedCoordinatorService);
+                // Fire and forget - don't block task completion on workflow cancellation
+                coordinator.cancelWorkflowsForTask(sessionId, taskId).then(count => {
+                    if (count > 0) {
+                        this.log(`Cancelled ${count} workflow(s) for completed task ${taskId}`);
+                    }
+                }).catch(err => {
+                    this.log(`[WARN] Failed to cancel workflows for task ${taskId}: ${err}`);
+                });
+            } catch (e) {
+                // Coordinator might not be registered yet during startup
+                this.log(`[WARN] Could not cancel workflows for task ${taskId}: coordinator not available`);
+            }
+        }).catch(() => {
+            // Ignore import errors - should never happen in production
+        });
     }
 
     // ========================================================================
@@ -2258,13 +2629,14 @@ export class TaskManager {
         const newStatus = this.mapLegacyStageToStatus(stage);
         task.status = newStatus;
 
-        if (newStatus === 'completed') {
+        if (newStatus === 'succeeded') {
             task.completedAt = new Date().toISOString();
+            // Cancel any active workflows for this task and move them to history
+            this.cancelWorkflowsForCompletedTask(taskId, task.sessionId);
             this.updateDependentStatuses(task);
             this.onTaskCompletedCallback?.(task);
-        } else if (newStatus === 'failed') {
-            task.completedAt = new Date().toISOString();
         }
+        // NOTE: No 'failed' status handling - tasks stay in awaiting_decision
 
         this.log(`Task ${taskId}: ${oldStatus} → ${newStatus}${reason ? ` (${reason})` : ''}`);
         this.persistTasks();
@@ -2279,11 +2651,15 @@ export class TaskManager {
             'created': 'created',
             'in_progress': 'in_progress',
             'blocked': 'blocked',
-            'paused': 'paused',
-            'completed': 'completed',
-            'failed': 'failed',
+            'succeeded': 'succeeded',
+            'awaiting_decision': 'awaiting_decision',
             
-            // Legacy stage mappings
+            // Legacy status mappings
+            'completed': 'succeeded',      // Legacy: completed → succeeded
+            'failed': 'awaiting_decision', // Legacy: failed → awaiting_decision (retry possible)
+            
+            // Legacy stage mappings (paused now maps to created)
+            'paused': 'created',
             'pending': 'blocked',
             'ready': 'created',
             'ready_for_agent': 'created',
@@ -2365,26 +2741,23 @@ export class TaskManager {
         inProgress: number;
         ready: number;
         pending: number;
-        paused: number;
         total: number;
         percentage: number;
     } {
         const tasks = this.getTasksForSession(sessionId);
-        const completed = tasks.filter(t => t.status === 'completed').length;
-        const failed = tasks.filter(t => t.status === 'failed').length;
+        const succeeded = tasks.filter(t => t.status === 'succeeded').length;
+        const awaitingDecision = tasks.filter(t => t.status === 'awaiting_decision').length;
         const inProgress = tasks.filter(t => t.status === 'in_progress').length;
         const ready = tasks.filter(t => t.status === 'created').length;
         const pending = tasks.filter(t => t.status === 'blocked').length;
-        const paused = tasks.filter(t => t.status === 'paused').length;
 
         return {
-            completed: completed + failed,  // Count failed as "done" for progress
+            completed: succeeded,  // Only count succeeded tasks as complete
             inProgress,
             ready,
             pending,
-            paused,
             total: tasks.length,
-            percentage: tasks.length > 0 ? ((completed + failed) / tasks.length) * 100 : 0
+            percentage: tasks.length > 0 ? (succeeded / tasks.length) * 100 : 0
         };
     }
 
@@ -2404,10 +2777,6 @@ export class TaskManager {
         this.onAgentIdleCallback = callback;
     }
     
-    onTasksPaused(callback: (notification: PausedTaskNotification) => void): void {
-        this.onTasksPausedCallback = callback;
-    }
-
     // ========================================================================
     // Task Occupancy Management
     // ========================================================================

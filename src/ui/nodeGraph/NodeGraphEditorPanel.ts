@@ -321,6 +321,10 @@ export class NodeGraphEditorPanel {
                 this.updateNodeLabel(message.payload.nodeId, message.payload.label);
                 break;
                 
+            case 'updateNodeLocked':
+                this.updateNodeLocked(message.payload.nodeId, message.payload.locked);
+                break;
+                
             case 'updateGraphMeta':
                 this.updateGraphMeta(message.payload);
                 break;
@@ -642,11 +646,6 @@ export class NodeGraphEditorPanel {
         
         node.config = { ...node.config, ...config };
         
-        // Handle dynamic port updates for agent_bench
-        if (node.type === 'agent_bench' && config.seatCount !== undefined) {
-            this.updateAgentBenchPorts(node, config.seatCount);
-        }
-        
         // Handle dynamic port updates for branch node
         if (node.type === 'branch' && config.branchCount !== undefined) {
             this.updateBranchPorts(node, config.branchCount);
@@ -660,51 +659,6 @@ export class NodeGraphEditorPanel {
         this.isDirty = true;
         
         this.sendToWebview('nodeConfigUpdated', { nodeId, config: node.config });
-    }
-    
-    /**
-     * Update agent bench ports based on seat count
-     */
-    private updateAgentBenchPorts(node: INodeInstance, seatCount: number): void {
-        // Remove connections to ports that will be deleted
-        const maxPortIndex = seatCount - 1;
-        this.graph!.connections = this.graph!.connections.filter(c => {
-            if (c.fromNodeId === node.id && c.fromPortId.startsWith('agent_out_')) {
-                const portIndex = parseInt(c.fromPortId.replace('agent_out_', ''));
-                return portIndex <= maxPortIndex;
-            }
-            if (c.toNodeId === node.id && c.toPortId.startsWith('agent_in_')) {
-                const portIndex = parseInt(c.toPortId.replace('agent_in_', ''));
-                return portIndex <= maxPortIndex;
-            }
-            return true;
-        });
-        
-        // Generate new ports
-        node.inputs = [];
-        node.outputs = [];
-        
-        for (let i = 0; i < seatCount; i++) {
-            node.inputs.push({
-                id: `agent_in_${i}`,
-                name: `Seat ${i + 1} In`,
-                direction: 'input',
-                dataType: 'agent',
-                description: `Agent input for seat ${i + 1}`,
-                allowMultiple: true
-            });
-            node.outputs.push({
-                id: `agent_out_${i}`,
-                name: `Seat ${i + 1} Out`,
-                direction: 'output',
-                dataType: 'agent',
-                description: `Agent output for seat ${i + 1}`,
-                allowMultiple: true
-            });
-        }
-        
-        // Send node updated event to trigger re-render
-        this.sendToWebview('nodeUpdated', { node });
     }
     
     /**
@@ -824,6 +778,19 @@ export class NodeGraphEditorPanel {
         if (!node) return;
         
         node.label = label || undefined;
+        this.isDirty = true;
+    }
+    
+    /**
+     * Update node locked state
+     */
+    private updateNodeLocked(nodeId: string, locked: boolean): void {
+        if (!this.graph) return;
+        
+        const node = this.graph.nodes.find(n => n.id === nodeId);
+        if (!node) return;
+        
+        node.locked = locked || undefined;
         this.isDirty = true;
     }
     

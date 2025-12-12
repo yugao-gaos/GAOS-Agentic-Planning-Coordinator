@@ -29,11 +29,11 @@ export interface TaskOccupancy {
  * Task conflict declaration - what tasks a workflow conflicts with
  */
 export interface TaskConflict {
-    /** Task IDs this workflow conflicts with (those tasks should pause) */
+    /** Task IDs this workflow conflicts with (those task workflows should be cancelled) */
     taskIds: string[];
     
     /** How to handle the conflict */
-    resolution: 'pause_others' | 'wait_for_others' | 'abort_if_occupied';
+    resolution: 'cancel_others' | 'wait_for_others' | 'abort_if_occupied';
     
     /** Reason for conflict (for logging/UI) */
     reason?: string;
@@ -46,8 +46,8 @@ export interface ConflictResolution {
     /** Whether the workflow can proceed */
     canProceed: boolean;
     
-    /** Workflow IDs that were paused */
-    pausedWorkflowIds: string[];
+    /** Workflow IDs that were cancelled */
+    cancelledWorkflowIds: string[];
     
     /** Task IDs that are still occupied by other workflows */
     blockedByTaskIds: string[];
@@ -66,7 +66,7 @@ export interface ConflictResolution {
  * 
  * Every workflow declares which tasks it occupies/conflicts with:
  * - `task_implementation` occupies its target task exclusively
- * - `planning_revision` conflicts with affected tasks (pauses them)
+ * - `planning_revision` conflicts with affected tasks (cancels them)
  * - `error_resolution` occupies tasks related to the error
  * 
  * The coordinator tracks occupancy and handles conflicts automatically.
@@ -98,7 +98,7 @@ export interface IWorkflow {
     /** Get error message if workflow failed */
     getError(): string | undefined;
     
-    /** Get serializable state for persistence/resume */
+    /** Get serializable state for UI display */
     getState(): object;
     
     // ========================================================================
@@ -107,39 +107,6 @@ export interface IWorkflow {
     
     /** Start the workflow - runs until completion or error */
     start(): Promise<WorkflowResult>;
-    
-    /** 
-     * Pause the workflow 
-     * @param options.force If true, immediately kill any running agent and save state.
-     *                      If false (default), pause happens at next phase boundary.
-     * @param options.reason Why the workflow is being paused (for persistence)
-     */
-    pause(options?: { 
-        force?: boolean; 
-        reason?: 'user_request' | 'conflict' | 'error' | 'timeout' | 'daemon_shutdown';
-    }): Promise<void>;
-    
-    /** Resume a paused workflow */
-    resume(): Promise<void>;
-    
-    /**
-     * Restore workflow state from saved state
-     * Used during session recovery to set workflow back to its paused position
-     * 
-     * @param savedState State saved by persistState()
-     */
-    restoreFromSavedState(savedState: {
-        phaseIndex: number;
-        phaseName?: string;
-        phaseProgress?: 'not_started' | 'in_progress' | 'completed';
-        filesModified?: string[];
-        continuationContext?: {
-            phaseName: string;
-            partialOutput: string;
-            filesModified: string[];
-            whatWasDone: string;
-        };
-    }): void;
     
     /** Cancel the workflow */
     cancel(): Promise<void>;
@@ -166,6 +133,20 @@ export interface IWorkflow {
     /** Fired when workflow demotes an agent to bench (idle but allocated to session) */
     readonly onAgentDemotedToBench: TypedEventEmitter<string>;
     
+    /** Fired when workflow emits a custom event (e.g., review request) */
+    readonly onWorkflowEvent: TypedEventEmitter<{ eventType: string; payload?: any }>;
+    
+    /** Fired when an agent starts working on a task (with correct log file path) */
+    readonly onAgentWorkStarted: TypedEventEmitter<{
+        agentName: string;
+        sessionId: string;
+        roleId: string;
+        workflowId: string;
+        taskId: string;
+        workCount: number;
+        logFile: string;
+    }>;
+    
     /** Fired when workflow declares task occupancy (coordinator subscribes) */
     readonly onTaskOccupancyDeclared: TypedEventEmitter<TaskOccupancy>;
     
@@ -187,7 +168,7 @@ export interface IWorkflow {
     
     /**
      * Get task IDs this workflow conflicts with
-     * Called at startup to determine what to pause
+     * Called at startup to determine what to cancel
      * Return empty array if no conflicts
      */
     getConflictingTaskIds(): string[];
@@ -198,13 +179,13 @@ export interface IWorkflow {
      * 
      * @param taskId The task that has a conflict
      * @param otherWorkflowId The workflow that occupies the task
-     * @returns How to resolve: 'wait' (pause self), 'proceed' (ignore), 'abort' (cancel self)
+     * @returns How to resolve: 'wait' (block self), 'proceed' (ignore), 'abort' (cancel self)
      */
     handleConflict(taskId: string, otherWorkflowId: string): 'wait' | 'proceed' | 'abort';
     
     /**
-     * Called by coordinator when conflicts are resolved (other workflows paused/completed)
-     * Workflow can resume working on the conflicting tasks
+     * Called by coordinator when conflicts are resolved (other workflows cancelled/completed)
+     * Workflow can continue working on the conflicting tasks
      */
     onConflictsResolved?(resolvedTaskIds: string[]): void;
     

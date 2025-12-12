@@ -458,7 +458,7 @@ export class EventBroadcaster extends EventEmitter implements IEventBroadcaster 
         totalAgents: number,
         available: string[],
         allocated: Array<{ name: string; workflowId: string; roleId?: string }>,
-        busy: Array<{ name: string; coordinatorId: string; roleId?: string }>,
+        busy: Array<{ name: string; workflowId: string; roleId?: string }>,
         resting: string[]
     ): void {
         this.broadcast('pool.changed', {
@@ -476,19 +476,25 @@ export class EventBroadcaster extends EventEmitter implements IEventBroadcaster 
      */
     unityStatusChanged(
         status: 'idle' | 'compiling' | 'testing' | 'playing' | 'error',
+        connected: boolean,
         isCompiling: boolean,
         isPlaying: boolean,
         isPaused: boolean,
         hasErrors: boolean,
-        errorCount: number
+        errorCount: number,
+        queueLength: number,
+        currentTask?: { id: string; type: string; phase?: string }
     ): void {
         this.broadcast('unity.statusChanged', {
             status,
+            connected,
             isCompiling,
             isPlaying,
             isPaused,
             hasErrors,
             errorCount,
+            queueLength,
+            currentTask,
             timestamp: new Date().toISOString()
         });
     }
@@ -559,6 +565,21 @@ export class EventBroadcaster extends EventEmitter implements IEventBroadcaster 
             duration,
             completedAt: new Date().toISOString()
         }, sessionId);
+    }
+    
+    /**
+     * Request player test popup from VS Code extension
+     * Used during test_player_playmode pipeline step
+     */
+    unityPlayerTestRequest(
+        pipelineId: string,
+        stepIndex: number
+    ): void {
+        this.broadcast('unity.playerTestRequest', {
+            pipelineId,
+            stepIndex,
+            timestamp: new Date().toISOString()
+        });
     }
     
     /**

@@ -62,8 +62,6 @@ export {
     SwitchCaseNodeExecutor,
     ForLoopNodeDefinition, 
     ForLoopNodeExecutor,
-    WhileLoopNodeDefinition, 
-    WhileLoopNodeExecutor,
     registerControlFlowNodes 
 } from './ControlFlowNodes';
 

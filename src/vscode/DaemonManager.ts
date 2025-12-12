@@ -309,8 +309,12 @@ export class DaemonManager {
         daemonProcess.unref();
         
         // Wait for daemon to start and write port file
-        // Daemon should be ready in <1 second (WebSocket starts immediately in vscode mode)
-        const port = await this.waitForDaemonReady(5000);
+        // Timeout increased to 45s to account for startup cleanup:
+        // - Port-in-use check: ~500ms
+        // - WSL orphan cursor-agent cleanup: ~5-15s (WSL commands can be VERY slow on some machines)
+        // - Service bootstrap: ~1s
+        // - Extra buffer for slow machines or antivirus scans
+        const port = await this.waitForDaemonReady(45000);
         
         // Start health check
         this.startHealthCheck();
@@ -327,11 +331,23 @@ export class DaemonManager {
         const startTime = Date.now();
         const portPath = this.getPortPath();
         
-        log.debug('Waiting for daemon to write port file...');
+        log.debug(`Waiting for daemon to write port file (timeout: ${timeoutMs / 1000}s)...`);
+        log.debug(`Port file path: ${portPath}`);
         
-        // Wait for port file
+        // Wait for port file with periodic progress logging
         let port: number | null = null;
+        let lastLogTime = startTime;
+        const logInterval = 5000; // Log every 5 seconds
+        
         while (Date.now() - startTime < timeoutMs) {
+            // Log progress every 5 seconds
+            if (Date.now() - lastLogTime >= logInterval) {
+                const elapsed = Math.round((Date.now() - startTime) / 1000);
+                const remaining = Math.round((timeoutMs - (Date.now() - startTime)) / 1000);
+                log.debug(`Still waiting for daemon port file... (${elapsed}s elapsed, ${remaining}s remaining)`);
+                lastLogTime = Date.now();
+            }
+            
             if (fs.existsSync(portPath)) {
                 const p = parseInt(fs.readFileSync(portPath, 'utf-8').trim(), 10);
                 if (!isNaN(p)) {
@@ -344,7 +360,8 @@ export class DaemonManager {
         }
         
         if (!port) {
-            throw new Error('Daemon failed to start within timeout (no port file)');
+            const elapsed = Math.round((Date.now() - startTime) / 1000);
+            throw new Error(`Daemon failed to start within timeout (no port file after ${elapsed}s)`);
         }
         
         // Give WebSocket server 200ms to fully bind (port file written before listen completes)
@@ -488,6 +505,20 @@ export class DaemonManager {
             }
         } else {
             log.info('[waitForDaemonStop] PID file already removed');
+        }
+        
+        // Clean up orphan cursor-agent processes after force kill
+        // Since daemon was interrupted, it may not have cleaned up properly
+        try {
+            const { killOrphanCursorAgents, countCursorAgentProcesses } = await import('../utils/orphanCleanup');
+            const orphanCount = countCursorAgentProcesses();
+            if (orphanCount > 0) {
+                log.info(`[waitForDaemonStop] Cleaning up ${orphanCount} orphan cursor-agent processes...`);
+                const killed = await killOrphanCursorAgents(new Set(), '[DaemonManager.forceKill]');
+                log.info(`[waitForDaemonStop] Cleaned up ${killed} orphan processes`);
+            }
+        } catch (err) {
+            log.warn('[waitForDaemonStop] Orphan cleanup error:', err);
         }
     }
     

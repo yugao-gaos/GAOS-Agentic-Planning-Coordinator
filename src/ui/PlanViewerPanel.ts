@@ -20,7 +20,6 @@ const log = Logger.create('Client', 'PlanViewer');
 interface ParsedMetadata {
     title: string;
     session: string;
-    status: string;
     created: string;
     updated: string;
 }
@@ -31,6 +30,7 @@ interface ParsedTask {
     completed: boolean;
     dependencies: string[];
     engineer: string;
+    unity?: string;  // Unity pipeline: none, prep, prep_editmode, prep_playmode, prep_playtest, full
 }
 
 interface ParsedSection {
@@ -124,6 +124,32 @@ export class PlanViewerPanel {
         PlanViewerPanel.currentPanel = new PlanViewerPanel(panel, extensionUri, planPath, sessionId, sessionStatus || '');
     }
 
+    /**
+     * Update the session status and refresh the panel (called when session.updated event received)
+     */
+    public static updateSessionStatus(sessionId: string, newStatus: string): void {
+        if (PlanViewerPanel.currentPanel && PlanViewerPanel.currentPanel._sessionId === sessionId) {
+            PlanViewerPanel.currentPanel._sessionStatus = newStatus;
+            PlanViewerPanel.currentPanel.updateWebviewContent();
+        }
+    }
+
+    /**
+     * Show daemon unavailable message
+     */
+    public static showDaemonUnavailable(): void {
+        if (PlanViewerPanel.currentPanel) {
+            PlanViewerPanel.currentPanel.showDaemonUnavailableContent();
+        }
+    }
+
+    /**
+     * Get the current session ID (if panel is open)
+     */
+    public static getCurrentSessionId(): string | undefined {
+        return PlanViewerPanel.currentPanel?._sessionId;
+    }
+
     private async handleMessage(message: any): Promise<void> {
         switch (message.command) {
             case 'refresh':
@@ -134,8 +160,18 @@ export class PlanViewerPanel {
                     session: { id: this._sessionId } 
                 });
                 break;
+            case 'addTaskToPlan':
+                vscode.commands.executeCommand('agenticPlanning.addTaskToPlan', { 
+                    session: { id: this._sessionId } 
+                });
+                break;
             case 'approvePlan':
                 vscode.commands.executeCommand('agenticPlanning.approvePlan', { 
+                    session: { id: this._sessionId } 
+                });
+                break;
+            case 'completePlan':
+                vscode.commands.executeCommand('agenticPlanning.completeSession', { 
                     session: { id: this._sessionId } 
                 });
                 break;
@@ -199,20 +235,14 @@ export class PlanViewerPanel {
             const titleMatch = content.match(/^#\s+(?:Execution Plan:|Plan:)?\s*(.+?)$/m);
             const title = titleMatch ? titleMatch[1].trim() : 'Untitled Plan';
 
-            // Extract metadata fields
-            const statusMatch = content.match(/\*\*Status:\*\*\s*(.+?)$/m);
+            // Extract metadata fields (status is managed by session, not stored in plan)
             const sessionMatch = content.match(/\*\*Session(?:\s*ID)?:\*\*\s*(.+?)$/m);
             const createdMatch = content.match(/\*\*Created:\*\*\s*(.+?)$/m);
             const updatedMatch = content.match(/\*\*Updated:\*\*\s*(.+?)$/m);
 
-            // Clean up status (remove emoji and extra text)
-            let status = statusMatch ? statusMatch[1].trim() : 'Unknown';
-            status = status.replace(/[📋🔄✅❌⏸️]/g, '').trim();
-
             return {
                 title,
                 session: sessionMatch ? sessionMatch[1].trim() : this._sessionId,
-                status,
                 created: createdMatch ? createdMatch[1].trim() : 'Unknown',
                 updated: updatedMatch ? updatedMatch[1].trim() : 'Unknown'
             };
@@ -303,23 +333,77 @@ export class PlanViewerPanel {
         this._panel.webview.html = this.getWebviewContent(data);
     }
 
+    private showDaemonUnavailableContent(): void {
+        this._panel.title = 'Plan Viewer';
+        this._panel.webview.html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plan Viewer</title>
+    <style>
+        body {
+            font-family: var(--vscode-font-family);
+            background: var(--vscode-editor-background);
+            color: var(--vscode-foreground);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .message-box {
+            text-align: center;
+            padding: 40px;
+            border-radius: 8px;
+            background: var(--vscode-editorWidget-background);
+            border: 1px solid var(--vscode-editorWidget-border);
+        }
+        .icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+        .title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+        .subtitle {
+            color: var(--vscode-descriptionForeground);
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+    <div class="message-box">
+        <div class="icon">🔌</div>
+        <div class="title">Daemon Unavailable</div>
+        <div class="subtitle">The daemon is not connected. Session status cannot be retrieved.</div>
+    </div>
+</body>
+</html>`;
+    }
+
     private getWebviewContent(data: ParsedPlanData): string {
         const nonce = this.getNonce();
         const defaultTab = data.parseSuccess ? 'structured' : 'markdown';
         
-        // Determine which action buttons to show based on status
-        // Use actual session status (not markdown status text) for approval/completion check
+        // Determine which action buttons to show based on session status (authoritative source)
         const sessionStatus = this._sessionStatus.toLowerCase();
-        const metadataStatus = data.metadata?.status?.toLowerCase() || '';
         // Show Revise/Approve buttons when plan exists (not during active planning)
-        const isActivelyPlanning = sessionStatus === 'planning' || (metadataStatus.includes('planning') && !metadataStatus.includes('updated'));
-        const isActivelyRevising = sessionStatus === 'revising' || metadataStatus.includes('revising');
+        const isActivelyPlanning = sessionStatus === 'planning';
+        const isActivelyRevising = sessionStatus === 'revising';
         // Use session status (which is authoritative) to determine if plan is already approved
-        const isApprovedOrCompleted = sessionStatus === 'approved' || sessionStatus === 'completed' || sessionStatus === 'executing';
+        const isApproved = sessionStatus === 'approved';
+        const isCompleted = sessionStatus === 'completed';
+        const isExecuting = sessionStatus === 'executing';
+        const isApprovedOrCompleted = isApproved || isCompleted || isExecuting;
         // Show buttons unless actively planning (buttons are disabled during revising)
         const showButtons = data.rawContent && !isActivelyPlanning;
         // Disable buttons during revision
         const buttonsDisabled = isActivelyRevising;
+        // Show Complete button when session is approved (user can manually complete anytime)
+        const showCompleteButton = isApproved;
 
         return `<!DOCTYPE html>
 <html lang="en">
@@ -338,10 +422,12 @@ export class PlanViewerPanel {
             <span class="plan-session">${this.escapeHtml(data.metadata?.session || this._sessionId)}</span>
         </div>
         <div class="title-bar-right">
-            <span class="status-badge ${this.getStatusClass(sessionStatus || metadataStatus)}">${this.escapeHtml(data.metadata?.status || 'Unknown')}</span>
+            <span class="status-badge ${this.getStatusClass(sessionStatus)}">${this.escapeHtml(this.formatSessionStatus(sessionStatus) || 'Unknown')}</span>
             ${showButtons ? `
+                <button class="action-btn secondary" data-command="addTaskToPlan" ${buttonsDisabled ? 'disabled title="Revision in progress..."' : ''} title="Add specific tasks to the plan">+ Task</button>
                 <button class="action-btn secondary" data-command="revisePlan" ${buttonsDisabled ? 'disabled title="Revision in progress..."' : ''}>Revise</button>
                 ${!isApprovedOrCompleted ? `<button class="action-btn primary" data-command="approvePlan" ${buttonsDisabled ? 'disabled title="Revision in progress..."' : ''}>Approve</button>` : ''}
+                ${showCompleteButton ? `<button class="action-btn primary" data-command="completePlan" title="Mark session as complete">Complete</button>` : ''}
             ` : ''}
             <button class="action-btn secondary" data-command="refresh" title="Refresh">↻</button>
         </div>
@@ -437,10 +523,6 @@ export class PlanViewerPanel {
                             <div class="metadata-item">
                                 <span class="metadata-label">Session</span>
                                 <span class="metadata-value">${this.escapeHtml(data.metadata.session)}</span>
-                            </div>
-                            <div class="metadata-item">
-                                <span class="metadata-label">Status</span>
-                                <span class="metadata-value">${this.escapeHtml(data.metadata.status)}</span>
                             </div>
                             <div class="metadata-item">
                                 <span class="metadata-label">Created</span>
@@ -583,6 +665,12 @@ export class PlanViewerPanel {
                                 <span class="task-meta-label">Engineer:</span>
                                 ${this.escapeHtml(task.engineer)}
                             </span>
+                            ${task.unity && task.unity !== 'none' ? `
+                            <span class="task-meta-item unity-${task.unity.replace('-', '')}">
+                                <span class="task-meta-label">Unity:</span>
+                                ${this.escapeHtml(task.unity)}
+                            </span>
+                            ` : ''}
                         </div>
                     </div>
                 </div>
@@ -648,6 +736,26 @@ export class PlanViewerPanel {
         if (s.includes('complet')) return 'completed';
         if (s.includes('fail')) return 'failed';
         return '';
+    }
+
+    /**
+     * Format session status for display (authoritative status from daemon)
+     */
+    private formatSessionStatus(status: string): string {
+        if (!status) return '';
+        const s = status.toLowerCase();
+        switch (s) {
+            case 'planning': return '🔄 Planning';
+            case 'debating': return '💭 Debating';
+            case 'reviewing': return '📋 Ready for Review';
+            case 'revising': return '✏️ Revising';
+            case 'approved': return '✅ Approved';
+            case 'executing': return '⚡ Executing';
+            case 'completed': return '🎉 Completed';
+            case 'failed': return '❌ Failed';
+            case 'cancelled': return '🚫 Cancelled';
+            default: return status.charAt(0).toUpperCase() + status.slice(1);
+        }
     }
 
     private getSectionIcon(title: string): string {

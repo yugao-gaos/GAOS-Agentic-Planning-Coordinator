@@ -15,8 +15,6 @@ export type CoordinatorEventType =
     | 'unity_error'            // Unity compilation/test errors detected
     | 'user_responded'         // User provided clarification
     | 'agent_available'        // An agent became available
-    | 'task_paused'            // Tasks were paused (e.g., due to errors)
-    | 'task_resumed'           // Tasks were resumed
     | 'manual_evaluation';     // Manual trigger for re-evaluation
 
 /**
@@ -40,14 +38,18 @@ export type CoordinatorEventPayload =
     | UnityErrorPayload
     | UserRespondedPayload
     | AgentAvailablePayload
-    | TaskPausedPayload
-    | TaskResumedPayload
     | ManualEvaluationPayload;
 
 export interface ExecutionStartedPayload {
     type: 'execution_started';
     planPath: string;
     taskCount: number;
+    /** Number of tasks successfully auto-created from plan */
+    tasksCreated: number;
+    /** Total number of tasks found in the plan file */
+    totalTasksInPlan: number;
+    /** Tasks that failed to create during auto-creation (coordinator should create these) */
+    failedToCreate: string[];
 }
 
 export interface WorkflowCompletedPayload {
@@ -102,17 +104,6 @@ export interface AgentAvailablePayload {
     roles: string[];
 }
 
-export interface TaskPausedPayload {
-    type: 'task_paused';
-    taskIds: string[];
-    reason: string;
-}
-
-export interface TaskResumedPayload {
-    type: 'task_resumed';
-    taskIds: string[];
-}
-
 export interface ManualEvaluationPayload {
     type: 'manual_evaluation';
     reason?: string;
@@ -129,7 +120,8 @@ export interface TaskSummary {
     id: string;
     sessionId?: string;  // Added for multi-plan support
     description: string;
-    status: 'created' | 'pending' | 'in_progress' | 'completed' | 'failed' | 'paused' | 'blocked' | 'awaiting_decision';
+    status: 'created' | 'pending' | 'in_progress' | 'succeeded' | 'blocked' | 'awaiting_decision';
+    // NOTE: 'failed' removed - tasks are never permanently failed
     type: 'implementation' | 'error_fix' | 'context_gathering';
     dependencies: string[];
     dependencyStatus: 'all_complete' | 'some_pending' | 'some_failed';
@@ -140,6 +132,10 @@ export interface TaskSummary {
     attempts: number;
     priority: number;
     targetFiles?: string[];  // Files this task will modify - for cross-plan conflict detection
+    contextGathered: boolean;      // Whether context has been gathered for this task
+    contextPath?: string;          // Path to context file (if gathered)
+    needsContext?: boolean;        // Whether task requires context gathering before implementation
+    contextWorkflowStatus?: 'none' | 'running' | 'succeeded' | 'failed';  // Status of context workflow
 }
 
 /**
@@ -280,7 +276,7 @@ export interface WorkflowHealth {
     status: string;
     minutesSinceActivity: number;
     /** null = healthy, otherwise indicates why workflow may be stuck */
-    stuckReason: null | 'task_completed' | 'paused' | 'no_activity' | 'waiting_for_agent' | 'agents_idle';
+    stuckReason: null | 'task_completed' | 'no_activity' | 'waiting_for_agent' | 'agents_idle';
     /** Additional context about the stuck condition */
     stuckDetail?: string;
 }
@@ -324,9 +320,7 @@ export interface CoordinatorHistoryEntry {
     decision: {
         dispatchCount: number;
         dispatchedTasks: string[];
-        askedUser: boolean;
-        pausedCount: number;
-        resumedCount: number;
+        cancelledCount: number;
         reasoning: string;
     };
     
@@ -352,8 +346,8 @@ export interface CoordinatorAgentConfig {
     /** Timeout for AI evaluation (ms) */
     evaluationTimeout: number;
     
-    /** Model to use for evaluation */
-    model: string;
+    /** Model tier to use for evaluation (low/mid/high) */
+    model: 'low' | 'mid' | 'high';
     
     /** Enable debug logging */
     debug: boolean;
@@ -365,7 +359,7 @@ export interface CoordinatorAgentConfig {
 export const DEFAULT_COORDINATOR_CONFIG: CoordinatorAgentConfig = {
     maxHistoryEntries: 20,
     evaluationTimeout: 300000,  // 5 minutes - coordinator needs time to execute multiple commands
-    model: 'sonnet-4.5',
+    model: 'mid',
     debug: false,
 };
 

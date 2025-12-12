@@ -207,9 +207,10 @@ export class CoordinatorContext {
                     return taskManager.getTask(depId.toUpperCase());
                 });
                 
-                if (depTasks.some(t => t?.status === 'failed')) {
-                    dependencyStatus = 'some_failed';
-                } else if (depTasks.some(t => t?.status !== 'completed')) {
+                // Check if all dependencies have succeeded
+                // NOTE: No 'failed' check - tasks are never permanently failed
+                if (depTasks.some(t => t?.status !== 'succeeded')) {
+                    // Some deps are still in progress, blocked, or awaiting_decision
                     dependencyStatus = 'some_pending';
                 }
             }
@@ -226,7 +227,11 @@ export class CoordinatorContext {
                 dependencyStatus,
                 assignedAgent: undefined, // TaskManager doesn't track this directly
                 attempts: task.previousAttempts || 0,
-                targetFiles: task.targetFiles  // For cross-plan conflict detection
+                targetFiles: task.targetFiles,  // For cross-plan conflict detection
+                contextGathered: !!task.contextPath,  // Whether context has been gathered
+                contextPath: task.contextPath,        // Path to context file (if gathered)
+                needsContext: task.needsContext ?? false,  // Whether task requires context gathering
+                contextWorkflowStatus: taskManager.getContextWorkflowStatus(task.id)  // Status of context workflow
             };
         });
     }
@@ -244,17 +249,15 @@ export class CoordinatorContext {
             let dependencyStatus: 'all_complete' | 'some_pending' | 'some_failed' = 'all_complete';
             if (task.dependencies && task.dependencies.length > 0) {
                 const depTasks = task.dependencies.map(depId => {
-                    // Dependencies might be short (T1) or full (PS_000001_T1) format
-                    // Normalize to UPPERCASE for consistent lookup
-                    const globalDepId = depId.includes('_') 
-                        ? depId.toUpperCase() 
-                        : `${sessionId.toUpperCase()}_${depId.toUpperCase()}`;
+                    // Dependencies must be in global format - just normalize to UPPERCASE
+                    const globalDepId = depId.toUpperCase();
                     return taskManager.getTask(globalDepId);
                 });
                 
-                if (depTasks.some(t => t?.status === 'failed')) {
-                    dependencyStatus = 'some_failed';
-                } else if (depTasks.some(t => t?.status !== 'completed')) {
+                // Check if all dependencies have succeeded
+                // NOTE: No 'failed' check - tasks are never permanently failed
+                if (depTasks.some(t => t?.status !== 'succeeded')) {
+                    // Some deps are still in progress, blocked, or awaiting_decision
                     dependencyStatus = 'some_pending';
                 }
             }
@@ -274,7 +277,12 @@ export class CoordinatorContext {
                 assignedAgent: task.actualAgent,
                 errors: [],  // Errors are now stored in errorText field
                 attempts: 0,
-                priority: task.priority || 10
+                priority: task.priority || 10,
+                targetFiles: task.targetFiles,  // For cross-plan conflict detection
+                contextGathered: !!task.contextPath,  // Whether context has been gathered
+                contextPath: task.contextPath,        // Path to context file (if gathered)
+                needsContext: task.needsContext ?? false,  // Whether task requires context gathering
+                contextWorkflowStatus: taskManager.getContextWorkflowStatus(task.id)  // Status of context workflow
             };
         });
     }
@@ -296,6 +304,7 @@ export class CoordinatorContext {
             
             if (status === 'failed') {
                 // Include failed workflows so coordinator knows about failures
+                // NOTE: Workflow 'failed' is fine - workflows CAN fail, tasks cannot
                 failed.push({
                     id: workflowId,
                     type: progress.type,
@@ -304,8 +313,8 @@ export class CoordinatorContext {
                     failedAt: progress.updatedAt,
                     phase: progress.phase
                 });
-            } else if (status === 'completed' || status === 'cancelled') {
-                // Skip completed/cancelled - coordinator doesn't need these
+            } else if (status === 'succeeded' || status === 'cancelled') {
+                // Skip succeeded/cancelled - coordinator doesn't need these
                 continue;
             } else {
                 // Active workflows (running, pending, blocked)
@@ -339,7 +348,7 @@ export class CoordinatorContext {
             const status = workflow.getStatus();
             
             // Only check running/pending/blocked workflows
-            if (status === 'completed' || status === 'cancelled' || status === 'failed') {
+            if (status === 'succeeded' || status === 'cancelled' || status === 'failed') {
                 continue;
             }
             
@@ -362,16 +371,10 @@ export class CoordinatorContext {
                 // taskId should be in global format - just normalize to uppercase
                 const globalTaskId = taskId.toUpperCase();
                 const task = taskManager.getTask(globalTaskId);
-                if (task && task.status === 'completed') {
+                if (task && task.status === 'succeeded') {
                     stuckReason = 'task_completed';
-                    stuckDetail = `Task ${taskId} already completed - cancel this orphan workflow`;
+                    stuckDetail = `Task ${taskId} already succeeded - cancel this orphan workflow`;
                 }
-            }
-            
-            // Check 0: Workflow is paused - needs resume
-            if (!stuckReason && status === 'paused') {
-                stuckReason = 'paused';
-                stuckDetail = `Workflow paused for ${minutesSinceActivity} min - use 'apc workflow resume' to continue`;
             }
             
             // Check 1: No activity for too long

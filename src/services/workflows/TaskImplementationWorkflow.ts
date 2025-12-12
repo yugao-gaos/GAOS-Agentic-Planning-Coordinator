@@ -63,11 +63,18 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     private filesModified: string[] = [];
     private unityResult: { success: boolean; errors?: string[] } | null = null;
     private previousErrors: string[] = [];
+    private needsCoordinatorReview: boolean = false;  // Set when agent output was truncated
     
     // Agent names for bench management
     private engineerName?: string;
     private reviewerName?: string;
     private contextGathererName?: string;
+    
+    // Cached project overview (extracted from plan header)
+    private projectOverview?: string;
+    
+    // Cached Unity pipeline config (fetched from TaskManager)
+    private pipelineConfig?: UnityPipelineConfig;
     
     constructor(config: WorkflowConfig, services: WorkflowServices) {
         super(config, services);
@@ -228,7 +235,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
     protected getOutput(): any {
         // With fire-and-forget Unity, workflow success is determined by code review approval
         // Unity verification happens asynchronously - coordinator monitors for errors
-        const success = this.status === 'completed' && this.reviewResult === 'approved';
+        const success = this.status === 'succeeded' && this.reviewResult === 'approved';
         
         return {
             taskId: this.taskId,
@@ -236,7 +243,9 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             filesModified: this.filesModified,
             reviewIterations: this.reviewIterations,
             unityVerificationQueued: this.unityEnabled,
-            unityEnabled: this.unityEnabled
+            unityEnabled: this.unityEnabled,
+            // Flag to indicate coordinator should verify work (agent output was truncated)
+            needsCoordinatorReview: this.needsCoordinatorReview || undefined
         };
     }
     
@@ -259,7 +268,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         const role = this.getRole('engineer');
         const prompt = this.buildImplementPrompt(role);
         
-        this.log(`Running engineer ${this.engineerName} (${role?.defaultModel || 'sonnet-4.5'})...`);
+        this.log(`Running engineer ${this.engineerName} (tier: ${role?.defaultModel || 'mid'})...`);
         
         // Use pre-allocated engineer - pass agentName to avoid requesting a new one
         const result = await this.runAgentTaskWithCallback(
@@ -275,22 +284,22 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             }
         );
         
-        if (result.fromCallback) {
-            // Got structured data from CLI callback - preferred path
-            if (this.isAgentSuccess(result)) {
-                this.filesModified = result.payload?.files || [];
-                this.log(`✓ Implementation complete via CLI callback (${this.filesModified.length} files)`);
-            } else {
-                const error = result.payload?.error || result.payload?.message || 'Unknown error';
-                throw new Error(`Engineer implementation failed for ${this.taskId}: ${error}`);
-            }
+        // Process agent result from output parsing
+        if (this.isAgentSuccess(result)) {
+            this.filesModified = result.payload?.files || [];
+            this.log(`✓ Implementation complete (${this.filesModified.length} files)`);
+        } else if (result.result === 'needs_review' || result.payload?.needsCoordinatorDecision) {
+            // Work may be complete - mark for coordinator review instead of failing
+            this.filesModified = result.payload?.files || [];
+            this.needsCoordinatorReview = true;
+            this.log(`⚠️ Implementation needs review - agent output was truncated`);
+            this.log(`  → Files found in summary: ${this.filesModified.length > 0 ? this.filesModified.join(', ') : 'none'}`);
+            this.log(`  → Task will be marked 'awaiting_decision' for coordinator to verify`);
+            // Don't throw - let the workflow complete with needs_review status
+            // The coordinator can then verify the files and decide to complete or retry
         } else {
-            // No callback received - agent must use CLI callback
-            throw new Error(
-                'Engineer did not use CLI callback (`apc agent complete`). ' +
-                'All agents must report results via CLI callback for structured data. ' +
-                'Legacy output parsing is no longer supported.'
-            );
+            const error = result.payload?.error || result.payload?.message || 'Unknown error';
+            throw new Error(`Engineer implementation failed for ${this.taskId}: ${error}`);
         }
         
         // Demote engineer to bench after work (reviewer will work next)
@@ -313,7 +322,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         const role = this.getRole('code_reviewer');
         const prompt = this.buildReviewPrompt(role);
         
-        this.log(`Running code reviewer ${this.reviewerName} (${role?.defaultModel || 'sonnet-4.5'})...`);
+        this.log(`Running code reviewer ${this.reviewerName} (tier: ${role?.defaultModel || 'high'})...`);
         
         // Use pre-allocated reviewer - pass agentName to avoid requesting a new one
         const result = await this.runAgentTaskWithCallback(
@@ -329,30 +338,21 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             }
         );
         
-        if (result.fromCallback) {
-            // Got structured data from CLI callback - preferred path
-            const resultType = result.result?.toLowerCase();
-            
-            if (resultType === 'approved') {
-                this.reviewResult = 'approved';
-                this.log(`✓ Review approved via CLI callback`);
-            } else if (resultType === 'changes_requested') {
-                this.reviewResult = 'changes_requested';
-                this.reviewFeedback = result.payload?.feedback || (Array.isArray(result.payload?.issues) ? result.payload.issues.join('\n') : '') || 'See review comments';
-                this.log(`⚠️ Changes requested via CLI callback`);
-            } else {
-                // Unexpected result - treat as changes_requested
-                this.reviewResult = 'changes_requested';
-                this.reviewFeedback = result.payload?.message || 'Review result unclear';
-                this.log(`⚠️ Review result unclear, treating as changes_requested`);
-            }
+        // Process agent result from output parsing
+        const resultType = result.result?.toLowerCase();
+        
+        if (resultType === 'approved') {
+            this.reviewResult = 'approved';
+            this.log(`✓ Review approved`);
+        } else if (resultType === 'changes_requested') {
+            this.reviewResult = 'changes_requested';
+            this.reviewFeedback = result.payload?.feedback || (Array.isArray(result.payload?.issues) ? result.payload.issues.join('\n') : '') || 'See review comments';
+            this.log(`⚠️ Changes requested`);
         } else {
-            // No callback received - agent must use CLI callback
-            throw new Error(
-                'Reviewer did not use CLI callback (`apc agent complete`). ' +
-                'All agents must report results via CLI callback for structured data. ' +
-                'Legacy output parsing is no longer supported.'
-            );
+            // Unexpected result - treat as changes_requested
+            this.reviewResult = 'changes_requested';
+            this.reviewFeedback = result.payload?.message || 'Review result unclear';
+            this.log(`⚠️ Review result unclear, treating as changes_requested`);
         }
         
         // Demote reviewer to bench after work
@@ -402,7 +402,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         const role = this.getRole('context_gatherer');
         const prompt = this.buildDeltaContextPrompt(role);
         
-        this.log(`Running context gatherer ${this.contextGathererName} in delta mode (${role?.defaultModel || 'gemini-3-pro'})...`);
+        this.log(`Running context gatherer ${this.contextGathererName} in delta mode (tier: ${role?.defaultModel || 'mid'})...`);
         
         // Use runAgentTaskWithCallback - agent must call CLI callback to complete
         const result = await this.runAgentTaskWithCallback(
@@ -418,15 +418,10 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
             }
         );
         
-        if (result.fromCallback) {
-            if (this.isAgentSuccess(result)) {
-                this.log(`✓ Delta context updated via CLI callback`);
-            } else {
-                this.log(`⚠️ Delta context update failed: ${result.payload?.error || 'unknown'}, continuing`);
-            }
+        if (this.isAgentSuccess(result)) {
+            this.log(`✓ Delta context updated`);
         } else {
-            // Context gatherer didn't use callback - log warning but don't fail workflow
-            this.log(`⚠️ Context gatherer did not use CLI callback - delta context may be incomplete`);
+            this.log(`⚠️ Delta context update failed: ${result.payload?.error || 'unknown'}, continuing`);
         }
         
         // Context gatherer will be released in executePhase cleanup
@@ -445,7 +440,7 @@ export class TaskImplementationWorkflow extends BaseWorkflow {
         // Get task's Unity pipeline configuration from TaskManager
         const taskManager = ServiceLocator.resolve(TaskManager);
         const task = taskManager.getTask(this.taskId);
-        const pipelineConfig = task?.unityPipeline || 'prep_editmode'; // Default for backward compat
+        const pipelineConfig = task?.unityPipeline || 'none'; // Default: no Unity pipeline
         
         // Map pipeline config to operations
         const operations = this.getOperationsForPipelineConfig(pipelineConfig);
@@ -564,28 +559,36 @@ Focus on fixing the issues raised while preserving working code.`;
 ${this.previousErrors.join('\n')}`;
         }
         
-        return `${basePrompt}
+        // Get project overview (cached, extracted from plan header)
+        const projectOverview = this.getProjectOverview();
+        
+        // Build test requirements based on Unity pipeline config
+        const testRequirements = this.buildTestRequirements();
+        
+        const prompt = `${basePrompt}
+
+## Project Overview
+${projectOverview}
 
 ## Your Task
 ${this.taskId}: ${this.taskDescription}
-
-## Plan File
-Read the plan if you need more context: ${this.planPath}
 
 ## Context Brief
 ${contextContent}
 ${revisionContext}
 ${errorContext}
 
+${testRequirements}
+
 ## Instructions
+0. Read documentation and context files referenced above
 1. Implement the task as described
 2. Follow existing code patterns
-3. Write tests if appropriate for the task type
-4. Track all files you create or modify (you'll need to report them)
-
-## How to Complete This Task
-After implementing, you MUST signal completion via CLI callback (see end of prompt).
-Include the list of files you modified in the callback payload.`;
+3. Follow the Testing Requirements section above
+4. Track all files you create or modify
+5. Run the completion command when done`;
+        
+        return this.appendExtraInstruction(prompt);
     }
     
     private buildReviewPrompt(role: AgentRole | undefined): string {
@@ -594,7 +597,7 @@ Include the list of files you modified in the callback payload.`;
         }
         const basePrompt = role.promptTemplate;
         
-        return `${basePrompt}
+        const prompt = `${basePrompt}
 
 ## Task Being Reviewed
 ${this.taskId}: ${this.taskDescription}
@@ -607,11 +610,9 @@ ${this.filesModified.map(f => `- ${f}`).join('\n')}
 2. Are code patterns consistent with the project?
 3. Are there any bugs or issues?
 4. Is the code well-organized and readable?
-
-## How to Complete This Review
-After reviewing, you MUST signal your decision via CLI callback (see end of prompt).
-- Use \`--result approved\` if the code is acceptable
-- Use \`--result changes_requested\` if changes are needed (include feedback in payload)`;
+5. Run the completion command when done`;
+        
+        return this.appendExtraInstruction(prompt);
     }
     
     private buildDeltaContextPrompt(role: AgentRole | undefined): string {
@@ -620,7 +621,7 @@ After reviewing, you MUST signal your decision via CLI callback (see end of prom
         }
         const basePrompt = role.promptTemplate;
         
-        return `${basePrompt}
+        const prompt = `${basePrompt}
 
 ## MODE: DELTA CONTEXT UPDATE
 You are running in delta mode after a task was completed and approved.
@@ -638,11 +639,154 @@ Update the _AiDevLog/Context/ files to reflect:
 3. Updated architecture decisions
 
 Keep updates concise and focused on what changed.`;
+        
+        return this.appendExtraInstruction(prompt);
     }
     
     // =========================================================================
     // HELPER METHODS
     // =========================================================================
+    
+    /**
+     * Get the Unity pipeline config for this task (cached).
+     * Fetches from TaskManager on first call.
+     */
+    private getPipelineConfig(): UnityPipelineConfig {
+        if (this.pipelineConfig !== undefined) {
+            return this.pipelineConfig;
+        }
+        
+        try {
+            const taskManager = ServiceLocator.resolve(TaskManager);
+            const task = taskManager.getTask(this.taskId);
+            this.pipelineConfig = task?.unityPipeline || 'none';
+        } catch {
+            // TaskManager not available - use default
+            this.pipelineConfig = 'none';
+        }
+        
+        return this.pipelineConfig;
+    }
+    
+    /**
+     * Build test requirements section based on Unity pipeline config.
+     * Tells engineer what tests to write (or not write) based on pipeline flag.
+     */
+    private buildTestRequirements(): string {
+        const config = this.getPipelineConfig();
+        
+        switch (config) {
+            case 'none':
+                return `## Testing Requirements
+This task does not require Unity tests (documentation or non-Unity changes).`;
+            
+            case 'prep':
+                return `## Testing Requirements
+This task does NOT require writing tests. Focus on implementation only.
+The Unity pipeline will only run compilation - no test runner will be invoked.`;
+            
+            case 'prep_editmode':
+                return `## Testing Requirements
+You MUST write Unity TestFramework **EditMode** tests for this task.
+- Use \`[Test]\` attribute for test methods
+- Tests run in editor without entering Play mode
+- Test file should be under an Editor folder or EditMode test assembly
+- Example: \`Tests/EditMode/YourFeatureTests.cs\``;
+            
+            case 'prep_playmode':
+                return `## Testing Requirements
+You MUST write Unity TestFramework **PlayMode** tests for this task.
+- Use \`[UnityTest]\` attribute for coroutine tests, \`[Test]\` for sync tests
+- Tests run in Play mode with full Unity lifecycle
+- Test file should be in a PlayMode test assembly
+- Example: \`Tests/PlayMode/YourFeatureTests.cs\``;
+            
+            case 'prep_playtest':
+                return `## Testing Requirements
+This task does NOT require writing automated tests.
+The Unity pipeline includes manual player playtesting (not your concern).
+Focus on implementation only.`;
+            
+            case 'full':
+                return `## Testing Requirements
+You MUST write BOTH Unity TestFramework **EditMode** AND **PlayMode** tests.
+- EditMode tests: \`[Test]\` in Editor folder or EditMode assembly
+- PlayMode tests: \`[UnityTest]\` or \`[Test]\` in PlayMode assembly
+This is a milestone task requiring comprehensive test coverage.`;
+            
+            default:
+                return `## Testing Requirements
+Write tests if appropriate for the task type.`;
+        }
+    }
+    
+    /**
+     * Extract project overview from plan file header.
+     * Extracts content from start to just before "## Task Breakdown" or similar task section.
+     * This gives the agent project context without the full 300+ line plan.
+     * 
+     * Filters out session metadata (Status, Created) that is managed by code, not relevant to agent.
+     */
+    private getProjectOverview(): string {
+        // Return cached if available
+        if (this.projectOverview !== undefined) {
+            return this.projectOverview;
+        }
+        
+        // Try to extract from plan file
+        if (!fs.existsSync(this.planPath)) {
+            this.projectOverview = '(Plan file not found)';
+            return this.projectOverview;
+        }
+        
+        try {
+            const content = fs.readFileSync(this.planPath, 'utf-8');
+            const lines = content.split('\n');
+            
+            // Find where the task breakdown starts (## Task Breakdown, ## Tasks, etc.)
+            const taskSectionPatterns = [
+                /^##\s*Task\s*Breakdown/i,
+                /^##\s*Tasks/i,
+                /^##\s*Implementation\s*Tasks/i,
+                /^##\s*Phase\s*\d/i  // "## Phase 1: ..."
+            ];
+            
+            // Lines to filter out (session metadata managed by code, not relevant to agent)
+            const filterPatterns = [
+                /^\*\*Status:\*\*/i,
+                /^\*\*Created:\*\*/i
+            ];
+            
+            let endIndex = lines.length;
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                if (taskSectionPatterns.some(pattern => pattern.test(line))) {
+                    endIndex = i;
+                    break;
+                }
+            }
+            
+            // Extract overview (header to task section), filter out metadata, limit to reasonable size
+            const overviewLines = lines
+                .slice(0, Math.min(endIndex, 50))
+                .filter(line => !filterPatterns.some(pattern => pattern.test(line)));
+            this.projectOverview = overviewLines.join('\n').trim();
+            
+            // If overview is too short, something might be wrong - use first 30 lines
+            if (this.projectOverview.length < 50) {
+                this.projectOverview = lines
+                    .slice(0, 30)
+                    .filter(line => !filterPatterns.some(pattern => pattern.test(line)))
+                    .join('\n').trim();
+            }
+            
+            return this.projectOverview;
+        } catch (error) {
+            this.log(`Warning: Failed to extract project overview: ${error}`);
+            this.projectOverview = '(Failed to read plan overview)';
+            return this.projectOverview;
+        }
+    }
     
     private async updateTaskCheckbox(completed: boolean): Promise<void> {
         if (!fs.existsSync(this.planPath)) return;

@@ -3,10 +3,11 @@ import * as path from 'path';
 import * as os from 'os';
 import { spawn, ChildProcess, execSync } from 'child_process';
 import { ProcessManager, ProcessState } from './ProcessManager';
-import { IAgentBackend } from './AgentBackend';
+import { IAgentBackend, BackendDependencyStatus } from './AgentBackend';
 import { ServiceLocator } from './ServiceLocator';
 import { Logger } from '../utils/Logger';
 import { CursorSetupScripts } from './cursor/CursorSetupScripts';
+import { ModelTier } from '../types';
 import * as vscode from 'vscode';
 
 const log = Logger.create('Daemon', 'AgentRunner');
@@ -23,7 +24,7 @@ export interface AgentRunResult {
 }
 
 /**
- * Options for running cursor-agent CLI
+ * Options for running an agent CLI
  */
 export interface AgentRunOptions {
     /** Unique identifier for this agent run */
@@ -32,8 +33,8 @@ export interface AgentRunOptions {
     prompt: string;
     /** Working directory */
     cwd: string;
-    /** Model to use (default: sonnet-4.5) */
-    model?: string;
+    /** Model tier to use (default: 'mid') - each backend maps this to specific models */
+    model?: ModelTier;
     /** Log file path to write streaming output (commentary, reasoning, tool calls) */
     logFile?: string;
     /** Plan file path to stream plan content to (markdown starting with #) */
@@ -99,6 +100,28 @@ export class CursorAgentRunner implements IAgentBackend {
     private static readonly SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     private static readonly IDLE_THRESHOLD_MS = 5000;  // 5 seconds
     private static readonly IDLE_LOG_INTERVAL_MS = 10000;  // Log idle status every 10 seconds (not every second)
+    
+    /**
+     * Model tier to actual model name mapping for Cursor backend
+     * - low: Fast, cheap model for simple tasks
+     * - mid: Balanced model for most tasks  
+     * - high: Most capable model for complex tasks
+     * 
+     * NOTE: Model names must match cursor CLI's available models exactly.
+     * Use 'sonnet-4.5', 'opus-4.5', 'auto' etc. (without 'claude-' prefix)
+     */
+    private static readonly MODEL_TIER_MAP: Record<ModelTier, string> = {
+        low: 'auto',
+        mid: 'sonnet-4.5',
+        high: 'opus-4.5'
+    };
+    
+    /**
+     * Convert model tier to actual model name
+     */
+    private resolveModel(tier: ModelTier): string {
+        return CursorAgentRunner.MODEL_TIER_MAP[tier] || CursorAgentRunner.MODEL_TIER_MAP.mid;
+    }
     
     // ANSI color codes for terminal output
     private COLORS = {
@@ -258,7 +281,7 @@ export class CursorAgentRunner implements IAgentBackend {
             id,
             prompt,
             cwd,
-            model = 'sonnet-4.5',
+            model: modelTier = 'mid',
             logFile,
             planFile,
             timeoutMs = 30 * 60 * 1000,  // 30 minutes default
@@ -268,6 +291,9 @@ export class CursorAgentRunner implements IAgentBackend {
             metadata,
             simpleMode = false
         } = options;
+        
+        // Resolve model tier to actual model name
+        const model = this.resolveModel(modelTier);
 
         const startTime = Date.now();
         let collectedOutput = '';
@@ -306,6 +332,17 @@ export class CursorAgentRunner implements IAgentBackend {
         onProgress?.(`🚀 Starting cursor-agent (${model})...`);
         if (logFile) {
             const C = this.COLORS;
+            // Write the prompt to log file FIRST (before agent runs)
+            // This helps debug what context the agent received
+            this.appendToLog(logFile, `${'═'.repeat(80)}\n`);
+            this.appendToLog(logFile, `${C.cyan}${C.bold}PROMPT SENT TO AGENT${C.reset}\n`);
+            this.appendToLog(logFile, `${'═'.repeat(80)}\n\n`);
+            this.appendToLog(logFile, `${prompt}\n\n`);
+            this.appendToLog(logFile, `${'═'.repeat(80)}\n`);
+            this.appendToLog(logFile, `${C.cyan}${C.bold}END OF PROMPT - AGENT OUTPUT BELOW${C.reset}\n`);
+            this.appendToLog(logFile, `${'═'.repeat(80)}\n\n`);
+            
+            // Log agent metadata
             this.appendToLog(logFile, `${C.cyan}${C.bold}🚀 Agent started: ${new Date().toISOString()}${C.reset}\n`);
             this.appendToLog(logFile, `${C.gray}Model: ${model}${C.reset}\n`);
             this.appendToLog(logFile, `${C.gray}Process ID: ${id}${C.reset}\n`);
@@ -325,8 +362,9 @@ export class CursorAgentRunner implements IAgentBackend {
             if (process.platform === 'win32') {
                 // Windows: Use WSL to run cursor-agent (cursor-agent requires Unix environment)
                 // Use Ubuntu distribution and pipe prompt file content
-                // IMPORTANT: Use absolute path to cursor-agent since PATH may not be configured yet
-                const cursorAgentPath = '$HOME/.local/bin/cursor-agent';
+                // IMPORTANT: Use tilde (~) instead of $HOME because Windows env vars contaminate
+                // the WSL environment, causing $HOME to become a mangled Windows path like "C:Usersyuepr"
+                const cursorAgentPath = '~/.local/bin/cursor-agent';
                 const wslPromptPath = promptFile.replace(/\\/g, '/').replace(/^[A-Z]:/, (match) => `/mnt/${match.toLowerCase().charAt(0)}`);
                 const bashCmd = `cat "${wslPromptPath}" | ${cursorAgentPath} ${cursorFlags} 2>&1; rm -f "${wslPromptPath}"`;
                 
@@ -1102,7 +1140,7 @@ export class CursorAgentRunner implements IAgentBackend {
         if (!interactive) {
             const platform = process.platform;
             const loginCmd = platform === 'win32' 
-                ? 'wsl -d Ubuntu bash -c "$HOME/.local/bin/cursor-agent login"'
+                ? 'wsl -d Ubuntu bash -c "~/.local/bin/cursor-agent login"'
                 : 'cursor-agent login';
             
             return {
@@ -1124,7 +1162,7 @@ export class CursorAgentRunner implements IAgentBackend {
             terminal.show();
             
             if (platform === 'win32') {
-                terminal.sendText('wsl -d Ubuntu bash -c "$HOME/.local/bin/cursor-agent login"');
+                terminal.sendText('wsl -d Ubuntu bash -c "~/.local/bin/cursor-agent login"');
             } else {
                 terminal.sendText('cursor-agent login');
             }
@@ -1167,29 +1205,77 @@ export class CursorAgentRunner implements IAgentBackend {
      * to ensure consistency across the codebase
      */
     async isAvailable(): Promise<boolean> {
+        const status = await this.getDependencyStatus(false);
+        return status.installed;
+    }
+    
+    /**
+     * Get dependency status for cursor-agent CLI
+     * This is the authoritative source for cursor-agent availability
+     * 
+     * @param isCurrentBackend Whether cursor is the currently active backend (affects 'required' field)
+     */
+    async getDependencyStatus(isCurrentBackend: boolean): Promise<BackendDependencyStatus> {
+        let installed = false;
+        let version: string | undefined;
+        
         try {
             if (process.platform === 'win32') {
                 // On Windows, check if cursor-agent exists in WSL
-                // Use the EXACT SAME check as DependencyService for consistency
-                const { execSync } = require('child_process');
                 const result = execSync(
                     'wsl -d Ubuntu bash -c "if [ -f ~/.local/bin/cursor-agent ]; then ~/.local/bin/cursor-agent --version 2>&1; else echo NOT_FOUND; fi"',
                     { encoding: 'utf8', stdio: 'pipe', timeout: 5000, windowsHide: true }
                 );
                 
-                // Check if it returned a version (not NOT_FOUND)
                 if (result && !result.includes('NOT_FOUND') && result.trim()) {
-                    return true;
+                    installed = true;
+                    version = result.trim().split('\n')[0];
                 }
-                return false;
             } else {
                 // On macOS/Linux, check if cursor-agent is in PATH
-                execSync('which cursor-agent', { stdio: 'ignore', windowsHide: true });
-                return true;
+                const { promisify } = require('util');
+                const exec = promisify(require('child_process').exec);
+                try {
+                    const { stdout } = await exec('cursor-agent --version', { timeout: 5000, windowsHide: true });
+                    installed = true;
+                    version = stdout.trim().split('\n')[0];
+                } catch {
+                    // Try ~/.local/bin
+                    try {
+                        const { stdout } = await exec('~/.local/bin/cursor-agent --version', { timeout: 5000, windowsHide: true });
+                        installed = true;
+                        version = stdout.trim().split('\n')[0];
+                    } catch {
+                        installed = false;
+                    }
+                }
             }
         } catch {
-            return false;
+            installed = false;
         }
+        
+        const description = installed
+            ? (isCurrentBackend 
+                ? '✅ Installed and ready for cursor backend'
+                : 'Installed (not currently in use)')
+            : (isCurrentBackend
+                ? '❌ cursor-agent not installed!\n\n' +
+                  'INSTALLATION:\n' +
+                  (process.platform === 'win32' 
+                    ? '• Click "Install" to run automated WSL setup\n'
+                    : '• Run install script from extension\n') +
+                  '\n📖 See Dependencies panel for setup instructions'
+                : 'Not needed (cursor backend not in use)');
+        
+        return {
+            name: 'Cursor Agent CLI',
+            installed,
+            version,
+            required: isCurrentBackend,
+            description,
+            platform: 'all',
+            installType: 'cursor-agent-cli'
+        };
     }
     
     /**

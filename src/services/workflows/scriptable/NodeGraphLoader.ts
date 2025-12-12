@@ -66,6 +66,7 @@ interface RawYamlNode {
     checkpoint?: boolean;
     position?: { x: number; y: number };
     label?: string;
+    locked?: boolean;
 }
 
 /**
@@ -540,27 +541,10 @@ export class NodeGraphLoader {
         // Handle dynamic port nodes based on config
         const config = raw.config || {};
         
-        // Agent Bench - dynamic seat ports
-        if (raw.type === 'agent_bench' && config.seatCount !== undefined) {
-            const seatCount = config.seatCount;
+        // Agent Bench has no ports - it's a visual display only
+        if (raw.type === 'agent_bench') {
             inputs = [];
             outputs = [];
-            for (let i = 0; i < seatCount; i++) {
-                inputs.push({
-                    id: `agent_in_${i}`,
-                    name: `Seat ${i + 1} In`,
-                    direction: 'input',
-                    dataType: 'agent',
-                    description: `Agent input for seat ${i + 1}`
-                });
-                outputs.push({
-                    id: `agent_out_${i}`,
-                    name: `Seat ${i + 1} Out`,
-                    direction: 'output',
-                    dataType: 'agent',
-                    description: `Agent output for seat ${i + 1}`
-                });
-            }
         }
         
         // Branch - dynamic branch output ports
@@ -644,8 +628,6 @@ export class NodeGraphLoader {
         if (raw.on_error) {
             onError = {
                 strategy: raw.on_error.strategy as any,
-                maxRetries: raw.on_error.max_retries,
-                retryDelayMs: raw.on_error.retry_delay_ms,
                 gotoNodeId: raw.on_error.goto_node_id,
                 skipDefaultValue: raw.on_error.skip_default_value
             };
@@ -661,7 +643,8 @@ export class NodeGraphLoader {
             onError,
             checkpoint: raw.checkpoint,
             position: raw.position,
-            label: raw.label
+            label: raw.label,
+            locked: raw.locked
         };
     }
     
@@ -694,14 +677,13 @@ export class NodeGraphLoader {
                 timeout_ms: n.timeoutMs,
                 on_error: n.onError ? {
                     strategy: n.onError.strategy,
-                    max_retries: n.onError.maxRetries,
-                    retry_delay_ms: n.onError.retryDelayMs,
                     goto_node_id: n.onError.gotoNodeId,
                     skip_default_value: n.onError.skipDefaultValue
                 } : undefined,
                 checkpoint: n.checkpoint,
                 position: n.position,
-                label: n.label
+                label: n.label,
+                locked: n.locked
             })),
             connections: graph.connections.map(c => ({
                 from: `${c.fromNodeId}.${c.fromPortId}`,

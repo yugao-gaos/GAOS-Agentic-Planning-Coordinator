@@ -39,6 +39,10 @@ const NodeRenderer = {
             this.renderGroupNode(node);
             return;
         }
+        if (node.type === 'for_loop') {
+            this.renderLoopNode(node);
+            return;
+        }
         
         const nodeDef = this.getNodeDefinition(node.type);
         
@@ -59,10 +63,34 @@ const NodeRenderer = {
         if (nodeDef?.color) {
             headerEl.style.background = nodeDef.color;
         }
+        
+        // Get display name: prioritize config.label, then node.label, then definition name
+        const displayName = node.config?.label || node.label || nodeDef?.name || node.type;
+        
         headerEl.innerHTML = \`
-            <span>\${this.getNodeIcon(nodeDef)}</span>
-            <span>\${node.label || nodeDef?.name || node.type}</span>
+            <span class="node-header-icon">\${this.getNodeIcon(nodeDef)}</span>
+            <span class="node-header-title">\${displayName}</span>
+            <span class="node-lock-btn \${node.locked ? 'locked' : ''}" title="\${node.locked ? 'Unlock position' : 'Lock position'}">
+                \${node.locked ? this.getLockIcon(true) : this.getLockIcon(false)}
+            </span>
         \`;
+        
+        // Lock button click handler
+        const lockBtn = headerEl.querySelector('.node-lock-btn');
+        if (lockBtn) {
+            lockBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                node.locked = !node.locked;
+                lockBtn.classList.toggle('locked', node.locked);
+                lockBtn.innerHTML = node.locked ? this.getLockIcon(true) : this.getLockIcon(false);
+                lockBtn.title = node.locked ? 'Unlock position' : 'Lock position';
+                vscode.postMessage({
+                    type: 'updateNodeLocked',
+                    payload: { nodeId: node.id, locked: node.locked }
+                });
+            });
+        }
+        
         nodeEl.appendChild(headerEl);
         
         // Body with ports
@@ -172,6 +200,216 @@ const NodeRenderer = {
         this.setupNodeEvents(nodeEl, node);
     },
     
+    // Render a loop node (container style with internal ports)
+    renderLoopNode(node) {
+        const nodeDef = this.getNodeDefinition(node.type);
+        const color = nodeDef?.color || '#009688';
+        const width = node.config?.width || 400;
+        const height = node.config?.height || 250;
+        
+        const nodeEl = document.createElement('div');
+        nodeEl.className = 'node node-loop';
+        nodeEl.id = 'node-' + node.id;
+        nodeEl.dataset.nodeId = node.id;
+        nodeEl.style.left = (node.position?.x || 0) + 'px';
+        nodeEl.style.top = (node.position?.y || 0) + 'px';
+        nodeEl.style.width = width + 'px';
+        nodeEl.style.height = height + 'px';
+        
+        if (GraphState.selectedNodeIds.has(node.id)) {
+            nodeEl.classList.add('selected');
+        }
+        if (node.locked) {
+            nodeEl.classList.add('locked');
+        }
+        
+        // === Title bar ===
+        const titleBar = document.createElement('div');
+        titleBar.className = 'loop-title-bar';
+        titleBar.style.backgroundColor = color;
+        
+        const displayName = node.config?.label || node.label || nodeDef?.name || 'For Loop';
+        
+        titleBar.innerHTML = \`
+            <span class="node-header-icon">\${this.getNodeIcon(nodeDef)}</span>
+            <span class="loop-title">\${displayName}</span>
+            <span class="node-lock-btn \${node.locked ? 'locked' : ''}" title="\${node.locked ? 'Unlock position' : 'Lock position'}">
+                \${node.locked ? this.getLockIcon(true) : this.getLockIcon(false)}
+            </span>
+        \`;
+        
+        // Lock button handler
+        const lockBtn = titleBar.querySelector('.node-lock-btn');
+        if (lockBtn) {
+            lockBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                node.locked = !node.locked;
+                nodeEl.classList.toggle('locked', node.locked);
+                lockBtn.classList.toggle('locked', node.locked);
+                lockBtn.innerHTML = node.locked ? this.getLockIcon(true) : this.getLockIcon(false);
+                lockBtn.title = node.locked ? 'Unlock position' : 'Lock position';
+                vscode.postMessage({
+                    type: 'updateNodeLocked',
+                    payload: { nodeId: node.id, locked: node.locked }
+                });
+            });
+        }
+        
+        nodeEl.appendChild(titleBar);
+        
+        // === External ports bar (between title and container) ===
+        const portsBar = document.createElement('div');
+        portsBar.className = 'loop-ports-bar';
+        portsBar.style.borderColor = color;
+        
+        // External inputs (left side of bar)
+        const externalInputs = document.createElement('div');
+        externalInputs.className = 'loop-external-inputs';
+        for (const port of node.inputs || []) {
+            const portEl = this.createPortElement(node.id, port, 'input');
+            externalInputs.appendChild(portEl);
+        }
+        portsBar.appendChild(externalInputs);
+        
+        // External outputs (right side of bar)
+        const externalOutputs = document.createElement('div');
+        externalOutputs.className = 'loop-external-outputs';
+        for (const port of node.outputs || []) {
+            const portEl = this.createPortElement(node.id, port, 'output');
+            externalOutputs.appendChild(portEl);
+        }
+        // Add external Result output port (receives data from internal result port)
+        const resultOutputPort = { id: 'result', name: 'Result', dataType: 'any', description: 'Accumulated result from the loop' };
+        const resultOutputEl = this.createPortElement(node.id, resultOutputPort, 'output');
+        externalOutputs.appendChild(resultOutputEl);
+        portsBar.appendChild(externalOutputs);
+        
+        nodeEl.appendChild(portsBar);
+        
+        // === Container area (where nodes can be placed inside) ===
+        const containerArea = document.createElement('div');
+        containerArea.className = 'loop-container-area';
+        containerArea.style.borderColor = color;
+        
+        // Prevent drag initiation from container area
+        containerArea.addEventListener('mousedown', (e) => {
+            // Only stop propagation if clicking directly on container area (not on internal ports)
+            if (e.target === containerArea || e.target.classList.contains('loop-container-area')) {
+                e.stopPropagation();
+            }
+        });
+        
+        // Internal ports - Left side (Loop Body output)
+        const internalLeft = document.createElement('div');
+        internalLeft.className = 'loop-internal-ports loop-internal-left';
+        
+        // Add internal output ports (loop_body, item, index)
+        const internalOutputs = [
+            { id: 'loop_body', name: 'Loop Body', dataType: 'trigger', description: 'Triggers for each iteration' },
+            { id: 'item', name: 'Item', dataType: 'any', description: 'Current iteration item' },
+            { id: 'index', name: 'Index', dataType: 'number', description: 'Current iteration index' }
+        ];
+        for (const port of internalOutputs) {
+            const portEl = this.createPortElement(node.id, port, 'output');
+            portEl.classList.add('internal-port');
+            // Mark port dot as internal for connection validation
+            const portDot = portEl.querySelector('.port-dot');
+            if (portDot) portDot.dataset.internal = 'true';
+            internalLeft.appendChild(portEl);
+        }
+        containerArea.appendChild(internalLeft);
+        
+        // Internal ports - Right side (Loop Back and Break inputs)
+        const internalRight = document.createElement('div');
+        internalRight.className = 'loop-internal-ports loop-internal-right';
+        
+        const loopBackPort = { id: 'loop_back', name: 'Loop Back', dataType: 'trigger', description: 'Continue to next iteration' };
+        const loopBackEl = this.createPortElement(node.id, loopBackPort, 'input');
+        loopBackEl.classList.add('internal-port');
+        // Mark port dot as internal for connection validation
+        const loopBackDot = loopBackEl.querySelector('.port-dot');
+        if (loopBackDot) loopBackDot.dataset.internal = 'true';
+        internalRight.appendChild(loopBackEl);
+        
+        const breakPort = { id: 'break', name: 'Break', dataType: 'trigger', description: 'Exit the loop early' };
+        const breakEl = this.createPortElement(node.id, breakPort, 'input');
+        breakEl.classList.add('internal-port');
+        // Mark port dot as internal for connection validation
+        const breakDot = breakEl.querySelector('.port-dot');
+        if (breakDot) breakDot.dataset.internal = 'true';
+        internalRight.appendChild(breakEl);
+        
+        const resultPort = { id: 'result_in', name: 'Result', dataType: 'any', description: 'Data to output from the loop' };
+        const resultEl = this.createPortElement(node.id, resultPort, 'input');
+        resultEl.classList.add('internal-port');
+        // Mark port dot as internal for connection validation
+        const resultDot = resultEl.querySelector('.port-dot');
+        if (resultDot) resultDot.dataset.internal = 'true';
+        internalRight.appendChild(resultEl);
+        
+        containerArea.appendChild(internalRight);
+        
+        nodeEl.appendChild(containerArea);
+        
+        // Resize handle
+        const resizeHandle = document.createElement('div');
+        resizeHandle.className = 'loop-resize-handle';
+        resizeHandle.innerHTML = '<svg viewBox="0 0 10 10" width="10" height="10"><path d="M9 1L1 9M9 5L5 9M9 9L9 9" stroke="currentColor" stroke-width="1.5" fill="none"/></svg>';
+        
+        // Resize logic
+        let isResizing = false;
+        let startX, startY, startWidth, startHeight;
+        
+        resizeHandle.addEventListener('mousedown', (e) => {
+            e.stopPropagation();
+            isResizing = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            startWidth = nodeEl.offsetWidth;
+            startHeight = nodeEl.offsetHeight;
+            document.body.style.cursor = 'nwse-resize';
+            
+            const onMouseMove = (e) => {
+                if (!isResizing) return;
+                const dx = (e.clientX - startX) / GraphState.zoom;
+                const dy = (e.clientY - startY) / GraphState.zoom;
+                const newWidth = Math.max(250, startWidth + dx);
+                const newHeight = Math.max(150, startHeight + dy);
+                nodeEl.style.width = newWidth + 'px';
+                nodeEl.style.height = newHeight + 'px';
+                ConnectionRenderer.renderAll();
+            };
+            
+            const onMouseUp = () => {
+                if (!isResizing) return;
+                isResizing = false;
+                document.body.style.cursor = '';
+                document.removeEventListener('mousemove', onMouseMove);
+                document.removeEventListener('mouseup', onMouseUp);
+                
+                // Save new size
+                vscode.postMessage({
+                    type: 'updateNodeConfig',
+                    payload: { 
+                        nodeId: node.id, 
+                        config: { 
+                            width: parseInt(nodeEl.style.width), 
+                            height: parseInt(nodeEl.style.height) 
+                        } 
+                    }
+                });
+            };
+            
+            document.addEventListener('mousemove', onMouseMove);
+            document.addEventListener('mouseup', onMouseUp);
+        });
+        
+        nodeEl.appendChild(resizeHandle);
+        
+        this.nodesLayer.appendChild(nodeEl);
+        this.setupNodeEvents(nodeEl, node);
+    },
+    
     // Create a port element
     createPortElement(nodeId, port, direction) {
         const portEl = document.createElement('div');
@@ -246,8 +484,10 @@ const NodeRenderer = {
                 GraphState.selectNode(node.id, false);
             }
             
-            // Start drag
-            DragManager.startDrag(e, node.id);
+            // Start drag only if node is not locked
+            if (!node.locked) {
+                DragManager.startDrag(e, node.id);
+            }
         });
         
         // Click - select node
@@ -306,6 +546,15 @@ const NodeRenderer = {
         return null;
     },
     
+    // Get lock/unlock icon
+    getLockIcon(locked) {
+        if (locked) {
+            return '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M18 8h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm-6 9c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2zm3.1-9H8.9V6c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2z"/></svg>';
+        } else {
+            return '<svg viewBox="0 0 24 24" width="12" height="12" fill="currentColor"><path d="M12 17c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm6-9h-1V6c0-2.76-2.24-5-5-5S7 3.24 7 6h1.9c0-1.71 1.39-3.1 3.1-3.1 1.71 0 3.1 1.39 3.1 3.1v2H6c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V10c0-1.1-.9-2-2-2zm0 12H6V10h12v10z"/></svg>';
+        }
+    },
+    
     // Get node icon (SVG icons for better quality)
     getNodeIcon(nodeDef) {
         const svgIcons = {
@@ -336,6 +585,8 @@ const NodeRenderer = {
             // Control flow nodes - unique icons
             'git-compare': '<svg viewBox="0 0 24 24"><path d="M19 3h-5v2h5v13l-5-6v4H9v2h5v4l5-6v4h2V5c0-1.1-.9-2-2-2zM9 6l-5 6h4v9H2v2h8V13l5 6V3H9v3z"/></svg>',
             'split-branch': '<svg viewBox="0 0 24 24"><path d="M14 4l2.29 2.29-2.88 2.88 1.42 1.42 2.88-2.88L20 10V4h-6zm-4 0H4v6l2.29-2.29 4.71 4.7V20h2v-8.41l-5.29-5.3L10 4z"/></svg>',
+            'if-else': '<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75l-.9.92C13.45 12.9 13 13.5 13 15h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H8c0-2.21 1.79-4 4-4s4 1.79 4 4c0 .88-.36 1.68-.93 2.25z"/></svg>',
+            'signpost': '<svg viewBox="0 0 24 24"><path d="M13 10h5l3-3-3-3h-5V2h-2v2H4v6h7v2H6l-3 3 3 3h5v4h2v-4h7v-6h-7v-2zM6 6h11.17l1 1-1 1H6V6zm12 10H6.83l-1-1 1-1H18v2z"/></svg>',
             'switch': '<svg viewBox="0 0 24 24"><path d="M19 9l1.25-2.75L23 5l-2.75-1.25L19 1l-1.25 2.75L15 5l2.75 1.25L19 9zm-7.5.5L9 4 6.5 9.5 1 12l5.5 2.5L9 20l2.5-5.5L17 12l-5.5-2.5zM19 15l-1.25 2.75L15 19l2.75 1.25L19 23l1.25-2.75L23 19l-2.75-1.25L19 15z"/></svg>',
             'loop': '<svg viewBox="0 0 24 24"><path d="M12 4V1L8 5l4 4V6c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg>',
             'repeat': '<svg viewBox="0 0 24 24"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z"/></svg>',

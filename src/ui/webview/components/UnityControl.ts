@@ -1,7 +1,7 @@
 /**
  * Unity control section component.
  */
-import { UnityInfo } from '../types';
+import { UnityInfo, formatTaskTypeDetailed } from '../types';
 
 /**
  * Render the Unity control section content.
@@ -11,7 +11,7 @@ export function renderUnityContent(unity: UnityInfo): string {
     
     // Show current task if one is running
     if (unity.currentTask) {
-        const taskType = formatTaskType(unity.currentTask.type);
+        const taskType = formatTaskTypeDetailed(unity.currentTask.type);
         const phase = unity.currentTask.phase ? ` (${unity.currentTask.phase})` : '';
         statusRow = `
             <div class="unity-row">
@@ -30,19 +30,6 @@ export function renderUnityContent(unity: UnityInfo): string {
             </span>
         </div>
     `;
-}
-
-/**
- * Format task type for display.
- */
-function formatTaskType(type: string): string {
-    const typeMap: Record<string, string> = {
-        'prep_editor': 'Compile',
-        'test_framework_editmode': 'EditMode Tests',
-        'test_framework_playmode': 'PlayMode Tests',
-        'test_player_playmode': 'Player Test'
-    };
-    return typeMap[type] || type;
 }
 
 /**
@@ -73,11 +60,30 @@ export function getUnityBadgeInfo(unity: UnityInfo): { text: string; background:
         };
     }
     
-    if (unity.status === 'testing' || unity.currentTask) {
+    // Show current task with details
+    if (unity.currentTask) {
+        const taskName = formatTaskTypeDetailed(unity.currentTask.type);
+        return {
+            text: taskName,
+            background: 'rgba(234, 179, 8, 0.3)',
+            className: 'testing'
+        };
+    }
+    
+    if (unity.status === 'testing') {
         return {
             text: 'Testing',
             background: 'rgba(234, 179, 8, 0.3)',
             className: 'testing'
+        };
+    }
+    
+    // Show queued state when there are pipelines waiting
+    if (unity.queueLength > 0) {
+        return {
+            text: `Queued (${unity.queueLength})`,
+            background: 'rgba(168, 85, 247, 0.3)',
+            className: 'running'
         };
     }
     

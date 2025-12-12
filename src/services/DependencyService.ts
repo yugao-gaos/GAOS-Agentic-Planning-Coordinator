@@ -24,6 +24,50 @@ const execAsync = (command: string, options?: ExecOptions): Promise<{ stdout: st
     }) as Promise<{ stdout: string; stderr: string }>;
 };
 
+/**
+ * Restart WSL when it becomes unresponsive.
+ * This is needed when WSL hangs or times out during dependency checks.
+ * @returns true if WSL was successfully restarted
+ */
+async function restartWsl(): Promise<boolean> {
+    if (process.platform !== 'win32') {
+        return false;
+    }
+    
+    try {
+        log.info('[restartWsl] WSL is unresponsive, attempting restart...');
+        log.info('[restartWsl] Running: wsl --shutdown');
+        
+        // Shutdown WSL
+        execSync('wsl --shutdown', {
+            stdio: 'ignore',
+            windowsHide: true,
+            timeout: 10000  // 10 second timeout for shutdown
+        });
+        
+        // Wait for WSL to fully shut down
+        log.info('[restartWsl] Waiting for WSL to shut down...');
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        
+        // Start WSL by running a simple command
+        log.info('[restartWsl] Starting WSL...');
+        spawnSync('wsl', ['-d', 'Ubuntu', '-e', 'echo', 'WSL_READY'], {
+            encoding: 'utf8',
+            timeout: 30000,  // 30 second timeout for startup
+            windowsHide: true
+        });
+        
+        // Give WSL a moment to fully initialize
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        log.info('[restartWsl] ✅ WSL restarted successfully');
+        return true;
+    } catch (err) {
+        log.error('[restartWsl] Failed to restart WSL:', err);
+        return false;
+    }
+}
+
 // ============================================================================
 // Unity MCP Config Types
 // ============================================================================
@@ -56,7 +100,7 @@ export interface DependencyStatus {
     description: string;
     platform: 'darwin' | 'win32' | 'linux' | 'all';
     /** Special handling type - e.g. 'cursor-agent-cli' for login vs install, 'retry' for re-check */
-    installType?: 'url' | 'command' | 'apc-cli' | 'vscode-command' | 'cursor-agent-cli' | 'unity-mcp' | 'retry';
+    installType?: 'url' | 'command' | 'apc-cli' | 'vscode-command' | 'cursor-agent-cli' | 'unity-mcp' | 'unity-bridge' | 'retry';
 }
 
 /**
@@ -186,12 +230,15 @@ export class DependencyService {
         dependencies.push(
             'Cursor CLI',
             'Cursor Agent CLI',
+            'Claude CLI',
+            'Codex CLI',
             'APC CLI (apc)'
         );
         
         // WSL-specific (only on Windows)
         if (platform === 'win32') {
             dependencies.push(
+                'WSL Default Distribution',
                 'Node.js in WSL',
                 'apc CLI in WSL'
             );
@@ -199,7 +246,7 @@ export class DependencyService {
         
         // Unity dependencies (if enabled)
         if (this.unityEnabled && this.isUnityProject()) {
-            dependencies.push('MCP for Unity', 'Unity Temp Scene');
+            dependencies.push('MCP for Unity', 'APC Unity Bridge', 'Unity Temp Scene');
         }
         
         return dependencies;
@@ -821,6 +868,7 @@ Examples of WRONG responses:
 Reply now with ONLY "CONNECTED" or "ERROR: reason":`,
                 cwd: this.workspaceRoot || process.cwd(),
                 timeoutMs,
+                model: 'low',  // Use 'auto' model - simple task doesn't need powerful model
                 onOutput: (text, type) => {
                     // Only capture stdout text, ignore stderr warnings
                     if (type === 'text' || type === 'tool_result' || type === 'info') {
@@ -965,6 +1013,17 @@ Exit code is 0: ${result.exitCode === 0}
                     }
                 }
                 
+                // Format 4: "Cannot use this model" - cursor CLI model name mismatch
+                const modelMatch = filteredOutput.match(/Cannot use this model:\s*([^\.\n]+)/i);
+                if (modelMatch) {
+                    const invalidModel = modelMatch[1].trim();
+                    return { 
+                        connected: false, 
+                        error: `Invalid model "${invalidModel}" for cursor CLI. ` +
+                               `This is a configuration issue - check CursorAgentRunner model names.`
+                    };
+                }
+                
                 // UNKNOWN ERROR FORMAT - Don't hide it, show everything!
                 throw new Error(
                     `Unity MCP connectivity test failed with UNKNOWN error format.\n\n` +
@@ -1058,7 +1117,12 @@ Exit code is 0: ${result.exitCode === 0}
                 ]);
                 platformResults.push(appleScript, accessibility);
             } else if (platform === 'win32') {
-                platformResults.push(await this.checkPowerShell());
+                // Windows checks - PowerShell and WSL configuration
+                const [powerShell, wslDefault] = await Promise.all([
+                    this.checkPowerShell(),
+                    this.checkWslDefaultDistro()
+                ]);
+                platformResults.push(powerShell, wslDefault);
             } else if (platform === 'linux') {
                 platformResults.push(await this.checkXdotool());
             }
@@ -1069,12 +1133,22 @@ Exit code is 0: ${result.exitCode === 0}
         // ====================================================================
         // Phase 2: Common dependencies (run in parallel - no dependencies between them)
         // ====================================================================
+        // Get current backend type to determine which CLI is "required"
+        const currentBackend = this.getCurrentBackendType();
+        
+        // Use AgentRunner to get CLI status for Claude/Codex - delegates to each backend's getDependencyStatus()
+        // NOTE: cursor-agent uses checkCursorAgentCli() which has special WSL handling on Windows
+        const agentRunner = ServiceLocator.resolve(AgentRunner);
+        
         const commonChecksPromise = Promise.all([
-            this.checkCursorCli(),
-            this.checkCursorAgentCli(),
+            this.checkCursorCli(),        // Cursor IDE CLI (info only, not required)
+            this.checkCursorAgentCli(),   // Cursor Agent CLI (has special WSL handling on Windows)
+            // Backend CLI checks - delegate to each backend implementation
+            agentRunner.getDependencyStatusForBackend('claude', currentBackend === 'claude'),
+            agentRunner.getDependencyStatusForBackend('codex', currentBackend === 'codex'),
             this.checkApcCli(),
-            this.checkNodeJsInWsl(),    // Node.js in WSL (for apc CLI)
-            this.checkApcCliInWsl()     // apc CLI in WSL (for cursor-agent)
+            this.checkNodeJsInWsl(),     // Node.js in WSL (for apc CLI)
+            this.checkApcCliInWsl()      // apc CLI in WSL (for cursor-agent)
         ]);
 
         // Wait for both phases to complete
@@ -1087,9 +1161,11 @@ Exit code is 0: ${result.exitCode === 0}
         platformResults.forEach(addAndNotify);
 
         // Add common results (extract for dependency checking)
-        const [cursorCliResult, cursorAgentResult, apcResult, nodeJsWslResult, apcWslResult] = commonResults;
+        const [cursorCliResult, cursorAgentResult, claudeCliResult, codexCliResult, apcResult, nodeJsWslResult, apcWslResult] = commonResults;
         addAndNotify(cursorCliResult);
-        addAndNotify(cursorAgentResult);
+        addAndNotify(cursorAgentResult);                      // From DependencyService (has WSL handling)
+        addAndNotify(claudeCliResult as DependencyStatus);    // From backend
+        addAndNotify(codexCliResult as DependencyStatus);     // From backend
         addAndNotify(apcResult);
         addAndNotify(nodeJsWslResult);
         addAndNotify(apcWslResult);
@@ -1121,6 +1197,12 @@ Exit code is 0: ${result.exitCode === 0}
                 });
             }
 
+            // APC Unity Bridge check (fast, only for Unity projects)
+            if (this.isUnityProject()) {
+                const bridgeResult = this.checkApcUnityBridge();
+                addAndNotify(bridgeResult);
+            }
+            
             // Unity temp scene check (fast, only for Unity projects)
             if (this.isUnityProject()) {
                 const tempSceneResult = await this.checkUnityTempScene();
@@ -1377,6 +1459,299 @@ Exit code is 0: ${result.exitCode === 0}
                 platform: 'all'
             };
         }
+    }
+    
+    /**
+     * Check if APC Unity Bridge package is installed in the Unity project's Packages folder.
+     * This package provides direct WebSocket communication between Unity and the daemon,
+     * eliminating the need for MCP-based polling for basic operations.
+     */
+    private checkApcUnityBridge(): DependencyStatus {
+        if (!this.workspaceRoot) {
+            return {
+                name: 'APC Unity Bridge',
+                installed: false,
+                required: false,
+                description: 'Workspace not set',
+                platform: 'all'
+            };
+        }
+        
+        // Only relevant for Unity projects
+        if (!this.isUnityProject()) {
+            return {
+                name: 'APC Unity Bridge',
+                installed: false,
+                required: false,
+                description: 'Not applicable (not a Unity project)',
+                platform: 'all'
+            };
+        }
+        
+        // Get expected version from source package
+        const expectedVersion = this.getExpectedUnityBridgeVersion();
+        
+        // Check if the package exists in Packages folder
+        const packagePath = path.join(this.workspaceRoot, 'Packages', 'com.gaos.apc.bridge');
+        const packageJsonPath = path.join(packagePath, 'package.json');
+        
+        if (fs.existsSync(packageJsonPath)) {
+            try {
+                const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+                const installedVersion = packageJson.version || 'unknown';
+                
+                // Check if version matches
+                if (expectedVersion && installedVersion !== expectedVersion) {
+                    return {
+                        name: 'APC Unity Bridge',
+                        installed: false, // Flag as not installed due to version mismatch
+                        version: installedVersion,
+                        required: true,
+                        description: `Version mismatch: installed v${installedVersion}, expected v${expectedVersion}. Click Install to update.`,
+                        platform: 'all',
+                        installType: 'unity-bridge'
+                    };
+                }
+                
+                return {
+                    name: 'APC Unity Bridge',
+                    installed: true,
+                    version: installedVersion,
+                    required: true, // Required for efficient Unity control
+                    description: `Direct WebSocket control (v${installedVersion})`,
+                    platform: 'all'
+                };
+            } catch {
+                return {
+                    name: 'APC Unity Bridge',
+                    installed: false,
+                    required: true,
+                    description: 'Package found but could not read version',
+                    platform: 'all',
+                    installType: 'unity-bridge'
+                };
+            }
+        }
+        
+        // Check if Packages folder exists
+        const packagesDir = path.join(this.workspaceRoot, 'Packages');
+        if (!fs.existsSync(packagesDir)) {
+            return {
+                name: 'APC Unity Bridge',
+                installed: false,
+                required: true,
+                description: 'Unity Packages folder not found',
+                platform: 'all'
+            };
+        }
+        
+        // Package not installed
+        return {
+            name: 'APC Unity Bridge',
+            installed: false,
+            required: true,
+            description: 'Click Install to add Unity Bridge package for direct daemon control',
+            platform: 'all',
+            installType: 'unity-bridge'
+        };
+    }
+    
+    /**
+     * Get the expected version of Unity Bridge from the extension's source package.
+     */
+    private getExpectedUnityBridgeVersion(): string | null {
+        const extensionRoot = this.findExtensionRoot();
+        if (!extensionRoot) {
+            return null;
+        }
+        
+        const sourcePackageJson = path.join(extensionRoot, 'unity-package', 'com.gaos.apc.bridge', 'package.json');
+        if (!fs.existsSync(sourcePackageJson)) {
+            return null;
+        }
+        
+        try {
+            const packageJson = JSON.parse(fs.readFileSync(sourcePackageJson, 'utf8'));
+            return packageJson.version || null;
+        } catch {
+            return null;
+        }
+    }
+    
+    /**
+     * Install the APC Unity Bridge package to the Unity project's Packages folder.
+     * Copies the package from the extension's unity-package folder.
+     */
+    async installApcUnityBridge(): Promise<{ success: boolean; message: string }> {
+        if (!this.workspaceRoot) {
+            return { success: false, message: 'Workspace root not set' };
+        }
+        
+        if (!this.isUnityProject()) {
+            return { success: false, message: 'Not a Unity project' };
+        }
+        
+        try {
+            // Find the source package in the extension
+            const extensionRoot = this.findExtensionRoot();
+            if (!extensionRoot) {
+                log.error('[installApcUnityBridge] Could not find extension root. __dirname:', __dirname);
+                return { success: false, message: 'Could not find extension root. Check extension installation.' };
+            }
+            
+            log.info(`[installApcUnityBridge] Extension root: ${extensionRoot}`);
+            
+            const sourcePackage = path.join(extensionRoot, 'unity-package', 'com.gaos.apc.bridge');
+            if (!fs.existsSync(sourcePackage)) {
+                log.error(`[installApcUnityBridge] Package source not found at: ${sourcePackage}`);
+                return { success: false, message: `Unity Bridge package source not found at: ${sourcePackage}` };
+            }
+            
+            log.info(`[installApcUnityBridge] Source package: ${sourcePackage}`);
+            
+            // Ensure Packages folder exists
+            const packagesDir = path.join(this.workspaceRoot, 'Packages');
+            if (!fs.existsSync(packagesDir)) {
+                fs.mkdirSync(packagesDir, { recursive: true });
+            }
+            
+            // Target path
+            const targetPackage = path.join(packagesDir, 'com.gaos.apc.bridge');
+            
+            // Remove existing installation if present
+            if (fs.existsSync(targetPackage)) {
+                this.removeDirectoryRecursive(targetPackage);
+            }
+            
+            // Copy the package
+            this.copyDirectoryRecursive(sourcePackage, targetPackage);
+            
+            // Verify installation
+            const packageJsonPath = path.join(targetPackage, 'package.json');
+            if (!fs.existsSync(packageJsonPath)) {
+                return { success: false, message: 'Installation failed - package.json not found' };
+            }
+            
+            log.info(`APC Unity Bridge installed to ${targetPackage}`);
+            
+            return { 
+                success: true, 
+                message: 'APC Unity Bridge installed successfully. Refresh Unity to load the package.' 
+            };
+        } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            log.error('Failed to install APC Unity Bridge:', err);
+            return { success: false, message: `Installation failed: ${message}` };
+        }
+    }
+    
+    /**
+     * Find the extension root directory.
+     * Works both for installed extension and Extension Development Host testing.
+     * 
+     * Directory structure:
+     * - Installed: ~/.vscode/extensions/apc-xxx/out/services/DependencyService.js
+     *   Extension root: __dirname/../.. 
+     * - Dev Host: D:\Project\out\services\DependencyService.js
+     *   Extension root: __dirname/../..
+     */
+    private findExtensionRoot(): string | null {
+        // __dirname is the directory containing this compiled JS file
+        // In both installed and dev host cases, it's in out/services/
+        // So extension root is always two levels up
+        
+        const candidates = [
+            // Standard case: out/services/ -> extension root
+            path.resolve(__dirname, '..', '..'),
+            // Alternative: if running from out/ directly
+            path.resolve(__dirname, '..'),
+            // Fallback: current working directory (for standalone daemon)
+            process.cwd(),
+        ];
+        
+        log.debug(`[findExtensionRoot] __dirname: ${__dirname}`);
+        log.debug(`[findExtensionRoot] Candidates: ${candidates.join(', ')}`);
+        
+        // First, try to find by package.json with our extension name
+        for (const candidate of candidates) {
+            const packageJson = path.join(candidate, 'package.json');
+            if (fs.existsSync(packageJson)) {
+                try {
+                    const pkg = JSON.parse(fs.readFileSync(packageJson, 'utf8'));
+                    // Check for our extension by name or displayName
+                    if (pkg.name === 'agentic-planning-coordinator' || 
+                        pkg.displayName?.includes('APC') ||
+                        pkg.displayName?.includes('Agentic Planning')) {
+                        log.debug(`[findExtensionRoot] Found via package.json: ${candidate}`);
+                        return candidate;
+                    }
+                } catch {
+                    // Ignore parse errors
+                }
+            }
+        }
+        
+        // Second, try to find by unity-package folder presence
+        for (const candidate of candidates) {
+            const unityPackage = path.join(candidate, 'unity-package', 'com.gaos.apc.bridge');
+            if (fs.existsSync(unityPackage)) {
+                log.debug(`[findExtensionRoot] Found via unity-package folder: ${candidate}`);
+                return candidate;
+            }
+        }
+        
+        // Third, check if unity-package is a sibling (for some build configurations)
+        const siblingCheck = path.resolve(__dirname, '..', '..', '..', 'unity-package', 'com.gaos.apc.bridge');
+        if (fs.existsSync(siblingCheck)) {
+            const root = path.resolve(__dirname, '..', '..', '..');
+            log.debug(`[findExtensionRoot] Found via sibling check: ${root}`);
+            return root;
+        }
+        
+        return null;
+    }
+    
+    /**
+     * Recursively copy a directory
+     */
+    private copyDirectoryRecursive(source: string, target: string): void {
+        if (!fs.existsSync(target)) {
+            fs.mkdirSync(target, { recursive: true });
+        }
+        
+        const entries = fs.readdirSync(source, { withFileTypes: true });
+        
+        for (const entry of entries) {
+            const sourcePath = path.join(source, entry.name);
+            const targetPath = path.join(target, entry.name);
+            
+            if (entry.isDirectory()) {
+                this.copyDirectoryRecursive(sourcePath, targetPath);
+            } else {
+                fs.copyFileSync(sourcePath, targetPath);
+            }
+        }
+    }
+    
+    /**
+     * Recursively remove a directory
+     */
+    private removeDirectoryRecursive(dirPath: string): void {
+        if (!fs.existsSync(dirPath)) return;
+        
+        const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+        
+        for (const entry of entries) {
+            const fullPath = path.join(dirPath, entry.name);
+            
+            if (entry.isDirectory()) {
+                this.removeDirectoryRecursive(fullPath);
+            } else {
+                fs.unlinkSync(fullPath);
+            }
+        }
+        
+        fs.rmdirSync(dirPath);
     }
 
     private async checkApcCli(): Promise<DependencyStatus> {
@@ -1733,6 +2108,111 @@ Exit code is 0: ${result.exitCode === 0}
         }
     }
 
+    /**
+     * Check that WSL default distribution is set to Ubuntu (not docker-desktop-data)
+     * 
+     * When Docker Desktop is installed, it may set docker-desktop-data as the default
+     * WSL distribution. This breaks cursor-agent because docker-desktop-data is not
+     * a real Linux distribution (it's Docker storage) and doesn't have /bin/sh.
+     */
+    private async checkWslDefaultDistro(): Promise<DependencyStatus> {
+        if (process.platform !== 'win32') {
+            return {
+                name: 'WSL Default Distribution',
+                installed: true,
+                required: false,
+                description: 'Not applicable (not Windows)',
+                platform: 'win32'
+            };
+        }
+
+        log.debug('[checkWslDefaultDistro] Checking WSL default distribution...');
+
+        try {
+            // Run 'wsl --status' to get the default distribution
+            const result = spawnSync('wsl', ['--status'], {
+                encoding: 'utf8',
+                timeout: 10000,
+                windowsHide: true
+            });
+
+            const output = (result.stdout || '').trim();
+            const errorOutput = (result.stderr || '').trim();
+
+            log.debug('[checkWslDefaultDistro] Output:', output);
+            if (errorOutput) {
+                log.debug('[checkWslDefaultDistro] stderr:', errorOutput);
+            }
+
+            if (result.error) {
+                throw result.error;
+            }
+
+            // Parse the output to find default distribution
+            // Format: "Default Distribution: Ubuntu" (with spaces due to Unicode encoding)
+            // The output may have Unicode spacing, so we normalize it
+            const normalizedOutput = output.replace(/\s+/g, ' ').replace(/\0/g, '');
+            
+            // Match "Default Distribution: <name>" pattern
+            const defaultMatch = normalizedOutput.match(/Default\s*Distribution\s*:\s*(\S+)/i);
+            const defaultDistro = defaultMatch ? defaultMatch[1].trim() : null;
+
+            log.debug('[checkWslDefaultDistro] Detected default distribution:', defaultDistro);
+
+            // Check if it's a broken distribution (Docker internal storage)
+            const brokenDistros = ['docker-desktop-data', 'docker-desktop'];
+            
+            if (!defaultDistro) {
+                log.warn('[checkWslDefaultDistro] Could not detect default WSL distribution');
+                return {
+                    name: 'WSL Default Distribution',
+                    installed: false,
+                    required: true,
+                    description: 'Could not detect default WSL distribution',
+                    platform: 'win32',
+                    installCommand: 'wsl --set-default Ubuntu',
+                    installType: 'command'
+                };
+            }
+
+            if (brokenDistros.includes(defaultDistro.toLowerCase())) {
+                log.warn(`[checkWslDefaultDistro] ❌ Default WSL distribution is ${defaultDistro} (broken for cursor-agent)`);
+                return {
+                    name: 'WSL Default Distribution',
+                    installed: false,
+                    required: true,
+                    version: defaultDistro,
+                    description: `Default is "${defaultDistro}" (not a real Linux) - cursor-agent will fail`,
+                    platform: 'win32',
+                    installCommand: 'wsl --set-default Ubuntu',
+                    installType: 'command'
+                };
+            }
+
+            // Valid distribution
+            log.info(`[checkWslDefaultDistro] ✅ Default WSL distribution: ${defaultDistro}`);
+            return {
+                name: 'WSL Default Distribution',
+                installed: true,
+                required: true,
+                version: defaultDistro,
+                description: `Default: ${defaultDistro} (valid Linux distribution)`,
+                platform: 'win32'
+            };
+
+        } catch (error) {
+            log.error('[checkWslDefaultDistro] Error checking WSL:', error);
+            return {
+                name: 'WSL Default Distribution',
+                installed: false,
+                required: true,
+                description: 'WSL not available or error checking status',
+                platform: 'win32',
+                installUrl: 'https://docs.microsoft.com/en-us/windows/wsl/install'
+            };
+        }
+    }
+
     // Note: checkPython() removed - Python is no longer required
     // The coordinator was migrated from Python to TypeScript
 
@@ -1818,131 +2298,9 @@ Exit code is 0: ${result.exitCode === 0}
                 };
             }
             
-            // Step 2: Check if cursor-agent exists in WSL
-            // Use spawnSync instead of execSync to avoid cmd.exe and quoting issues
-            try {
-                log.debug('[checkCursorAgentCli] Checking for cursor-agent in WSL...');
-                
-                // Use spawnSync to call wsl.exe directly (avoids cmd.exe shell parsing issues)
-                const result = spawnSync(
-                    'wsl',
-                    [
-                        '-d', 'Ubuntu',
-                        'bash', '-c',
-                        'if [ -f ~/.local/bin/cursor-agent ]; then ~/.local/bin/cursor-agent --version 2>&1; else echo NOT_FOUND; fi'
-                    ],
-                    { 
-                        encoding: 'utf8',
-                        timeout: 15000,  // 15 seconds
-                        maxBuffer: 1024 * 1024,  // 1MB buffer
-                        windowsHide: true
-                    }
-                );
-                
-                // spawnSync returns output in stdout/stderr properties, and status/error
-                const fileCheck = (result.stdout || '').trim();
-                const errorOutput = (result.stderr || '').trim();
-                
-                log.debug('[checkCursorAgentCli] WSL check result:', fileCheck);
-                if (errorOutput) {
-                    log.debug('[checkCursorAgentCli] WSL stderr:', errorOutput);
-                }
-                
-                // Check for errors
-                if (result.error) {
-                    throw result.error;
-                }
-                
-                if (!fileCheck || fileCheck.includes('NOT_FOUND') || !fileCheck.trim()) {
-                log.warn('[checkCursorAgentCli] cursor-agent not found in WSL');
-                return {
-                    name: 'Cursor Agent CLI',
-                    installed: false,
-                    required: isRequired,
-                    description: isRequired
-                        ? '❌ cursor-agent not installed in WSL!\n\n' +
-                          'WHAT IT DOES:\n' +
-                          '• Runs AI agents via Cursor backend\n' +
-                          '• Connects to Unity MCP on Windows\n\n' +
-                          'INSTALLATION:\n' +
-                          '• Click Install to run automated setup\n' +
-                          '• Requires admin privileges for WSL\n' +
-                          '• Installs WSL, Ubuntu, cursor-agent, Node.js, apc CLI\n\n' +
-                          '📖 Documentation: https://cursor.com/docs/cli/installation'
-                        : 'Not needed (cursor backend not in use)',
-                    platform: 'all',
-                    installUrl: 'https://cursor.com/docs/cli/installation',
-                    installType: 'cursor-agent-cli'
-                };
-                }
-                
-                log.info('[checkCursorAgentCli] cursor-agent found in WSL:', fileCheck.split('\n')[0]);
-                
-                // Step 3: Verify WSL mirrored mode is enabled (REQUIRED for Unity MCP)
-                const mirroredModeCheck = this.checkWslMirroredMode();
-                
-                if (!mirroredModeCheck.enabled) {
-                    log.warn('[checkCursorAgentCli] WSL mirrored mode not enabled!');
-                    return {
-                        name: 'Cursor Agent CLI',
-                        installed: false,  // Mark as NOT installed because it won't work properly
-                        required: isRequired,
-                        description: isRequired
-                            ? `❌ WSL mirrored mode REQUIRED but not enabled!\n\n${mirroredModeCheck.error}\n\nClick Install to run the setup script that will configure WSL properly.`
-                            : 'WSL mirrored mode not enabled (required for Unity MCP connectivity)',
-                        platform: 'all',
-                        installUrl: 'https://cursor.com/docs/cli/installation',
-                        installType: 'cursor-agent-cli'
-                    };
-                }
-                
-                // SUCCESS: cursor-agent + mirrored mode enabled
-                log.info('[checkCursorAgentCli] ✅ cursor-agent + WSL mirrored mode verified');
-                return {
-                    name: 'Cursor Agent CLI',
-                    installed: true,
-                    version: `${fileCheck.split('\n')[0]} (in WSL)`,
-                    required: isRequired,
-                    description: isRequired
-                        ? '✅ Installed in WSL with mirrored networking - ready for cursor backend'
-                        : 'Not needed (cursor backend not in use)',
-                    platform: 'all',
-                    installCommand: 'curl https://cursor.com/install -fsS | bash',
-                    installUrl: 'https://cursor.com/docs/cli/installation'
-                };
-                
-            } catch (checkError: any) {
-                // Handle errors
-                log.error('[checkCursorAgentCli] cursor-agent check failed:', checkError);
-                
-                // Check if this is a timeout error
-                if (checkError.code === 'ETIMEDOUT') {
-                    log.warn('[checkCursorAgentCli] WSL command timed out - WSL may be slow or unresponsive');
-                    return {
-                        name: 'Cursor Agent CLI',
-                        installed: false,
-                        required: isRequired,
-                        description: isRequired
-                            ? '❌ WSL check timed out - WSL may be slow or not responding.\n\nTry:\n1. Restart WSL: wsl --shutdown\n2. Check WSL status: wsl --status\n3. Click Install to run the setup script'
-                            : 'Not needed (cursor backend not in use)',
-                        platform: 'all',
-                        installUrl: 'https://cursor.com/docs/cli/installation',
-                        installType: 'cursor-agent-cli'
-                    };
-                }
-                
-                return {
-                    name: 'Cursor Agent CLI',
-                    installed: false,
-                    required: isRequired,
-                    description: isRequired
-                        ? `❌ Failed to check cursor-agent in WSL: ${checkError.message || String(checkError)}`
-                        : 'Not needed (cursor backend not in use)',
-                    platform: 'all',
-                    installUrl: 'https://cursor.com/docs/cli/installation',
-                    installType: 'cursor-agent-cli'
-                };
-            }
+            // Step 2: Check if cursor-agent exists in WSL (with automatic restart on timeout)
+            const checkResult = await this.checkCursorAgentInWslWithRetry(isRequired);
+            return checkResult;
         } else {
             // macOS/Linux: Check native PATH
             log.debug('[checkCursorAgentCli] macOS/Linux - checking native PATH');
@@ -1978,6 +2336,162 @@ Exit code is 0: ${result.exitCode === 0}
             }
         }
     }
+
+    /**
+     * Check cursor-agent in WSL with automatic restart on timeout.
+     * If WSL times out, it will be restarted and the check retried once.
+     */
+    private async checkCursorAgentInWslWithRetry(isRequired: boolean, isRetry: boolean = false): Promise<DependencyStatus> {
+        try {
+            log.debug(`[checkCursorAgentInWslWithRetry] Checking for cursor-agent in WSL... (retry: ${isRetry})`);
+            
+            // Use spawnSync to call wsl.exe directly (avoids cmd.exe shell parsing issues)
+            const result = spawnSync(
+                'wsl',
+                [
+                    '-d', 'Ubuntu',
+                    'bash', '-c',
+                    'if [ -f ~/.local/bin/cursor-agent ]; then ~/.local/bin/cursor-agent --version 2>&1; else echo NOT_FOUND; fi'
+                ],
+                { 
+                    encoding: 'utf8',
+                    timeout: 15000,  // 15 seconds
+                    maxBuffer: 1024 * 1024,  // 1MB buffer
+                    windowsHide: true
+                }
+            );
+            
+            // spawnSync returns output in stdout/stderr properties, and status/error
+            const fileCheck = (result.stdout || '').trim();
+            const errorOutput = (result.stderr || '').trim();
+            
+            log.debug('[checkCursorAgentInWslWithRetry] WSL check result:', fileCheck);
+            if (errorOutput) {
+                log.debug('[checkCursorAgentInWslWithRetry] WSL stderr:', errorOutput);
+            }
+            
+            // Check for errors
+            if (result.error) {
+                throw result.error;
+            }
+            
+            if (!fileCheck || fileCheck.includes('NOT_FOUND') || !fileCheck.trim()) {
+                log.warn('[checkCursorAgentInWslWithRetry] cursor-agent not found in WSL');
+                return {
+                    name: 'Cursor Agent CLI',
+                    installed: false,
+                    required: isRequired,
+                    description: isRequired
+                        ? '❌ cursor-agent not installed in WSL!\n\n' +
+                          'WHAT IT DOES:\n' +
+                          '• Runs AI agents via Cursor backend\n' +
+                          '• Connects to Unity MCP on Windows\n\n' +
+                          'INSTALLATION:\n' +
+                          '• Click Install to run automated setup\n' +
+                          '• Requires admin privileges for WSL\n' +
+                          '• Installs WSL, Ubuntu, cursor-agent, Node.js, apc CLI\n\n' +
+                          '📖 Documentation: https://cursor.com/docs/cli/installation'
+                        : 'Not needed (cursor backend not in use)',
+                    platform: 'all',
+                    installUrl: 'https://cursor.com/docs/cli/installation',
+                    installType: 'cursor-agent-cli'
+                };
+            }
+            
+            log.info('[checkCursorAgentInWslWithRetry] cursor-agent found in WSL:', fileCheck.split('\n')[0]);
+            
+            // Step 3: Verify WSL mirrored mode is enabled (REQUIRED for Unity MCP)
+            const mirroredModeCheck = this.checkWslMirroredMode();
+            
+            if (!mirroredModeCheck.enabled) {
+                log.warn('[checkCursorAgentInWslWithRetry] WSL mirrored mode not enabled!');
+                return {
+                    name: 'Cursor Agent CLI',
+                    installed: false,  // Mark as NOT installed because it won't work properly
+                    required: isRequired,
+                    description: isRequired
+                        ? `❌ WSL mirrored mode REQUIRED but not enabled!\n\n${mirroredModeCheck.error}\n\nClick Install to run the setup script that will configure WSL properly.`
+                        : 'WSL mirrored mode not enabled (required for Unity MCP connectivity)',
+                    platform: 'all',
+                    installUrl: 'https://cursor.com/docs/cli/installation',
+                    installType: 'cursor-agent-cli'
+                };
+            }
+            
+            // SUCCESS: cursor-agent + mirrored mode enabled
+            log.info('[checkCursorAgentInWslWithRetry] ✅ cursor-agent + WSL mirrored mode verified');
+            return {
+                name: 'Cursor Agent CLI',
+                installed: true,
+                version: `${fileCheck.split('\n')[0]} (in WSL)`,
+                required: isRequired,
+                description: isRequired
+                    ? '✅ Installed in WSL with mirrored networking - ready for cursor backend'
+                    : 'Not needed (cursor backend not in use)',
+                platform: 'all',
+                installCommand: 'curl https://cursor.com/install -fsS | bash',
+                installUrl: 'https://cursor.com/docs/cli/installation'
+            };
+            
+        } catch (checkError: any) {
+            // Handle errors
+            log.error('[checkCursorAgentInWslWithRetry] cursor-agent check failed:', checkError);
+            
+            // Check if this is a timeout error
+            if (checkError.code === 'ETIMEDOUT') {
+                log.warn('[checkCursorAgentInWslWithRetry] WSL command timed out - WSL may be slow or unresponsive');
+                
+                // If this is the first attempt, try restarting WSL and retry
+                if (!isRetry) {
+                    log.info('[checkCursorAgentInWslWithRetry] Attempting automatic WSL restart...');
+                    const restarted = await restartWsl();
+                    
+                    if (restarted) {
+                        log.info('[checkCursorAgentInWslWithRetry] WSL restarted, retrying check...');
+                        // Retry the check after WSL restart
+                        return this.checkCursorAgentInWslWithRetry(isRequired, true);
+                    } else {
+                        log.warn('[checkCursorAgentInWslWithRetry] WSL restart failed, cannot retry');
+                    }
+                } else {
+                    log.error('[checkCursorAgentInWslWithRetry] WSL still timing out after restart');
+                }
+                
+                return {
+                    name: 'Cursor Agent CLI',
+                    installed: false,
+                    required: isRequired,
+                    description: isRequired
+                        ? '❌ WSL check timed out even after restart.\n\n' +
+                          'WSL appears to be broken or extremely slow.\n\n' +
+                          'Try manually:\n' +
+                          '1. Open PowerShell as Admin\n' +
+                          '2. Run: wsl --shutdown\n' +
+                          '3. Run: wsl --status\n' +
+                          '4. If WSL is corrupted, reinstall: wsl --unregister Ubuntu && wsl --install Ubuntu'
+                        : 'Not needed (cursor backend not in use)',
+                    platform: 'all',
+                    installUrl: 'https://cursor.com/docs/cli/installation',
+                    installType: 'cursor-agent-cli'
+                };
+            }
+            
+            return {
+                name: 'Cursor Agent CLI',
+                installed: false,
+                required: isRequired,
+                description: isRequired
+                    ? `❌ Failed to check cursor-agent in WSL: ${checkError.message || String(checkError)}`
+                    : 'Not needed (cursor backend not in use)',
+                platform: 'all',
+                installUrl: 'https://cursor.com/docs/cli/installation',
+                installType: 'cursor-agent-cli'
+            };
+        }
+    }
+
+    // checkClaudeCli() and checkCodexCli() have been removed.
+    // CLI checks are now delegated to each backend via AgentRunner.getDependencyStatusForBackend()
 
     /**
      * Check if Node.js is installed in WSL (required for apc CLI to work in WSL)

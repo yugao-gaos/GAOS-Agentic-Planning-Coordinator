@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { getFolderStructureManager } from './FolderStructureManager';
+import { TaskIdValidator } from './TaskIdValidator';
 
 // ============================================================================
 // Plan Parser - Single Source of Truth for Plan/Task Parsing
@@ -13,14 +14,12 @@ import { getFolderStructureManager } from './FolderStructureManager';
 // - Parsing inline checkbox tasks for UI (PlanViewerPanel)
 //
 // **Task ID Format:**
-// Supports both global format (ps_XXXXXX_TN) and simple format (T1, T2).
-// Global format is preferred and used everywhere for consistency.
+// ONLY global format (PS_XXXXXX_TN) is supported. Example: PS_000001_T1
+// Simple IDs like "T1" are NOT supported - plans must use full global IDs.
 //
 // **Plan Formats Supported:**
-// 1. Legacy: ## Engineer's Checklist with - [ ] tasks
-// 2. Modern: ### Section with #### Task X.Y and **Engineer**: Engineer-N
-// 3. Table: | ID | Task | Dependencies | Files | Tests |
-// 4. Inline Checkbox: - [ ] **ps_000001_T1**: Description | Deps: X | Engineer: TBD
+// 1. Table: | ID | Task | Dependencies | Files | Tests |
+// 2. Inline Checkbox: - [ ] **PS_000001_T1**: Description | Deps: PS_000001_T2 | Engineer: TBD
 // ============================================================================
 
 /**
@@ -81,37 +80,57 @@ export interface ParsedTaskBasic {
     completed: boolean;
     dependencies: string[];
     engineer: string;
+    unity?: string;  // Unity pipeline config: none, prep, prep_editmode, prep_playmode, prep_playtest, full
 }
 
 // ============================================================================
-// Regex Patterns for Task Parsing
+// Regex Patterns for Task EXTRACTION (validation via TaskIdValidator)
+// ============================================================================
+//
+// NOTE: These patterns are PERMISSIVE for extraction. All captured task IDs
+// are validated through TaskIdValidator which enforces strict format:
+// - PS_XXXXXX_T1 (simple numbered)
+// - PS_XXXXXX_T7A (sub-task with letter)
+// - PS_XXXXXX_T24_EVENTS (task with underscore suffix)
+// - PS_XXXXXX_CTX1 (context task)
+//
+// INVALID formats rejected by TaskIdValidator:
+// - PS_XXXXXX_T24EVENTS (missing underscore before suffix)
+// - T1 (missing session prefix)
 // ============================================================================
 
 /**
- * Pattern for inline checkbox format tasks:
- * - [ ] **T1**: Description | Deps: None | Engineer: TBD (local)
- * - [ ] **ps_000001_T1**: Description | Deps: ps_000001_T2 | Engineer: TBD (global)
+ * Pattern for inline checkbox format tasks (FLEXIBLE - handles AI variations):
+ * Standard: - [ ] **PS_000001_T1**: Description | Deps: None | Engineer: TBD | Unity: none
+ * No bold:  - [ ] PS_000001_T1: Description | Deps: None | Engineer: TBD
+ * Asterisk: * [ ] **PS_000001_T1**: Description | Deps: None
+ * Lettered: - [ ] **PS_000001_T7A**: Description (supports T0A, T7B, T24B, etc.)
+ * Suffixed: - [ ] **PS_000001_T9_EVENTS**: Description (requires underscore: T9_EVENTS, not T9EVENTS)
+ * No pipes: - [ ] **PS_000001_T1**: Full description without metadata fields
  * 
  * Capture groups:
  * 1. Checkbox state (x, X, or space)
- * 2. Full task ID (e.g., "ps_000001_T1" or "T1")
- * 3. Description (everything before first |)
+ * 2. Raw task ID - validated via TaskIdValidator after capture
+ * 3. Description (everything before first | or end of line)
  * 4. Dependencies string (optional)
  * 5. Engineer name (optional)
+ * 6. Unity pipeline config (optional) - e.g., "none", "prep", "prep_editmode", "prep_playmode", "full"
+ * 
+ * NOTE: This pattern is intentionally permissive for extraction.
+ * TaskIdValidator enforces strict format validation after capture.
  */
-const INLINE_CHECKBOX_PATTERN = /^-\s*\[([xX ])\]\s*\*\*((?:ps_\d+_)?T[\d.]+)\*\*:\s*(.+?)(?:\s*\|\s*Deps?:\s*([^|]+))?(?:\s*\|\s*Engineer:\s*(\w+))?$/gm;
+const INLINE_CHECKBOX_PATTERN = /^[-*]\s*\[([xX ])\]\s*\*{0,2}((?:ps_\d+_)?T[\dA-Z_]+)\*{0,2}:\s*([^|]+)(?:\s*\|\s*Deps?:\s*([^|]+))?(?:\s*\|\s*Engineer:\s*([^|]+))?(?:\s*\|\s*Unity:\s*([^|\n]+))?.*$/gim;
 
 /**
- * Pattern for dependency references in deps string
- * Matches both: T1, T2.1, ps_000001_T1, ps_000001_T2.1
+ * Pattern for dependency references in deps string (extraction only)
+ * Validation happens via TaskIdValidator.extractGlobalTaskId()
  */
-const DEPENDENCY_PATTERN = /(?:ps_\d+_)?T[\d.]+/gi;
+const DEPENDENCY_PATTERN = /(?:ps_\d+_)?T[\dA-Z_]+/gi;
 
 /**
- * Pattern for detecting table format tasks
- * Matches: | T1 | or | ps_000001_T1 |
+ * Pattern for detecting table format tasks (counting only)
  */
-const TABLE_TASK_PATTERN = /\|\s*(?:ps_\d+_)?T\d+\s*\|/gi;
+const TABLE_TASK_PATTERN = /\|\s*(?:ps_\d+_)?T[\dA-Z_]+\s*\|/gi;
 
 // ============================================================================
 // Plan Parser Service
@@ -466,37 +485,20 @@ export class PlanParser {
 
     /**
      * Normalize a task ID to the standard format (UPPERCASE).
-     * Supports both global format (ps_XXXXXX_XX) and simple format (T1, CTX1, etc.).
+     * Only accepts global format (PS_XXXXXX_TN).
      * Returns the ID in uppercase if valid, or null if invalid.
+     * 
+     * Delegates to TaskIdValidator as the single source of truth.
      */
     private static normalizeTaskId(taskId: string): string | null {
-        if (!taskId) return null;
-        
-        const trimmed = taskId.trim();
-        
-        // Global format: ps_XXXXXX_XX (e.g., ps_000001_T1, ps_000001_CTX1 -> uppercase)
-        // Match any task ID after the session prefix, not just T\d+
-        const globalMatch = trimmed.match(/^(ps_\d{6})_(\S+)$/i);
-        if (globalMatch) {
-            // Normalize to uppercase
-            return `${globalMatch[1].toUpperCase()}_${globalMatch[2].toUpperCase()}`;
-        }
-        
-        // Simple format: T1, T2, T3.1, CTX1, etc. (or just numbers: 1, 2, 3)
-        // Accept any alphanumeric task ID pattern
-        const simpleMatch = trimmed.match(/^([A-Za-z]*\d+(?:\.\d+)?)$/i);
-        if (simpleMatch) {
-            const id = simpleMatch[1].toUpperCase();
-            // If no letter prefix, add 'T'
-            return /^[A-Za-z]/.test(id) ? id : `T${id}`;
-        }
-        
-        return null;
+        return TaskIdValidator.normalizeTaskId(taskId);
     }
 
     /**
      * Parse dependencies string into array of task IDs.
-     * Supports both global format (ps_XXXXXX_XX) and simple format (T1, CTX1, etc.).
+     * Only accepts global format (PS_XXXXXX_TN).
+     * 
+     * Uses TaskIdValidator for ID extraction and normalization.
      */
     private static parseDependencies(depsStr: string): string[] {
         const dependencies: string[] = [];
@@ -509,21 +511,12 @@ export class PlanParser {
         const depParts = depsStr.split(/[,\s]+(?:and\s+)?/).map(d => d.trim()).filter(d => d);
         
         for (const dep of depParts) {
-            // Try global format first: ps_XXXXXX_XX (any task ID after session prefix)
-            const globalMatch = dep.match(/(ps_\d{6})_(\S+)/i);
-            if (globalMatch) {
-                // Normalize to uppercase: PS_000001_T1
-                dependencies.push(`${globalMatch[1].toUpperCase()}_${globalMatch[2].toUpperCase()}`);
-                continue;
+            // Only global format supported - extract using TaskIdValidator
+            const globalId = TaskIdValidator.extractGlobalTaskId(dep);
+            if (globalId) {
+                dependencies.push(globalId);
             }
-            
-            // Try simple format: T1, CTX1 or just numbers
-            const simpleMatch = dep.match(/([A-Za-z]*\d+(?:\.\d+)?)/i);
-            if (simpleMatch) {
-                const id = simpleMatch[1].toUpperCase();
-                // If no letter prefix, add 'T'
-                dependencies.push(/^[A-Za-z]/.test(id) ? id : `T${id}`);
-            }
+            // Invalid/simple IDs are silently skipped - plans must use global format
         }
         
         return dependencies;
@@ -566,9 +559,9 @@ export class PlanParser {
 
         // Pattern: - [ ] or - [x] or N. [ ] or N. [x]
         // Also capture task ID if present:
-        // - [ ] **T1**: Description (local format)
-        // - [ ] **ps_000001_T1**: Description (global format)
-        // - [ ] **Task 1.1**: Description (legacy format)
+        // - [ ] **T1**: Description (local format - NOT supported, must be global)
+        // - [ ] **ps_000001_T1**: Description (global format - REQUIRED)
+        // - [ ] **Task 1.1**: Description (legacy format - NOT supported)
         const taskPattern = /(?:^|\n)\s*(?:(\d+)\.\s*)?[\-\*]\s*\[([ xX])\]\s*(?:\*\*(?:Task\s+)?((?:ps_\d+_)?T?[\d.]+)\*\*[:\s]*)?\s*(.+?)(?=\n|$)/g;
 
         let taskMatch;
@@ -584,7 +577,20 @@ export class PlanParser {
             const isComplete = checkboxComplete || /✅/.test(description);
 
             taskIndex++;
-            const taskId = explicitId ? explicitId.toUpperCase() : `${engineer.charAt(0)}${taskIndex}`;
+            
+            // Task must have explicit ID - no auto-generation
+            if (!explicitId) {
+                // Skip tasks without explicit IDs - they must use global format
+                continue;
+            }
+            
+            // UNIFIED VALIDATION: Use TaskIdValidator as single source of truth
+            const taskId = TaskIdValidator.normalizeGlobalTaskId(explicitId);
+            if (!taskId) {
+                // Not a valid global ID - skip
+                console.warn(`[PlanParser] Skipping task with invalid ID "${explicitId}" in checklist: Must be global format PS_XXXXXX_TN`);
+                continue;
+            }
 
             tasks.push({
                 id: taskId,
@@ -761,26 +767,63 @@ export class PlanParser {
         const tasks: ParsedTaskBasic[] = [];
         
         // Reset regex state (important for global patterns)
-        const pattern = new RegExp(INLINE_CHECKBOX_PATTERN.source, 'gm');
+        // IMPORTANT: Include 'i' flag for case-insensitive matching (PS_000002_ or ps_000002_)
+        const pattern = new RegExp(INLINE_CHECKBOX_PATTERN.source, 'gim');
         
         let match: RegExpExecArray | null;
+        let tasksWithDeps = 0;
+        let skippedInvalidIds = 0;
+        
         while ((match = pattern.exec(content)) !== null) {
             const completed = match[1].toLowerCase() === 'x';
-            const taskId = match[2].toUpperCase();
+            const rawTaskId = match[2];
             const description = match[3].trim();
             const depsStr = match[4]?.trim() || 'None';
             const engineer = match[5]?.trim() || 'TBD';
+            const unity = match[6]?.trim() || 'none';  // Default to 'none' if not specified
+            
+            // UNIFIED VALIDATION: Use TaskIdValidator as single source of truth
+            // Try global format first (ps_XXXXXX_TN)
+            let taskId = TaskIdValidator.normalizeGlobalTaskId(rawTaskId);
+            
+            if (!taskId) {
+                // Not a valid global ID - log warning and skip
+                console.warn(`[PlanParser] Skipping task with invalid ID "${rawTaskId}": Must be global format PS_XXXXXX_TN (e.g., PS_000001_T1, PS_000001_T24_EVENTS). Suffixes require underscore.`);
+                skippedInvalidIds++;
+                continue;
+            }
             
             // Parse dependencies using the robust method
             const dependencies = this.parseDependenciesFromString(depsStr);
+            
+            if (dependencies.length > 0) {
+                tasksWithDeps++;
+            }
             
             tasks.push({
                 id: taskId,
                 description,
                 completed,
                 dependencies,
-                engineer
+                engineer,
+                unity
             });
+        }
+        
+        // Log summary of skipped invalid IDs
+        if (skippedInvalidIds > 0) {
+            console.warn(`[PlanParser] Skipped ${skippedInvalidIds} tasks with invalid IDs. Valid formats: PS_000001_T1, PS_000001_T7A, PS_000001_T24_EVENTS`);
+        }
+        
+        // Log warning if tasks found but none have dependencies (suspicious)
+        if (tasks.length > 1 && tasksWithDeps === 0) {
+            console.warn(`[PlanParser] WARNING: Found ${tasks.length} tasks but NONE have dependencies. Plan format may be missing pipe-separated metadata.`);
+            console.warn(`[PlanParser] Expected format: - [ ] **PS_000001_T1**: Description | Deps: PS_000001_T2 | Engineer: TBD`);
+            // Show sample of what was parsed
+            if (tasks.length > 0) {
+                const sample = tasks[0];
+                console.warn(`[PlanParser] Sample parsed task: id=${sample.id}, desc="${sample.description.substring(0, 50)}...", deps=[${sample.dependencies.join(',')}]`);
+            }
         }
         
         return tasks;
@@ -819,5 +862,194 @@ export class PlanParser {
         const matches = content.match(TABLE_TASK_PATTERN);
         return matches ? matches.length : 0;
     }
+    
+    // ========================================================================
+    // FORMAT VALIDATION (for workflow format validation loops)
+    // ========================================================================
+    
+    /**
+     * Result of format validation
+     */
+    static validatePlanFormat(content: string, sessionId: string): PlanFormatValidationResult {
+        const errors: PlanFormatError[] = [];
+        const warnings: string[] = [];
+        let validTaskCount = 0;
+        
+        // Reset regex state
+        const pattern = new RegExp(INLINE_CHECKBOX_PATTERN.source, 'gim');
+        
+        let match: RegExpExecArray | null;
+        let taskLikeCount = 0;  // Count of things that look like tasks
+        let tasksWithDeps = 0;
+        
+        while ((match = pattern.exec(content)) !== null) {
+            taskLikeCount++;
+            const rawTaskId = match[2];
+            const lineNumber = this.getLineNumber(content, match.index);
+            
+            // Validate task ID through TaskIdValidator
+            const normalizedId = TaskIdValidator.normalizeGlobalTaskId(rawTaskId);
+            
+            if (!normalizedId) {
+                // Determine the specific error
+                let errorMessage: string;
+                let suggestion: string;
+                
+                if (!rawTaskId.toLowerCase().startsWith('ps_')) {
+                    errorMessage = `Task ID "${rawTaskId}" missing session prefix`;
+                    suggestion = `Change to "${sessionId}_${rawTaskId}"`;
+                } else if (/T\d+[A-Z]{2,}/.test(rawTaskId.toUpperCase()) && !rawTaskId.includes('_')) {
+                    // Matches things like T24EVENTS (multiple letters after number, no underscore)
+                    const parts = rawTaskId.toUpperCase().match(/^(.*?)(T\d+)([A-Z]{2,})$/i);
+                    if (parts) {
+                        errorMessage = `Task ID "${rawTaskId}" has suffix without underscore separator`;
+                        suggestion = `Change to "${parts[1]}${parts[2]}_${parts[3]}"`;
+                    } else {
+                        errorMessage = `Task ID "${rawTaskId}" has invalid format`;
+                        suggestion = `Use format: ${sessionId}_T1, ${sessionId}_T7A, or ${sessionId}_T24_EVENTS`;
+                    }
+                } else {
+                    errorMessage = `Task ID "${rawTaskId}" has invalid format`;
+                    suggestion = `Use format: ${sessionId}_T1, ${sessionId}_T7A, or ${sessionId}_T24_EVENTS`;
+                }
+                
+                errors.push({
+                    line: lineNumber,
+                    rawId: rawTaskId,
+                    message: errorMessage,
+                    suggestion
+                });
+            } else {
+                validTaskCount++;
+                
+                // Check dependencies
+                const depsStr = match[4]?.trim() || '';
+                if (depsStr && depsStr.toLowerCase() !== 'none') {
+                    const deps = this.parseDependenciesFromString(depsStr);
+                    if (deps.length > 0) {
+                        tasksWithDeps++;
+                    }
+                }
+            }
+        }
+        
+        // Check for tasks without pipe-separated metadata
+        if (validTaskCount > 1 && tasksWithDeps === 0) {
+            warnings.push(
+                `Found ${validTaskCount} tasks but NONE have dependencies. ` +
+                `Plan may be missing pipe-separated metadata. ` +
+                `Expected format: - [ ] **${sessionId}_T1**: Description | Deps: ${sessionId}_T2 | Engineer: TBD`
+            );
+        }
+        
+        // Check if no tasks found at all
+        if (taskLikeCount === 0) {
+            warnings.push(
+                `No tasks found in plan. Expected checkbox format: ` +
+                `- [ ] **${sessionId}_T1**: Description | Deps: None | Engineer: TBD`
+            );
+        }
+        
+        return {
+            valid: errors.length === 0,
+            errors,
+            warnings,
+            validTaskCount,
+            totalTaskLikeCount: taskLikeCount
+        };
+    }
+    
+    /**
+     * Validate plan format from file path
+     */
+    static validatePlanFormatFromFile(planPath: string, sessionId: string): PlanFormatValidationResult {
+        if (!fs.existsSync(planPath)) {
+            return {
+                valid: false,
+                errors: [{
+                    line: 0,
+                    rawId: '',
+                    message: `Plan file not found: ${planPath}`,
+                    suggestion: 'Ensure the plan file exists'
+                }],
+                warnings: [],
+                validTaskCount: 0,
+                totalTaskLikeCount: 0
+            };
+        }
+        
+        const content = fs.readFileSync(planPath, 'utf-8');
+        return this.validatePlanFormat(content, sessionId);
+    }
+    
+    /**
+     * Format validation errors for display in prompts
+     */
+    static formatValidationErrorsForPrompt(result: PlanFormatValidationResult): string {
+        if (result.valid && result.warnings.length === 0) {
+            return '';
+        }
+        
+        const lines: string[] = [];
+        
+        if (result.errors.length > 0) {
+            lines.push(`## ❌ FORMAT ERRORS (${result.errors.length} found - MUST FIX)`);
+            lines.push('');
+            for (const error of result.errors) {
+                lines.push(`- **Line ${error.line}**: ${error.message}`);
+                lines.push(`  - Raw ID: \`${error.rawId}\``);
+                lines.push(`  - Fix: ${error.suggestion}`);
+            }
+            lines.push('');
+        }
+        
+        if (result.warnings.length > 0) {
+            lines.push(`## ⚠️ WARNINGS`);
+            lines.push('');
+            for (const warning of result.warnings) {
+                lines.push(`- ${warning}`);
+            }
+            lines.push('');
+        }
+        
+        return lines.join('\n');
+    }
+    
+    /**
+     * Get line number from content index
+     */
+    private static getLineNumber(content: string, index: number): number {
+        return content.substring(0, index).split('\n').length;
+    }
+}
+
+/**
+ * Result of plan format validation
+ */
+export interface PlanFormatValidationResult {
+    /** Whether the plan format is valid (no errors) */
+    valid: boolean;
+    /** List of format errors found */
+    errors: PlanFormatError[];
+    /** List of warnings (non-blocking) */
+    warnings: string[];
+    /** Number of valid tasks found */
+    validTaskCount: number;
+    /** Total number of task-like patterns found (including invalid) */
+    totalTaskLikeCount: number;
+}
+
+/**
+ * Individual format error
+ */
+export interface PlanFormatError {
+    /** Line number in the file */
+    line: number;
+    /** Raw task ID that failed validation */
+    rawId: string;
+    /** Error message */
+    message: string;
+    /** Suggested fix */
+    suggestion: string;
 }
 

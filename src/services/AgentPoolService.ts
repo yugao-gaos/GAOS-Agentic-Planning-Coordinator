@@ -323,7 +323,7 @@ export class AgentPoolService {
     }
 
     /**
-     * Demote agent from busy back to bench (workflow paused/waiting)
+     * Demote agent from busy back to bench (workflow waiting/blocked)
      */
     demoteAgentToBench(agentName: string): boolean {
         const state = this.stateManager.getAgentPoolState();

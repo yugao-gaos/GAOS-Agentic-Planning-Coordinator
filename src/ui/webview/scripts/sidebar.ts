@@ -13,6 +13,7 @@ export function getSidebarScript(): string {
         let expandedSessions = new Set();
         let expandedCoordinators = new Set();
         let expandedHistories = new Set();
+        let completedSessionsExpanded = false;
         
         // Cooldown state for buttons (prevents double-clicks)
         let lastNewSessionClick = 0;
@@ -219,7 +220,7 @@ export function getSidebarScript(): string {
                 };
             });
             
-            // Workflow action button handlers (pause/resume/cancel)
+            // Workflow action button handlers (cancel)
             sessionsContent.querySelectorAll('.workflow-action-btn').forEach(btn => {
                 btn.onclick = (e) => {
                     e.stopPropagation();
@@ -278,6 +279,79 @@ export function getSidebarScript(): string {
                     }
                 };
             });
+            
+            // Completed sessions section handlers
+            attachCompletedSessionsHandlers();
+        }
+        
+        /**
+         * Attach event handlers to completed sessions section.
+         */
+        function attachCompletedSessionsHandlers() {
+            // Toggle completed sessions section
+            const completedHeader = sessionsContent.querySelector('[data-action="toggleCompletedSessions"]');
+            if (completedHeader) {
+                completedHeader.onclick = () => {
+                    const section = completedHeader.closest('.completed-sessions-section');
+                    const body = section ? section.querySelector('.completed-sessions-body') : null;
+                    const expand = completedHeader.querySelector('.completed-sessions-expand');
+                    
+                    completedSessionsExpanded = !completedSessionsExpanded;
+                    
+                    if (completedSessionsExpanded) {
+                        if (section) section.classList.add('expanded');
+                        if (body) body.classList.add('expanded');
+                        if (expand) expand.classList.add('expanded');
+                    } else {
+                        if (section) section.classList.remove('expanded');
+                        if (body) body.classList.remove('expanded');
+                        if (expand) expand.classList.remove('expanded');
+                    }
+                };
+            }
+            
+            // Open completed plan button
+            sessionsContent.querySelectorAll('[data-action="openCompletedPlan"]').forEach(btn => {
+                btn.onclick = (e) => {
+                    e.stopPropagation();
+                    const sessionId = btn.dataset.sessionId;
+                    const item = btn.closest('.completed-session-item');
+                    const planPath = item ? item.dataset.planPath : null;
+                    vscode.postMessage({ type: 'openPlan', sessionId, planPath, sessionStatus: 'completed' });
+                };
+            });
+            
+            // Reopen session button
+            sessionsContent.querySelectorAll('[data-action="reopenSession"]').forEach(btn => {
+                btn.onclick = (e) => {
+                    e.stopPropagation();
+                    const sessionId = btn.dataset.sessionId;
+                    vscode.postMessage({ type: 'reopenSession', sessionId });
+                };
+            });
+            
+            // View all completed sessions button
+            const viewAllBtn = sessionsContent.querySelector('[data-action="viewAllCompletedSessions"]');
+            if (viewAllBtn) {
+                viewAllBtn.onclick = () => {
+                    vscode.postMessage({ type: 'viewAllCompletedSessions' });
+                };
+            }
+        }
+        
+        /**
+         * Reapply completed sessions expanded state after HTML update.
+         */
+        function reapplyCompletedSessionsExpandedState() {
+            if (completedSessionsExpanded) {
+                const section = sessionsContent.querySelector('.completed-sessions-section');
+                const body = section ? section.querySelector('.completed-sessions-body') : null;
+                const expand = section ? section.querySelector('.completed-sessions-expand') : null;
+                
+                if (section) section.classList.add('expanded');
+                if (body) body.classList.add('expanded');
+                if (expand) expand.classList.add('expanded');
+            }
         }
 
         /**
@@ -382,25 +456,29 @@ export function getSidebarScript(): string {
             
             let unityHtml = '';
             if (unityEnabled && unity) {
-                const unityBadge = getUnityBadgeStyle(unity);
-                const queueText = unity.queueLength > 0 ? '(' + unity.queueLength + ')' : '';
-                // Show prep button when Unity is idle and queue is empty
-                const canTriggerPrep = unity.connected && 
-                                       !unity.isCompiling && 
-                                       !unity.isPlaying && 
-                                       !unity.currentTask && 
-                                       unity.queueLength === 0;
-                const prepBtnHtml = canTriggerPrep 
-                    ? '<button class="coord-icon-btn" id="unityPrepBtn" title="Trigger Unity Prep (compile)">🔄</button>'
-                    : '';
+                const unityState = getUnityStateInfo(unity);
+                const unityClass = getUnityStateClass(unity);
+                const queueText = unity.queueLength > 0 ? ' (' + unity.queueLength + ')' : '';
+                
+                // Action buttons - always show, but disable when not applicable
+                const canTriggerActions = unity.connected && 
+                                          !unity.isCompiling && 
+                                          !unity.isPlaying && 
+                                          !unity.currentTask;
+                const disabledClass = canTriggerActions ? '' : ' disabled';
+                const disabledAttr = canTriggerActions ? '' : ' disabled';
                 
                 unityHtml = '<div class="status-boxes-row" style="margin-top: 6px;">' +
-                    '<div class="status-box">' +
+                    '<div class="status-box" id="unityInfo">' +
                     '<span class="status-box-label">Unity</span>' +
-                    '<span class="unity-badge" style="background: ' + unityBadge.background + ';">' + unityBadge.text + '</span>' +
-                    (queueText ? '<span class="unity-queue">' + queueText + '</span>' : '') +
-                    prepBtnHtml +
-                    '</div></div>';
+                    '<div class="unity-dot ' + unityClass + '" id="unityDot"></div>' +
+                    '<span class="unity-text" id="unityText">' + unityState.text + queueText + '</span>' +
+                    '<div class="unity-actions">' +
+                    '<button class="coord-icon-btn' + disabledClass + '" id="unityPrepBtn" title="Prep (compile only)"' + disabledAttr + '>⚡</button>' +
+                    '<button class="coord-icon-btn' + disabledClass + '" id="unityEditModeBtn" title="Prep + EditMode Tests"' + disabledAttr + '>🧪</button>' +
+                    '<button class="coord-icon-btn' + disabledClass + '" id="unityPlayModeBtn" title="Prep + PlayMode Tests"' + disabledAttr + '>▶️</button>' +
+                    '<button class="coord-icon-btn' + disabledClass + '" id="unityPlayerTestBtn" title="Prep + Player Test"' + disabledAttr + '>🎮</button>' +
+                    '</div></div></div>';
             }
             
             return '<div class="context-box context-box-ready">' +
@@ -417,27 +495,67 @@ export function getSidebarScript(): string {
                 '</div>';
         }
         
-        function getUnityBadgeStyle(unity) {
+        function getUnityStateInfo(unity) {
             if (!unity.connected) {
-                return { text: 'Offline', background: 'rgba(107, 114, 128, 0.3)' };
+                return { text: 'Offline', state: 'offline' };
             }
             if (unity.isCompiling) {
-                return { text: 'Compiling', background: 'rgba(0, 122, 204, 0.3)' };
+                return { text: 'Compiling', state: 'compiling' };
+            }
+            if (unity.currentTask) {
+                const taskType = unity.currentTask.type;
+                if (taskType === 'test_editmode') {
+                    return { text: 'Testing (Edit)', state: 'testing' };
+                }
+                if (taskType === 'test_playmode') {
+                    return { text: 'Testing (Play)', state: 'testing' };
+                }
+                if (taskType === 'test_player_playmode') {
+                    return { text: 'Player Test', state: 'playing' };
+                }
+                if (taskType === 'prep_editor' || taskType === 'prep') {
+                    return { text: 'Compiling', state: 'compiling' };
+                }
+                return { text: 'Running', state: 'running' };
+            }
+            // Show queued state when there are pipelines waiting
+            if (unity.queueLength > 0) {
+                return { text: 'Queued', state: 'running' };
+            }
+            if (unity.isPlaying) {
+                return { text: 'Playing', state: 'playing' };
+            }
+            return { text: 'Idle', state: 'idle' };
+        }
+        
+        function getUnityStateClass(unity) {
+            if (!unity.connected) {
+                return 'offline';
+            }
+            if (unity.isCompiling) {
+                return 'compiling';
             }
             if (unity.currentTask) {
                 const taskType = unity.currentTask.type;
                 if (taskType === 'test_editmode' || taskType === 'test_playmode') {
-                    return { text: 'Testing', background: 'rgba(234, 179, 8, 0.3)' };
+                    return 'testing';
                 }
-                if (taskType === 'prep_editor') {
-                    return { text: 'Compiling', background: 'rgba(0, 122, 204, 0.3)' };
+                if (taskType === 'test_player_playmode') {
+                    return 'playing';
                 }
-                return { text: 'Running', background: 'rgba(115, 201, 145, 0.3)' };
+                if (taskType === 'prep_editor' || taskType === 'prep') {
+                    return 'compiling';
+                }
+                return 'running';
+            }
+            // Show running animation when pipelines are queued
+            if (unity.queueLength > 0) {
+                return 'running';
             }
             if (unity.isPlaying) {
-                return { text: 'Playing', background: 'rgba(115, 201, 145, 0.3)' };
+                return 'playing';
             }
-            return { text: 'Idle', background: 'rgba(107, 114, 128, 0.3)' };
+            return 'idle';
         }
         
         /**
@@ -470,8 +588,26 @@ export function getSidebarScript(): string {
             
             // Unity Prep button
             const unityPrepBtn = document.getElementById('unityPrepBtn');
-            if (unityPrepBtn) {
+            if (unityPrepBtn && !unityPrepBtn.disabled) {
                 unityPrepBtn.onclick = () => vscode.postMessage({ type: 'triggerUnityPrep' });
+            }
+            
+            // Unity EditMode Test button
+            const unityEditModeBtn = document.getElementById('unityEditModeBtn');
+            if (unityEditModeBtn && !unityEditModeBtn.disabled) {
+                unityEditModeBtn.onclick = () => vscode.postMessage({ type: 'triggerUnityEditModeTest' });
+            }
+            
+            // Unity PlayMode Test button
+            const unityPlayModeBtn = document.getElementById('unityPlayModeBtn');
+            if (unityPlayModeBtn && !unityPlayModeBtn.disabled) {
+                unityPlayModeBtn.onclick = () => vscode.postMessage({ type: 'triggerUnityPlayModeTest' });
+            }
+            
+            // Unity Player Test button
+            const unityPlayerTestBtn = document.getElementById('unityPlayerTestBtn');
+            if (unityPlayerTestBtn && !unityPlayerTestBtn.disabled) {
+                unityPlayerTestBtn.onclick = () => vscode.postMessage({ type: 'triggerUnityPlayerTest' });
             }
             
             // Install buttons
@@ -588,10 +724,11 @@ export function getSidebarScript(): string {
             // Sessions - use pre-rendered HTML from server
             if (state.sessionsHtml) {
                 sessionsContent.innerHTML = state.sessionsHtml;
-                // Reapply expanded state to sessions, coordinators, and histories
+                // Reapply expanded state to sessions, coordinators, histories, and completed sessions
                 reapplyExpandedState();
                 reapplyCoordinatorExpandedState();
                 reapplyHistoryExpandedState();
+                reapplyCompletedSessionsExpandedState();
                 attachSessionHandlers();
             }
 
